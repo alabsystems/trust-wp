@@ -1,0 +1,31 @@
+# .gitleaks.toml
+# Gitleaks secret scanning configuration
+# See: https://github.com/gitleaks/gitleaks
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+title = "trust-wp gitleaks config"
+
+[extend]
+# Use default gitleaks rules
+useDefault = true
+
+# No [allowlist] table, by design.
+#
+# This file used to carry an inherited "ai_template" allowlist that skipped
+# `tests/fixtures/`, `vendor/`, `third_party/`, `node_modules/` and any string
+# containing `TEST_`/`EXAMPLE_`/`PLACEHOLDER_`/`sk-test-`/`pk-test-`. That is a
+# repository-wide hole in this repo's own secret scan: a real credential pasted
+# into a test fixture would never have been reported.
+#
+# The publication engine also rejects it outright — `check_gitleaks_config` in
+# publication's `bin/pub` fails the stage if `.gitleaks.toml` declares
+# `[allowlist]`/`[allowlists]` at any level, because a published repo must not
+# be able to neutralize the scan that guards it. Scanning without the allowlist
+# is clean, so there was nothing being suppressed but the guarantee itself.
+#
+# Do not re-add one. If a genuine false positive appears, fix it at the source
+# (rename the fixture value, use an obviously-fake literal) rather than teaching
+# the scanner to look away.

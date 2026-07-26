@@ -1,0 +1,128 @@
+# trust-wp - Deductive verification for Rust
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[workspace]
+resolver = "2"
+# Nested standalone workspaces (own [workspace] roots): the INTERFACE-v1 reference crate
+# and the spike suite build on stable with their own lockfiles; excluded here so
+# path-deps into them (e.g. trust-wp-driver → trust-spec-iface behind the clean-kernel
+# feature) do not conflict with this workspace root.
+exclude = ["iface/trust-spec-iface", "spikes"]
+members = [
+    "crates/cargo-trust-wp",
+    "crates/creusot-contracts",
+    "crates/creusot-std",
+    "crates/trust-wp",
+    "crates/trust-wp-core",
+    "crates/trust-wp-macros",
+    "crates/trust-wp-std",
+    "crates/trust-wp-test-utils",
+]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+# rust-version omitted: requires nightly for rustc_private
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/trust-wp"
+
+[workspace.dependencies]
+# Internal crates
+cargo-trust-wp = { path = "crates/cargo-trust-wp" }
+creusot-contracts = { path = "crates/creusot-contracts" }
+creusot-std = { path = "crates/creusot-std" }
+trust-wp = { path = "crates/trust-wp" }
+trust-wp-core = { path = "crates/trust-wp-core" }
+trust-wp-macros = { path = "crates/trust-wp-macros" }
+trust-wp-std = { path = "crates/trust-wp-std" }
+trust-wp-test-utils = { path = "crates/trust-wp-test-utils" }
+
+# The ay SMT backend (crates/trust-wp-ay), the rustc-driver (crates/trust-wp-driver),
+# the lib facade (crates/trust-wp-lib), their `trust-ir` proof-IR bundle, and
+# the first-party `ay` solver dependency are omitted from this public
+# snapshot: `ay` is not yet public. See publish/DECISIONS.md.
+
+
+# Proc macro support
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "parsing", "visit", "fold"] }
+
+# Numeric (ay model extraction uses BigInt)
+num-bigint = "0.4"
+num-traits = "0.2"
+sha2 = "0.10"
+
+# Common utilities
+thiserror = "2.0"
+log = "0.4"
+stacker = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+trybuild = "1.0"
+proptest = "1.5"
+
+[workspace.lints.rust]
+# Note: trust-wp-driver requires unsafe for rustc_private (lifetime transmutes)
+# See reference/creusot/creusot/src/callbacks.rs for the pattern
+# unsafe_code = "forbid" disabled for rustc_private compatibility
+# Allow cfg conditions set by trust-wp-driver and opt-in solver proof benchmarks.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trust_wp)', 'cfg(ay_performance_proofs)'] }
+unused_assignments = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow common patterns
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Spec/trait definitions often lack these sections
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Spec code uses patterns that trigger these
+return_self_not_must_use = "allow"
+needless_raw_string_hashes = "allow"
+should_implement_trait = "allow"
+result_unit_err = "allow"
+implicit_hasher = "allow"
+match_wild_err_arm = "allow"
+elidable_lifetime_names = "allow"
+uninlined_format_args = "allow"
+cast_lossless = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_map_or = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+# Doc formatting in spec comments uses function-style notation
+doc_markdown = "allow"
+# &[x.clone()] is a common, readable pattern; std::slice::from_ref is less clear
+cloned_ref_to_slice_refs = "allow"
+# EncodingError is large (SortConflict variant ~128 bytes) but pervasive;
+# boxing would require rewriting all error-handling call sites in trust-wp-ay
+result_large_err = "allow"
+# Verifier functions consume args by value for builder/fold patterns.
+needless_pass_by_value = "allow"
+# Decision/error enums carry a large payload variant but are short-lived;
+# boxing would churn pervasive match sites for no real gain.
+large_enum_variant = "allow"
+# Spec/doc comments use list-style notation that trips lazy-continuation.
+doc_lazy_continuation = "allow"
+# Style/pedantic lints the verifier deliberately does not chase (explicit
+# boolean logic, guards, and blocks aid soundness review); consistent with the
+# allow set above and trust-mc's policy.
+redundant_guards = "allow"
+nonminimal_bool = "allow"
+if_same_then_else = "allow"
+field_reassign_with_default = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"
+no_effect_underscore_binding = "allow"
+cast_possible_wrap = "allow"
+match_like_matches_macro = "allow"
+ref_option = "allow"
+# if/cmp chains and single-char math/permutation bindings are clearer as-is.
+comparison_chain = "allow"
+many_single_char_names = "allow"

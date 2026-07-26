@@ -1,0 +1,5 @@
+error: requires: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_requires_chained_comparison.rs:16:23
+   |
+16 | #[requires(0 < old(x) < 10)]
+   |                       ^

@@ -1,0 +1,5 @@
+error: extern_spec: #[requires] must use parenthesized form: #[requires(expr)]
+  --> tests/compile_fail/extern_spec_bare_requires.rs:17:9
+   |
+17 |         #[requires]
+   |         ^^^^^^^^^^^

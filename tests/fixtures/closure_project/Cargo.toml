@@ -1,0 +1,13 @@
+# Test fixture: closure contract support
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "closure_project"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace - exclude from parent workspace
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }

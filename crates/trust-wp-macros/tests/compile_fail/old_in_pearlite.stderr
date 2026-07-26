@@ -1,0 +1,5 @@
+error: pearlite!: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_pearlite.rs:11:23
+   |
+11 |     let _ = pearlite!(old(x) > 0);
+   |                       ^^^

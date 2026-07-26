@@ -1,0 +1,5 @@
+error: proof_assert: `result` can only be used in #[ensures] postconditions or #[invariant] loop invariants
+  --> tests/compile_fail/result_in_proof_assert.rs:15:19
+   |
+15 |     proof_assert!(result > 0);
+   |                   ^^^^^^

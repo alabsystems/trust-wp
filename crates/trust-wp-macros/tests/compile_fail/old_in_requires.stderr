@@ -1,0 +1,5 @@
+error: requires: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_requires.rs:15:12
+   |
+15 | #[requires(old(x) > 0)]
+   |            ^^^

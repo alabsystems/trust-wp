@@ -1,0 +1,24 @@
+# creusot-contracts - Creusot compatibility shim
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Re-exports trust-wp macros and trust-wp-std types under the `creusot_contracts`
+# crate name, allowing Creusot test code using `use creusot_contracts::*;`
+# to compile against trust-wp without source modification.
+#
+# Part of #459 (Creusot compat shim).
+
+[package]
+name = "creusot-contracts"
+description = "Creusot compatibility shim for trust-wp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+trust-wp = { workspace = true }
+trust-wp-std = { workspace = true }
+
+[lints]
+workspace = true

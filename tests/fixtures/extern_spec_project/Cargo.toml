@@ -1,0 +1,13 @@
+# Test fixture: extern_spec! user-defined contract test
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "extern_spec_project"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace - exclude from parent workspace
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }

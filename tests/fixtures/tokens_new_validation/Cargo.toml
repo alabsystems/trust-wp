@@ -1,0 +1,33 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "tokens-new-validation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_pass_main"
+path = "src/should_pass_main.rs"
+
+[[bin]]
+name = "should_fail_not_main"
+path = "src/should_fail_not_main.rs"
+
+[[bin]]
+name = "should_fail_loop"
+path = "src/should_fail_loop.rs"
+
+[[bin]]
+name = "should_fail_twice"
+path = "src/should_fail_twice.rs"

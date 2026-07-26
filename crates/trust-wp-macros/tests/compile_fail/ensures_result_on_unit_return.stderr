@@ -1,0 +1,5 @@
+error: ensures: `result` requires the annotated item to return a value
+  --> tests/compile_fail/ensures_result_on_unit_return.rs:10:11
+   |
+10 | #[ensures(result == 0)]
+   |           ^^^^^^^^^^^

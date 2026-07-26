@@ -1,0 +1,28 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "trusted-contract-validation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+creusot-contracts = { path = "../../../crates/creusot-contracts" }
+creusot-std = { path = "../../../crates/creusot-std" }
+trust-wp = { path = "../../../crates/trust-wp" }
+trust-wp-std = { package = "trust-wp-std", path = "../../../crates/trust-wp-std" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_fail_ghost_ref"
+path = "src/should_fail_ghost_ref.rs"
+
+[[bin]]
+name = "should_pass_trusted_scalar_contract"
+path = "src/should_pass_trusted_scalar_contract.rs"

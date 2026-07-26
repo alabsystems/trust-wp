@@ -1,0 +1,5 @@
+error: extern_spec requires: failed to parse contract: parse error at position 3: expected expression
+  --> tests/compile_fail/extern_spec_invalid_requires_expr.rs:18:9
+   |
+18 |         fn unwrap(self) -> T;
+   |         ^^^^^^^^^^^^^^^^^^^^

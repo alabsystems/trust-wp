@@ -1,0 +1,5 @@
+error: variant: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_variant.rs:15:11
+   |
+15 | #[variant(old(n) - i)]
+   |           ^^^

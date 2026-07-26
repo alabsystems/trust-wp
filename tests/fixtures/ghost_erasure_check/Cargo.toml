@@ -1,0 +1,74 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "ghost-erasure-check-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+# trust-wp-std provides Ghost<T> and ghost! macro
+trust-wp-std = { path = "../../../crates/trust-wp-std" }
+
+# Disable the default lib target - we only want to test individual binaries
+# Each binary is tested in isolation to avoid cross-module compilation
+[lib]
+path = "src/lib.rs"
+# Only build lib when explicitly requested, not with bins
+doctest = false
+
+[[bin]]
+name = "should_pass_ghost_return"
+path = "src/should_pass_ghost_return.rs"
+
+[[bin]]
+name = "should_pass"
+path = "src/should_pass.rs"
+
+[[bin]]
+name = "should_fail_switchint"
+path = "src/should_fail_switchint.rs"
+
+[[bin]]
+name = "should_fail_program_context"
+path = "src/should_fail_program_context.rs"
+
+[[bin]]
+name = "should_fail_program_context_create"
+path = "src/should_fail_program_context_create.rs"
+
+[[bin]]
+name = "should_fail_program_context_deref"
+path = "src/should_fail_program_context_deref.rs"
+
+[[bin]]
+name = "should_fail_program_context_mutate"
+path = "src/should_fail_program_context_mutate.rs"
+
+[[bin]]
+name = "should_fail_program_context_into_inner"
+path = "src/should_fail_program_context_into_inner.rs"
+
+[[bin]]
+name = "should_fail_non_ghost_call"
+path = "src/should_fail_non_ghost_call.rs"
+
+[[bin]]
+name = "should_fail_erasure_attribute_mismatch"
+path = "src/should_fail_erasure_attribute_mismatch.rs"
+
+[[bin]]
+name = "should_fail_permission_identity"
+path = "src/should_fail_permission_identity.rs"
+
+[[bin]]
+name = "should_pass_snapshot_stmt_logic"
+path = "src/should_pass_snapshot_stmt_logic.rs"
+
+[[bin]]
+name = "should_pass_erasure_permission_identity"
+path = "src/should_pass_erasure_permission_identity.rs"

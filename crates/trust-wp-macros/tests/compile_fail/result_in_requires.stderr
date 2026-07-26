@@ -1,0 +1,5 @@
+error: requires: `result` can only be used in #[ensures] postconditions or #[invariant] loop invariants
+  --> tests/compile_fail/result_in_requires.rs:15:12
+   |
+15 | #[requires(result > 0)]
+   |            ^^^^^^

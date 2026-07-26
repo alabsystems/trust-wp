@@ -1,0 +1,38 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "ghost-move-validation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+# trust-wp-std provides Ghost<T> and ghost! macro
+trust-wp-std = { path = "../../../crates/trust-wp-std" }
+
+# Disable the default lib target - we only want to test individual binaries
+# Each binary is tested in isolation to avoid cross-module compilation
+[lib]
+path = "src/lib.rs"
+# Only build lib when explicitly requested, not with bins
+doctest = false
+
+[[bin]]
+name = "should_fail"
+path = "src/should_fail.rs"
+
+[[bin]]
+name = "should_pass"
+path = "src/should_pass.rs"
+
+[[bin]]
+name = "should_fail_user_ghost"
+path = "src/should_fail_user_ghost.rs"
+
+[[bin]]
+name = "should_pass_user_copy"
+path = "src/should_pass_user_copy.rs"

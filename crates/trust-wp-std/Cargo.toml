@@ -1,0 +1,21 @@
+# trust-wp-std - Verified standard library specifications
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-wp-std"
+description = "Standard library specifications for trust-wp"
+version.workspace = true
+edition.workspace = true
+# rust-version omitted: requires nightly
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+trust-wp-macros = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

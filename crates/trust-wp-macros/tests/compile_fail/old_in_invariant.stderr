@@ -1,0 +1,5 @@
+error: invariant: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_invariant.rs:15:18
+   |
+15 | #[invariant(i <= old(n))]
+   |                  ^^^

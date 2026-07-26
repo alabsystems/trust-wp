@@ -1,0 +1,31 @@
+# Simple trust-wp Examples - Phase 6 Completion Criteria
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# This project contains examples that demonstrate trust-wp's core
+# verification features as defined in designs/2026-02-02-simple-creusot-criteria.md
+#
+# Each example exercises a specific feature:
+# 1. requires/ensures contracts
+# 2. Views (x@) and Seq<T>
+# 3. proof_assert! assertions
+# 4. old() for pre-state reference
+# 5. Logic functions (#[logic])
+# 6. snapshot! macro for capturing values
+# 7. ghost! / Ghost<T> for proof-only state
+# 8. #[variant] for termination proofs
+
+[package]
+name = "simple_examples"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace - exclude from parent workspace
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+trust-wp-std = { path = "../../../crates/trust-wp-std" }
+
+# Allow the `trust-wp` cfg used by trust-wp-macros for conditional compilation
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(trust_wp)"] }

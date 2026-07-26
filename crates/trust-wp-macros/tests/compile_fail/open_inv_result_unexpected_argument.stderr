@@ -1,0 +1,5 @@
+error: open_inv_result: unexpected argument `something`. #[open_inv_result] takes no arguments
+  --> tests/compile_fail/open_inv_result_unexpected_argument.rs:14:19
+   |
+14 | #[open_inv_result(something)]
+   |                   ^^^^^^^^^

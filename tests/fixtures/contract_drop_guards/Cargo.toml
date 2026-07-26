@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "contract-drop-guards-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "requires_dropped"
+path = "src/requires_dropped.rs"
+
+[[bin]]
+name = "variant_dropped"
+path = "src/variant_dropped.rs"
+
+[[bin]]
+name = "per_loop_invariant_dropped"
+path = "src/per_loop_invariant_dropped.rs"

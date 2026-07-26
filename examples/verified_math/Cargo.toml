@@ -1,0 +1,14 @@
+# Verified Math Example
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# An example project demonstrating trust-wp verification
+
+[package]
+name = "verified_math"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trust-wp = { path = "../../crates/trust-wp" }
+
+# Keep this example out of the parent workspace
+[workspace]

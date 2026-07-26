@@ -1,0 +1,27 @@
+# creusot-std - Creusot standard library compatibility shim
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Re-exports trust-wp-std modules under the `creusot_std` crate name,
+# allowing Creusot test code using `use creusot_std::prelude::*;`
+# to compile against trust-wp without source modification.
+#
+# Part of #459 (Creusot compat shim).
+
+[package]
+name = "creusot-std"
+description = "Creusot std compatibility shim for trust-wp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+trust-wp = { workspace = true }
+trust-wp-std = { workspace = true }
+
+[dev-dependencies]
+creusot-contracts = { workspace = true }
+
+[lints]
+workspace = true

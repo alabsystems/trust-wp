@@ -1,0 +1,42 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "shift-amount-range-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+# trust-wp provides the contract macros
+trust-wp = { path = "../../../crates/trust-wp" }
+
+# Disable the default lib target - we only want to test individual binaries
+# Each binary is tested in isolation to avoid cross-module compilation
+[lib]
+path = "src/lib.rs"
+# Only build lib when explicitly requested, not with bins
+doctest = false
+
+[[bin]]
+name = "should_fail_over_wide"
+path = "src/should_fail_over_wide.rs"
+
+[[bin]]
+name = "should_fail_unguarded"
+path = "src/should_fail_unguarded.rs"
+
+[[bin]]
+name = "should_verify"
+path = "src/should_verify.rs"
+
+[[bin]]
+name = "should_fail_bitwise_over_wide"
+path = "src/should_fail_bitwise_over_wide.rs"
+
+[[bin]]
+name = "should_verify_bitwise"
+path = "src/should_verify_bitwise.rs"

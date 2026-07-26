@@ -1,0 +1,33 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "purity-validation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_fail_program_logic_call"
+path = "src/should_fail_program_logic_call.rs"
+
+[[bin]]
+name = "should_fail_logic_surface"
+path = "src/should_fail_logic_surface.rs"
+
+[[bin]]
+name = "should_fail_raw_pointer_deref"
+path = "src/should_fail_raw_pointer_deref.rs"
+
+[[bin]]
+name = "should_pass_text_noise"
+path = "src/should_pass_text_noise.rs"

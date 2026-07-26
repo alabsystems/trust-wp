@@ -1,0 +1,5 @@
+error: predicate: unknown attribute argument `typo`. Expected combinations of: `open`, `open(self)`, `open(super)`, `open(crate)`, `prophetic`, `opaque`, `law`
+  --> tests/compile_fail/predicate_unknown_argument.rs:15:13
+   |
+15 | #[predicate(typo)]
+   |             ^^^^

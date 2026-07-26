@@ -1,0 +1,5 @@
+error: extern_spec requires: `result` can only be used in #[ensures] postconditions or #[invariant] loop invariants
+  --> tests/compile_fail/extern_spec_result_in_requires.rs:19:9
+   |
+19 |         fn unwrap(self) -> T;
+   |         ^^^^^^^^^^^^^^^^^^^^

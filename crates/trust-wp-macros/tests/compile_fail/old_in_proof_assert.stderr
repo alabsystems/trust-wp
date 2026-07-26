@@ -1,0 +1,5 @@
+error: proof_assert: `old()` can only be used in #[ensures] postconditions
+  --> tests/compile_fail/old_in_proof_assert.rs:16:19
+   |
+16 |     proof_assert!(old(*x) == 0);
+   |                   ^^^

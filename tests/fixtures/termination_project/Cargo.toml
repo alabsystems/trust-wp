@@ -1,0 +1,12 @@
+# Test fixture: recursive termination checking e2e verification
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "termination_project"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }

@@ -1,0 +1,6 @@
+# trust-wp is a Trust-native rustc-driver verifier: it links rustc_private and
+# drives the Trust compiler's MIR. It must build with the Trust toolchain
+# (a self-hosted rustc fork), NOT a stock nightly — stock rustc's internals
+# (e.g. Rvalue::NullaryOp arity) differ from the Trust fork's.
+[toolchain]
+channel = "trust"

@@ -1,0 +1,74 @@
+# Rust
+target/
+target_*/
+**/*.rs.bk
+
+# Build artifacts
+*.o
+*.so
+build/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+\#*\#
+.#*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.*
+
+# Credentials and secrets
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*_secret*
+*.secret
+.secrets/
+
+# Reference repositories (cloned for study, not part of project)
+reference
+reference/
+
+# Compiled example/test binaries (no extension, root directory)
+/simple
+/multiple_contracts
+
+# Compiled binaries dropped into a fixture crate root by an ad-hoc `rustc -o`
+# run. A fixture crate's real bin targets are declared in its Cargo.toml and
+# build into target/, so every legitimate tracked file sitting next to a
+# fixture Cargo.toml has an extension — an extension-less one is build output.
+# tests/fixtures/proof_assert/test_multi_field (a 439 KB Mach-O executable) was
+# committed this way and reached the publication export as forbidden binary
+# content. Ignore the whole class; subdirectories and any file with an
+# extension are re-included on the two lines below.
+tests/fixtures/*/*
+!tests/fixtures/*/*/
+!tests/fixtures/*/*.*
+
+# Rustc crash reports
+rustc-ice-*.txt
+
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Harness artifacts
+target/creusot-replacement-review/
+.claude/worktrees/
+tests/creusot_compat/results-*.json
+!tests/creusot_compat/results-should-fail.json
+!tests/creusot_compat/results-examples.json
+
+# Publish tool work area (allowlisted-snapshot export, staging clone, reports)
+publish/.out/

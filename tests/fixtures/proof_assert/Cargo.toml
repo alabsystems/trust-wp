@@ -1,0 +1,145 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "proof-assert-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+# trust-wp provides proof_assert! and contract macros
+trust-wp = { path = "../../../crates/trust-wp" }
+trust-wp-std = { path = "../../../crates/trust-wp-std" }
+creusot-contracts = { path = "../../../crates/creusot-contracts" }
+creusot-std = { path = "../../../crates/creusot-std" }
+
+# Disable the default lib target - we only want to test individual binaries
+# Each binary is tested in isolation to avoid cross-module compilation
+[lib]
+path = "src/lib.rs"
+# Only build lib when explicitly requested, not with bins
+doctest = false
+
+[[bin]]
+name = "should_verify"
+path = "src/should_verify.rs"
+
+[[bin]]
+name = "should_fail"
+path = "src/should_fail.rs"
+
+[[bin]]
+name = "soundness_815_branch_leak"
+path = "src/soundness_815_branch_leak.rs"
+
+[[bin]]
+name = "soundness_816_bool_ice"
+path = "src/soundness_816_bool_ice.rs"
+
+[[bin]]
+name = "callspec_branch_scope"
+path = "src/callspec_branch_scope.rs"
+
+[[bin]]
+name = "callspec_precondition_obligation"
+path = "src/callspec_precondition_obligation.rs"
+
+[[bin]]
+name = "callspec_bool_return"
+path = "src/callspec_bool_return.rs"
+
+[[bin]]
+name = "callspec_before_unsupported_tail"
+path = "src/callspec_before_unsupported_tail.rs"
+
+[[bin]]
+name = "if_let_some_verify"
+path = "src/if_let_some_verify.rs"
+
+[[bin]]
+name = "match_arm_discriminant_verify"
+path = "src/match_arm_discriminant_verify.rs"
+
+[[bin]]
+name = "deref_assign_verify"
+path = "src/deref_assign_verify.rs"
+
+[[bin]]
+name = "diverging_branch_before_assert"
+path = "src/diverging_branch_before_assert.rs"
+
+[[bin]]
+name = "runtime_assert_before_proof_assert"
+path = "src/runtime_assert_before_proof_assert.rs"
+
+[[bin]]
+name = "callspec_multibranch_obligation"
+path = "src/callspec_multibranch_obligation.rs"
+
+[[bin]]
+name = "projected_deref_write_verify"
+path = "src/projected_deref_write_verify.rs"
+
+[[bin]]
+name = "tuple_field_assign_verify"
+path = "src/tuple_field_assign_verify.rs"
+
+[[bin]]
+name = "closure_quantifier_enrichment"
+path = "src/closure_quantifier_enrichment.rs"
+
+[[bin]]
+name = "closure_mutation_capture_verify"
+path = "src/closure_mutation_capture_verify.rs"
+
+[[bin]]
+name = "contradictory_projected_writes_should_fail"
+path = "src/contradictory_projected_writes_should_fail.rs"
+
+[[bin]]
+name = "projected_write_then_whole_reassign_should_fail"
+path = "src/projected_write_then_whole_reassign_should_fail.rs"
+
+[[bin]]
+name = "stale_projected_write_symbolic_reassign_should_fail"
+path = "src/stale_projected_write_symbolic_reassign_should_fail.rs"
+
+[[bin]]
+name = "multi_field_projected_writes_verify"
+path = "src/multi_field_projected_writes_verify.rs"
+
+[[bin]]
+name = "projected_write_call_match_verify"
+path = "src/projected_write_call_match_verify.rs"
+
+[[bin]]
+name = "projected_substruct_overwrite_should_fail"
+path = "src/projected_substruct_overwrite_should_fail.rs"
+
+[[bin]]
+name = "by_value_self_verify"
+path = "src/by_value_self_verify.rs"
+
+[[bin]]
+name = "closure_caller_capture_verify"
+path = "src/closure_caller_capture_verify.rs"
+
+[[bin]]
+name = "ghost_perm_disjoint_verify"
+path = "src/ghost_perm_disjoint_verify.rs"
+
+[[bin]]
+name = "ghost_tuple_mutation_post_state_verify"
+path = "src/ghost_tuple_mutation_post_state_verify.rs"
+
+[[bin]]
+name = "seq_push_back_ghost_vacuity"
+path = "src/seq_push_back_ghost_vacuity.rs"
+
+[[bin]]
+name = "deref_write_local_current_value_verify"
+path = "src/deref_write_local_current_value_verify.rs"

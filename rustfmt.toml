@@ -1,0 +1,27 @@
+# rustfmt configuration for trust-wp
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Based on Rust project style guidelines with minor adjustments
+# for readability in formal verification context.
+
+# Stable options
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Auto"
+use_small_heuristics = "Default"
+
+# Force explicit returns in complex expressions for clarity
+# (verification code benefits from explicit control flow)
+fn_single_line = false
+
+# Keep imports organized
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Documentation formatting
+format_code_in_doc_comments = true
+doc_comment_code_block_width = 80
+normalize_doc_attributes = true

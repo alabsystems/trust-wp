@@ -1,0 +1,5 @@
+error: requires: `result` can only be used in #[ensures] postconditions or #[invariant] loop invariants
+  --> tests/compile_fail/result_in_requires_chained_comparison.rs:16:23
+   |
+16 | #[requires(0 < result < 10)]
+   |                       ^

@@ -1,0 +1,27 @@
+# cargo-trust-wp - Cargo subcommand for trust-wp verification
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "cargo-trust-wp"
+description = "Cargo subcommand for trust-wp verification"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+trust-wp-core = { workspace = true, features = ["tracing-init"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ntest = "0.9"
+trust-wp-test-utils = { workspace = true }
+tempfile = "3.10"
+
+[[bin]]
+name = "cargo-trust-wp"
+path = "src/main.rs"
+
+[lints]
+workspace = true

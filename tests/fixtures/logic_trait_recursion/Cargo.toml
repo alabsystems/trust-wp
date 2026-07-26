@@ -1,0 +1,50 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "logic-trait-recursion-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+# trust-wp provides the contract macros
+trust-wp = { path = "../../../crates/trust-wp" }
+
+# Disable the default lib target - we only want to test individual binaries
+# Each binary is tested in isolation to avoid cross-module compilation
+[lib]
+path = "src/lib.rs"
+# Only build lib when explicitly requested, not with bins
+doctest = false
+
+[[bin]]
+name = "should_fail_impl_arg"
+path = "src/should_fail_impl_arg.rs"
+
+[[bin]]
+name = "should_fail_trait_where"
+path = "src/should_fail_trait_where.rs"
+
+[[bin]]
+name = "should_fail_trait_impl_where"
+path = "src/should_fail_trait_impl_where.rs"
+
+[[bin]]
+name = "should_fail_trait_where_supertrait"
+path = "src/should_fail_trait_where_supertrait.rs"
+
+[[bin]]
+name = "should_pass_sized_bound"
+path = "src/should_pass_sized_bound.rs"
+
+[[bin]]
+name = "should_pass_trait_bounded_arg"
+path = "src/should_pass_trait_bounded_arg.rs"
+
+[[bin]]
+name = "should_pass_field_dispatch"
+path = "src/should_pass_field_dispatch.rs"

@@ -1,0 +1,5 @@
+error: pearlite!: `result` can only be used in #[ensures] postconditions or #[invariant] loop invariants
+  --> tests/compile_fail/result_in_pearlite.rs:14:23
+   |
+14 |     let _ = pearlite!(result > 0);
+   |                       ^^^^^^

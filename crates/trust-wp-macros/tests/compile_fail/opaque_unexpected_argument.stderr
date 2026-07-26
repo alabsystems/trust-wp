@@ -1,0 +1,5 @@
+error: opaque: unexpected argument `something`. #[opaque] takes no arguments
+  --> tests/compile_fail/opaque_unexpected_argument.rs:14:10
+   |
+14 | #[opaque(something)]
+   |          ^^^^^^^^^

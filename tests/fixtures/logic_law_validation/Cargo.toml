@@ -1,0 +1,49 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "logic-law-validation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_pass_match"
+path = "src/should_pass_match.rs"
+
+[[bin]]
+name = "should_fail_mismatch"
+path = "src/should_fail_mismatch.rs"
+
+[[bin]]
+name = "should_fail_prophetic_impl"
+path = "src/should_fail_prophetic_impl.rs"
+
+[[bin]]
+name = "should_fail_sealed_default"
+path = "src/should_fail_sealed_default.rs"
+
+[[bin]]
+name = "should_fail_law_generics"
+path = "src/should_fail_law_generics.rs"
+
+[[bin]]
+name = "should_fail_trait_logic_plain_impl"
+path = "src/should_fail_trait_logic_plain_impl.rs"
+
+[[bin]]
+name = "should_fail_plain_trait_logic_impl"
+path = "src/should_fail_plain_trait_logic_impl.rs"
+
+[[bin]]
+name = "should_fail_macro_sealed_default"
+path = "src/should_fail_macro_sealed_default.rs"

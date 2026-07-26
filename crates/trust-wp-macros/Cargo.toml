@@ -1,0 +1,29 @@
+# trust-wp-macros - Contract attribute macros
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-wp-macros"
+description = "Proc macros for trust-wp contracts (#[requires], #[ensures])"
+version.workspace = true
+edition.workspace = true
+# rust-version omitted: requires nightly
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+trust-wp-core = { workspace = true }
+syn = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+trust-wp = { workspace = true }
+trybuild = { workspace = true }
+
+[lints]
+workspace = true
