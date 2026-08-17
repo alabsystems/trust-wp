@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 trust-wp = { workspace = true }
+trust-wp-test-utils = { workspace = true }
 trybuild = { workspace = true }
 
 [lints]

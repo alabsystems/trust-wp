@@ -1470,7 +1470,15 @@ fn prove_binary_bool(
         BinOp::Or => prove_or(left, right, env, context),
         BinOp::Implies => prove_implies(left, right, env, context),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            prove_comparison(left, op, right, env, context)
+            // Preserve the guard of a conditional operand instead of asking
+            // the comparison prover to reason about an opaque value.  This is
+            // the exact semantics of a total `if`: both guarded comparisons
+            // must discharge independently.
+            if let Some(rewritten) = split_comparison_ite(left, op, right) {
+                prove_bool_with_env(&rewritten, env, context)
+            } else {
+                prove_comparison(left, op, right, env, context)
+            }
         }
         BinOp::Add
         | BinOp::Sub
@@ -1577,6 +1585,12 @@ fn assumption_contains_predicate(assumption: &PureExpr, predicate: &PureExpr) ->
         return true;
     }
 
+    if let Some(normalized) = denegate_ordered_integer_comparison(assumption) {
+        if predicates_equivalent(&normalized, predicate) {
+            return true;
+        }
+    }
+
     match assumption {
         PureExpr::BinOp(left, BinOp::And, right) => {
             assumption_contains_predicate(left, predicate)
@@ -1613,6 +1627,108 @@ fn comparison_reverse(op: BinOp) -> Option<BinOp> {
         BinOp::Ge => Some(BinOp::Le),
         _ => None,
     }
+}
+
+/// Negate an ordered comparison without swapping its operands.
+///
+/// This is deliberately separate from [`comparison_reverse`].  It is valid
+/// only over a total order and therefore remains gated by
+/// [`is_ordered_integer_operand`] at its call site.
+fn negate_ordered_comparison(op: BinOp) -> Option<BinOp> {
+    match op {
+        BinOp::Lt => Some(BinOp::Ge),
+        BinOp::Gt => Some(BinOp::Le),
+        BinOp::Le => Some(BinOp::Gt),
+        BinOp::Ge => Some(BinOp::Lt),
+        BinOp::Eq | BinOp::Ne => None,
+        _ => None,
+    }
+}
+
+/// Whether an expression is inside the native replay engine's integer-order
+/// fragment.  An absent sort means `Int` by the formula AST's documented
+/// backwards-compatible convention.  Every other sort fails closed.
+fn is_ordered_integer_operand(expr: &PureExpr) -> bool {
+    match expr {
+        PureExpr::Int(_) => true,
+        PureExpr::Float(_) => false,
+        PureExpr::Var(_, sort) => sort.as_ref().is_none_or(|sort| *sort == ExprSort::Int),
+        PureExpr::UnOp(UnOp::Neg, inner) => is_ordered_integer_operand(inner),
+        PureExpr::BinOp(left, op, right) => {
+            matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::DivTrunc
+                    | BinOp::RemTrunc
+            ) && is_ordered_integer_operand(left)
+                && is_ordered_integer_operand(right)
+        }
+        PureExpr::Old(inner)
+        | PureExpr::Deref(inner)
+        | PureExpr::Final(inner)
+        | PureExpr::View(inner) => is_ordered_integer_operand(inner),
+        _ => false,
+    }
+}
+
+/// Rewrite `!(a op b)` to the equivalent ordered integer comparison.
+///
+/// Equality and disequality are intentionally excluded: their negations do not
+/// project to one ordered comparison. Float and other explicitly non-integer
+/// sorts are also excluded, so this helper can only add a total-order integer
+/// fact.
+fn denegate_ordered_integer_comparison(expr: &PureExpr) -> Option<PureExpr> {
+    let PureExpr::UnOp(UnOp::Not, inner) = expr else {
+        return None;
+    };
+    let PureExpr::BinOp(left, op, right) = &**inner else {
+        return None;
+    };
+    let negated = negate_ordered_comparison(*op)?;
+    if !is_ordered_integer_operand(left) || !is_ordered_integer_operand(right) {
+        return None;
+    }
+    Some(PureExpr::BinOp(
+        Arc::clone(left),
+        negated,
+        Arc::clone(right),
+    ))
+}
+
+fn ite_comparison_cases(cond: &PureExpr, then_cmp: PureExpr, else_cmp: PureExpr) -> PureExpr {
+    let then_case = PureExpr::BinOp(Arc::new(cond.clone()), BinOp::Implies, Arc::new(then_cmp));
+    let negated_cond = PureExpr::UnOp(UnOp::Not, Arc::new(cond.clone()));
+    let else_case = PureExpr::BinOp(Arc::new(negated_cond), BinOp::Implies, Arc::new(else_cmp));
+    PureExpr::BinOp(Arc::new(then_case), BinOp::And, Arc::new(else_case))
+}
+
+/// Split one conditional comparison operand into two guarded comparisons.
+///
+/// `(if c { t } else { e }) op rhs` is definitionally equivalent to
+/// `(c -> t op rhs) && (!c -> e op rhs)`.  Recursion through the ordinary
+/// boolean prover handles nested conditionals one layer at a time.  Splitting
+/// the left operand first makes the rewrite deterministic when both sides are
+/// conditional.
+fn split_comparison_ite(left: &PureExpr, op: BinOp, right: &PureExpr) -> Option<PureExpr> {
+    if let PureExpr::Ite(cond, then_arm, else_arm) = left {
+        return Some(ite_comparison_cases(
+            cond,
+            PureExpr::BinOp(Arc::clone(then_arm), op, Arc::new(right.clone())),
+            PureExpr::BinOp(Arc::clone(else_arm), op, Arc::new(right.clone())),
+        ));
+    }
+    if let PureExpr::Ite(cond, then_arm, else_arm) = right {
+        return Some(ite_comparison_cases(
+            cond,
+            PureExpr::BinOp(Arc::new(left.clone()), op, Arc::clone(then_arm)),
+            PureExpr::BinOp(Arc::new(left.clone()), op, Arc::clone(else_arm)),
+        ));
+    }
+    None
 }
 
 fn prove_ite(
@@ -1981,10 +2097,22 @@ fn prove_int_arithmetic_predicate_with_constraints(
                 rule: "int-arithmetic-implication",
             })
         }
+        PureExpr::BinOp(guard, BinOp::Implies, conclusion) => {
+            // The conclusion of an implication is checked under both the
+            // enclosing constraints and its own guard.  This is what carries
+            // branch facts produced by `split_comparison_ite` into each arm.
+            let mut extended = constraints.to_vec();
+            collect_linear_constraints(guard, &mut extended);
+            prove_int_arithmetic_predicate_with_constraints(conclusion, &extended)
+        }
         PureExpr::BinOp(left, op, right)
             if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
         {
-            prove_int_arithmetic_comparison_with_constraints(left, *op, right, constraints)
+            if let Some(rewritten) = split_comparison_ite(left, *op, right) {
+                prove_int_arithmetic_predicate_with_constraints(&rewritten, constraints)
+            } else {
+                prove_int_arithmetic_comparison_with_constraints(left, *op, right, constraints)
+            }
         }
         _ => None,
     }
@@ -2364,14 +2492,14 @@ fn integer_bound_from_comparison(expr: &PureExpr) -> Option<IntegerBound> {
 }
 
 fn integer_bounds_from_assumption(expr: &PureExpr) -> Option<Vec<IntegerBound>> {
-    match expr {
-        PureExpr::BinOp(left, BinOp::And, right) => {
-            let mut bounds = Vec::new();
-            collect_integer_bounds(left, &mut bounds);
-            collect_integer_bounds(right, &mut bounds);
-            (!bounds.is_empty()).then_some(bounds)
-        }
-        _ => integer_bound_from_comparison(expr).map(|bound| vec![bound]),
+    if let PureExpr::BinOp(left, BinOp::And, right) = expr {
+        let mut bounds = Vec::new();
+        collect_integer_bounds(left, &mut bounds);
+        collect_integer_bounds(right, &mut bounds);
+        (!bounds.is_empty()).then_some(bounds)
+    } else {
+        let normalized = denegate_ordered_integer_comparison(expr);
+        integer_bound_from_comparison(normalized.as_ref().unwrap_or(expr)).map(|bound| vec![bound])
     }
 }
 
@@ -2382,7 +2510,9 @@ fn collect_integer_bounds(expr: &PureExpr, bounds: &mut Vec<IntegerBound>) {
             collect_integer_bounds(right, bounds);
         }
         _ => {
-            if let Some(bound) = integer_bound_from_comparison(expr) {
+            if let Some(normalized) = denegate_ordered_integer_comparison(expr) {
+                collect_integer_bounds(&normalized, bounds);
+            } else if let Some(bound) = integer_bound_from_comparison(expr) {
                 bounds.push(bound);
             }
         }
@@ -2402,8 +2532,13 @@ fn collect_linear_constraints(expr: &PureExpr, constraints: &mut Vec<LinearConst
             collect_linear_constraints(right, constraints);
         }
         _ => {
-            if let Some((expr, strict)) = linear_goal_from_comparison(expr) {
-                constraints.push(LinearConstraint { expr, strict });
+            if let Some(normalized) = denegate_ordered_integer_comparison(expr) {
+                collect_linear_constraints(&normalized, constraints);
+            } else if let Some((linear, strict)) = linear_goal_from_comparison(expr) {
+                constraints.push(LinearConstraint {
+                    expr: linear,
+                    strict,
+                });
             }
         }
     }
@@ -2993,6 +3128,177 @@ fn compare_known_values_with_int_rule(
             TruthValue::from_bool(value, int_rule)
         }
         _ => TruthValue::unknown("comparison mixes incompatible constant sorts"),
+    }
+}
+
+#[cfg(test)]
+mod guarded_ite_comparison_tests {
+    use super::*;
+    use crate::formula::FloatBits;
+
+    fn int_var(name: &str) -> PureExpr {
+        PureExpr::Var(name.to_string(), Some(ExprSort::Int))
+    }
+
+    fn bool_var(name: &str) -> PureExpr {
+        PureExpr::Var(name.to_string(), Some(ExprSort::Bool))
+    }
+
+    fn bin(left: PureExpr, op: BinOp, right: PureExpr) -> PureExpr {
+        PureExpr::BinOp(Arc::new(left), op, Arc::new(right))
+    }
+
+    fn not(expr: PureExpr) -> PureExpr {
+        PureExpr::UnOp(UnOp::Not, Arc::new(expr))
+    }
+
+    fn ite(cond: PureExpr, then_expr: PureExpr, else_expr: PureExpr) -> PureExpr {
+        PureExpr::Ite(Arc::new(cond), Arc::new(then_expr), Arc::new(else_expr))
+    }
+
+    fn verified(predicate: &PureExpr) -> bool {
+        matches!(
+            prove_native_pure_predicate(predicate, NativeClaimFormat::TrustWpPureExprV1, &[],),
+            NativePureProofOutcome::Verified(_)
+        )
+    }
+
+    fn clamp(candidate: PureExpr, lo: PureExpr, hi: PureExpr) -> PureExpr {
+        ite(
+            bin(candidate.clone(), BinOp::Lt, lo.clone()),
+            lo,
+            ite(bin(candidate.clone(), BinOp::Gt, hi.clone()), hi, candidate),
+        )
+    }
+
+    #[test]
+    fn proves_total_ite_comparison_only_when_both_arms_hold() {
+        let condition = bool_var("condition");
+        let true_predicate = bin(
+            ite(condition.clone(), PureExpr::Int(1), PureExpr::Int(2)),
+            BinOp::Ge,
+            PureExpr::Int(1),
+        );
+        assert!(verified(&true_predicate));
+
+        let false_predicate = bin(
+            ite(condition, PureExpr::Int(1), PureExpr::Int(0)),
+            BinOp::Ge,
+            PureExpr::Int(1),
+        );
+        assert!(
+            !verified(&false_predicate),
+            "one false conditional arm must keep the result non-authoritative"
+        );
+
+        let right_operand_predicate = bin(
+            PureExpr::Int(2),
+            BinOp::Le,
+            ite(
+                bool_var("right_condition"),
+                PureExpr::Int(2),
+                PureExpr::Int(3),
+            ),
+        );
+        assert!(
+            verified(&right_operand_predicate),
+            "the symmetric right-operand rewrite must retain both guards"
+        );
+    }
+
+    #[test]
+    fn proves_nested_clamp_bounds_under_the_enclosing_precondition() {
+        let candidate = int_var("candidate");
+        let lo = int_var("lo");
+        let hi = int_var("hi");
+        let result = clamp(candidate, lo.clone(), hi.clone());
+        let postcondition = bin(
+            bin(lo.clone(), BinOp::Le, result.clone()),
+            BinOp::And,
+            bin(result, BinOp::Le, hi.clone()),
+        );
+        let predicate = bin(bin(lo, BinOp::Le, hi), BinOp::Implies, postcondition);
+
+        assert!(
+            verified(&predicate),
+            "the enclosing bound and each dominating branch guard prove the clamp range"
+        );
+    }
+
+    #[test]
+    fn rejects_a_false_strict_clamp_bound() {
+        let candidate = int_var("candidate");
+        let lo = int_var("lo");
+        let hi = int_var("hi");
+        let result = clamp(candidate, lo.clone(), hi.clone());
+        let predicate = bin(
+            bin(lo, BinOp::Le, hi.clone()),
+            BinOp::Implies,
+            bin(result, BinOp::Lt, hi),
+        );
+
+        assert!(
+            !verified(&predicate),
+            "the upper clamp arm equals `hi`, so a strict upper bound is false"
+        );
+    }
+
+    #[test]
+    fn projects_negated_order_only_for_the_integer_fragment() {
+        let x = int_var("x");
+        let lo = int_var("lo");
+        let integer_predicate = bin(
+            not(bin(x.clone(), BinOp::Lt, lo.clone())),
+            BinOp::Implies,
+            bin(lo, BinOp::Le, x),
+        );
+        assert!(verified(&integer_predicate));
+
+        let float_x = PureExpr::Var("float_x".to_string(), Some(ExprSort::Float));
+        let float_y = PureExpr::Var("float_y".to_string(), Some(ExprSort::Float));
+        let float_predicate = bin(
+            not(bin(float_x.clone(), BinOp::Lt, float_y.clone())),
+            BinOp::Implies,
+            bin(float_x, BinOp::Ge, float_y),
+        );
+        assert!(
+            !verified(&float_predicate),
+            "ordered-negation projection is intentionally integer-only"
+        );
+    }
+
+    #[test]
+    fn rejects_equality_negation_and_nan_order_projection() {
+        let x = int_var("x");
+        let y = int_var("y");
+        let equality_predicate = bin(
+            not(bin(x.clone(), BinOp::Eq, y.clone())),
+            BinOp::Implies,
+            bin(x, BinOp::Lt, y),
+        );
+        assert!(
+            !verified(&equality_predicate),
+            "disequality does not choose either direction of an integer order"
+        );
+
+        assert_eq!(negate_ordered_comparison(BinOp::Lt), Some(BinOp::Ge));
+        assert_eq!(negate_ordered_comparison(BinOp::Gt), Some(BinOp::Le));
+        assert_eq!(negate_ordered_comparison(BinOp::Le), Some(BinOp::Gt));
+        assert_eq!(negate_ordered_comparison(BinOp::Ge), Some(BinOp::Lt));
+        assert_eq!(negate_ordered_comparison(BinOp::Eq), None);
+        assert_eq!(negate_ordered_comparison(BinOp::Ne), None);
+
+        let nan = PureExpr::Float(FloatBits::from_f64(f64::NAN));
+        let zero = PureExpr::Float(FloatBits::from_f64(0.0));
+        let nan_predicate = bin(
+            not(bin(nan.clone(), BinOp::Lt, zero.clone())),
+            BinOp::Implies,
+            bin(nan, BinOp::Ge, zero),
+        );
+        assert!(
+            !verified(&nan_predicate),
+            "the direct replay API must not turn a NaN negated order into its converse"
+        );
     }
 }
 

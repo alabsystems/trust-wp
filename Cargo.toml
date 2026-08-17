@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # rust-version omitted: requires nightly for rustc_private
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -29,7 +29,10 @@ repository = "https://github.com/alabsystems/trust-wp"
 
 [workspace.dependencies]
 # Internal crates
-cargo-trust-wp = { path = "crates/cargo-trust-wp" }
+# Package renamed to `targo-trust-wp` (Trust-native; invoked `targo trust-wp`).
+# Directory kept as crates/cargo-trust-wp. The crate also ships a back-compat
+# `cargo-trust-wp` [[bin]] alias so `cargo trust-wp` keeps working.
+targo-trust-wp = { path = "crates/cargo-trust-wp" }
 creusot-contracts = { path = "crates/creusot-contracts" }
 creusot-std = { path = "crates/creusot-std" }
 trust-wp = { path = "crates/trust-wp" }
@@ -126,3 +129,46 @@ ref_option = "allow"
 # if/cmp chains and single-char math/permutation bindings are clearer as-is.
 comparison_chain = "allow"
 many_single_char_names = "allow"
+
+[workspace.metadata.atpkg]
+# SHIPPING — but NOT from this bin lane. `expose = []` below is correct and must
+# stay empty; trust-wp reaches users inside the `trust` SYSROOT BUNDLE.
+#
+# The commands: `targo-trust-wp` (the clippy-shaped front end, invoked
+# `targo trust-wp`; back-compat bin alias `cargo-trust-wp`) and `trust-wp-driver`
+# (the driver doing the real weakest-precondition work, back-compat bin alias
+# `trust-wp-rustc`, also usable directly as
+# `trust-wp-driver file.rs --crate-type=lib -- --force`).
+#
+# STATUS (verified 2026-08-15 against the signed pkg-trust-5520.toml published
+# 2026-08-11 to alabsystems/trust): all five bins ship in the trust bundle and are
+# in its `exposes` list — targo-trust-wp, trust-wp-driver, trust-wp,
+# cargo-trust-wp, trust-wp-rustc.
+#
+# RELOCATABILITY — SOLVED 2026-07-30, and confirmed in the shipped artifact.
+# scripts/trustc-private-wrapper.sh emits @executable_path/../lib and
+# @loader_path/../lib BEFORE the four machine-local absolute rpaths. At pack time
+# `atpkg relocate` DELETES every machine-local rpath (aterm crates/atpkg/src/
+# relocate.rs is_machine_local), so the loader-relative pair is all that survives —
+# and it is what resolves @rpath/librustc_driver-<hash>.dylib out of the bundle's
+# own lib/. otool on the shipped bin/trust-wp-driver shows exactly three LC_RPATHs:
+#   @executable_path/../lib, @loader_path/../lib, @loader_path/../lib/atpkg-vendored
+# Hiding that lib/ makes it die with "Library not loaded: @rpath/librustc_driver-…",
+# proving the loader-relative entries are load-bearing rather than decorative.
+# Only trust_wp_driver / trust_wp_rustc get this treatment (is_driver_bin matches
+# the crate name), so build scripts never get -Cprefer-dynamic; the three front-end
+# bins link statically and carry no rpaths at all.
+#
+# WHY NOT A STANDALONE MEMBER: trust-wp needs a Trust sysroot at RUNTIME, so it can
+# only ever ship ALONGSIDE the `trust` bundle (the `rustc` coherence group).
+# ay-core and ay-dpll are also exact path deps on the sibling ay checkout, so the
+# build host must carry it at the pinned rev. (Spelled without the literal
+# relative path on purpose: publish transform T1 treats that string as a private
+# dependency marker and refuses the export when it survives into the snapshot.)
+#
+#     when bundled:  EXPOSES="targo-trust-wp trust-wp-driver trust-wp"
+#                    (plus back-compat alias bins cargo-trust-wp, trust-wp-rustc)
+#     KNOWN DRIFT: the bins in build 5520 were compiled 2026-08-01; five trust-wp
+#     commits have landed since (through a224bb25), touching the encoder and the
+#     driver's ADT analysis. The next trust bundle re-pack picks them up.
+expose = []

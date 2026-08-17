@@ -33,7 +33,8 @@ By writing contracts — preconditions, postconditions, and loop invariants — 
 This is a source snapshot of the trust-wp **specification surface and Weakest-Precondition
 core** — the contract macros (`crates/trust-wp-macros`), verified std specs
 (`crates/trust-wp-std`), the WP/formula core (`crates/trust-wp-core`), the Creusot-compat
-contract crates, and the `cargo-trust-wp` front-end — together with the test harness,
+contract crates, and the `targo-trust-wp` front-end (`targo trust-wp`, back-compat
+alias `cargo trust-wp`) — together with the test harness,
 examples, and reference docs.
 
 The executable verifier lanes — the SMT encoder, the rustc-driver, and the CIC kernel

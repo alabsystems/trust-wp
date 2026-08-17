@@ -34,32 +34,389 @@
 use std::{
     ffi::OsStr,
     fmt::Write as _,
-    fs,
+    fs::{self, File},
+    io::{self, Read as _},
     path::{Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
 };
 
+use sha2::{Digest as _, Sha256};
+
 mod freshness;
 
-/// Returns the trust-wp workspace root directory.
+const TRYBUILD_CHILD_TEST_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_CHILD";
+const TRYBUILD_WRAPPER_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_WRAPPER";
+const TRYBUILD_TARGO_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO";
+const TRYBUILD_TARGO_SHA256_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO_SHA256";
+const TARGO_NESTED_UNVERIFIED_BROKER_ENV: &str = "TRUST_TARGO_NESTED_UNVERIFIED_BROKER";
+
+const VERIFIED_TARGO_AUTHORITY_ENVS: &[&str] = &[
+    "TRUST_TARGO_VERIFY",
+    "TRUST_TARGO_TEST_EXECUTE_FRESH_SESSION",
+    "TRUST_TARGO_TEST_MONITOR_AUTHORITY_SESSION",
+    "TRUST_TARGO_TEST_MONITOR_SESSION",
+];
+
+/// Enters a trybuild test without relying on ambient nested-Targo authority.
 ///
-/// This uses `CARGO_MANIFEST_DIR` to navigate up to the workspace root.
-/// Works correctly when called from any crate within the workspace.
+/// On Linux, a live Targo broker already authenticates an outer command's
+/// explicit `--unverified` decision, so the test runs normally. On platforms
+/// without that broker, this function runs the current test once in a child
+/// process whose `CARGO` is a private wrapper around an immutable snapshot of
+/// the exact outer Targo executable. The wrapper spells `--unverified` on each
+/// trybuild compilation command while leaving authority-neutral commands such
+/// as `metadata` and `clean` unmodified; it does not inherit or synthesize a
+/// proof claim.
+///
+/// This is deliberately an **unverified UI-test lane**. Its results must never
+/// be cited as verified Targo, certified-monitor, release, or proof evidence.
+/// A test reached from an authenticated verified session fails closed instead
+/// of silently changing that session's authority.
+///
+/// Returns `true` when the caller should execute its trybuild body. Returns
+/// `false` only in the parent after the isolated child has completed the body.
 ///
 /// # Panics
 ///
-/// Panics if `CARGO_MANIFEST_DIR` is not set (should only happen outside cargo).
+/// Panics if branded Targo state is inconsistent, a verified authority marker
+/// is present, the private harness cannot be authenticated, or the child test
+/// fails.
+pub fn enter_explicit_unverified_trybuild_test(test_name: &str) -> bool {
+    assert!(
+        !test_name.is_empty(),
+        "trybuild test name must not be empty"
+    );
+
+    if let Some(selected_test) = std::env::var_os(TRYBUILD_CHILD_TEST_ENV) {
+        assert_eq!(
+            selected_test,
+            OsStr::new(test_name),
+            "explicit-unverified trybuild child selected a different test"
+        );
+        validate_explicit_unverified_trybuild_child()
+            .expect("authenticate explicit-unverified trybuild child");
+        return true;
+    }
+
+    let Some(outer_targo) =
+        unbrokered_outer_targo().expect("identify the Cargo/Targo frontend for trybuild")
+    else {
+        return true;
+    };
+
+    let verified_markers: Vec<&str> = VERIFIED_TARGO_AUTHORITY_ENVS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    assert!(
+        verified_markers.is_empty(),
+        "trybuild fixture compilation is an explicitly unverified UI-test lane and cannot run under verified Targo authority; present markers: {}",
+        verified_markers.join(", ")
+    );
+
+    let harness = ExplicitUnverifiedTrybuildHarness::create(&outer_targo)
+        .expect("create explicit-unverified trybuild harness");
+    let current_test = std::env::current_exe().expect("locate current test executable");
+    let status = Command::new(current_test)
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env("CARGO", &harness.wrapper)
+        .env(TRYBUILD_CHILD_TEST_ENV, test_name)
+        .env(TRYBUILD_WRAPPER_ENV, &harness.wrapper)
+        .env(TRYBUILD_TARGO_ENV, &harness.targo)
+        .env(TRYBUILD_TARGO_SHA256_ENV, &harness.targo_sha256)
+        .env_remove(TARGO_NESTED_UNVERIFIED_BROKER_ENV)
+        .status();
+    harness.unlock_for_cleanup();
+    let status = status.expect("launch explicit-unverified trybuild child");
+    assert!(
+        status.success(),
+        "explicit-unverified trybuild child `{test_name}` failed with {status}"
+    );
+    false
+}
+
+fn unbrokered_outer_targo() -> Result<Option<PathBuf>, String> {
+    let trust_frontend =
+        std::env::var_os("TRUST_TARGO_FRONTEND").as_deref() == Some(OsStr::new("1"));
+    let Some(cargo) = std::env::var_os("CARGO").map(PathBuf::from) else {
+        if trust_frontend {
+            return Err("TRUST_TARGO_FRONTEND=1 reached a test without an exact CARGO path".into());
+        }
+        return Ok(None);
+    };
+
+    let named_targo = executable_path_is_named(&cargo, "targo");
+    if !named_targo {
+        if trust_frontend {
+            return Err(format!(
+                "TRUST_TARGO_FRONTEND=1 supplied a non-Targo CARGO path: {}",
+                cargo.display()
+            ));
+        }
+        return Ok(None);
+    }
+
+    let metadata = fs::symlink_metadata(&cargo)
+        .map_err(|error| format!("inspect outer Targo {}: {error}", cargo.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "outer Targo CARGO path is not a plain regular file: {}",
+            cargo.display()
+        ));
+    }
+    ensure_targo_brand(&cargo)?;
+
+    if std::env::var_os(TARGO_NESTED_UNVERIFIED_BROKER_ENV).is_some() {
+        return Ok(None);
+    }
+    Ok(Some(cargo))
+}
+
+fn executable_path_is_named(path: &Path, expected: &str) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    #[cfg(windows)]
+    return name.eq_ignore_ascii_case(&format!("{expected}.exe"));
+    #[cfg(not(windows))]
+    return name == expected;
+}
+
+fn ensure_targo_brand(path: &Path) -> Result<(), String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("execute Targo identity probe {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Targo identity probe {} failed with {}: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if !output.stdout.starts_with(b"targo ") {
+        return Err(format!(
+            "CARGO path {} did not identify itself as branded Targo: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout)
+        ));
+    }
+    Ok(())
+}
+
+struct ExplicitUnverifiedTrybuildHarness {
+    directory: tempfile::TempDir,
+    wrapper: PathBuf,
+    targo: PathBuf,
+    targo_sha256: String,
+}
+
+impl ExplicitUnverifiedTrybuildHarness {
+    fn create(outer_targo: &Path) -> io::Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("trust-wp-explicit-unverified-trybuild-")
+            .tempdir()?;
+        #[cfg(unix)]
+        set_mode(directory.path(), 0o700)?;
+
+        let targo = directory
+            .path()
+            .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(outer_targo, &targo)?;
+        #[cfg(unix)]
+        set_mode(&targo, 0o500)?;
+
+        let wrapper = directory.path().join(if cfg!(windows) {
+            "targo-explicit-unverified.cmd"
+        } else {
+            "targo-explicit-unverified"
+        });
+        fs::write(&wrapper, explicit_unverified_wrapper_contents())?;
+        #[cfg(unix)]
+        set_mode(&wrapper, 0o500)?;
+
+        let targo_sha256 = sha256_file(&targo)?;
+        ensure_targo_brand(&targo).map_err(io::Error::other)?;
+        #[cfg(unix)]
+        set_mode(directory.path(), 0o500)?;
+
+        Ok(Self {
+            directory,
+            wrapper,
+            targo,
+            targo_sha256,
+        })
+    }
+
+    fn unlock_for_cleanup(&self) {
+        #[cfg(unix)]
+        set_mode(self.directory.path(), 0o700)
+            .expect("unlock explicit-unverified trybuild harness for cleanup");
+    }
+}
+
+fn explicit_unverified_wrapper_contents() -> &'static [u8] {
+    #[cfg(unix)]
+    return b"#!/bin/sh\nset -eu\nunset TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_CHILD TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_WRAPPER TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO_SHA256 TRUST_TARGO_NESTED_UNVERIFIED_BROKER\nfor argument in \"$@\"; do\n    case \"$argument\" in\n        build|check|fix|clippy|miri|test|run|bench|doc|rustc|rustdoc|install|package|publish)\n            exec \"${0%/*}/targo\" --unverified \"$@\"\n            ;;\n    esac\ndone\nexec \"${0%/*}/targo\" \"$@\"\n";
+    #[cfg(windows)]
+    return b"@echo off\r\nset TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_CHILD=\r\nset TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_WRAPPER=\r\nset TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO=\r\nset TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_TARGO_SHA256=\r\nset TRUST_TARGO_NESTED_UNVERIFIED_BROKER=\r\nfor %%A in (%*) do (\r\n    for %%C in (build check fix clippy miri test run bench doc rustc rustdoc install package publish) do (\r\n        if \"%%~A\"==\"%%C\" goto explicit_unverified\r\n    )\r\n)\r\n\"%~dp0targo.exe\" %*\r\nexit /b %errorlevel%\r\n:explicit_unverified\r\n\"%~dp0targo.exe\" --unverified %*\r\n";
+}
+
+fn validate_explicit_unverified_trybuild_child() -> Result<(), String> {
+    let wrapper = required_path_env(TRYBUILD_WRAPPER_ENV)?;
+    let targo = required_path_env(TRYBUILD_TARGO_ENV)?;
+    let cargo = required_path_env("CARGO")?;
+    if cargo != wrapper {
+        return Err(format!(
+            "trybuild child CARGO {} does not match its private wrapper {}",
+            cargo.display(),
+            wrapper.display()
+        ));
+    }
+    if wrapper.parent() != targo.parent() {
+        return Err("trybuild wrapper and private Targo are not in one harness directory".into());
+    }
+    let directory = wrapper
+        .parent()
+        .ok_or_else(|| "trybuild wrapper has no parent directory".to_owned())?;
+    ensure_plain_file(&wrapper, "trybuild wrapper")?;
+    ensure_plain_file(&targo, "private Targo")?;
+    let wrapper_contents = fs::read(&wrapper)
+        .map_err(|error| format!("read trybuild wrapper {}: {error}", wrapper.display()))?;
+    if wrapper_contents != explicit_unverified_wrapper_contents() {
+        return Err(
+            "private trybuild wrapper does not spell the reviewed explicit-unverified command"
+                .into(),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::symlink_metadata(directory)
+            .map_err(|error| format!("inspect trybuild harness directory: {error}"))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "trybuild harness directory is group/other writable: mode {:#o}",
+                mode & 0o777
+            ));
+        }
+    }
+
+    let expected_sha256 = std::env::var(TRYBUILD_TARGO_SHA256_ENV)
+        .map_err(|error| format!("read {TRYBUILD_TARGO_SHA256_ENV}: {error}"))?;
+    let actual_sha256 = sha256_file(&targo)
+        .map_err(|error| format!("hash private Targo {}: {error}", targo.display()))?;
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "private Targo digest changed: expected {expected_sha256}, got {actual_sha256}"
+        ));
+    }
+    ensure_targo_brand(&targo)
+}
+
+fn required_path_env(name: &str) -> Result<PathBuf, String> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("explicit-unverified trybuild child is missing {name}"))
+}
+
+fn ensure_plain_file(path: &Path, description: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{description} is not a plain regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Returns the trust-wp workspace root directory.
+///
+/// Runtime discovery is preferred over `CARGO_MANIFEST_DIR`: Cargo can reuse a
+/// dependency artifact across parallel worktrees, and embedding the compiling
+/// worktree's path would then point a later test process at a deleted checkout.
+/// An explicit `TRUST_WP_WORKSPACE_ROOT` wins, followed by the current working
+/// directory and its ancestors. The compile-time manifest path is only the
+/// final compatibility fallback.
+///
+/// # Panics
+///
+/// Panics if an explicit root is invalid, or if neither runtime discovery nor
+/// the compiled fallback identifies a live trust-wp checkout.
 pub fn workspace_root() -> PathBuf {
-    // In tests, CARGO_MANIFEST_DIR points to the crate's directory
-    // We need to navigate up to find the workspace root
+    if let Some(explicit) = std::env::var_os("TRUST_WP_WORKSPACE_ROOT") {
+        let explicit = PathBuf::from(explicit);
+        assert!(
+            is_workspace_root(&explicit),
+            "TRUST_WP_WORKSPACE_ROOT is not a trust-wp checkout: {}",
+            explicit.display()
+        );
+        return explicit;
+    }
+
+    if let Ok(current) = std::env::current_dir() {
+        if let Some(root) = find_workspace_root_from(&current) {
+            return root;
+        }
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // trust-wp-test-utils is at crates/trust-wp-test-utils, so parent.parent gives workspace
-    manifest_dir
+    let fallback = manifest_dir
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root should exist")
-        .to_path_buf()
+        .to_path_buf();
+    assert!(
+        is_workspace_root(&fallback),
+        "compiled trust-wp workspace no longer exists; set TRUST_WP_WORKSPACE_ROOT: {}",
+        fallback.display()
+    );
+    fallback
+}
+
+fn find_workspace_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|candidate| is_workspace_root(candidate))
+        .map(Path::to_path_buf)
+}
+
+fn is_workspace_root(candidate: &Path) -> bool {
+    candidate.join("Cargo.toml").is_file()
+        && candidate
+            .join("crates")
+            .join("trust-wp-test-utils")
+            .join("Cargo.toml")
+            .is_file()
 }
 
 /// Returns the path to the cargo-trust-wp binary.
@@ -470,6 +827,37 @@ mod tests {
             root.join("Cargo.toml").exists(),
             "workspace Cargo.toml should exist"
         );
+    }
+
+    #[test]
+    fn runtime_workspace_discovery_walks_from_nested_checkout_path() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("live-worktree");
+        let nested = root.join("target").join("debug").join("deps");
+        fs::create_dir_all(root.join("crates").join("trust-wp-test-utils")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("crates")
+                .join("trust-wp-test-utils")
+                .join("Cargo.toml"),
+            "[package]\nname = \"trust-wp-test-utils\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(find_workspace_root_from(&nested), Some(root));
+    }
+
+    #[test]
+    fn runtime_workspace_discovery_rejects_unrelated_cargo_project() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"other\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(find_workspace_root_from(temp.path()), None);
     }
 
     #[test]

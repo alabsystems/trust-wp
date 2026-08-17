@@ -65,7 +65,7 @@ fn test_parse_closure_postcondition_with_resolve() {
     // exists<f2: F> f.postcondition_mut(a, f2, result) && resolve(f2)
     let input = "exists<f2: F> f.postcondition_mut(a, f2, result) && resolve(f2)";
     let expr = parse_ok(input);
-    assert!(matches!(&expr, PureExpr::Exists { var, var_sort: _, .. } if var == "f2"));
+    assert!(matches!(&expr, PureExpr::Exists { var, .. } if var == "f2"));
 }
 
 #[test]
@@ -354,14 +354,14 @@ fn test_bug_1538_forall_unit_type() {
 fn test_forall_nested_tuple_type() {
     // Ensure nested tuple types in quantifiers parse correctly
     let expr = parse_contract("forall<p: (i32, (u8, u16))> true").unwrap();
-    assert!(matches!(&expr, PureExpr::Forall { var, var_sort: _, .. } if var == "p"));
+    assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "p"));
 }
 
 #[test]
 fn test_forall_trailing_comma_tuple_type() {
     // Singleton tuple type: `(T,)`
     let expr = parse_contract("forall<x: (i32,)> true").unwrap();
-    assert!(matches!(&expr, PureExpr::Forall { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "x"));
 }
 
 #[test]
@@ -400,14 +400,14 @@ fn test_forall_dyn_trait_type() {
     // unsound_dyn.rs: `forall<x: dyn False> x.falso() == ()` (#657)
     // Previously: "parse error at position 14: expected '>' after type in quantifier"
     let expr = parse_contract("forall<x: dyn False> x.falso() == ()").unwrap();
-    assert!(matches!(&expr, PureExpr::Forall { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "x"));
 }
 
 #[test]
 fn test_exists_dyn_trait_type() {
     // Verify `dyn` works in exists bindings too
     let expr = parse_contract("exists<x: dyn MyTrait> x.value() > 0").unwrap();
-    assert!(matches!(&expr, PureExpr::Exists { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(&expr, PureExpr::Exists { var, .. } if var == "x"));
 }
 
 #[test]

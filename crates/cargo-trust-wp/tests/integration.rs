@@ -2,7 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Integration tests for cargo-trust-wp command.
+//! Integration tests for the `targo-trust-wp` command and its
+//! `cargo-trust-wp` compatibility alias.
 //!
 //! These tests verify the cargo subcommand behavior including:
 //! - Help output
@@ -19,6 +20,10 @@ use trust_wp_test_utils::cargo_trust_wp_bin;
 
 const CARGO_TRUST_WP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn targo_trust_wp_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_targo-trust-wp")
+}
+
 #[test]
 #[timeout(10000)]
 fn test_help_flag() {
@@ -34,8 +39,12 @@ fn test_help_flag() {
         "--help should succeed; stderr: {stderr}"
     );
     assert!(
-        stdout.contains("cargo-trust-wp"),
-        "missing 'cargo-trust-wp' in help; stdout: {stdout}"
+        stdout.contains("targo-trust-wp"),
+        "missing primary 'targo-trust-wp' name in help; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("back-compat alias: cargo trust-wp"),
+        "missing cargo compatibility alias in help; stdout: {stdout}"
     );
     assert!(
         stdout.contains("USAGE"),
@@ -120,6 +129,34 @@ fn test_version_flag() {
     assert!(
         stdout.contains(CARGO_TRUST_WP_VERSION),
         "missing version number in --version; stdout: {stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "--version should write version text to stdout only; stderr: {stderr}"
+    );
+}
+
+#[test]
+#[timeout(10000)]
+fn test_primary_version_flag() {
+    let output = Command::new(targo_trust_wp_bin())
+        .arg("--version")
+        .output()
+        .expect("failed to execute targo-trust-wp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "--version should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("targo-trust-wp"),
+        "missing 'targo-trust-wp' in primary version output; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(CARGO_TRUST_WP_VERSION),
+        "missing version number in primary --version; stdout: {stdout}"
     );
     assert!(
         stderr.is_empty(),

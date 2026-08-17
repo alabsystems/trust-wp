@@ -1,9 +1,15 @@
-# cargo-trust-wp - Cargo subcommand for trust-wp verification
+# targo-trust-wp - Targo/Cargo subcommand for trust-wp verification
 # Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Trust-native name is `targo-trust-wp`, invoked `targo trust-wp`. The legacy
+# `cargo-trust-wp` [[bin]] alias below is retained for back-compat so that
+# `cargo trust-wp` discovery and existing scripts/docs keep working unchanged.
+# The package directory stays `crates/cargo-trust-wp` on purpose (only the
+# package/bin names and invocation are Trust-native, not the repo layout).
 
 [package]
-name = "cargo-trust-wp"
-description = "Cargo subcommand for trust-wp verification"
+name = "targo-trust-wp"
+description = "Targo/Cargo subcommand for trust-wp verification"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -19,6 +25,14 @@ ntest = "0.9"
 trust-wp-test-utils = { workspace = true }
 tempfile = "3.10"
 
+# Trust-native primary: invoked as `targo trust-wp`.
+[[bin]]
+name = "targo-trust-wp"
+path = "src/main.rs"
+
+# Back-compat alias: keeps `cargo trust-wp` discovery and existing
+# scripts/docs/tests (which resolve a `cargo-trust-wp` binary by name) working.
+# Same entry point as the primary bin.
 [[bin]]
 name = "cargo-trust-wp"
 path = "src/main.rs"

@@ -72,17 +72,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
-name = "cargo-trust-wp"
-version = "0.1.1"
-dependencies = [
- "ntest",
- "tempfile",
- "tracing",
- "trust-wp-core",
- "trust-wp-test-utils",
-]
-
-[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -157,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "creusot-contracts"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "trust-wp",
  "trust-wp-std",
@@ -165,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "creusot-std"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "creusot-contracts",
  "trust-wp",
@@ -948,6 +937,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 
 [[package]]
+name = "targo-trust-wp"
+version = "0.2.0"
+dependencies = [
+ "ntest",
+ "tempfile",
+ "tracing",
+ "trust-wp-core",
+ "trust-wp-test-utils",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1122,16 +1122,17 @@ dependencies = [
 
 [[package]]
 name = "trust-wp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "trust-wp-macros",
  "trust-wp-std",
+ "trust-wp-test-utils",
  "trybuild",
 ]
 
 [[package]]
 name = "trust-wp-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "num-bigint",
@@ -1145,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-macros"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1153,12 +1154,13 @@ dependencies = [
  "thiserror",
  "trust-wp",
  "trust-wp-core",
+ "trust-wp-test-utils",
  "trybuild",
 ]
 
 [[package]]
 name = "trust-wp-std"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "trust-wp-macros",
@@ -1166,8 +1168,9 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-test-utils"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "sha2",
  "tempfile",
 ]
 

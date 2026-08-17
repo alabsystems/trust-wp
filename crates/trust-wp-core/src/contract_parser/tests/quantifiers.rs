@@ -11,14 +11,14 @@ use crate::formula::{intern_sort_name, resolve_sort_name};
 fn test_forall_simple() {
     // forall<x: Int> x >= 0
     let expr = parse_ok("forall<x: Int> x >= 0");
-    assert!(matches!(expr, PureExpr::Forall { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(expr, PureExpr::Forall { var, .. } if var == "x"));
 }
 
 #[test]
 fn test_exists_simple() {
     // exists<x: Int> x > 0
     let expr = parse_ok("exists<x: Int> x > 0");
-    assert!(matches!(expr, PureExpr::Exists { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(expr, PureExpr::Exists { var, .. } if var == "x"));
 }
 
 #[test]
@@ -446,17 +446,17 @@ fn test_trigger_empty_error() {
 fn test_quantifier_type_annotation_space_before_colon() {
     // Space before colon should work (parser uses skip_whitespace)
     let expr = parse_ok("forall<x : Int> x >= 0");
-    assert!(matches!(expr, PureExpr::Forall { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(expr, PureExpr::Forall { var, .. } if var == "x"));
 
     let expr = parse_ok("exists<y : Int> y > 0");
-    assert!(matches!(expr, PureExpr::Exists { var, var_sort: _, .. } if var == "y"));
+    assert!(matches!(expr, PureExpr::Exists { var, .. } if var == "y"));
 }
 
 #[test]
 fn test_quantifier_type_annotation_trailing_space() {
     // Trailing space in type should work (parser uses skip_whitespace after type)
     let expr = parse_ok("forall<x: Int > x >= 0");
-    assert!(matches!(expr, PureExpr::Forall { var, var_sort: _, .. } if var == "x"));
+    assert!(matches!(expr, PureExpr::Forall { var, .. } if var == "x"));
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn test_parse_quantifier_type_elided() {
     let expr = parse_ok("forall<x> x > 0");
     assert!(matches!(
         &expr,
-        PureExpr::Forall { var, var_sort: _, .. } if var == "x"
+        PureExpr::Forall { var, .. } if var == "x"
     ));
 }
 
@@ -602,7 +602,7 @@ fn test_parse_quantifier_type_u32() {
     let expr = parse_ok("forall<x: u32> true");
     assert!(matches!(
         &expr,
-        PureExpr::Forall { var, var_sort: _, .. } if var == "x"
+        PureExpr::Forall { var, .. } if var == "x"
     ));
 }
 
@@ -612,7 +612,7 @@ fn test_parse_quantifier_type_generic() {
     let expr = parse_contract("exists<r: F> resolve(r)").unwrap();
     assert!(matches!(
         &expr,
-        PureExpr::Exists { var, var_sort: _, .. } if var == "r"
+        PureExpr::Exists { var, .. } if var == "r"
     ));
 }
 
@@ -643,7 +643,7 @@ fn test_parse_quantifier_multi_var() {
     } = &expr
     {
         assert_eq!(var, "a");
-        assert!(matches!(&**body, PureExpr::Forall { var, var_sort: _, .. } if var == "b"));
+        assert!(matches!(&**body, PureExpr::Forall { var, .. } if var == "b"));
     } else {
         panic!("Expected nested Forall, got {expr:?}");
     }
@@ -661,7 +661,7 @@ fn test_parse_quantifier_multi_var_typed() {
     } = &expr
     {
         assert_eq!(var, "s1");
-        assert!(matches!(&**body, PureExpr::Exists { var, var_sort: _, .. } if var == "r"));
+        assert!(matches!(&**body, PureExpr::Exists { var, .. } if var == "r"));
     } else {
         panic!("Expected nested Exists, got {expr:?}");
     }
@@ -687,7 +687,7 @@ fn test_parse_quantifier_three_vars() {
         } = &**body
         {
             assert_eq!(var, "st2");
-            assert!(matches!(&**body, PureExpr::Exists { var, var_sort: _, .. } if var == "r"));
+            assert!(matches!(&**body, PureExpr::Exists { var, .. } if var == "r"));
         } else {
             panic!("Expected second Exists, got {body:?}");
         }
@@ -716,7 +716,7 @@ fn test_parse_quantifier_unit_type() {
     let expr = parse_contract("forall<_x: ()> true").unwrap();
     assert!(matches!(
         &expr,
-        PureExpr::Forall { var, var_sort: _, .. } if var == "_x"
+        PureExpr::Forall { var, .. } if var == "_x"
     ));
 }
 
@@ -726,7 +726,7 @@ fn test_parse_quantifier_tuple_type() {
     let expr = parse_contract("exists<p: (i32, i32)> true").unwrap();
     assert!(matches!(
         &expr,
-        PureExpr::Exists { var, var_sort: _, .. } if var == "p"
+        PureExpr::Exists { var, .. } if var == "p"
     ));
 }
 

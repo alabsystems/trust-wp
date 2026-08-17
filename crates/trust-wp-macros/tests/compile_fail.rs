@@ -9,6 +9,9 @@
 
 #[test]
 fn compile_fail() {
+    if !trust_wp_test_utils::enter_explicit_unverified_trybuild_test("compile_fail") {
+        return;
+    }
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/*.rs");
 }

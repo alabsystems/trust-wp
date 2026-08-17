@@ -622,13 +622,47 @@ pub mod specs {
     ";
 
     /// Contract for `FMap::get_mut_ghost` (mutable key lookup in ghost blocks)
+    ///
+    /// Reference: Creusot `creusot-std/src/logic/fmap.rs:351-367` `get_mut_ghost`:
+    /// ```text
+    /// #[ensures(if self.contains(*key) {
+    ///     match result { None => false, Some(r) =>
+    ///         (^self).contains(*key) && self[*key] == *r && (^self)[*key] == ^r }
+    ///   } else { result == None && *self == ^self })]
+    /// #[ensures(forall<k: K> k != *key ==> (*self).get(k) == (^self).get(k))]
+    /// #[ensures((*self).len() == (^self).len())]
+    /// ```
+    /// The match clause below is the result-directed equivalent of the first
+    /// clause (`Some` forces containment; `None` forces absence and, with the
+    /// frame clauses, `*self == ^self`). The `get`-equality frame is rendered
+    /// as the contains/lookup pair — the table idiom for map equality (see
+    /// `INSERT_GHOST`).
+    ///
+    /// The value write-back `(^self)[*key] == ^r` is deliberately NOT
+    /// rendered: `^r` is the final value of the `&mut V` inside the `Some`
+    /// payload, and the encoder cannot carry a prophecy for an
+    /// `Option<&mut V>` payload binder today — `Final` on a pattern-bound
+    /// variable collapses to the binder itself
+    /// (`trust-wp-ay match_enc/deref_collapse.rs`), and `Final` on the
+    /// Datatype-sorted result carrier collapses to the carrier
+    /// (`pure_encoding/wrapper.rs` Phase 1b), so `^r` would alias `*r` (the
+    /// PRE-write payload) and the clause would invert into the false premise
+    /// `(^self)[*key] == old value`. Until the encoder gives Option payloads
+    /// a prophecy slot, the touched entry's post-value stays unconstrained:
+    /// fail-open to unknown, never to false-accept. (The `^self` mentions in
+    /// the clauses below still advance the receiver's carrier, so post-call
+    /// asserts are judged against the post-state, not a stale map.)
+    ///
     /// Args: self=arg0, k=arg1 (passed by ref)
     pub const GET_MUT_GHOST: &str = r"
         params: self, arg1
         ensures: match result {
-            Some(v) => self.contains(*arg1) && *v == self.lookup(*arg1),
-            None => !self.contains(*arg1),
+            Some(v) => self.contains(*arg1) && *v == self.lookup(*arg1) && (^self).contains(*arg1),
+            None => !self.contains(*arg1) && !(^self).contains(*arg1),
         }
+        ensures: forall<k2: _> k2 != *arg1 ==> (^self).contains(k2) == self.contains(k2)
+        ensures: forall<k2: _> k2 != *arg1 && self.contains(k2) ==> (^self).lookup(k2) == self.lookup(k2)
+        ensures: (^self).len() == self.len()
     ";
 
     /// Contract for `FMap::contains_ghost` (contains check by reference)
@@ -790,14 +824,52 @@ pub mod specs {
     /// Contract for `FMap::split_mut_ghost` (split mutable access in ghost blocks)
     ///
     /// Returns `(&mut V, FMapGhostSplit)` for the given key. The returned
-    /// value reference points to `self.lookup(key)`. The split view preserves
-    /// all entries but the pinned key cannot be modified through the split.
+    /// value reference points to `self.lookup(key)`.
+    ///
+    /// Reference: Creusot `creusot-std/src/logic/fmap.rs:389-397`
+    /// `split_mut_ghost` (there typed `(&mut V, &mut Self)`):
+    /// ```text
+    /// #[requires(self.contains(*key))]
+    /// #[ensures(*result.1 == (*self).remove(*key))]
+    /// #[ensures(self[*key] == *result.0 && ^self == (^result.1).insert(*key, ^result.0))]
+    /// ```
+    /// `*result.1 == (*self).remove(*key)` is rendered below by its GROUND
+    /// consequences only: key absence and `remove`'s length law (`len - 1`,
+    /// since `requires` guarantees the key is present). The pointwise
+    /// contains/lookup frame foralls of the remove-model are deliberately
+    /// omitted: they have no consumer until the parent write-back exists
+    /// (the corpus observes the PARENT map, not the split view), and each
+    /// extra forall is carried into every downstream proof_assert slice —
+    /// measured to push the ghost_map tail obligations from ~5-29s into
+    /// 20-83s e-matching grind (whole-test budget blowout). Sound either
+    /// way: fewer premises can only under-approximate.
+    ///
+    /// The parent write-back `^self == (^result.1).insert(*key, ^result.0)`
+    /// is deliberately NOT rendered: `^result.1` denotes the split view at
+    /// borrow end, and the substitution-chain state tracking has no sound
+    /// carrier for that generation at the split call site — instantiating it
+    /// against a fixed `Final` depth would equate the parent's post-state
+    /// with an intermediate split generation (a false-accept vector). The
+    /// parent's post-split state therefore stays (almost) unconstrained:
+    /// fail-open to unknown, never to false-accept.
+    ///
+    /// `(^self).contains(*arg1)` IS rendered: it is a ground consequence of
+    /// the write-back (`insert` always makes its key present), and its
+    /// `^self` mention is load-bearing — the parent is mutated through the
+    /// split borrow, so its carrier must ADVANCE (havoc) at the split site.
+    /// Without any `^self` mention the parent would stay bound to its
+    /// pre-split carrier and post-split asserts would be judged against
+    /// stale entries — a confidently-wrong counterexample instead of an
+    /// honest unknown.
     ///
     /// Args: self=arg0, key=arg1 (passed by ref)
     pub const SPLIT_MUT_GHOST: &str = r"
         params: self, arg1
         requires: self.contains(*arg1)
         ensures: *result.0 == self.lookup(*arg1)
+        ensures: (^self).contains(*arg1)
+        ensures: !(*result.1).contains(*arg1)
+        ensures: (*result.1).len() == self.len() - 1
     ";
 
     /// Contract for `FMap::is_empty` (emptiness check)
@@ -820,14 +892,22 @@ pub mod specs {
 
     /// Contract for `FMapGhostSplit::insert_ghost` (insert through split handle)
     ///
-    /// Inserts into the split view for non-pinned keys. The pinned key is
-    /// guarded by the `FMapGhostSplit` and cannot be modified through this
-    /// handle (returns `None` silently). The frame axiom preserves all keys
-    /// except `arg1`.
+    /// Reference: Creusot `creusot-std/src/logic/fmap.rs:389-397` — the split
+    /// handle is a plain `&mut FMap` there (`result.1` of `split_mut_ghost`,
+    /// seeded with `*result.1 == (*self).remove(*key)`), so inserts through it
+    /// carry `FMap::insert_ghost`'s own contract
+    /// (`creusot-std/src/logic/fmap.rs:418-426`:
+    /// `^self == (*self).insert(key, value)`, `result == (*self).get(key)`).
+    /// The clauses below mirror `INSERT_GHOST` verbatim.
     ///
-    /// NOTE: This spec describes the effect on the underlying `FMap`, not the
-    /// split handle. The encoder sees the split handle as a proxy for the map.
-    /// The `^self` post-state refers to the underlying map's final state.
+    /// `self`/`^self` here are the SPLIT VIEW's own state (the carrier bound
+    /// to `result.1` of `split_mut_ghost`), NOT the parent map: the split
+    /// view is the pin-removed map, and the parent's post-state is related to
+    /// the split view only through the (unrendered) parent write-back
+    /// `^parent == (^split).insert(pin, ^value_ref)` — which is what
+    /// pin-shadows split-handle writes at the pinned key. Asserting these
+    /// effects on the parent's carrier instead would smuggle the pinned-key
+    /// insert past the pin (false premise on the parent).
     ///
     /// Args: self=arg0 (FMapGhostSplit), k=arg1, v=arg2
     pub const GHOST_SPLIT_INSERT: &str = r"
@@ -836,17 +916,32 @@ pub mod specs {
         ensures: (^self).lookup(arg1) == arg2
         ensures: forall<k2: _> k2 != arg1 ==> (^self).contains(k2) == self.contains(k2)
         ensures: forall<k2: _> k2 != arg1 && self.contains(k2) ==> (^self).lookup(k2) == self.lookup(k2)
+        ensures: match result {
+            Some(prev) => self.contains(arg1) && prev == self.lookup(arg1) && (^self).len() == self.len(),
+            None => !self.contains(arg1) && (^self).len() == self.len() + 1,
+        }
     ";
 
     /// Contract for `FMapGhostSplit::remove_ghost` (remove through split handle)
     ///
-    /// Removes from the split view for non-pinned keys.
+    /// Reference: Creusot `creusot-std/src/logic/fmap.rs:389-397` — the split
+    /// handle is a plain `&mut FMap` there, so removes through it carry
+    /// `FMap::remove_ghost`'s own contract
+    /// (`creusot-std/src/logic/fmap.rs:443-450`:
+    /// `^self == (*self).remove(*key)`, `result == (*self).get(*key)`).
+    /// The clauses below mirror `REMOVE_GHOST` verbatim. As with
+    /// `GHOST_SPLIT_INSERT`, `self`/`^self` are the split view's own state.
+    ///
     /// Args: self=arg0 (FMapGhostSplit), k=arg1 (passed by ref)
     pub const GHOST_SPLIT_REMOVE: &str = r"
         params: self, arg1
         ensures: !(^self).contains(*arg1)
         ensures: forall<k2: _> k2 != *arg1 ==> (^self).contains(k2) == self.contains(k2)
         ensures: forall<k2: _> k2 != *arg1 && self.contains(k2) ==> (^self).lookup(k2) == self.lookup(k2)
+        ensures: match result {
+            Some(prev) => self.contains(*arg1) && prev == self.lookup(*arg1) && (^self).len() == self.len() - 1,
+            None => !self.contains(*arg1) && (^self).len() == self.len(),
+        }
     ";
 }
 

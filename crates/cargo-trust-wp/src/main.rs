@@ -13,13 +13,14 @@
 
 //! Cargo trust-wp - Cargo subcommand for trust-wp verification
 //!
-//! This binary is invoked as `cargo trust-wp` and sets up the environment
+//! This binary is invoked as `targo trust-wp` (back-compat alias
+//! `cargo trust-wp`) and sets up the environment
 //! to run trust-wp verification on the current project. It discovers the
 //! `trust-wp-rustc` binary, sets `RUSTC_WRAPPER`, and forwards CLI options
 //! to the trust-wp driver via the `TRUST_WP_ARGS` environment variable.
 //!
 //! Usage:
-//!   `cargo trust-wp [OPTIONS] [CARGO_OPTS]`
+//!   `targo trust-wp [OPTIONS] [CARGO_OPTS]`  (alias: `cargo trust-wp`)
 //!
 //! Options:
 //!   `-v`, `-vv`, `--verbose`    Show detailed verification progress
@@ -31,8 +32,8 @@
 //!   `--track <level>`           Set memory tracking level (auto, reg, ptr, mem)
 //!   `--wide-pointers`           Enable wide pointer support (unimplemented)
 //!   `--strict-axioms`           Treat unverified axioms as errors
-//!   `--strict-trust`            Reject proofs with trust/hole steps (default ON)
-//!   `--no-strict-trust`         Disable the strict-trust gate
+//!   `--strict-trust`            Require independently replayed proof authority
+//!   `--no-strict-trust`         Deprecated compatibility spelling (ignored)
 //!   `--strict-obligations`      Treat dropped obligations as errors (exit 2)
 //!   `--verify`                  Enable verification (default unless `--emit-smt`)
 //!   `--no-verify`               Skip verification
@@ -235,9 +236,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             "--wide-pointers" => trust_wp_args.push("--wide-pointers".to_string()),
             // Treat unverified logic function postconditions as errors (#1490)
             "--strict-axioms" => trust_wp_args.push("--strict-axioms".to_string()),
-            // Phase 1 soundness gate (#20): default is ON in the driver.
-            // Forward the explicit forms so callers can opt out via
-            // --no-strict-trust or affirm via --strict-trust.
+            // Proof authority is mandatory in the driver. Forward both forms
+            // so the retired negative spelling remains parse-compatible and
+            // produces the driver's deprecation warning.
             "--strict-trust" => trust_wp_args.push("--strict-trust".to_string()),
             "--no-strict-trust" => trust_wp_args.push("--no-strict-trust".to_string()),
             // Local policy flag: treat dropped obligation warnings as errors (#1779).
@@ -940,10 +941,11 @@ fn print_help() {
 
 fn render_help() -> String {
     format!(
-        r"cargo-trust-wp - Deductive verification for Rust
+        r"targo-trust-wp - Deductive verification for Rust
 
 USAGE:
-    cargo trust-wp [OPTIONS] [CARGO_OPTS]
+    targo trust-wp [OPTIONS] [CARGO_OPTS]
+    (back-compat alias: cargo trust-wp)
 
 OPTIONS:
     -v, -vv, --verbose Show detailed verification progress
@@ -955,9 +957,8 @@ OPTIONS:
     --track <level>    Set memory tracking level (auto, reg, ptr, mem)
     --wide-pointers    Enable wide pointer support [UNIMPLEMENTED]
     --strict-axioms    Treat unverified axioms as errors
-    --strict-trust     Reject UNSAT proofs with trust/hole/fallback steps
-                       (Phase 1 soundness gate; default ON)
-    --no-strict-trust  Disable the strict-trust gate (legacy permissive mode)
+    --strict-trust     Require independently replayed proof authority [default]
+    --no-strict-trust  Deprecated compatibility spelling; ignored
     --strict-obligations  Treat dropped obligations as errors (exit code 2)
     --verify           Enable verification (default unless --emit-smt)
     --no-verify        Skip verification
@@ -976,16 +977,16 @@ EXIT CODES:
 
 EXAMPLES:
     # Verify all annotated functions in the current project
-    cargo trust-wp
+    targo trust-wp
 
     # Verbose output
-    cargo trust-wp -v
+    targo trust-wp -v
 
     # Only verify specific functions
-    cargo trust-wp --filter increment
+    targo trust-wp --filter increment
 
     # Debug: emit SMT queries
-    cargo trust-wp --emit-smt
+    targo trust-wp --emit-smt
 
 CONTRACT SYNTAX:
     Use Creusot-compatible proc-macro attributes:
@@ -1005,7 +1006,8 @@ See https://github.com/alabsystems/trust-wp for documentation.",
 
 fn print_version() {
     println!(
-        "cargo-trust-wp {} ({})",
+        "{} {} ({})",
+        env!("CARGO_BIN_NAME"),
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_REPOSITORY")
     );

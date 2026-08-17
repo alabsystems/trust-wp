@@ -131,7 +131,7 @@ def ensure_harness_binaries(
         "-p",
         "trust-wp-driver",
         "-p",
-        "cargo-trust-wp",
+        "targo-trust-wp",
     ]
     if verbose:
         print("Building harness binaries (trust-wp-driver, cargo-trust-wp)...")

@@ -14,7 +14,7 @@ fn test_vec_bounds_with_quantifier() {
     let input = "forall<i: Int> 0 <= i && i < self@.len() ==> self@.index_logic(i) >= 0";
     let expr = parse_ok(input);
     assert!(
-        matches!(&expr, PureExpr::Forall { var, var_sort: _, .. } if var == "i"),
+        matches!(&expr, PureExpr::Forall { var, .. } if var == "i"),
         "Expected Forall with var 'i'"
     );
     // Verify spanned produces same AST
@@ -103,7 +103,7 @@ fn test_binary_search_precondition() {
     let input = "forall<i: Int> forall<j: Int> 0 <= i && i < j && j < arr@.len() ==> arr@.index_logic(i) <= arr@.index_logic(j)";
     let expr = parse_ok(input);
     assert!(
-        matches!(&expr, PureExpr::Forall { var, var_sort: _, .. } if var == "i"),
+        matches!(&expr, PureExpr::Forall { var, .. } if var == "i"),
         "Expected outer Forall with var 'i'"
     );
     let spanned = parse_spanned_ok(input);
@@ -136,7 +136,7 @@ fn test_existential_element() {
     let input = "exists<i: Int> 0 <= i && i < self@.len() && self@.index_logic(i) == target";
     let expr = parse_ok(input);
     assert!(
-        matches!(&expr, PureExpr::Exists { var, var_sort: _, .. } if var == "i"),
+        matches!(&expr, PureExpr::Exists { var, .. } if var == "i"),
         "Expected Exists with var 'i'"
     );
     let spanned = parse_spanned_ok(input);

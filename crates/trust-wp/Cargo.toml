@@ -16,6 +16,7 @@ trust-wp-macros = { workspace = true }
 trust-wp-std = { workspace = true }
 
 [dev-dependencies]
+trust-wp-test-utils = { workspace = true }
 trybuild = { workspace = true }
 
 [lints]
