@@ -52,6 +52,36 @@ impl PureExpr {
             SubstituteOptions {
                 filter: None,
                 beta_reduce_tuples: true,
+                binder_erasing: false,
+            },
+        )
+    }
+
+    /// Binder-erasing substitution (#125).
+    ///
+    /// Like `substitute()`, but the caller asserts that every substitution key
+    /// is a logically BOUND name being erased (logic-fn formals := call
+    /// arguments, `exists` binders := witnesses, match-pattern bindings :=
+    /// payloads, `Let` vars := values). Under that assertion, `Final(Var(x))`
+    /// with a ground-literal replacement normalises to the replacement itself
+    /// — bound values have no temporal state, so `^x [x := c]` is `c` — and
+    /// the substitution never mints `Final(<literal>)`, the shape that is
+    /// ambiguous with the driver's borrow-chain advance of a borrowed place's
+    /// constant value (the 8d7bf70 `^<constant>` false-accept class).
+    ///
+    /// MUST NOT be used for program-variable substitutions (`result` :=
+    /// return expr, requires-derived variable equalities): there `^x` names a
+    /// real prophecy and collapsing it is the `^p == *p` inversion. Those
+    /// sites keep `substitute()`, and any `Final(<literal>)` they mint is
+    /// refused fail-closed by the accepting evaluators downstream.
+    #[must_use]
+    pub fn substitute_binder_erasing(&self, substitutions: &HashMap<String, PureExpr>) -> PureExpr {
+        self.substitute_with_options(
+            substitutions,
+            SubstituteOptions {
+                filter: None,
+                beta_reduce_tuples: true,
+                binder_erasing: true,
             },
         )
     }
@@ -71,6 +101,7 @@ impl PureExpr {
             SubstituteOptions {
                 filter: None,
                 beta_reduce_tuples: false,
+                binder_erasing: false,
             },
         )
     }
@@ -136,6 +167,7 @@ impl PureExpr {
             SubstituteOptions {
                 filter: Some(filter),
                 beta_reduce_tuples: true,
+                binder_erasing: false,
             },
         )
     }

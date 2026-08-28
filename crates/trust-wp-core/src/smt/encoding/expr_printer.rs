@@ -373,8 +373,18 @@ fn write_expr_depth(out: &mut String, expr: &PureExpr, ctx: SmtContext, depth: u
             write_match_ite(out, scrutinee, arms, ctx, depth + 1);
         }
         PureExpr::LogicFnCall { name, args } => {
+            let symbol = crate::logic::logic_fn_smt_name(name);
+            // SMT-LIB's term grammar is `( qual_identifier term+ )`: a
+            // parenthesised application needs at least one argument. A nullary
+            // logic function is a constant and must print as the bare
+            // identifier — `(logic_zero)` is a parse error, not a zero-argument
+            // call.
+            if args.is_empty() {
+                out.push_str(&symbol);
+                return;
+            }
             out.push('(');
-            out.push_str(&crate::logic::logic_fn_smt_name(name));
+            out.push_str(&symbol);
             for a in args {
                 out.push(' ');
                 write_expr_depth(out, a, ctx, depth + 1);

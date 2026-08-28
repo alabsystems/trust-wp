@@ -18,7 +18,7 @@
 // The gate lemma below is pure integer-order transitivity, which IS sound under
 // Sort::Int, so trust-wp could discharge it once the Trust toolchain is built.
 // Run (after building the Trust toolchain):
-//   ./scripts/run-trust-wp-rustc.sh examples/ay_optimum_gate_lemma.rs -- --force
+//   trust-wp examples/ay_optimum_gate_lemma.rs
 
 use trust_wp::{ensures, requires};
 

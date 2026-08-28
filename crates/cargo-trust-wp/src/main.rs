@@ -37,7 +37,8 @@
 //!   `--strict-obligations`      Treat dropped obligations as errors (exit 2)
 //!   `--verify`                  Enable verification (default unless `--emit-smt`)
 //!   `--no-verify`               Skip verification
-//!   `--stop-after-analysis`     Stop after MIR analysis (no verification)
+//!   `--stop-after-analysis`     Stop the compiler after MIR analysis
+//!                               (contracts are still verified)
 //!   `-h`, `--help`              Print help information
 //!   `-V`, `--version`           Print version information
 //!
@@ -288,6 +289,22 @@ fn build_trust_wp_args_env(args: &[String]) -> String {
 
 /// Find the trust-wp-rustc binary.
 fn find_trust_wp_rustc() -> Option<PathBuf> {
+    // An explicit override wins. The `trust-wp` front door documents
+    // TRUST_WP_RUSTC in its ENVIRONMENT section and resolves the driver with
+    // it, but it can only hand the result down by putting the driver's
+    // *directory* on PATH — which does nothing when the override names a
+    // binary under a different file name. Reading it here is what makes the
+    // documented override take effect in crate mode.
+    //
+    // Read in this wrapper, not in `_with`: that function exists in injected
+    // form so its resolution is hermetic and its unit tests are not at the
+    // mercy of the developer's shell.
+    if let Some(explicit) = env::var_os("TRUST_WP_RUSTC") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
     let current_exe = env::current_exe().ok();
     let path_var = env::var_os("PATH");
     find_trust_wp_rustc_with(current_exe.as_deref(), path_var.as_deref())
@@ -372,12 +389,34 @@ fn touch_source_file(cargo_args: &[String]) {
     }
 }
 
-/// Touch a file by rewriting its contents to update mtime.
+/// Bump a file's modification time so cargo re-runs the wrapper on it.
+///
+/// Sets the timestamp; does not rewrite the bytes. The previous implementation
+/// read the user's source and wrote it back, which is a real read-modify-write
+/// over a file the tool does not own: a crash or a full disk between the read
+/// and the write truncates it, and every run replaced the inode, breaking hard
+/// links and file watchers. `File::set_times` states the intent — only the
+/// mtime is meant to change — and cannot lose the contents.
 fn touch_file(path: &Path) {
-    if path.exists() {
-        if let Ok(content) = fs::read(path) {
-            let _ = fs::write(path, content);
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        if file
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .is_ok()
+        {
+            return;
         }
+    }
+
+    // `set_times` writes an *explicit* timestamp, and POSIX only lets a caller
+    // do that when it owns the file (`utimensat` allows the write-permission
+    // shortcut only when both stamps are `UTIME_NOW`). A group-writable or
+    // bind-mounted checkout is write-permitted but not owned, and there the
+    // call fails — so fall back to the rewrite, which needs write permission
+    // only. That is the older, riskier path (a crash between read and write
+    // truncates the user's source), which is exactly why it is the fallback
+    // rather than the default.
+    if let Ok(content) = fs::read(path) {
+        let _ = fs::write(path, content);
     }
 }
 
@@ -962,7 +1001,8 @@ OPTIONS:
     --strict-obligations  Treat dropped obligations as errors (exit code 2)
     --verify           Enable verification (default unless --emit-smt)
     --no-verify        Skip verification
-    --stop-after-analysis  Stop after MIR analysis (no verification)
+    --stop-after-analysis  Stop the compiler after MIR analysis; contracts are
+                           still verified (use --no-verify to skip verification)
     -h, --help         Print help information
     -V, --version      Print version information
 

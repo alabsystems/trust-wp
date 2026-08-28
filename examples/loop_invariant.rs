@@ -4,18 +4,19 @@
 
 //! Loop invariant example demonstrating verification with loops.
 //!
-//! STATUS: Fully implemented. See `verify_loop_invariant` in trust-wp-ay.
+//! Verify it with:  `trust-wp examples/loop_invariant.rs`
 //!
-//! The implementation supports:
-//! - Loop detection via back-edge analysis
-//! - `#[invariant]` attribute parsing
-//! - Loop structure reporting
-//! - **Initialization check**: Invariant holds at loop entry (requires => inv)
-//! - **Preservation check**: Invariant maintained by loop body (inv && cond => inv')
-//! - **Postcondition check**: Invariant implies postcondition when loop exits
-//! - **Variant checks** (optional): Termination via decreasing expressions
+//! trust-wp discharges four obligations per annotated loop:
+//! - **Initialization**: the invariant holds on entry (`requires => inv`)
+//! - **Preservation**: the body maintains it (`inv && cond => inv'`)
+//! - **Postcondition**: it implies the contract on exit
+//! - **Termination** (with `#[variant]`): the variant strictly decreases and
+//!   stays non-negative
+//!
+//! Every function here verifies. The invariants are the *weakest* ones that
+//! do — strengthening one is how you fix a `preservation check failed`.
 
-use trust_wp::{ensures, invariant, requires};
+use trust_wp::{ensures, invariant, requires, variant};
 
 /// Sum of first n natural numbers.
 ///
@@ -38,11 +39,12 @@ fn sum_first_n(n: i32) -> i32 {
 
 /// Count down from n to 0.
 ///
-/// This demonstrates a simple decrementing loop.
-/// Invariant: `count >= 0` (always non-negative)
+/// `#[variant]` adds the termination proof: `count` strictly decreases each
+/// iteration and is bounded below by the invariant, so the loop ends.
 #[requires(n >= 0)]
 #[ensures(result == 0)]
 #[invariant(count >= 0)]
+#[variant(count)]
 fn count_down(n: i32) -> i32 {
     let mut count = n;
     while count > 0 {
@@ -51,19 +53,29 @@ fn count_down(n: i32) -> i32 {
     count
 }
 
-/// Factorial function (n!).
+/// Repeated doubling: `2^k`.
 ///
-/// Note: This will overflow for n > 12 with i32.
-/// Invariant: `acc >= 1` (factorial is always positive)
-#[requires(n >= 0 && n <= 12)]
+/// The accumulator grows multiplicatively, but by a *constant*, so the
+/// preservation obligation `acc >= 1 => 2 * acc >= 1` stays linear and the
+/// solver proves it outright.
+///
+/// A loop whose step is `acc *= i` (factorial) does not work this way: the
+/// obligation becomes `acc >= 1 && i >= 1 => acc * i >= 1`, which is nonlinear
+/// integer arithmetic. `acc >= 1` is then not enough, and no bound on `acc`
+/// alone rescues it — you need an invariant that pins `acc` to `i` exactly
+/// (`acc == fact(i - 1)` with `fact` a `#[logic]` function). That is a
+/// different lesson than this file is for; see `contract-syntax.md` on
+/// `#[logic]`.
+#[requires(k >= 0 && k <= 30)]
 #[ensures(result >= 1)]
-#[invariant(acc >= 1)]
-fn factorial(n: i32) -> i32 {
+#[invariant(acc >= 1 && j >= 0)]
+#[variant(k - j)]
+fn power_of_two(k: i32) -> i32 {
     let mut acc = 1;
-    let mut i = 1;
-    while i <= n {
-        acc *= i;
-        i += 1;
+    let mut j = 0;
+    while j < k {
+        acc *= 2;
+        j += 1;
     }
     acc
 }
@@ -79,8 +91,8 @@ fn main() {
     println!("count_down(5) = {}", zero);
     assert_eq!(zero, 0);
 
-    // 5! = 120
-    let fact = factorial(5);
-    println!("factorial(5) = {}", fact);
-    assert_eq!(fact, 120);
+    // 2^5 = 32
+    let pow = power_of_two(5);
+    println!("power_of_two(5) = {}", pow);
+    assert_eq!(pow, 32);
 }

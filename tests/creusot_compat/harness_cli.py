@@ -23,6 +23,7 @@ try:
         _print_summary,
         _write_results_file,
     )
+    from tests.creusot_compat.harness_runner import _derive_solver_timeout_sec
 except ModuleNotFoundError:
     # Running as a script (`python3 tests/creusot_compat/harness.py`) puts this
     # directory on sys.path, so import sibling modules directly.
@@ -32,6 +33,9 @@ except ModuleNotFoundError:
         _print_policy_notes,
         _print_summary,
         _write_results_file,
+    )
+    from harness_runner import (  # type: ignore[no-redef]
+        _derive_solver_timeout_sec,
     )
 
 
@@ -414,6 +418,14 @@ def main(*, facade: object | None = None) -> int:
 
     print("Creusot Compatibility Test Harness")
     print("=" * 40)
+    # Decoupled timeout regime (#2708): -t is the per-test wall (process
+    # kill); the driver's per-obligation solver budget is derived from it so
+    # the driver's watchdog + crate-wall envelopes nest inside the wall.
+    # Per-test wall overrides derive their own budget the same way.
+    print(
+        f"Per-test wall: {args.timeout}s; derived driver solver budget: "
+        f"{_derive_solver_timeout_sec(args.timeout)}s (#2708)"
+    )
 
     bundle = _build_metadata_bundle(
         harness,

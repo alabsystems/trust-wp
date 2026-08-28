@@ -22,6 +22,24 @@ pub struct CaptureAvoidingSubstOptions {
 pub(super) struct SubstituteOptions<'a> {
     pub(super) filter: Option<&'a HashSet<&'a str>>,
     pub(super) beta_reduce_tuples: bool,
+    /// Binder-erasing mode (#125): the caller asserts that every substitution
+    /// key is a logically BOUND name being replaced by its instantiation
+    /// (logic-fn formals := call arguments, `exists` binders := witnesses,
+    /// match-pattern bindings := payloads, `Let` vars := values). Under that
+    /// assertion Phase 1's "bound values have no temporal state" rule licenses
+    /// normalising `Final(Var(x))` to the replacement when the replacement is
+    /// a ground literal — `^x [x := c]` is `c`, because `x` never named a
+    /// borrow. Without this, the substitution mints `Final(<literal>)`, a
+    /// shape that is AMBIGUOUS with the driver's borrow-chain advance of a
+    /// borrowed place's constant value (the 8d7bf70 false-accept class), so
+    /// every downstream accepting evaluator must refuse it. Normalising at
+    /// the erasing site keeps route (b) capability while the evaluators stay
+    /// fail-closed on route (a).
+    ///
+    /// Deliberately NARROW: only a `Final` DIRECTLY over a substituted `Var`
+    /// whose replacement is `Int`/`Bool`/`Float` is normalised. Everything
+    /// else keeps the wrapper (fail-closed downstream).
+    pub(super) binder_erasing: bool,
 }
 
 impl SubstituteOptions<'_> {

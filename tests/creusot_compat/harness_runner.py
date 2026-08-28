@@ -299,6 +299,65 @@ def run_trust_wp_on_project(
     )
 
 
+# Driver envelope constants, mirrored from the driver's published design so the
+# derived solver budget can be reasoned about in one place (#2708):
+#
+# - crates/trust-wp-driver/src/callbacks/verification/timeout_budget.rs
+#   (#2674): the driver treats `--timeout B` as the per-obligation solver
+#   budget, derives a crate wall-clock budget of 5 x B, and adaptively
+#   splits 5 x B across verifiable functions with a 15s floor and a B cap
+#   when a crate has more than four of them.
+# - crates/trust-wp-ay/src/verify/hard_timeout.rs (#2674): the in-process
+#   watchdog envelope for one solver call is 1.5 x B + 0.1s grace.
+_DRIVER_CRATE_BUDGET_RATIO = 5.0
+_DRIVER_WATCHDOG_FACTOR = 1.5
+_DRIVER_ADAPTIVE_FLOOR_SEC = 15
+_COMPILE_STARTUP_MARGIN_SEC = 20
+_SOLVER_TIMEOUT_ENV = "TRUST_WP_HARNESS_SOLVER_TIMEOUT"
+
+
+def _derive_solver_timeout_sec(wall_timeout_sec: int) -> int:
+    """Derive the driver's per-obligation solver budget from the test wall.
+
+    Restores the watchdog-fires-inside-the-wall invariant (#2708).  The
+    harness historically passed the per-test wall ``-t N`` as BOTH the
+    process kill-timeout AND ``cargo-trust-wp --timeout N``.  The driver
+    treats ``--timeout`` as the per-obligation solver budget and aborts a
+    stuck obligation only at ``1.5 x N + 0.1s`` — after the harness has
+    already killed the process at ``N``.  One obligation running to budget
+    therefore killed the whole test, and raising ``-t`` only gave it more
+    rope.
+
+    The wall must contain everything the driver's own design says a run may
+    cost for a solver budget ``B``:
+
+        wall >= startup/compile margin C
+                + 5 x B   (the driver's crate wall-clock budget, #2674)
+                + 1.5 x B (watchdog envelope of the last-launched function)
+
+    so ``B = (wall - C) / (5 + 1.5)`` with C = 20s.  The result is floored
+    at the driver's own 15s adaptive floor (below that a budget is
+    meaningless), but never exceeds ``wall // 2`` so the watchdog envelope
+    ``1.5 x B + 0.1s <= 0.75 x wall + 0.1s`` still fires inside the wall
+    even for tiny walls.  For the standard walls: ``-t 600`` -> 89s,
+    ``-t 300`` -> 43s, ``-t 200`` -> 27s, ``-t 120`` -> 15s.
+
+    ``TRUST_WP_HARNESS_SOLVER_TIMEOUT`` overrides the derivation for
+    experiments (it is still capped at ``wall // 2`` — the invariant is not
+    overridable).
+    """
+    env_override = os.environ.get(_SOLVER_TIMEOUT_ENV, "").strip()
+    if env_override.isdigit() and int(env_override) > 0:
+        derived = int(env_override)
+    else:
+        derived = int(
+            (wall_timeout_sec - _COMPILE_STARTUP_MARGIN_SEC)
+            // (_DRIVER_CRATE_BUDGET_RATIO + _DRIVER_WATCHDOG_FACTOR)
+        )
+        derived = max(derived, _DRIVER_ADAPTIVE_FLOOR_SEC)
+    return max(1, min(derived, wall_timeout_sec // 2))
+
+
 def _execute_cargo_trust_wp(
     harness: Any,
     cargo_trust_wp: Path,
@@ -310,21 +369,23 @@ def _execute_cargo_trust_wp(
     """Run cargo-trust-wp in a new process group and handle timeout cleanup."""
     sp = harness.subprocess
     start = time.time()
+    solver_timeout_sec = _derive_solver_timeout_sec(timeout_sec)
     try:
         # start_new_session=True puts cargo-trust-wp + trust-wp-rustc in one
         # process group so we can kill the entire tree on timeout.  (#2301)
         proc = sp.Popen(
-            # Pass the per-test budget through as the driver-side solver
-            # timeout. Without this, every obligation solved under the
-            # driver's 60s DEFAULT regardless of --timeout/overrides — the
-            # harness budget only killed the outer process. The driver's
-            # adaptive slicing + 1.5x hard-timeout envelopes are designed
-            # around this value (#2674).
+            # ``--timeout`` is the driver's PER-OBLIGATION solver budget, not
+            # the wall.  It is derived from the wall so the driver's own
+            # envelopes (crate wall 5xB, watchdog 1.5xB + grace, adaptive
+            # per-function split, #2674) nest inside the harness wall instead
+            # of being cut off by the process kill (#2708).  ``-t N`` keeps
+            # its meaning: the per-test wall-clock bound, enforced below by
+            # ``communicate(timeout=timeout_sec)``.
             [
                 str(cargo_trust_wp),
                 "--verbose",
                 "--timeout",
-                str(timeout_sec),
+                str(solver_timeout_sec),
                 "--locked",
             ],
             cwd=project_dir,
@@ -337,7 +398,9 @@ def _execute_cargo_trust_wp(
         try:
             stdout, stderr = proc.communicate(timeout=timeout_sec)
         except sp.TimeoutExpired:
-            return _handle_timeout(harness, proc, start, timeout_sec, workspace)
+            return _handle_timeout(
+                harness, proc, start, timeout_sec, workspace, solver_timeout_sec
+            )
 
         duration_ms = int((time.time() - start) * 1000)
         output = stdout + stderr
@@ -354,6 +417,7 @@ def _handle_timeout(
     start: float,
     timeout_sec: int,
     workspace: Path,
+    solver_timeout_sec: int | None = None,
 ) -> tuple[bool, str, int, int | None]:
     """Kill the process group and collect partial output after timeout."""
     try:
@@ -363,9 +427,15 @@ def _handle_timeout(
     stdout, stderr = proc.communicate(timeout=5)
     duration_ms = int((time.time() - start) * 1000)
     partial = (stdout or "") + (stderr or "")
+    # Keep the leading "Timeout after <N>s" shape — classification and the
+    # adversarial runner match on it — but make the decoupled solver budget
+    # visible in the diagnostic line (#2708).
+    header = f"Timeout after {timeout_sec}s"
+    if solver_timeout_sec is not None:
+        header = f"{header} (wall; driver solver budget {solver_timeout_sec}s)"
     if partial:
-        return False, f"Timeout after {timeout_sec}s\n{partial}", duration_ms, None
-    return False, f"Timeout after {timeout_sec}s", duration_ms, None
+        return False, f"{header}\n{partial}", duration_ms, None
+    return False, header, duration_ms, None
 
 
 def _apply_test_selection(

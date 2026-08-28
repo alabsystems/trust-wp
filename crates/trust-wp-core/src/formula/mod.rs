@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 mod display;
+mod final_pin;
 mod float_bits;
 pub mod int_bounds;
 pub mod internal;
@@ -37,6 +38,7 @@ mod types;
 mod tests;
 
 // Re-export the semantic AST surface.
+pub use final_pin::{FinalPinTarget, PinStep, ProjectedFinalPin};
 pub use named_binding::NamedBindingValue;
 pub use pure_expr::{
     reuse_arc, reuse_node, ExprSort, FloatBits, MatchArm, Pattern, PureExpr, PureExprChildRole,

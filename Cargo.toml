@@ -17,10 +17,11 @@ members = [
     "crates/trust-wp-macros",
     "crates/trust-wp-std",
     "crates/trust-wp-test-utils",
+    "crates/trust-wp-cli",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # rust-version omitted: requires nightly for rustc_private
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -40,6 +41,7 @@ trust-wp-core = { path = "crates/trust-wp-core" }
 trust-wp-macros = { path = "crates/trust-wp-macros" }
 trust-wp-std = { path = "crates/trust-wp-std" }
 trust-wp-test-utils = { path = "crates/trust-wp-test-utils" }
+trust-wp-cli = { path = "crates/trust-wp-cli" }
 
 # The ay SMT backend (crates/trust-wp-ay), the rustc-driver (crates/trust-wp-driver),
 # the lib facade (crates/trust-wp-lib), their `trust-ir` proof-IR bundle, and
@@ -134,7 +136,10 @@ many_single_char_names = "allow"
 # SHIPPING — but NOT from this bin lane. `expose = []` below is correct and must
 # stay empty; trust-wp reaches users inside the `trust` SYSROOT BUNDLE.
 #
-# The commands: `targo-trust-wp` (the clippy-shaped front end, invoked
+# The commands: `trust-wp` (the command-line front door, built from the
+# core-only package trust-wp-cli since 2026-08-21 — it needs neither
+# rustc_private nor the solver, so it builds wherever the WP core does and its
+# in-process verbs run in the public snapshot), `targo-trust-wp` (the clippy-shaped front end, invoked
 # `targo trust-wp`; back-compat bin alias `cargo-trust-wp`) and `trust-wp-driver`
 # (the driver doing the real weakest-precondition work, back-compat bin alias
 # `trust-wp-rustc`, also usable directly as

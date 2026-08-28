@@ -77,6 +77,26 @@ pub(super) fn substitute_with_options_inner(
             reuse_expr(expr, PureExpr::Deref(reuse_arc(inner, new_inner)))
         }
         PureExpr::Final(inner) => {
+            // Binder-erasing normalisation (#125): `^x [x := <literal>]` is the
+            // literal itself when `x` is a bound name being erased — bound
+            // values have no temporal state. Only fires for a `Final` DIRECTLY
+            // over a substituted, non-shadowed `Var` with a ground-literal
+            // replacement; every other shape keeps the `Final` wrapper so the
+            // downstream accepting evaluators can refuse it fail-closed.
+            if options.binder_erasing {
+                if let PureExpr::Var(name, _) = inner.as_ref() {
+                    if options.allows_name(name) {
+                        if let Some(replacement) = binding.get(name) {
+                            if matches!(
+                                replacement,
+                                PureExpr::Int(_) | PureExpr::Bool(_) | PureExpr::Float(_)
+                            ) {
+                                return replacement.clone();
+                            }
+                        }
+                    }
+                }
+            }
             let new_inner = recurse(inner, binding);
             reuse_expr(expr, PureExpr::Final(reuse_arc(inner, new_inner)))
         }

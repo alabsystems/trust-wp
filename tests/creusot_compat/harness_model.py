@@ -34,6 +34,10 @@ class VerificationTelemetry:
     verified_with_axiom_deps: int = 0
     unverified_axioms: int = 0
     vacuous: int = 0
+    # Optional on the wire (absent from lines emitted before the field existed);
+    # mirrors the Rust decoder, which claims no required bit for it.
+    proof_assert_verified: int = 0
+    verified_native_only: int = 0
     proof_assert_failed: int = 0
     proof_assert_errors: int = 0
     evidence_gaps: int = 0
@@ -58,6 +62,8 @@ class VerificationTelemetry:
             "verified_with_axiom_deps": self.verified_with_axiom_deps,
             "unverified_axioms": self.unverified_axioms,
             "vacuous": self.vacuous,
+            "proof_assert_verified": self.proof_assert_verified,
+            "verified_native_only": self.verified_native_only,
             "proof_assert_failed": self.proof_assert_failed,
             "proof_assert_errors": self.proof_assert_errors,
             "evidence_gaps": self.evidence_gaps,
@@ -77,6 +83,20 @@ class VerificationTelemetry:
 
 
 TELEMETRY_FIELD_NAMES = tuple(VerificationTelemetry.__dataclass_fields__)
+
+# Fields the wire line may legitimately omit. `proof_assert_verified` was added
+# to the driver's encoder in a6a8511 (v0.15.0 wave); the Rust decoder
+# (`StructuredVerificationResult::from_wire_line`) accepts lines with or
+# without it. The Python mirror must match, or every fresh wire line is
+# rejected and all wire-based classification carve-outs silently collapse
+# (the tip13 26-test no-reason signature). Unknown fields beyond
+# TELEMETRY_FIELD_NAMES still fail closed — that policy is deliberate and
+# tested (test_parse_wire_line_rejects_future_fields).
+# `verified_native_only` joined the protocol later still: obligations that
+# verified on authority no independent checker can re-check. Optional for
+# the same reason, and additionally because a producer that cannot
+# determine it should omit it rather than report a confident zero.
+OPTIONAL_TELEMETRY_FIELDS = frozenset({"proof_assert_verified", "verified_native_only"})
 
 
 def parse_wire_line(line: str) -> VerificationTelemetry | None:
@@ -103,10 +123,16 @@ def parse_wire_line(line: str) -> VerificationTelemetry | None:
         if value < 0:
             return None
         pairs[key] = value
-    required = set(TELEMETRY_FIELD_NAMES)
-    if set(pairs) != required:
+    known = set(TELEMETRY_FIELD_NAMES)
+    required = known - OPTIONAL_TELEMETRY_FIELDS
+    seen = set(pairs)
+    if not seen <= known:
         return None
-    return VerificationTelemetry(**{key: pairs[key] for key in TELEMETRY_FIELD_NAMES})
+    if not required <= seen:
+        return None
+    return VerificationTelemetry(
+        **{key: pairs.get(key, 0) for key in TELEMETRY_FIELD_NAMES}
+    )
 
 
 @dataclass

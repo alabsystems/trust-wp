@@ -359,10 +359,12 @@ def check_baseline_freshness(
     }
 
     # The examples lane is a demonstrative, known-degraded corpus (rustc ICE /
-    # never-green since inception). Its freshness is reported for visibility but
-    # is ADVISORY: it must not escalate the overall status, so a stale/invalid
-    # examples baseline can never fail the canonical should_succeed/should_fail
-    # freshness gate. See refresh-baselines.sh (examples is best-effort publish).
+    # never-green since inception). Its age and parse validity are advisory, so
+    # stale/invalid examples do not fail the canonical should_succeed/should_fail
+    # freshness gate. Complete absence is different: there is then no published
+    # examples census at all, and the full refresh command must restore it.
+    # See refresh-baselines.sh (examples execution is best-effort, publication
+    # of the resulting census is not).
     advisory_lanes = {"examples"}
 
     for lane_name, canonical_path in lanes.items():
@@ -372,7 +374,7 @@ def check_baseline_freshness(
 
         def _apply(status: str) -> None:
             lane_info["status"] = status
-            if not advisory:
+            if not advisory or status == "missing":
                 result["status"] = _escalate(str(result["status"]), status)
 
         commit = None

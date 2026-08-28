@@ -208,8 +208,9 @@ def test_inherited_skip_prebuild_rejects_stale_existing_executable(
     assert "bytes differ from build provenance" in result.stderr
 
 
-def test_fixture_verification_command_is_locked(tmp_path):
+def test_fixture_verification_command_is_locked(tmp_path, monkeypatch):
     """The actual cargo-trust-wp fixture subprocess must consume Cargo.lock."""
+    monkeypatch.delenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", raising=False)
     calls = []
 
     class FinishedProcess:
@@ -217,6 +218,7 @@ def test_fixture_verification_command_is_locked(tmp_path):
 
         @staticmethod
         def communicate(timeout=None):
+            # The harness wall (-t) stays the process kill-timeout ...
             assert timeout == 17
             return "trust-wp: 1 verified, 0 failed, 0 errors\n", ""
 
@@ -249,13 +251,55 @@ def test_fixture_verification_command_is_locked(tmp_path):
 
     assert success is True
     assert exit_code == 0
+    # ... while --timeout carries the DERIVED per-obligation solver budget
+    # (#2708): for a 17s wall the derivation floors at 15s then caps at
+    # wall // 2 = 8s so the driver watchdog (1.5 x B + 0.1s) still fires
+    # inside the wall.
     assert calls[0][0] == [
         str(binary),
         "--verbose",
         "--timeout",
-        "17",
+        "8",
         "--locked",
     ]
+
+
+def test_derive_solver_timeout_restores_watchdog_inside_wall(monkeypatch):
+    """The derived solver budget keeps every driver envelope inside the wall.
+
+    Invariant (#2708): wall >= compile margin (20s) + 5 x B (driver crate
+    wall, #2674) + 1.5 x B + 0.1s (driver watchdog envelope).  Historically
+    the harness passed the wall itself as --timeout, so the watchdog at
+    1.5 x wall could NEVER fire before the process kill at the wall.
+    """
+    monkeypatch.delenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", raising=False)
+    # The standard walls: SS lane, per-test overrides, SF lane, default.
+    assert harness_runner._derive_solver_timeout_sec(600) == 89
+    assert harness_runner._derive_solver_timeout_sec(300) == 43
+    assert harness_runner._derive_solver_timeout_sec(200) == 27
+    assert harness_runner._derive_solver_timeout_sec(120) == 15
+    # Floor at the driver's 15s adaptive floor once the wall allows it.
+    assert harness_runner._derive_solver_timeout_sec(60) == 15
+    # Tiny walls: the watchdog-inside-wall cap (wall // 2) wins over the floor.
+    assert harness_runner._derive_solver_timeout_sec(17) == 8
+    assert harness_runner._derive_solver_timeout_sec(3) == 1
+    for wall in (3, 17, 60, 120, 200, 300, 600, 1800):
+        budget = harness_runner._derive_solver_timeout_sec(wall)
+        assert budget >= 1
+        # The watchdog envelope must fire inside the wall.
+        assert 1.5 * budget + 0.1 < wall or wall <= 2
+
+
+def test_derive_solver_timeout_env_override_still_capped(monkeypatch):
+    """TRUST_WP_HARNESS_SOLVER_TIMEOUT overrides the derivation, not the cap."""
+    monkeypatch.setenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", "60")
+    assert harness_runner._derive_solver_timeout_sec(600) == 60
+    # The override cannot defeat the watchdog-inside-wall invariant.
+    monkeypatch.setenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", "1000")
+    assert harness_runner._derive_solver_timeout_sec(600) == 300
+    # Junk values fall back to the derivation.
+    monkeypatch.setenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", "not-a-number")
+    assert harness_runner._derive_solver_timeout_sec(600) == 89
 
 
 def test_review_gate_rejects_harness_binary_reuse_env(tmp_path):
@@ -555,6 +599,224 @@ def _private_wrapper_layout(
     return fake_rustc, driver_hash, compiler_commit
 
 
+def _cross_private_wrapper_layout(
+    tmp_path: Path,
+    *,
+    driver_suffix: str,
+) -> dict[str, Path | str]:
+    """Create host + target rustc-private surfaces for a wrapper dry run."""
+    compiler_commit = "c" * 40
+    host_hash = hashlib.sha256(f"host:{tmp_path}".encode()).hexdigest()[:12]
+    cross_hash = hashlib.sha256(f"cross:{tmp_path}".encode()).hexdigest()[:12]
+    host_triple = f"host-{host_hash}"
+    cross_triple = f"cross-{cross_hash}"
+    build_root = tmp_path / "build"
+    sysroot = build_root / host_triple / "stage2"
+    sysroot_lib = sysroot / "lib"
+    host_std = sysroot_lib / "rustlib" / host_triple / "lib"
+    cross_std = sysroot_lib / "rustlib" / cross_triple / "lib"
+    host_std.mkdir(parents=True)
+    cross_std.mkdir(parents=True)
+    host_driver = sysroot_lib / f"librustc_driver-{host_hash}.{driver_suffix}"
+    host_driver.write_bytes(b"host-driver")
+    (host_std / "libstd-host.rlib").touch()
+    (cross_std / "libstd-cross.rlib").touch()
+
+    private_root = sysroot.parent / "rustc-private-sysroots"
+    host_private_root = private_root / f"rustc-private-tool-stage2-{host_triple}-fixture"
+    host_private = host_private_root / host_triple
+    host_private.mkdir(parents=True)
+    (host_private_root / ".rustc-commit-hash").write_text(f"{compiler_commit}\n")
+    (host_private / host_driver.name).write_bytes(host_driver.read_bytes())
+    (host_private / "librustc_middle-host.rmeta").touch()
+
+    cross_stage = build_root / cross_triple / "stage2"
+    cross_stage_lib = cross_stage / "lib"
+    cross_stage_lib.mkdir(parents=True)
+    cross_driver = cross_stage_lib / f"librustc_driver-{cross_hash}.{driver_suffix}"
+    cross_driver.write_bytes(b"cross-driver")
+    cross_private_root = private_root / f"rustc-private-tool-stage2-{cross_triple}-fixture"
+    cross_private = cross_private_root / cross_triple
+    cross_private.mkdir(parents=True)
+    (cross_private_root / ".rustc-commit-hash").write_text(f"{compiler_commit}\n")
+    (cross_private / cross_driver.name).write_bytes(cross_driver.read_bytes())
+    (cross_private / "librustc_middle-cross.rmeta").touch()
+    cross_llvm = build_root / cross_triple / "llvm" / "lib"
+    cross_llvm.mkdir(parents=True)
+
+    capture = tmp_path / "rustc-args.txt"
+    fake_rustc = tmp_path / "fake-rustc"
+    fake_rustc.write_text(
+        "\n".join(
+            [
+                "#!/bin/sh",
+                'if [ "$1" = "--print" ] && [ "$2" = "sysroot" ]; then',
+                f"    printf '%s\\n' '{sysroot}'",
+                "    exit 0",
+                "fi",
+                'if [ "$1" = "--print" ] && [ "$2" = "target-libdir" ]; then',
+                f"    printf '%s\\n' '{host_std}'",
+                "    exit 0",
+                "fi",
+                'if [ "$1" = "-vV" ]; then',
+                f"    printf '%s\\n' 'commit-hash: {compiler_commit}'",
+                "    exit 0",
+                "fi",
+                f": > '{capture}'",
+                f"for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{capture}'; done",
+                "exit 0",
+                "",
+            ]
+        )
+    )
+    fake_rustc.chmod(0o755)
+    return {
+        "fake_rustc": fake_rustc,
+        "capture": capture,
+        "host_hash": host_hash,
+        "cross_triple": cross_triple,
+        "compiler_commit": compiler_commit,
+        "host_private": host_private,
+        "host_std": host_std,
+        "cross_private": cross_private,
+        "cross_std": cross_std,
+        "cross_llvm": cross_llvm,
+        "cross_native": cross_stage_lib,
+        "private_root": private_root,
+        "cross_driver": cross_driver,
+    }
+
+
+def _remove_cross_wrapper_artifacts(layout: dict[str, Path | str]) -> None:
+    """Remove the repository-local cache/overlay made by a cross dry run."""
+    cross_triple = str(layout["cross_triple"])
+    host_hash = str(layout["host_hash"])
+    compiler_commit = str(layout["compiler_commit"])
+    cache = WORKSPACE_ROOT / "target" / f".trust-private-env-{cross_triple}"
+    overlay = (
+        WORKSPACE_ROOT
+        / "target"
+        / f"trust-private-sysroot-{host_hash}-{compiler_commit}-{cross_triple}"
+    )
+    cache.unlink(missing_ok=True)
+    shutil.rmtree(overlay, ignore_errors=True)
+    shutil.rmtree(Path(f"{overlay}.lock"), ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("driver_suffix", "relative_rpath"),
+    [("dylib", "@executable_path/../lib"), ("so", "$ORIGIN/../lib")],
+)
+def test_private_wrapper_stages_and_links_cross_target_surface(
+    tmp_path, driver_suffix, relative_rpath
+):
+    """Cross driver units must use target std/private/native paths exclusively."""
+    layout = _cross_private_wrapper_layout(tmp_path, driver_suffix=driver_suffix)
+    _remove_cross_wrapper_artifacts(layout)
+    command = [
+        str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
+        str(layout["fake_rustc"]),
+        "--target",
+        str(layout["cross_triple"]),
+        "--crate-name",
+        "trust_wp_driver",
+        "--crate-type",
+        "bin",
+    ]
+    try:
+        for _ in range(2):  # slow assembly, then the per-target cache fast path
+            result = subprocess.run(
+                command,
+                cwd=WORKSPACE_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            args = Path(layout["capture"]).read_text().splitlines()
+            rendered = "\n".join(args)
+            assert f"-L\n{layout['cross_llvm']}" in rendered
+            assert f"-L\n{layout['cross_native']}" in rendered
+            assert str(layout["cross_private"]) in rendered
+            assert str(layout["cross_std"]) in rendered
+            assert str(layout["host_private"]) not in rendered
+            assert str(layout["host_std"]) not in rendered
+            assert f"-Clink-arg=-Wl,-rpath,{relative_rpath}" in args
+
+        overlay = (
+            WORKSPACE_ROOT
+            / "target"
+            / (
+                f"trust-private-sysroot-{layout['host_hash']}-"
+                f"{layout['compiler_commit']}-{layout['cross_triple']}"
+            )
+            / "lib"
+            / "rustlib"
+            / str(layout["cross_triple"])
+            / "lib"
+        )
+        assert (overlay / "libstd-cross.rlib").exists()
+        assert (overlay / Path(layout["cross_driver"]).name).exists()
+        assert (overlay / "librustc_middle-cross.rmeta").exists()
+    finally:
+        _remove_cross_wrapper_artifacts(layout)
+
+
+def test_private_wrapper_rejects_ambiguous_cross_private_sysroots(tmp_path):
+    """Cross metadata selection must not fall back to private-root order."""
+    layout = _cross_private_wrapper_layout(tmp_path, driver_suffix="dylib")
+    duplicate_root = (
+        Path(layout["private_root"])
+        / f"duplicate-{layout['cross_triple']}-fixture"
+    )
+    duplicate = duplicate_root / str(layout["cross_triple"])
+    duplicate.mkdir(parents=True)
+    cross_driver = Path(layout["cross_driver"])
+    (duplicate / cross_driver.name).write_bytes(cross_driver.read_bytes())
+    (duplicate / "librustc_middle-duplicate.rmeta").touch()
+    _remove_cross_wrapper_artifacts(layout)
+    try:
+        result = subprocess.run(
+            [
+                str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
+                str(layout["fake_rustc"]),
+                "--target",
+                str(layout["cross_triple"]),
+                "--crate-name",
+                "trust_wp_driver",
+            ],
+            cwd=WORKSPACE_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "multiple byte-identical private sysroots match the cross driver" in result.stderr
+    finally:
+        _remove_cross_wrapper_artifacts(layout)
+
+
+def test_private_wrapper_rejects_target_spec_paths_before_cache_use(tmp_path):
+    """A JSON target path must not become part of an overlay/cache pathname."""
+    target_spec = tmp_path / "custom-target.json"
+    target_spec.write_text("{}")
+    result = subprocess.run(
+        [
+            str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
+            "/bin/false",
+            "--target",
+            str(target_spec),
+            "--version",
+        ],
+        cwd=WORKSPACE_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--target must name an installed target triple" in result.stderr
+
+
 def test_private_wrapper_rejects_ambiguous_private_sysroots(tmp_path):
     """Two matching private sysroots must not be resolved by directory order."""
     fake_rustc, _, _ = _private_wrapper_layout(tmp_path, candidate_count=2)
@@ -572,7 +834,7 @@ def test_private_wrapper_rejects_ambiguous_private_sysroots(tmp_path):
     )
 
     assert result.returncode != 0
-    assert "multiple private sysroots match compiler" in result.stderr
+    assert "multiple byte-identical private sysroots match compiler" in result.stderr
 
 
 def test_private_wrapper_does_not_reclaim_observed_stale_lock(tmp_path):
@@ -661,6 +923,12 @@ def review_dependency_fixture(tmp_path):
     project = tmp_path / "trust-wp"
     ay = tmp_path / "ay"
     project.mkdir()
+    (ay / "Cargo.toml").parent.mkdir(parents=True)
+    (ay / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/ay-core", "crates/ay-dpll"]\n'
+        '\n[workspace.package]\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
     for crate in ("ay-core", "ay-dpll"):
         crate_dir = ay / "crates" / crate
         crate_dir.mkdir(parents=True)
@@ -694,10 +962,17 @@ def review_dependency_fixture(tmp_path):
         ],
         check=True,
     )
+    ay_commit = subprocess.run(
+        ["git", "-C", str(ay), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
     trust_ir_commit = "1" * 40
     (project / "Cargo.toml").write_text(
         f"""\
+# Current AY authority: version=0.1.0 commit={ay_commit}
 [workspace]
 members = []
 
@@ -706,6 +981,12 @@ trust-ir = {{ git = "https://github.com/alabsystems/trust-ir.git", rev = "{trust
 ay-core = {{ path = "../ay/crates/ay-core" }}
 ay-dpll = {{ path = "../ay/crates/ay-dpll" }}
 """
+    )
+    (project / "VISION.md").write_text(
+        "| Component | Status | Tests | Notes |\n"
+        f"| trust-wp-ay | Building | fixture | AY v0.1.0 backend at `{ay_commit[:8]}` "
+        "on current `main` |\n",
+        encoding="utf-8",
     )
     (project / "Cargo.lock").write_text(
         f"""\
@@ -744,6 +1025,8 @@ def test_review_dependency_validator_accepts_exact_fixture(review_dependency_fix
     assert result.returncode == 0, result.stderr
     assert "cargo_toml_trust_ir_matches_lock: yes" in result.stdout
     assert "sibling_ay_is_path_dep_source_of_truth: yes" in result.stdout
+    assert "ay_evidence_version: 0.1.0" in result.stdout
+    assert "active_ay_provenance_claims_match_evidence: yes" in result.stdout
 
 
 def test_review_dependency_validator_rejects_wrong_remote(review_dependency_fixture):
@@ -814,6 +1097,49 @@ def test_review_dependency_validator_rejects_dirty_ay(review_dependency_fixture)
     result = _run_review_dependency_validator(project, ay, trust_ir_commit)
     assert result.returncode != 0
     assert "uncommitted path" in result.stderr
+
+
+def test_review_dependency_validator_rejects_cargo_ay_claim_drift(
+    review_dependency_fixture,
+):
+    project, ay, trust_ir_commit = review_dependency_fixture
+    manifest = (project / "Cargo.toml").read_text().replace(
+        "Current AY authority: version=0.1.0",
+        "Current AY authority: version=9.9.9",
+    )
+    (project / "Cargo.toml").write_text(manifest)
+    result = _run_review_dependency_validator(project, ay, trust_ir_commit)
+    assert result.returncode != 0
+    assert "current AY authority claim" in result.stderr
+
+
+def test_review_dependency_validator_rejects_vision_ay_claim_drift(
+    review_dependency_fixture,
+):
+    project, ay, trust_ir_commit = review_dependency_fixture
+    vision = (project / "VISION.md").read_text().replace(
+        "AY v0.1.0 backend", "AY v9.9.9 backend"
+    )
+    (project / "VISION.md").write_text(vision)
+    result = _run_review_dependency_validator(project, ay, trust_ir_commit)
+    assert result.returncode != 0
+    assert "VISION.md current trust-wp-ay claim" in result.stderr
+
+
+def test_review_dependency_validator_rejects_stale_ay_lock_version(
+    review_dependency_fixture,
+):
+    project, ay, trust_ir_commit = review_dependency_fixture
+    lock = (project / "Cargo.lock").read_text()
+    for crate in ("ay-core", "ay-dpll"):
+        lock = lock.replace(
+            f'name = "{crate}"\nversion = "0.1.0"',
+            f'name = "{crate}"\nversion = "0.0.9"',
+        )
+    (project / "Cargo.lock").write_text(lock)
+    result = _run_review_dependency_validator(project, ay, trust_ir_commit)
+    assert result.returncode != 0
+    assert "does not match sibling package version" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +2307,137 @@ def test_parse_wire_line_rejects_future_fields():
     )
 
     assert telemetry is None, "Unexpected future telemetry fields should fail closed"
+
+
+def test_parse_wire_line_accepts_current_driver_emitter_shape():
+    """The exact line the a6a8511 driver emits (with proof_assert_verified) must
+    parse; its rejection was the tip13 26-test no-reason signature — every
+    wire-based classification carve-out silently collapsed to error."""
+    line = (
+        "TRUST_WP_RESULT:v1 base_exit_code=2 verified=2 failed=0 errors=0 "
+        "warnings=0 assumed=0 trusted=2 skipped=0 verified_with_axiom_deps=0 "
+        "unverified_axioms=0 vacuous=0 evidence_gaps=0 proof_assert_verified=3 "
+        "proof_assert_failed=0 proof_assert_errors=0 panics=0 demoted=0 "
+        "parse_errors=0 termination_errors=0 logic_recursion_errors=0 "
+        "erasure_errors=0"
+    )
+    telemetry = harness.parse_wire_line(line)
+
+    assert telemetry is not None, "Current driver wire line must parse"
+    assert telemetry.trusted == 2
+    assert telemetry.proof_assert_verified == 3
+    assert telemetry.base_exit_code == 2
+
+
+def test_parse_wire_line_accepts_missing_proof_assert_verified():
+    """Lines emitted before the field existed (pre-a6a8511 drivers, stored
+    baselines) must keep parsing: the field is optional, mirroring the Rust
+    decoder's REQUIRED_FIELDS bitmask which claims no bit for it."""
+    line = " ".join(
+        token
+        for token in _wire_line(verified=1, trusted=1).strip().split()
+        if not token.startswith("proof_assert_verified=")
+    )
+    telemetry = harness.parse_wire_line(line)
+
+    assert telemetry is not None, "Pre-field wire line must keep parsing"
+    assert telemetry.proof_assert_verified == 0
+    assert telemetry.verified == 1
+    assert telemetry.trusted == 1
+
+
+# --- Wire-protocol conformance fixture (#132) -------------------------------
+#
+# tests/creusot_compat/wire_fields.v1.txt is GENERATED from the Rust manifest
+# (trust_wp_core::result_protocol::WIRE_FIELDS_V1 — the same const slice the
+# Rust emitter and decoder are driven by) and pinned by a Rust unit test
+# (wire_manifest_fixture_matches_code). The tests below pin BOTH Python
+# decoders to the same file, so a wire-field change cannot land without
+# touching the mirrors — the drift class behind the two mirror incidents (the
+# stale hand-maintained tuple documented atop this file, and the
+# proof_assert_verified day fixed by commit 6cd6400). Unknown-field rejection
+# stays (test_parse_wire_line_rejects_future_fields): the fixture enforces
+# agreement, not tolerance.
+
+WIRE_FIXTURE_PATH = HARNESS_DIR / "wire_fields.v1.txt"
+
+
+def _load_wire_field_manifest() -> tuple[list[str], list[str]]:
+    """Parse the Rust-generated conformance fixture into (required, optional)."""
+    sections: dict[str, list[str]] = {"[required]": [], "[optional]": []}
+    current: list[str] | None = None
+    for raw_line in WIRE_FIXTURE_PATH.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line in sections:
+            current = sections[line]
+            continue
+        assert current is not None, f"fixture field before any section marker: {line!r}"
+        current.append(line)
+    return sections["[required]"], sections["[optional]"]
+
+
+def test_wire_fixture_is_well_formed():
+    """Both section markers present, non-empty required set, no duplicates,
+    no field claimed by both sections."""
+    required, optional = _load_wire_field_manifest()
+
+    assert required, "fixture must declare at least one required field"
+    assert len(required) == len(set(required)), "duplicate required fields"
+    assert len(optional) == len(set(optional)), "duplicate optional fields"
+    assert set(required).isdisjoint(optional), "field in both sections"
+
+
+def test_harness_model_field_sets_match_wire_fixture():
+    """harness_model's known/optional field sets must equal the Rust manifest
+    exactly — its parse_wire_line rejects unknown fields and fails closed on
+    missing required ones, so any inequality is a live decoder split-brain."""
+    required, optional = _load_wire_field_manifest()
+    from tests.creusot_compat import harness_model
+
+    fixture_known = set(required) | set(optional)
+    model_known = set(harness_model.TELEMETRY_FIELD_NAMES)
+    assert model_known == fixture_known, (
+        "harness_model.TELEMETRY_FIELD_NAMES drifted from the Rust wire manifest: "
+        f"missing={sorted(fixture_known - model_known)} "
+        f"extra={sorted(model_known - fixture_known)}"
+    )
+
+    model_optional = set(harness_model.OPTIONAL_TELEMETRY_FIELDS)
+    assert model_optional == set(optional), (
+        "harness_model.OPTIONAL_TELEMETRY_FIELDS drifted from the Rust wire manifest: "
+        f"missing={sorted(set(optional) - model_optional)} "
+        f"extra={sorted(model_optional - set(optional))}"
+    )
+
+
+def test_compare_baselines_field_sets_match_wire_fixture():
+    """compare_baselines' telemetry-integrity gate must agree with the Rust
+    manifest exactly, or every refreshed baseline flags spurious
+    missing/unexpected-field violations (the second drift incident)."""
+    required, optional = _load_wire_field_manifest()
+    compare_spec = importlib.util.spec_from_file_location(
+        "compare_baselines_under_test",
+        WORKSPACE_ROOT / "scripts" / "compare_baselines.py",
+    )
+    compare_baselines = importlib.util.module_from_spec(compare_spec)
+    compare_spec.loader.exec_module(compare_baselines)
+
+    fixture_known = set(required) | set(optional)
+    script_known = set(compare_baselines.TELEMETRY_FIELD_NAMES)
+    assert script_known == fixture_known, (
+        "compare_baselines.TELEMETRY_FIELD_NAMES drifted from the Rust wire manifest: "
+        f"missing={sorted(fixture_known - script_known)} "
+        f"extra={sorted(script_known - fixture_known)}"
+    )
+
+    script_optional = set(compare_baselines.OPTIONAL_TELEMETRY_FIELDS)
+    assert script_optional == set(optional), (
+        "compare_baselines.OPTIONAL_TELEMETRY_FIELDS drifted from the Rust wire "
+        f"manifest: missing={sorted(set(optional) - script_optional)} "
+        f"extra={sorted(script_optional - set(optional))}"
+    )
 
 
 def test_extract_telemetry_uses_last_complete_wire_line():

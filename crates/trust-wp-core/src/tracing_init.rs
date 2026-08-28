@@ -28,9 +28,21 @@ pub const TIMING_STAGE_EXTRACT_SPAN: &str = timing_layer::STAGE_EXTRACT_SPAN;
 pub const TIMING_STAGE_VC_SPAN: &str = timing_layer::STAGE_VC_SPAN;
 pub const TIMING_STAGE_SOLVE_SPAN: &str = timing_layer::STAGE_SOLVE_SPAN;
 
-const QUIET_FILTER_BASELINE: &str = "warn";
+/// Third-party solver targets, silenced at the quiet baseline.
+///
+/// `EnvFilter` matches a directive target as a prefix of the event target, so
+/// the single `ay` directive covers every `ay_*` crate in the solver workspace.
+///
+/// The `ay` solver logs routine, expected conditions at `error!` — most visibly
+/// "strict proof checker rejected UNSAT proof", which is the *normal* path when
+/// a refutation leans on a trusted rule. trust-wp already reports that outcome
+/// in its own voice (`unknown (proof-trusted)`, counted as an error, exit 2),
+/// so relaying the solver's internal chatter on top of it tells the user
+/// nothing they can act on and reads as a crash. `-v` and an explicit
+/// `TRUST_WP_LOG=ay_dpll=error` both bring it back.
+const QUIET_FILTER_BASELINE: &str = "warn,ay=off";
 const VERBOSE_FILTER_BASELINE: &str =
-    "warn,cargo_trust_wp=info,trust_wp_core=info,trust_wp_driver=info,trust_wp_ay=info";
+    "warn,ay=warn,cargo_trust_wp=info,trust_wp_core=info,trust_wp_driver=info,trust_wp_ay=info";
 const TRUST_WP_AY_DEBUG_DIRECTIVE: &str = "trust_wp_ay=debug";
 const LOG_TARGET_ALIASES: [(&str, &str); 5] = [
     ("callbacks", "trust_wp_driver::callbacks"),
@@ -82,7 +94,7 @@ pub fn trust_wp_log_help() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "LOGGING:\n    TRUST_WP_LOG=<target>=<level>[,...]\n        targets: {targets}\n        example: TRUST_WP_LOG=callbacks=debug,verify=trace cargo trust-wp -v"
+        "LOGGING:\n    TRUST_WP_LOG=<target>=<level>[,...]\n        targets: {targets}\n        example: TRUST_WP_LOG=callbacks=debug,verify=trace trust-wp -v"
     )
 }
 
@@ -102,6 +114,12 @@ fn fallback_filter_string(verbose: bool, trust_wp_debug: bool) -> String {
     directives.join(",")
 }
 
+/// Build the effective filter.
+///
+/// `verbose` is honoured whether or not `TRUST_WP_LOG` is set. It used to be
+/// ignored on the `TRUST_WP_LOG` path, which made `-v` silently do nothing
+/// alongside a custom filter — including for the exact combination
+/// [`trust_wp_log_help`] prints as its example.
 fn build_filter_string(verbose: bool, trust_wp_log: Option<&str>, trust_wp_debug: bool) -> String {
     let Some(raw_filter) = trust_wp_log else {
         return fallback_filter_string(verbose, trust_wp_debug);
@@ -112,7 +130,7 @@ fn build_filter_string(verbose: bool, trust_wp_log: Option<&str>, trust_wp_debug
     let append_trust_wp_ay_debug = trust_wp_debug && should_append_trust_wp_ay_debug(&normalized);
 
     if normalized.global_level.is_none() {
-        directives.push(QUIET_FILTER_BASELINE.to_string());
+        directives.push(default_filter_baseline(verbose).to_string());
     }
 
     directives.extend(normalized.directives);
@@ -228,20 +246,56 @@ mod tests {
         let filter = build_filter_string(false, Some("encoder=debug,verify=trace"), false);
         assert_eq!(
             filter,
-            "warn,trust_wp_ay::encoder=debug,trust_wp_ay::verify=trace"
+            format!("{QUIET_FILTER_BASELINE},trust_wp_ay::encoder=debug,trust_wp_ay::verify=trace")
         );
     }
 
     #[test]
     fn test_build_filter_preserves_raw_directive() {
         let filter = build_filter_string(false, Some("trust_wp_ay::verify=trace"), false);
-        assert_eq!(filter, "warn,trust_wp_ay::verify=trace");
+        assert_eq!(
+            filter,
+            format!("{QUIET_FILTER_BASELINE},trust_wp_ay::verify=trace")
+        );
     }
 
     #[test]
     fn test_trust_wp_debug_does_not_append_when_ay_alias_present() {
         let filter = build_filter_string(false, Some("memory_model=trace"), true);
-        assert_eq!(filter, "warn,trust_wp_ay::memory_model=trace");
+        assert_eq!(
+            filter,
+            format!("{QUIET_FILTER_BASELINE},trust_wp_ay::memory_model=trace")
+        );
+    }
+
+    /// The solver's own `error!` chatter must not reach a quiet run, but an
+    /// explicit `TRUST_WP_LOG` directive for it must still win: `EnvFilter`
+    /// resolves the longer (more specific) target first.
+    #[test]
+    fn test_solver_targets_are_silenced_at_the_quiet_baseline() {
+        assert!(QUIET_FILTER_BASELINE.contains("ay=off"));
+        assert!(VERBOSE_FILTER_BASELINE.contains("ay=warn"));
+        // `ay` is a target *prefix*, so it covers every `ay_*` solver crate.
+        assert!("ay_dpll::executor::proof".starts_with("ay"));
+        // A caller who asks for the solver's logs by name still gets them.
+        let filter = build_filter_string(false, Some("ay_dpll=error"), false);
+        assert_eq!(filter, format!("{QUIET_FILTER_BASELINE},ay_dpll=error"));
+        assert!(EnvFilter::try_new(filter).is_ok());
+    }
+
+    /// `-v` has to mean the same thing with and without `TRUST_WP_LOG`,
+    /// including for the combination `trust_wp_log_help` prints as its example.
+    #[test]
+    fn test_verbose_raises_the_baseline_even_with_a_custom_filter() {
+        let quiet = build_filter_string(false, Some("verify=trace"), false);
+        let verbose = build_filter_string(true, Some("verify=trace"), false);
+        assert!(quiet.starts_with(QUIET_FILTER_BASELINE), "{quiet}");
+        assert!(verbose.starts_with(VERBOSE_FILTER_BASELINE), "{verbose}");
+        assert!(verbose.contains("ay=warn"), "{verbose}");
+
+        // A directive that names its own global level still governs.
+        let explicit = build_filter_string(true, Some("off,verify=trace"), false);
+        assert!(!explicit.contains(VERBOSE_FILTER_BASELINE), "{explicit}");
     }
 
     #[test]

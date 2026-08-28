@@ -15,65 +15,60 @@ A simple library demonstrating trust-wp contract verification.
 
 ## Running Verification
 
-From the trust-wp root directory:
+As a single file, from the trust-wp root directory:
 
 ```bash
-# Verify all functions (--crate-type=lib for library files)
-./scripts/run-trust-wp-rustc.sh examples/verified_math/src/lib.rs --crate-type=lib -- --force
+trust-wp examples/verified_math/src/lib.rs
+```
+
+Or as a crate, from this directory:
+
+```bash
+cd examples/verified_math && trust-wp
 ```
 
 ### Expected Output (Success)
 
 ```
-trust-wp: Found 6 functions with contracts:
-  safe_increment
-    requires: x < 2147483647
-    ensures: result == x + 1
-  double
-    requires: x >= -1000 && x <= 1000
-    ensures: result == x * 2
-  abs
-    requires: x > -2147483648
-    ensures: result >= 0
-  is_positive
-    ensures: result == (x > 0)
-  zero
-    ensures: result == 0
-  negate
-    ensures: result == !b
+✓ safe_increment verified
+✓ double verified
+✓ abs verified
+✓ is_positive verified
+✓ zero verified
+✓ negate verified
 
-trust-wp: safe_increment verified ✓
-trust-wp: double verified ✓
-trust-wp: abs verified ✓
-trust-wp: is_positive verified ✓
-trust-wp: zero verified ✓
-trust-wp: negate verified ✓
-
-trust-wp: 6 verified, 0 failed, 0 errors
+6 verified, 0 failed, 0 errors
 ```
+
+Exit code 0. A crate with several contracted functions also prints an
+adaptive-timeout note, which divides the crate budget across them.
 
 ### Verbose Mode
 
 ```bash
-./scripts/run-trust-wp-rustc.sh examples/verified_math/src/lib.rs --crate-type=lib -- --force --verbose
+trust-wp -v examples/verified_math/src/lib.rs
 ```
 
 This shows details about the verification condition generation and SMT solving.
 
 ## Running Tests
 
-The source file includes unit tests:
+The source file includes unit tests. This example is its own workspace (its
+`Cargo.toml` carries an empty `[workspace]` table so it does not join the
+trust-wp workspace), so run them from this directory rather than by package
+name from the root:
 
 ```bash
-cargo test -p verified_math
+cd examples/verified_math && cargo test
 ```
 
 ## Contract Syntax
 
-Contracts use Creusot-compatible proc-macro attributes:
+Contracts use Creusot-compatible proc-macro attributes. Note the crate is
+`trust_wp` in Rust code — the hyphen only appears in the *package* name:
 
 ```rust
-use trust-wp::{ensures, requires};
+use trust_wp::{ensures, requires};
 
 #[requires(precondition expression)]
 #[ensures(postcondition expression)]

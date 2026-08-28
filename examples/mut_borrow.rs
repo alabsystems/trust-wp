@@ -7,9 +7,18 @@
 //! This file demonstrates the syntax for mutable borrow contracts
 //! using Creusot-style `*v` (current value) and `^v` (final value) notation.
 //!
-//! STATUS: Phase 6 - Mutable borrow verification implemented
+//! Verify it with:  `trust-wp examples/mut_borrow.rs`
 //!
-//! The implementation now supports:
+//! STATUS: `increment_ref` and `swap` verify. `abs_mut` reports
+//! `unknown (proof-trusted)` (so the file exits 2): the solver answers `unsat`
+//! but publishes no replayable proof, and the proof-authority gate declines a
+//! verdict it cannot check. That is the honesty meter, not a broken contract.
+//!
+//! This lane is also the one most sensitive to the `ay` revision in the sibling
+//! checkout the manifest path-depends on — an older solver demotes all three.
+//! See `docs/e2e-trait-refinement-ay010-drift-2026-08-16.md`.
+//!
+//! The implementation supports:
 //! - `*v` (deref current) maps to `v_current` in SMT
 //! - `^v` (final/prophecy) maps to `v_final` in SMT
 //! - `old(*v)` correctly maps to `v_current` (entry state value)

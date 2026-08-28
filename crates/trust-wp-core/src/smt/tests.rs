@@ -1013,13 +1013,17 @@ mod logic_fn_tests {
         assert_eq!(expr_to_smt(&expr), "(logic_crate_P__P_specs_P__P_max x y)");
     }
 
+    /// A nullary logic function is a constant, and SMT-LIB spells a constant as
+    /// the bare identifier. Its term grammar is `( qual_identifier term+ )`, so
+    /// the parenthesised form this used to emit — `(logic_const__val)` — is a
+    /// parse error rather than a zero-argument application.
     #[test]
     fn test_expr_to_smt_logic_fn_call_nullary() {
         let expr = PureExpr::LogicFnCall {
             name: "const_val".into(),
             args: vec![],
         };
-        assert_eq!(expr_to_smt(&expr), "(logic_const__val)");
+        assert_eq!(expr_to_smt(&expr), "logic_const__val");
     }
 }
 

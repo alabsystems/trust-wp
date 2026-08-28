@@ -181,43 +181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trust-wp"
-version = "0.1.1"
-dependencies = [
- "trust-wp-macros",
- "trust-wp-std",
-]
-
-[[package]]
-name = "trust-wp-core"
-version = "0.1.1"
-dependencies = [
- "num-bigint",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "trust-wp-macros"
-version = "0.1.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "trust-wp-core",
- "syn",
- "thiserror",
-]
-
-[[package]]
-name = "trust-wp-std"
-version = "0.1.1"
-dependencies = [
- "trust-wp-macros",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +209,43 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "trust-wp"
+version = "0.3.0"
+dependencies = [
+ "trust-wp-macros",
+ "trust-wp-std",
+]
+
+[[package]]
+name = "trust-wp-core"
+version = "0.3.0"
+dependencies = [
+ "num-bigint",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "trust-wp-macros"
+version = "0.3.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "thiserror",
+ "trust-wp-core",
+]
+
+[[package]]
+name = "trust-wp-std"
+version = "0.3.0"
+dependencies = [
+ "trust-wp-macros",
 ]
 
 [[package]]

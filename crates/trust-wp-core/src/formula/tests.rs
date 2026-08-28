@@ -276,6 +276,69 @@ mod substitute_tests {
         );
     }
 
+    // ★ #125 pins: binder-erasing substitution normalises `^x [x := c]` to
+    // `c` (bound values have no temporal state), while the PLAIN substitution
+    // keeps minting `Final(<literal>)` so program-variable sites stay
+    // fail-closed downstream.
+
+    #[test]
+    fn binder_erasing_normalizes_final_over_substituted_literal() {
+        let expr = PureExpr::Final(Arc::new(PureExpr::Var("x".to_string(), None)));
+        let mut subs = HashMap::new();
+        subs.insert("x".to_string(), PureExpr::Int(5));
+
+        assert_eq!(expr.substitute_binder_erasing(&subs), PureExpr::Int(5));
+        // The plain substitution deliberately does NOT normalise.
+        assert_eq!(
+            expr.substitute(&subs),
+            PureExpr::Final(Arc::new(PureExpr::Int(5)))
+        );
+    }
+
+    #[test]
+    fn binder_erasing_keeps_final_over_nonliteral_replacement() {
+        // `^x [x := y]` keeps the wrapper: the replacement may name a borrow.
+        let expr = PureExpr::Final(Arc::new(PureExpr::Var("x".to_string(), None)));
+        let mut subs = HashMap::new();
+        subs.insert("x".to_string(), PureExpr::Var("y".to_string(), None));
+
+        assert_eq!(
+            expr.substitute_binder_erasing(&subs),
+            PureExpr::Final(Arc::new(PureExpr::Var("y".to_string(), None)))
+        );
+    }
+
+    #[test]
+    fn binder_erasing_respects_inner_binder_shadowing() {
+        // `exists<x> ^x` — the outer erasure of `x` must not reach the
+        // re-bound occurrence, so the `Final` stays over the bound Var.
+        let expr = PureExpr::Exists {
+            var: "x".to_string(),
+            var_sort: None,
+            body: Arc::new(PureExpr::Final(Arc::new(PureExpr::Var(
+                "x".to_string(),
+                None,
+            )))),
+            triggers: vec![],
+        };
+        let mut subs = HashMap::new();
+        subs.insert("x".to_string(), PureExpr::Int(5));
+
+        assert_eq!(expr.substitute_binder_erasing(&subs), expr);
+    }
+
+    #[test]
+    fn binder_erasing_never_folds_preexisting_final_over_literal() {
+        // A `Final(Int(3))` already present in the input (the driver's
+        // borrow-chain print, the 8d7bf70 false-accept shape) passes through
+        // UNTOUCHED — normalisation fires only for `Final(Var(<erased>))`.
+        let expr = PureExpr::Final(Arc::new(PureExpr::Int(3)));
+        let mut subs = HashMap::new();
+        subs.insert("x".to_string(), PureExpr::Int(5));
+
+        assert_eq!(expr.substitute_binder_erasing(&subs), expr);
+    }
+
     #[test]
     fn test_substitute_literals_unchanged() {
         let int_expr = PureExpr::Int(42);

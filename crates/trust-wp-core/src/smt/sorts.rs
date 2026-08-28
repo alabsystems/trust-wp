@@ -49,6 +49,16 @@ impl fmt::Display for SortConversionError {
 impl Error for SortConversionError {}
 
 impl VarSort {
+    /// The SMT-LIB sort name, as it appears in a declaration.
+    #[must_use]
+    pub const fn smt_name(self) -> &'static str {
+        match self {
+            Self::Int => "Int",
+            Self::Bool => "Bool",
+            Self::Seq => "Seq",
+        }
+    }
+
     /// Convert an optional `ExprSort` into a concrete SMT variable sort.
     ///
     /// `None` is treated as `VarSort::Int` (default sort).

@@ -331,11 +331,21 @@ pub mod specs {
     /// Returns `Box<T>`. Prevents opaque classification. Part of #2682.
     pub const PERM_TO_BOX: &str = "";
 
-    /// `Resource::alloc(value)` — allocate a fresh resource.
+    /// `Resource::alloc(r)` — allocate a fresh resource.
     ///
     /// Returns `Ghost<Resource<R>>`. Prevents opaque classification.
     /// The resource identity is fresh (unique). (#2316)
-    pub const RESOURCE_ALLOC: &str = "";
+    ///
+    /// The value clause is the spec's own law — Creusot
+    /// `creusot-std/src/ghost/resource.rs` `Resource::alloc`:
+    /// `#[ensures(result@ == *r)]` (the allocated resource's view is the
+    /// snapshot's payload). Without it `result@` is completely free and
+    /// `Authority::new`-style wrappers fail on an unconstrained view.
+    /// (ce-census 2026-08-20, resource_algebras/fmap_view_view.rs `new`)
+    pub const RESOURCE_ALLOC: &str = r"
+        params: arg0
+        ensures: result@ == *arg0
+    ";
 
     /// `Resource::split(self, a, b)` — split a resource into two parts.
     ///
@@ -482,18 +492,41 @@ pub mod specs {
 
     /// `Resource::join_shared(&self, &other) -> &Self` — join shared references.
     ///
-    /// In Creusot: `#[requires(self.id() == other.id())]` and
-    /// `#[ensures(result.id() == self.id())]` and
-    /// `#[ensures(self@.incl_eq(result@) && other@.incl_eq(result@))]`.
+    /// Creusot's committed contract
+    /// (`reference/creusot/creusot-std/src/ghost/resource.rs`, `join_shared`):
+    /// ```text
+    ///   #[requires(self.id() == other.id())]
+    ///   #[ensures(result.id() == self.id())]
+    ///   #[ensures(self@.incl_eq(result@) && other@.incl_eq(result@))]
+    /// ```
     ///
-    /// Bounded Phase 1 spec: encodes `self@ == other@` as the key consequence
-    /// of the RA join semantics — two shared resources with the same identity
-    /// have equal views. This is exact for the Agree RA and an
-    /// over-approximation for RAs with non-trivial inclusion (e.g., Frac).
-    /// Full `incl_eq` encoding deferred to RA axiom support. (#2154)
+    /// ★ SOUNDNESS (2026-08-27 quantifier-frontier adjudication). This const
+    /// previously rendered `ensures: self@ == other@` as a "bounded Phase 1"
+    /// approximation of the `incl_eq` clause. That is NOT entailed by Creusot's
+    /// contract: `incl_eq(a, b) == a.eq(b) || a.incl(b)` (reference
+    /// `creusot-std/src/logic/ra.rs`, `incl_eq`), so
+    /// `self@.incl_eq(result@) && other@.incl_eq(result@)` only places both
+    /// operands BELOW the join — for any RA with non-trivial inclusion (Frac,
+    /// Auth/ViewRA) two distinct fragments join without being equal. Asserting
+    /// the equality as a callee `ensures` is therefore a premise
+    /// STRENGTHENING: a trusted, false assumption handed to the caller, i.e. a
+    /// latent false accept. Per the withhold rule (a clause that cannot be
+    /// rendered faithfully must be WITHHELD, not approximated) the `incl_eq`
+    /// conjunct is now withheld entirely, and the two clauses that DO render
+    /// faithfully are committed here.
+    ///
+    /// The RA-specific consequence survives for the Agree RA ONLY, injected by
+    /// the strictly gated driver specialization `ag_join_shared_ensures`
+    /// (`trust-wp-driver` `mir_analysis/extract/call_spec`), where it is exact
+    /// rather than approximate. See that function for the derivation.
+    ///
+    /// The `requires` is load-bearing and must NOT be dropped: without
+    /// `self.id() == other.id()` the join relates two unrelated resources and
+    /// even the Ag-gated equality would be unsound. (#2154)
     pub const RESOURCE_JOIN_SHARED: &str = r"
         params: self, other
-        ensures: self@ == other@
+        requires: self.id() == other.id()
+        ensures: result.id() == self.id()
     ";
 
     /// `NonAtomicInvariant::open(self, tokens, f)` token-guarded ghost open.

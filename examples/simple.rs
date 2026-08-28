@@ -6,7 +6,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //
 // This file demonstrates a simple function with contracts.
-// It can be compiled with: ./scripts/run-trust-wp-rustc.sh examples/simple.rs -- --force
+// Verify it with:  trust-wp examples/simple.rs
 //
 // Contracts use Creusot-compatible proc-macro syntax: #[requires(...)]
 // The trust-wp driver extracts these during compilation.

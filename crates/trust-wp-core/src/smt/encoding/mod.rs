@@ -41,12 +41,12 @@ pub(crate) use preamble::generate_seq_preamble;
 pub(crate) use preamble::{
     generate_heap_preamble, needs_bitwise_preamble, needs_heap_preamble, needs_seq_preamble,
 };
-#[cfg(test)]
-pub(crate) use sort_inference::infer_var_sorts_multi;
+#[allow(unused_imports)]
+pub(crate) use sort_inference::collect_vars_with_sorts;
 #[allow(unused_imports)]
 pub(crate) use sort_inference::is_seq_var;
-#[allow(unused_imports)]
-pub(crate) use sort_inference::{collect_vars_with_sorts, infer_var_sorts};
+#[cfg(test)]
+pub(crate) use sort_inference::{infer_var_sorts, infer_var_sorts_multi};
 #[allow(unused_imports)]
 pub(crate) use var_collect::{collect_vars_expr, collect_vars_formula};
 

@@ -12,7 +12,7 @@
 //!
 //! ```bash
 //! # From trust-wp root directory:
-//! ./scripts/run-trust-wp-rustc.sh examples/verified_math/src/lib.rs --crate-type=lib -- --force
+//! trust-wp examples/verified_math/src/lib.rs
 //! ```
 
 use trust_wp::{ensures, requires};

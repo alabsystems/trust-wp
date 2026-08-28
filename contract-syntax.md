@@ -7,7 +7,7 @@
 Author: Andrew Yates <andrewyates.name@gmail.com>
 
 This document describes the user-facing contract syntax re-exported by the
-`trust-wp` facade, typically via `use trust-wp::*;`.
+`trust-wp` facade, typically via `use trust_wp::*;`.
 
 It covers contract attributes, specification macros, and the contract expression
 grammar. The facade also re-exports support items used in contracts:
@@ -25,7 +25,7 @@ facade:
 |-----------------|---------|---------------|
 | `#[requires(...)]` | Precondition | None |
 | `#[ensures(...)]` | Postcondition | `result`, `old(...)` |
-| `#[invariant(...)]` | Loop invariant | `result` |
+| `#[invariant(...)]` | Loop invariant (on the function, or on the loop) | `result` |
 | `#[variant(...)]` | Termination variant | None |
 | `#[logic(...)]` | Specification-only function | `open`, `open(self)`, `open(crate)`, `open(super)`, `law`, `opaque`, `prophetic` |
 | `#[predicate(...)]` | Bool-returning logic helper | Same modes as `#[logic(...)]` |
@@ -50,7 +50,7 @@ facade:
 macro attributes from the `trust-wp` crate:
 
 ```rust
-use trust-wp::*;
+use trust_wp::*;
 
 #[requires(x > 0)]
 #[ensures(result > x)]
@@ -67,6 +67,20 @@ This syntax is compatible with Creusot where the underlying feature exists,
 enabling code to be verified by either tool. The proc macros provide IDE
 support, type checking, and syntax highlighting.
 
+> Placement: `#[invariant(...)]` may sit with the other contract attributes on
+> the function, or directly on the loop in the Creusot style:
+>
+> ```rust
+> #[invariant(i >= 0)]
+> while i < n { ... }
+> ```
+>
+> The loop form is an attribute in expression position, which rustc gates
+> behind `proc_macro_hygiene`. `trust-wp <FILE.rs>` enables that gate for you,
+> so both spellings work with no `#![feature(...)]` in your source. In a Cargo
+> crate, add the feature attribute yourself or put the invariant on the
+> function.
+>
 > Note: `#[invariant]` attributes support inductive loop verification with three
 > checks: initialization (precondition implies invariant), preservation (invariant
 > maintained across iterations), and postcondition (invariant implies ensures at
@@ -175,7 +189,7 @@ For mutable references, trust-wp supports RustHorn-style forms on `&mut` binding
 - `old(*v)` is the same as `*v` for mutable borrows.
 
 ```rust
-use trust-wp::{ensures, requires};
+use trust_wp::{ensures, requires};
 
 #[requires(*v > i32::MIN)]
 #[ensures(^v == old(*v) + 1)]
@@ -218,7 +232,7 @@ Use the `#[logic]` attribute to mark pure specification helpers. Logic
 functions are erased at runtime and are only available to contracts.
 
 ```rust
-use trust-wp::logic;
+use trust_wp::logic;
 
 #[logic]
 fn max(x: i32, y: i32) -> i32 {
@@ -237,7 +251,7 @@ Use `#[predicate]` for bool-returning logic helpers. It accepts the same mode
 arguments as `#[logic(...)]`, but the function must return `bool`.
 
 ```rust
-use trust-wp::predicate;
+use trust_wp::predicate;
 
 #[predicate]
 fn is_non_negative(x: i32) -> bool {
@@ -251,7 +265,7 @@ fn is_non_negative(x: i32) -> bool {
 defining body should stay visible to callers as an axiom source.
 
 ```rust
-use trust-wp::{ensures, law};
+use trust_wp::{ensures, law};
 
 #[law]
 fn triple(x: i32) -> i32 {
@@ -309,7 +323,7 @@ Specifies a termination variant (decreasing expression) for loops. The variant
 must be non-negative while the loop continues and strictly decrease each iteration.
 
 ```rust
-use trust-wp::{invariant, variant};
+use trust_wp::{invariant, variant};
 
 fn sum_to_n(n: u32) -> u32 {
     let mut i = 0;
@@ -331,7 +345,7 @@ sites, but postconditions are assumed without verifying the body. Useful for
 FFI wrappers or incremental verification.
 
 ```rust
-use trust-wp::{ensures, requires, trusted};
+use trust_wp::{ensures, requires, trusted};
 
 #[trusted]
 #[requires(s.len() > 0)]
@@ -348,8 +362,8 @@ Marks a block as ghost (verification-only) code. Ghost blocks are erased at
 compile time but verified by trust-wp. They can manipulate `Ghost<T>` values.
 
 ```rust
-use trust-wp::ghost;
-use trust-wp_std::ghost::Ghost;
+use trust_wp::ghost;
+use trust_wp_std::ghost::Ghost;
 
 fn example(x: i32) {
     ghost! {{
@@ -376,7 +390,7 @@ remain incomplete (`#2209`).
 The binding is a `Ghost<T>` under verification and is erased in normal builds.
 
 ```rust
-use trust-wp::ghost_let;
+use trust_wp::ghost_let;
 
 fn example() {
     ghost_let!(g = 41 + 1);
@@ -390,8 +404,8 @@ Captures a value snapshot as a `Snapshot<T>` for proof purposes. The snapshot
 is zero-sized at runtime and always `Copy`.
 
 ```rust
-use trust-wp::snapshot;
-use trust-wp_std::ghost::Snapshot;
+use trust_wp::snapshot;
+use trust_wp_std::ghost::Snapshot;
 
 fn example(v: &mut Vec<i32>) {
     let original_len: Snapshot<usize> = snapshot!(v.len());
@@ -406,7 +420,7 @@ Inserts a verification-only assertion. Unlike `assert!`, it creates an SMT
 verification condition and is completely erased at runtime.
 
 ```rust
-use trust-wp::proof_assert;
+use trust_wp::proof_assert;
 
 fn example(x: i32, y: i32) {
     let sum = x + y;
@@ -420,7 +434,7 @@ Embeds a specification expression using Pearlite DSL syntax. Supports `x@`
 (view) syntax. Erased at compile time.
 
 ```rust
-use trust-wp::pearlite;
+use trust_wp::pearlite;
 
 fn example(v: &Vec<i32>) {
     pearlite! { v@.len() > 0 };
@@ -437,7 +451,7 @@ Attaches specifications to external functions you don't own. External specs are
 trusted (not verified against the implementation).
 
 ```rust
-use trust-wp::extern_spec;
+use trust_wp::extern_spec;
 
 extern_spec! {
     impl<T> core::option::Option::<T> {
@@ -471,8 +485,8 @@ contexts. `seq![a, b, c]` produces a `Seq` value usable in contracts and
 logic functions.
 
 ```rust
-use trust-wp::{ensures, seq};
-use trust-wp_std::logic::seq::Seq;
+use trust_wp::{ensures, seq};
+use trust_wp_std::logic::seq::Seq;
 
 #[ensures(result@ == seq![1, 2, 3])]
 fn make_seq() -> Vec<i32> {

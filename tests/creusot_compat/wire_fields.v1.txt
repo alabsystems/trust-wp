@@ -1,0 +1,31 @@
+# TRUST_WP_RESULT:v1 wire-field manifest — generated, do not hand-edit.
+# Source of truth: trust_wp_core::result_protocol::WIRE_FIELDS_V1 (the same
+# slice drives the Rust emitter and decoder). Regenerate and commit together
+# with any manifest change:
+#   TRUST_WP_BLESS_WIRE_FIXTURE=1 cargo test -p trust-wp-core --lib wire_manifest
+# Pinned consumers: tests/creusot_compat/harness_model.py and
+# scripts/compare_baselines.py, via tests/creusot_compat/test_harness.py.
+[required]
+base_exit_code
+verified
+failed
+errors
+warnings
+assumed
+trusted
+skipped
+verified_with_axiom_deps
+unverified_axioms
+vacuous
+evidence_gaps
+proof_assert_failed
+proof_assert_errors
+panics
+demoted
+parse_errors
+termination_errors
+logic_recursion_errors
+erasure_errors
+[optional]
+proof_assert_verified
+verified_native_only

@@ -55,6 +55,13 @@ tests/fixtures/*/*
 !tests/fixtures/*/*/
 !tests/fixtures/*/*.*
 
+# ...but `!tests/fixtures/*/*/` above re-includes EVERY directory under a
+# fixture, which cancels the blanket `target/` rule at the top of this file for
+# exactly those paths. Running `trust-wp` (or `cargo trust-wp`) inside a fixture
+# crate then leaves a couple of hundred megabytes of build output showing as
+# untracked. Re-ignore it here, after the negations.
+tests/fixtures/*/target/
+
 # Rustc crash reports
 rustc-ice-*.txt
 
