@@ -57,8 +57,8 @@ as a full or drop-in replacement yet.
 | `Seq<T>` | Full | Partial | Type exists, uninterpreted funcs in ay |
 | `Ghost<T>` | Full | Partial | Constructors/accessors/deref are wired through the std-spec table; runtime erasure and end-to-end ghost coverage remain incomplete (`#2209`) |
 | `Snapshot<T>` | Full | Partial | Capture/inner/deref are wired through the std-spec table and sort inference normalizes snapshots into the Int-model lane; full proof_assert coverage remains incomplete (`#2209`) |
-| `FSet<T>` | Full (`Set<T>`) | Done | trust-wp-std/src/logic/fset.rs (461 LOC, backed by HashSet) |
-| `Mapping<K,V>` | Full | Done | trust-wp-std/src/logic/mapping.rs (327 LOC, backed by HashMap) |
+| `FSet<T>` | Full (`Set<T>`) | Done | trust-wp-std/src/logic/fset.rs (backed by HashSet) |
+| `Mapping<K,V>` | Full | Done | trust-wp-std/src/logic/mapping.rs (backed by HashMap) |
 | `Int` (unbounded) | Full | Partial | `Int(i128)` in trust-wp-std/src/logic/int.rs (not truly unbounded) |
 | Generic types | Full | Partial | Basic monomorphization only |
 
@@ -81,9 +81,9 @@ as a full or drop-in replacement yet.
 | Feature | Creusot Attribute | trust-wp Status | Notes |
 |---------|-------------------|---------------|-------|
 | Logic functions | `#[logic]` | Done | Detection, declaration, calls, and axiom guards work |
-| Predicates | `#[predicate]` | Done | trust-wp-macros/src/lib.rs:131 (= `#[logic]` + bool return check) |
+| Predicates | `#[predicate]` | Done | `predicate` in trust-wp-macros/src/lib.rs (= `#[logic]` + bool return check) |
 | Trusted specs | `#[trusted]` | Done | Skip body verification |
-| Law functions | `#[law]` | Done | trust-wp-macros/src/lib.rs:141 via `process_law()` |
+| Law functions | `#[law]` | Done | `law` in trust-wp-macros/src/lib.rs via `process_law()` |
 
 ## Ghost Code
 
@@ -103,7 +103,7 @@ as a full or drop-in replacement yet.
 
 | Feature | Creusot Syntax | trust-wp Status | Notes |
 |---------|---------------|---------------|-------|
-| Extern specs | `extern_spec! { ... }` | Done | trust-wp-macros/src/extern_spec.rs (497 LOC) |
+| Extern specs | `extern_spec! { ... }` | Done | trust-wp-macros/src/extern_spec.rs |
 | Extern crate | `#[extern_crate]` | Missing | Crate-level specs |
 | Impl specs | `impl ...` in extern_spec | Done | extern_spec only supports impl blocks |
 

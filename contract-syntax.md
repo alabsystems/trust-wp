@@ -32,7 +32,10 @@ facade:
 | `#[law]` | Open-mode logic alias | None |
 | `#[opaque]` | Hide logic body or type structure | None |
 | `#[check(...)]` | Enable extra verifier modes | `terminates`, `ghost` |
-| `#[erasure(target)]` | Compatibility marker for runtime counterpart | target path or `_` |
+| `#[terminates]` | Standalone alias for `#[check(terminates)]` | None (takes no arguments) |
+| `#[builtin("name")]` | Map the item to a prover primitive | Required name argument |
+| `#[open_inv_result]` | Suppress result-type invariant injection | None (takes no arguments) |
+| `#[erasure(target)]` | Records the runtime counterpart of a spec-enriched item | target path or `_` |
 | `#[trusted]` | Skip verification of function body | None |
 | `ghost! { ... }` | Verification-only code block | None |
 | `ghost_let!(...)` | Ghost binding helper | `ghost_let!(var = expr)`, `ghost_let!(mut var = expr)` |
@@ -40,8 +43,8 @@ facade:
 | `proof_assert!(expr)` | Verification-only assertion | None |
 | `pearlite!(expr)` | Pearlite DSL expression | `x@` (view syntax) |
 | `extern_spec! { ... }` | Specs for external functions | None |
-| `#[bitwise_proof]` | Bitvector-mode compatibility marker | None (currently pass-through) |
-| `#[maintains(...)]` | Loop-maintains compatibility marker | `#[maintains(clause)]` |
+| `#[bitwise_proof]` | Bitvector-mode compatibility marker (BV mode is always on) | None |
+| `#[maintains(...)]` | Desugars to `#[requires]` + `#[ensures]` | `#[maintains(clause)]` |
 | `seq![...]` | Seq literal helper for ghost/spec contexts | `seq![a, b, c]` |
 
 ### Attribute Forms
@@ -313,9 +316,14 @@ Unknown `#[check(...)]` modes are compile-time errors.
 
 #### `#[erasure(target)]`
 
-`#[erasure(target)]` is currently a preserved compatibility marker that records
-which runtime item a spec-enriched definition corresponds to. The marker is
-accepted and preserved today, but the driver does not yet consume it.
+`#[erasure(target)]` records which runtime item a spec-enriched definition
+corresponds to. The proc macro emits it as a `trust-wp:erasure:<target>` doc
+marker, and the driver consumes it: `has_erasure_marker` / `get_erasure_targets`
+(`crates/trust-wp-driver/src/attr_utils.rs`) feed erasure-pair discovery
+(`crates/trust-wp-driver/src/callbacks/discovery/erasure.rs`), which resolves
+each `(lhs, rhs)` `DefId` pair. Wildcard targets (`_`) are accepted and skipped,
+matching Creusot's opt-out. A pair that fails the driver-side validity check is
+counted as an `erasure_errors` fatal-result counter and maps to exit code 2.
 
 #### `#[variant(...)]` (loops)
 
@@ -466,17 +474,30 @@ extern_spec! {
 
 #### `#[bitwise_proof]`
 
-Compatibility marker for bitvector-mode verification. Currently accepted as a
-pass-through attribute — the proc macro preserves the annotation, but the
-verifier does not yet switch to bitvector encoding. Exported from the facade
-for Creusot compile-surface parity.
+Compatibility marker for bitvector-mode verification. The attribute is no
+longer needed to opt in: BV mode is unconditionally on, so bitwise operations
+use ay's native BV theory rather than UF approximations. The driver sets
+`bitwise_proof: true` for every contract
+(`crates/trust-wp-driver/src/callbacks/verification/per_contract.rs`), the flag
+rides the verification request (`crates/trust-wp-ay/src/verify/types/request.rs`)
+and is applied by the encoder (`crates/trust-wp-ay/src/verify/pipeline.rs`). The
+annotation is kept, accepted, and exported from the facade for Creusot
+compile-surface parity.
 
 #### `#[maintains(...)]`
 
-Compatibility marker for loop-maintains clauses. Accepts a required clause
-argument (`#[maintains(invariant_expr)]`) and preserves the raw text as a
-contract annotation. The driver does not yet desugar maintains clauses into
-full contract semantics — the attribute exists for Creusot source parity.
+Desugars a Creusot `maintains` clause into a matching pre/postcondition pair:
+`#[maintains(P)]` emits both a `trust-wp:requires:P` and a `trust-wp:ensures:P`
+doc marker, which the driver's ordinary contract discovery picks up with no
+special casing. A required clause argument is expected
+(`#[maintains(invariant_expr)]`); an empty attribute is a compile error.
+
+`mut` in the clause is rewritten per side: `(mut x)` / `mut x` becomes `* x` in
+the precondition (current value) and `^ x` in the postcondition (final value),
+so `#[maintains(inv(mut self))]` means "`inv(*self)` on entry and `inv(^self)`
+on exit". The rewrite only fires for `mut` immediately after `(` or `,` (or at
+the start of the clause), so `mut` inside string literals or nested expressions
+is left alone. See `crates/trust-wp-macros/src/marker_attrs.rs`.
 
 #### `seq![...]`
 

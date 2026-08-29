@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# `iface/trust-spec-iface` is the frozen INTERFACE-v1 reference implementation:
+# like the spikes, it is its own `[workspace]` on the `stable` channel, and like
+# the spikes it inherits the repository-root `../.cargo/config.toml` because
+# Cargo's config discovery walks parent DIRECTORIES and ignores workspace
+# boundaries. Without this file a bare `cargo` here dies in the Trust
+# rustc-private wrapper or on `-Ztrust-verify=off`.
+#
+# See ../spikes/.cargo/config.toml for the full rationale, the Cargo rustflags
+# precedence rules that dictate this exact shape, and why the wrapper's refusal
+# must be routed around rather than relaxed.
+[build]
+rustc-wrapper = ""
+
+[target.aarch64-apple-darwin]
+rustflags = ["-Wwarnings"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-Wwarnings"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Wwarnings"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Wwarnings"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Wwarnings"]

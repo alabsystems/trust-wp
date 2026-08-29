@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,7 @@ from tests.creusot_compat.harness_model import (  # noqa: E402
     TELEMETRY_FIELD_NAMES as WIRE_TELEMETRY_FIELD_ORDER,
 )
 from tests.creusot_compat import harness_runner  # noqa: E402
+from tests.creusot_compat import harness_targets  # noqa: E402
 
 COMPLETE_ZERO_TELEMETRY = {key: 0 for key in WIRE_TELEMETRY_FIELD_ORDER}
 
@@ -7852,3 +7854,94 @@ class TestSoundnessGapOnlyExitProofAssertEvidence:
 
         output = self._wire(base_exit_code=2, verified=2, trusted=1)
         assert _is_soundness_gap_only_exit(output, 2)
+
+
+# --- driver build-profile resolution (#142) ---------------------------------
+# The build profile selects a *different verifier*, so it must never be
+# implicit. cfg(debug_assertions) reaches into ay and changes the PUBLISHED
+# VERDICT: on should_succeed/option.rs a debug driver publishes `sat` -- a
+# refutation of a claim that is true -- where a release driver publishes
+# `unknown`. Two runs differing only by profile are therefore incomparable.
+# Left implicit, this presented as a phantom "219 vs 221" regression that
+# consumed a full session before the profile turned out to be the variable.
+
+
+def _profile_workspace(tmp_path, *, release: bool, debug: bool):
+    for profile, present in (("release", release), ("debug", debug)):
+        if present:
+            d = tmp_path / "target" / profile
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "trust-wp-rustc").write_text("#!/bin/sh\n")
+    return tmp_path
+
+
+def test_profile_auto_prefers_release_when_present(monkeypatch, tmp_path):
+    monkeypatch.delenv(harness_targets.HARNESS_PROFILE_ENV, raising=False)
+    ws = _profile_workspace(tmp_path, release=True, debug=True)
+    assert harness_targets.resolve_driver_profile(ws)[0] == "release"
+
+
+def test_profile_auto_falls_back_to_debug(monkeypatch, tmp_path):
+    monkeypatch.delenv(harness_targets.HARNESS_PROFILE_ENV, raising=False)
+    ws = _profile_workspace(tmp_path, release=False, debug=True)
+    assert harness_targets.resolve_driver_profile(ws)[0] == "debug"
+
+
+def test_profile_explicit_pin_is_honoured(monkeypatch, tmp_path):
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "debug")
+    ws = _profile_workspace(tmp_path, release=True, debug=True)
+    assert harness_targets.resolve_driver_profile(ws)[0] == "debug"
+
+
+def test_profile_pin_fails_closed_when_binary_absent(monkeypatch, tmp_path):
+    """Never silently substitute the other verifier -- that is the whole fix."""
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "release")
+    ws = _profile_workspace(tmp_path, release=False, debug=True)
+    with pytest.raises(RuntimeError, match="Refusing to fall back"):
+        harness_targets.resolve_driver_profile(ws)
+
+
+def test_profile_unknown_value_is_refused_not_ignored(monkeypatch, tmp_path):
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "fast")
+    ws = _profile_workspace(tmp_path, release=True, debug=True)
+    with pytest.raises(RuntimeError):
+        harness_targets.resolve_driver_profile(ws)
+
+
+# --- source-revision recording (#146) ---------------------------------------
+# ay is an unpinned relative path dep (`../ay`). On 2026-08-28 it moved three
+# times in one day under sibling agents and silently invalidated a measurement,
+# because no result artefact recorded which backend had produced it. The source
+# FINGERPRINT already hashed these roots -- that is how drift was detectable --
+# but a hash cannot say WHICH dependency moved, and that check only runs under
+# skip-prebuild. These pin the human-readable record.
+
+
+def test_source_revisions_include_path_dependencies(tmp_path):
+    """The backend's sha must be recoverable from any run, not just its hash."""
+    revisions = harness_targets.resolved_source_revisions(Path.cwd())
+    assert "trust-wp" in revisions
+    assert "ay" in revisions, "the ay path dep must be recorded, it moves independently"
+    for name, rev in revisions.items():
+        head = rev.split("-")[0]
+        assert len(head) == 10 or head == "unknown", f"{name}: {rev!r}"
+
+
+def test_source_revisions_flag_a_dirty_root():
+    """A dirty root must be visibly dirty -- an uncommitted backend is not a sha."""
+    revisions = harness_targets.resolved_source_revisions(Path.cwd())
+    for rev in revisions.values():
+        assert rev.endswith("-dirty") or "-" not in rev or rev.endswith("-unknown")
+
+
+def test_provenance_payload_carries_source_revisions(monkeypatch, tmp_path):
+    workspace = _seed_harness_provenance_workspace(monkeypatch, tmp_path)
+    harness._write_harness_binary_provenance(workspace)
+    payload = json.loads(
+        harness_targets._harness_provenance_path(workspace).read_text(encoding="utf-8")
+    )
+    assert "source_revisions" in payload, (
+        "provenance must record which revision of each source root built these "
+        "binaries, so a moving path dep cannot go unnoticed"
+    )
+    assert isinstance(payload["source_revisions"], dict)

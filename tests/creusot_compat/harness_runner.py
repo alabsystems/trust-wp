@@ -30,7 +30,12 @@ try:
         resolve_harness_facade,
     )
     from tests.creusot_compat.harness_model import parse_wire_line, WIRE_PREFIX
-    from tests.creusot_compat.harness_targets import _workspace_target_binary
+    from tests.creusot_compat.harness_targets import (
+        HARNESS_PROFILE_ENV,
+        _workspace_target_binary,
+        resolve_driver_profile,
+        resolved_source_revisions,
+    )
     from tests.creusot_compat.harness_verification_tier import (
         classify_verification_tier,
     )
@@ -39,7 +44,12 @@ except ModuleNotFoundError:
     # directory on sys.path, so import sibling modules directly.
     from harness_facade import RUNNER_REQUIRED_ATTRS, resolve_harness_facade
     from harness_model import parse_wire_line, WIRE_PREFIX
-    from harness_targets import _workspace_target_binary
+    from harness_targets import (
+        HARNESS_PROFILE_ENV,
+        _workspace_target_binary,
+        resolve_driver_profile,
+        resolved_source_revisions,
+    )
     from harness_verification_tier import classify_verification_tier
 
 _TEST_TIMEOUT_OVERRIDES_SEC = {
@@ -147,13 +157,15 @@ def ensure_harness_binaries(
             error_text = f"exit code {result.returncode}"
         raise RuntimeError(f"Failed to build harness binaries: {error_text}")
 
-    # If a release binary file exists, rebuild it too — run-trust-wp-rustc.sh
-    # uses `-f` and prefers release over debug, so a stale release binary
-    # silently overrides the freshly-built debug binary (#972).
+    # Rebuild release when it is the profile this run will actually use, or
+    # when a stale release binary exists that would otherwise silently override
+    # the freshly-built debug one (#972). Selection is `-f`-based and prefers
+    # release, so a stale artefact is not inert -- it changes the verifier.
     release_binary = _workspace_target_binary(
         workspace, "trust-wp-rustc", profile="release"
     )
-    if release_binary.is_file():
+    _requested = (os.environ.get(HARNESS_PROFILE_ENV) or "auto").strip().lower()
+    if release_binary.is_file() or _requested == "release":
         release_cmd = [
             "cargo",
             "build",
@@ -193,9 +205,20 @@ def setup_trust_wp_rustc_wrapper(
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper_path = bin_dir / "trust-wp-rustc"
     script_path = workspace / "scripts" / "run-trust-wp-rustc.sh"
-    release_binary = _workspace_target_binary(workspace, "trust-wp-rustc", profile="release")
-    debug_binary = _workspace_target_binary(workspace, "trust-wp-rustc")
-    driver_binary = release_binary if release_binary.is_file() else debug_binary
+    profile, driver_binary = resolve_driver_profile(workspace)
+    revisions = resolved_source_revisions(workspace)
+    print(
+        "trust-wp-harness: source revisions = "
+        + ", ".join(f"{name}={rev}" for name, rev in sorted(revisions.items()))
+        + ". A path dependency that moves mid-session changes the backend "
+        "without changing this workspace; quote these with any result."
+    )
+    print(
+        f"trust-wp-harness: driver profile = {profile} ({driver_binary}). "
+        f"Results are only comparable against runs using the same profile "
+        f"(cfg(debug_assertions) changes ay's published verdict); pin it with "
+        f"{HARNESS_PROFILE_ENV}=release|debug."
+    )
 
     contents = (
         "#!/bin/bash\n"

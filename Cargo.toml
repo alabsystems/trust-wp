@@ -14,14 +14,17 @@ members = [
     "crates/creusot-std",
     "crates/trust-wp",
     "crates/trust-wp-core",
+    "crates/trust-wp-driver",
+    "crates/trust-wp-lib",
     "crates/trust-wp-macros",
     "crates/trust-wp-std",
     "crates/trust-wp-test-utils",
+    "crates/trust-wp-ay",
     "crates/trust-wp-cli",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # rust-version omitted: requires nightly for rustc_private
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -38,15 +41,26 @@ creusot-contracts = { path = "crates/creusot-contracts" }
 creusot-std = { path = "crates/creusot-std" }
 trust-wp = { path = "crates/trust-wp" }
 trust-wp-core = { path = "crates/trust-wp-core" }
+trust-wp-driver = { path = "crates/trust-wp-driver" }
+trust-wp-lib = { path = "crates/trust-wp-lib" }
 trust-wp-macros = { path = "crates/trust-wp-macros" }
 trust-wp-std = { path = "crates/trust-wp-std" }
 trust-wp-test-utils = { path = "crates/trust-wp-test-utils" }
+trust-wp-ay = { path = "crates/trust-wp-ay" }
 trust-wp-cli = { path = "crates/trust-wp-cli" }
 
-# The ay SMT backend (crates/trust-wp-ay), the rustc-driver (crates/trust-wp-driver),
-# the lib facade (crates/trust-wp-lib), their `trust-ir` proof-IR bundle, and
-# the first-party `ay` solver dependency are omitted from this public
-# snapshot: `ay` is not yet public. See publish/DECISIONS.md.
+# ay SMT solver: consumed from the released public repo, pinned at the
+# newest ledger-mapped release at export time. The development layout
+# builds against a sibling the pinned ay release checkout instead; publish/transforms.sh
+# rewrites these pins and records the provenance in the stage attestation.
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "b8a8be6d198e0bbd1a1eef9f533204ac83b99762" }
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "b8a8be6d198e0bbd1a1eef9f533204ac83b99762" }
+
+# trust-ir: universal proof-carrying IR. Provides typed
+# NativeVerificationRequest::TrustWp bundles consumed by the optional
+# trust-ir-native feature in trust-wp-lib. Keep the standalone source exact:
+# a moving branch makes a previously valid --locked build fail when main moves.
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
 
 
 # Proc macro support

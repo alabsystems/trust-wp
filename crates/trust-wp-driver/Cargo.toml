@@ -1,0 +1,66 @@
+# trust-wp-driver - CLI and rustc integration
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-wp-driver"
+description = "Rustc driver for trust-wp verification"
+version.workspace = true
+edition.workspace = true
+# rust-version omitted: requires nightly
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The design §9 P(-1) act, applied to the product: clean-kernel (via the frozen
+# INTERFACE-v1 reference crate) enters trust-wp behind a feature flag. Enables
+# the clean-auto race leg of the formula kernel lane.
+clean-kernel = ["dep:trust-spec-iface", "dep:clean-auto"]
+
+[dependencies]
+trust-spec-iface = { path = "../../iface/trust-spec-iface", optional = true }
+# clean-auto races the kernel lane's quantified goals (Nat.rec induction terms,
+# meter re-checked). default-features = false: NO ay/SMT backend — the lane's
+# term assembly is pure clean-kernel, decoupled from the ay workspace.
+clean-auto = { git = "https://github.com/alabsystems/clean.git", rev = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb", optional = true, default-features = false }
+num-bigint = { workspace = true }
+trust-wp-core = { workspace = true, features = ["tracing-init"] }
+trust-wp-std = { workspace = true }
+trust-wp-ay = { workspace = true }
+ay-core = { workspace = true }
+ay-dpll = { workspace = true }
+sha2 = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# The `trust-wp` front-door binary lives in crates/trust-wp-cli (package
+# trust-wp-cli): it needs neither rustc_private nor the solver, so it builds
+# wherever the WP core builds and ships in the public snapshot.
+
+# Rustc driver binary for MIR extraction.
+# Trust-native primary name `trust-wp-driver` (matches trust-mc's native
+# `trust-mc-driver`; this bin embeds stock rustc for MIR extraction).
+[[bin]]
+name = "trust-wp-driver"
+path = "src/rustc_driver.rs"
+
+# Back-compat alias for the rustc driver. Retained because TRUST_WP_RUSTC_BIN,
+# scripts/run-trust-wp-rustc.sh, scripts/trustc-private-wrapper.sh, and the
+# test harness (trust-wp-test-utils) all resolve a `trust-wp-rustc` binary by
+# name. Same entry point as `trust-wp-driver`.
+[[bin]]
+name = "trust-wp-rustc"
+path = "src/rustc_driver.rs"
+
+[dev-dependencies]
+trust-wp = { workspace = true }
+trust-wp-test-utils = { workspace = true }
+ntest = "0.9"
+
+[lints]
+workspace = true
+
+# Enable rust-analyzer support for rustc_private
+[package.metadata.rust-analyzer]
+rustc_private = true

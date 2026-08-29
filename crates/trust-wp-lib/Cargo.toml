@@ -1,0 +1,31 @@
+# trust-wp-lib - Verification engine library API
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-wp-lib"
+description = "trust-wp verification engine library API"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+bincode = ["dep:bincode"]
+trust-ir-native = ["dep:trust-ir"]
+
+[dependencies]
+trust-wp-core = { workspace = true }
+trust-wp-ay = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+bincode = { version = "1", optional = true }
+trust-ir = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

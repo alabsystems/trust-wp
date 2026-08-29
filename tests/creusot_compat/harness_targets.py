@@ -181,6 +181,34 @@ def _git_source_state(repo: Path) -> bytes:
     return digest.hexdigest().encode()
 
 
+def resolved_source_revisions(workspace: Path) -> dict[str, str]:
+    """Human-readable HEAD sha per source root, including path dependencies.
+
+    The source fingerprint already *hashes* these roots, which is how drift is
+    detected -- but a hash cannot tell you WHICH dependency moved, and the
+    check only runs under skip-prebuild. ay is consumed as an unpinned relative
+    path dep (`../ay`), so it can move under a running session: on 2026-08-28 it
+    moved three times in one day and silently invalidated a measurement, because
+    no result artefact recorded which backend produced it.
+
+    Reported alongside every run so a number always carries its backend sha.
+    """
+    revisions: dict[str, str] = {}
+    for root in _workspace_source_roots(workspace):
+        try:
+            head = _git_output(root, "rev-parse", "HEAD").strip().decode()[:10]
+        except (subprocess.CalledProcessError, OSError, UnicodeDecodeError):
+            head = "unknown"
+        dirty = ""
+        try:
+            if _git_output(root, "status", "--porcelain").strip():
+                dirty = "-dirty"
+        except (subprocess.CalledProcessError, OSError):
+            dirty = "-unknown"
+        revisions[root.name] = f"{head}{dirty}"
+    return revisions
+
+
 def _tool_identity(command: str) -> bytes:
     try:
         return subprocess.check_output(
@@ -211,13 +239,60 @@ def _harness_source_fingerprint(workspace: Path) -> str:
     return digest.hexdigest()
 
 
-def _selected_harness_binaries(workspace: Path) -> dict[str, Path]:
-    cargo_binary = _workspace_target_binary(workspace, "cargo-trust-wp")
+HARNESS_PROFILE_ENV = "TRUST_WP_HARNESS_PROFILE"
+
+
+def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
+    """Resolve which trust-wp-rustc build profile this run uses.
+
+    The build profile is not cosmetic: `cfg(debug_assertions)` reaches into ay
+    and changes the *published verdict*, so a debug driver and a release driver
+    disagree on real corpus tests. Selecting one silently makes two runs
+    incomparable while looking identical, which is why this is resolved in one
+    place and reported rather than inferred at three separate call sites.
+
+    ``TRUST_WP_HARNESS_PROFILE`` accepts:
+
+    ``auto`` (default)
+        Historical behaviour — release when a release binary exists, else
+        debug — but the resolved profile is returned so callers can record and
+        announce it. Preserves every previously measured number.
+    ``release`` / ``debug``
+        Pin the profile. Missing binary is a hard error: falling back would
+        silently produce a number from a different verifier, which is the
+        defect this function exists to prevent.
+    """
+    requested = (os.environ.get(HARNESS_PROFILE_ENV) or "auto").strip().lower()
+    if requested not in ("auto", "release", "debug"):
+        raise RuntimeError(
+            f"{HARNESS_PROFILE_ENV}={requested!r} is not one of: auto, release, debug"
+        )
+
     release_driver = _workspace_target_binary(
         workspace, "trust-wp-rustc", profile="release"
     )
     debug_driver = _workspace_target_binary(workspace, "trust-wp-rustc")
-    driver_binary = release_driver if release_driver.is_file() else debug_driver
+
+    if requested == "auto":
+        if release_driver.is_file():
+            return "release", release_driver
+        return "debug", debug_driver
+
+    pinned = release_driver if requested == "release" else debug_driver
+    if not pinned.is_file():
+        raise RuntimeError(
+            f"{HARNESS_PROFILE_ENV}={requested} was requested but "
+            f"{pinned} does not exist. Refusing to fall back to the other "
+            f"profile: it is a different verifier and would silently produce "
+            f"an incomparable result. Build it first, or unset "
+            f"{HARNESS_PROFILE_ENV} to accept whichever profile is present."
+        )
+    return requested, pinned
+
+
+def _selected_harness_binaries(workspace: Path) -> dict[str, Path]:
+    cargo_binary = _workspace_target_binary(workspace, "cargo-trust-wp")
+    _profile, driver_binary = resolve_driver_profile(workspace)
     return {
         "cargo-trust-wp": cargo_binary.resolve(),
         "trust-wp-rustc": driver_binary.resolve(),
@@ -244,6 +319,9 @@ def _write_harness_binary_provenance(
         "workspace": str(workspace.resolve()),
         "source_fingerprint": source_fingerprint
         or _harness_source_fingerprint(workspace),
+        # Which revision of each source root -- notably the unpinned ay path dep
+        # -- actually produced this build. See resolved_source_revisions.
+        "source_revisions": resolved_source_revisions(workspace),
         "binaries": {
             name: {"path": str(path), "sha256": _sha256_file(path)}
             for name, path in binaries.items()

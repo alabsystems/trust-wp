@@ -28,4 +28,5 @@ logic_recursion_errors
 erasure_errors
 [optional]
 proof_assert_verified
+proof_assert_inconclusive
 verified_native_only

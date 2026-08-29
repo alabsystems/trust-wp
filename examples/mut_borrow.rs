@@ -9,14 +9,16 @@
 //!
 //! Verify it with:  `trust-wp examples/mut_borrow.rs`
 //!
-//! STATUS: `increment_ref` and `swap` verify. `abs_mut` reports
-//! `unknown (proof-trusted)` (so the file exits 2): the solver answers `unsat`
-//! but publishes no replayable proof, and the proof-authority gate declines a
-//! verdict it cannot check. That is the honesty meter, not a broken contract.
+//! STATUS: all three functions — `increment_ref`, `swap`, and `abs_mut` —
+//! verify, and the file exits 0. An earlier revision of this header recorded
+//! `abs_mut` as `unknown (proof-trusted)` with the file exiting 2; that was
+//! accurate when written and is no longer (see the 2026-08-23 retirement of the
+//! `&mut` proof-trusted rule in README.md and demo/README.md).
 //!
-//! This lane is also the one most sensitive to the `ay` revision in the sibling
-//! checkout the manifest path-depends on — an older solver demotes all three.
-//! See `docs/e2e-trait-refinement-ay010-drift-2026-08-16.md`.
+//! This lane is the one most sensitive to the `ay` revision in the sibling
+//! checkout the manifest path-depends on — an older solver demotes all three
+//! back to `unknown (proof-trusted)`, which is a stale dependency, not a
+//! broken contract.
 //!
 //! The implementation supports:
 //! - `*v` (deref current) maps to `v_current` in SMT
@@ -25,9 +27,9 @@
 //! - MIR body extraction for mutable borrow functions
 //! - Conditional body extraction (for if/else patterns like abs_mut)
 //!
-//! References:
-//! - designs/2026-02-01-rusthorn-vs-sl.md (RustHorn vs Separation Logic)
-//! - reference/creusot/ARCHITECTURE.md (Creusot's approach)
+//! References: an internal design note, "RustHorn vs Separation Logic"
+//! (2026-02-01), and Creusot's own `ARCHITECTURE.md`. Neither is tracked in
+//! this repository.
 
 use trust_wp::{ensures, requires};
 

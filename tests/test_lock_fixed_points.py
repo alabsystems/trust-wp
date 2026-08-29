@@ -157,6 +157,39 @@ def test_repair_refuses_a_rollback() -> None:
     assert any("git source" in finding for finding in findings)
 
 
+def test_declared_pin_rejects_wrong_origin_with_matching_sha() -> None:
+    """A matching rev/fragment cannot authenticate a different repository."""
+
+    declared = LOCK_GATE.read_pins()["ay"]
+    source = (
+        "git+https://example.invalid/alabsystems/ay.git"
+        f"?rev={declared}#{declared}"
+    )
+    assert not LOCK_GATE.lands_on_declared_pin(
+        "ay-core", {("0.19.0", source)}
+    )
+
+
+def test_declared_pin_rejects_moving_selector_with_matching_fragment() -> None:
+    """A resolved fragment cannot turn branch=main into an exact authority."""
+
+    declared = LOCK_GATE.read_pins()["trust-ir"]
+    moving = (
+        "git+https://github.com/alabsystems/trust-ir.git"
+        f"?branch=main#{declared}"
+    )
+    assert not LOCK_GATE.lands_on_declared_pin(
+        "trust-ir", {("0.11.0", moving)}
+    )
+    exact = (
+        "git+https://github.com/alabsystems/trust-ir.git"
+        f"?rev={declared}#{declared}"
+    )
+    assert LOCK_GATE.lands_on_declared_pin(
+        "trust-ir", {("0.11.0", exact)}
+    )
+
+
 def test_verdicts_and_exit_codes_keep_unverifiable_distinct_from_both() -> None:
     assert (LOCK_GATE.VERIFIED, LOCK_GATE.DRIFTED, LOCK_GATE.UNVERIFIABLE) == (
         "VERIFIED",

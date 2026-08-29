@@ -1,0 +1,10 @@
+[package]
+name = "trust-spec-iface"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "INTERFACE-v1: the frozen spec-language interface — UOb carrier record, three-axis ClauseStatus, Lane contract, invariants I1–I7 as tests."
+[workspace]
+[dependencies]
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb" }
+cert-meter = { path = "../../spikes/cert-meter" }

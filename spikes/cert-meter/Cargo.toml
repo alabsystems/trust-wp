@@ -1,0 +1,9 @@
+[package]
+name = "cert-meter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The ONE honesty meter: strictly audit a kernel proof judgment and its complete declaration/provenance closure."
+[workspace]
+[dependencies]
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb" }

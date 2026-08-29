@@ -1,0 +1,63 @@
+# trust-wp-ay - Verification condition encoding to ay SMT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+[package]
+name = "trust-wp-ay"
+description = "AY SMT backend for trust-wp verification conditions"
+version.workspace = true
+edition.workspace = true
+# rust-version omitted: requires nightly
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Enable heap operations for unsafe Rust verification pipeline.
+# These are currently unused and awaiting the unsafe Rust encoding.
+unsafe-heap = []
+# Enable experimental separation logic primitives (PointsTo, SepConj, MagicWand).
+# Not used in the production pipeline (production uses pure first-order PureExpr + MutBorrow).
+# Tests always compile these; this feature is for non-test builds that need sep-logic.
+sep-logic = []
+# Exposes internal encoder APIs only for opt-in benchmark targets.
+# This is not part of the stable public API surface.
+internal-bench-api = []
+# Opt in to debug-mode microbenchmark/scaling tests. These are noisy and slow
+# enough that the normal lib test gate should stay focused on functional proofs.
+performance-tests = []
+
+[dependencies]
+sha2.workspace = true
+trust-wp-core = { workspace = true }
+thiserror = { workspace = true }
+ay-core = { workspace = true }
+ay-dpll = { workspace = true }
+tracing = { workspace = true }
+num-bigint = { workspace = true }
+num-rational = "0.4"
+num-traits = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+stacker = { workspace = true }
+
+# fork/pipe process isolation (verify/process_isolation.rs) is unix-only;
+# Windows runs the verifier inline, so it never touches libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+ntest = "0.9"
+serial_test = "3"
+# Shared env-mutation choke point (env module): the lock-scoped ScopedEnvVar /
+# with_serialized_env_vars / with_env_edits helpers every test env write routes
+# through, so no raw set_var/remove_var (env_mutation) site remains in tests.
+trust-wp-test-utils = { workspace = true }
+
+[[bench]]
+name = "ay_encoding"
+harness = false
+required-features = ["internal-bench-api"]
+
+[lints]
+workspace = true

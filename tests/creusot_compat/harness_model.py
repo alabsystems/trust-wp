@@ -41,6 +41,7 @@ class VerificationTelemetry:
     proof_assert_failed: int = 0
     proof_assert_errors: int = 0
     evidence_gaps: int = 0
+    proof_assert_inconclusive: int = 0
     panics: int = 0
     demoted: int = 0
     parse_errors: int = 0
@@ -67,6 +68,7 @@ class VerificationTelemetry:
             "proof_assert_failed": self.proof_assert_failed,
             "proof_assert_errors": self.proof_assert_errors,
             "evidence_gaps": self.evidence_gaps,
+            "proof_assert_inconclusive": self.proof_assert_inconclusive,
             "panics": self.panics,
             "demoted": self.demoted,
             "parse_errors": self.parse_errors,
@@ -96,7 +98,9 @@ TELEMETRY_FIELD_NAMES = tuple(VerificationTelemetry.__dataclass_fields__)
 # verified on authority no independent checker can re-check. Optional for
 # the same reason, and additionally because a producer that cannot
 # determine it should omit it rather than report a confident zero.
-OPTIONAL_TELEMETRY_FIELDS = frozenset({"proof_assert_verified", "verified_native_only"})
+OPTIONAL_TELEMETRY_FIELDS = frozenset(
+    {"proof_assert_verified", "verified_native_only", "proof_assert_inconclusive"}
+)
 
 
 def parse_wire_line(line: str) -> VerificationTelemetry | None:

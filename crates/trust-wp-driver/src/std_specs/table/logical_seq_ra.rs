@@ -1,0 +1,563 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+//! Seq and Resource Algebra specs (logical sequence and separation logic).
+
+use trust_wp_std::logic::{
+    ra::{agree, excl, frac},
+    seq,
+};
+
+use super::super::SpecEntry;
+
+const VIEW_HELPER: &str = r"
+    params: value
+    ensures: result == value@
+";
+
+pub(super) static SPECS: &[SpecEntry] = &[
+    (
+        &[
+            "trust_wp_std::view",
+            "trust_wp_std::logic::view",
+            "trust_wp_std::logic::model::view",
+        ],
+        VIEW_HELPER,
+    ),
+    // ── Seq specs (logical sequence operations) ─────────────────────
+    // Ghost (mutable in-place) methods
+    (
+        &[
+            "trust_wp_std::logic::Seq::len_ghost",
+            "trust_wp_std::logic::seq::Seq::len_ghost",
+            "trust_wp_std::Seq::len_ghost",
+            "creusot_std::logic::Seq::len_ghost",
+            "creusot_std::logic::seq::Seq::len_ghost",
+            "creusot_std::Seq::len_ghost",
+        ],
+        seq::specs::LEN_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::is_empty_ghost",
+            "trust_wp_std::logic::seq::Seq::is_empty_ghost",
+            "trust_wp_std::Seq::is_empty_ghost",
+            "creusot_std::logic::Seq::is_empty_ghost",
+            "creusot_std::logic::seq::Seq::is_empty_ghost",
+            "creusot_std::Seq::is_empty_ghost",
+        ],
+        seq::specs::IS_EMPTY_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::push_back_ghost",
+            "trust_wp_std::logic::seq::Seq::push_back_ghost",
+            "trust_wp_std::Seq::push_back_ghost",
+            "creusot_std::logic::Seq::push_back_ghost",
+            "creusot_std::logic::seq::Seq::push_back_ghost",
+            "creusot_std::Seq::push_back_ghost",
+        ],
+        seq::specs::PUSH_BACK_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::push_front_ghost",
+            "trust_wp_std::logic::seq::Seq::push_front_ghost",
+            "trust_wp_std::Seq::push_front_ghost",
+            "creusot_std::logic::Seq::push_front_ghost",
+            "creusot_std::logic::seq::Seq::push_front_ghost",
+            "creusot_std::Seq::push_front_ghost",
+        ],
+        seq::specs::PUSH_FRONT_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::get_ghost",
+            "trust_wp_std::logic::seq::Seq::get_ghost",
+            "trust_wp_std::Seq::get_ghost",
+            "creusot_std::logic::Seq::get_ghost",
+            "creusot_std::logic::seq::Seq::get_ghost",
+            "creusot_std::Seq::get_ghost",
+        ],
+        seq::specs::GET_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::get_mut_ghost",
+            "trust_wp_std::logic::seq::Seq::get_mut_ghost",
+            "trust_wp_std::Seq::get_mut_ghost",
+            "creusot_std::logic::Seq::get_mut_ghost",
+            "creusot_std::logic::seq::Seq::get_mut_ghost",
+            "creusot_std::Seq::get_mut_ghost",
+        ],
+        seq::specs::GET_MUT_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::pop_back_ghost",
+            "trust_wp_std::logic::seq::Seq::pop_back_ghost",
+            "trust_wp_std::Seq::pop_back_ghost",
+            "creusot_std::logic::Seq::pop_back_ghost",
+            "creusot_std::logic::seq::Seq::pop_back_ghost",
+            "creusot_std::Seq::pop_back_ghost",
+        ],
+        seq::specs::POP_BACK_GHOST,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::pop_front_ghost",
+            "trust_wp_std::logic::seq::Seq::pop_front_ghost",
+            "trust_wp_std::Seq::pop_front_ghost",
+            "creusot_std::logic::Seq::pop_front_ghost",
+            "creusot_std::logic::seq::Seq::pop_front_ghost",
+            "creusot_std::Seq::pop_front_ghost",
+        ],
+        seq::specs::POP_FRONT_GHOST,
+    ),
+    // Logical (by-value) methods
+    (
+        &[
+            "trust_wp_std::logic::Seq::empty",
+            "trust_wp_std::logic::seq::Seq::empty",
+            "trust_wp_std::Seq::empty",
+            "creusot_std::logic::Seq::empty",
+            "creusot_std::logic::seq::Seq::empty",
+            "creusot_std::Seq::empty",
+            "trust_wp_std::logic::Seq::new",
+            "trust_wp_std::logic::seq::Seq::new",
+            "trust_wp_std::Seq::new",
+            "creusot_std::logic::Seq::new",
+            "creusot_std::logic::seq::Seq::new",
+            "creusot_std::Seq::new",
+        ],
+        seq::specs::EMPTY,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::singleton",
+            "trust_wp_std::logic::seq::Seq::singleton",
+            "trust_wp_std::Seq::singleton",
+            "creusot_std::logic::Seq::singleton",
+            "creusot_std::logic::seq::Seq::singleton",
+            "creusot_std::Seq::singleton",
+        ],
+        seq::specs::SINGLETON,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::len",
+            "trust_wp_std::logic::seq::Seq::len",
+            "trust_wp_std::Seq::len",
+            "creusot_std::logic::Seq::len",
+            "creusot_std::logic::seq::Seq::len",
+            "creusot_std::Seq::len",
+        ],
+        seq::specs::LEN,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::is_empty",
+            "trust_wp_std::logic::seq::Seq::is_empty",
+            "trust_wp_std::Seq::is_empty",
+            "creusot_std::logic::Seq::is_empty",
+            "creusot_std::logic::seq::Seq::is_empty",
+            "creusot_std::Seq::is_empty",
+        ],
+        seq::specs::IS_EMPTY,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::push_back",
+            "trust_wp_std::logic::seq::Seq::push_back",
+            "trust_wp_std::Seq::push_back",
+            "creusot_std::logic::Seq::push_back",
+            "creusot_std::logic::seq::Seq::push_back",
+            "creusot_std::Seq::push_back",
+        ],
+        seq::specs::PUSH_BACK,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::push_front",
+            "trust_wp_std::logic::seq::Seq::push_front",
+            "trust_wp_std::Seq::push_front",
+            "creusot_std::logic::Seq::push_front",
+            "creusot_std::logic::seq::Seq::push_front",
+            "creusot_std::Seq::push_front",
+        ],
+        seq::specs::PUSH_FRONT,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::get",
+            "trust_wp_std::logic::seq::Seq::get",
+            "trust_wp_std::Seq::get",
+            "creusot_std::logic::Seq::get",
+            "creusot_std::logic::seq::Seq::get",
+            "creusot_std::Seq::get",
+        ],
+        seq::specs::GET,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::index_logic",
+            "trust_wp_std::logic::seq::Seq::index_logic",
+            "trust_wp_std::Seq::index_logic",
+            "creusot_std::logic::Seq::index_logic",
+            "creusot_std::logic::seq::Seq::index_logic",
+            "creusot_std::Seq::index_logic",
+        ],
+        seq::specs::INDEX_LOGIC,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::pop_back",
+            "trust_wp_std::logic::seq::Seq::pop_back",
+            "trust_wp_std::Seq::pop_back",
+            "creusot_std::logic::Seq::pop_back",
+            "creusot_std::logic::seq::Seq::pop_back",
+            "creusot_std::Seq::pop_back",
+        ],
+        seq::specs::POP_BACK,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::tail",
+            "trust_wp_std::logic::seq::Seq::tail",
+            "trust_wp_std::Seq::tail",
+            "creusot_std::logic::Seq::tail",
+            "creusot_std::logic::seq::Seq::tail",
+            "creusot_std::Seq::tail",
+            "trust_wp_std::logic::Seq::pop_front",
+            "trust_wp_std::logic::seq::Seq::pop_front",
+            "trust_wp_std::Seq::pop_front",
+            "creusot_std::logic::Seq::pop_front",
+            "creusot_std::logic::seq::Seq::pop_front",
+            "creusot_std::Seq::pop_front",
+        ],
+        seq::specs::TAIL,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::subsequence",
+            "trust_wp_std::logic::seq::Seq::subsequence",
+            "trust_wp_std::Seq::subsequence",
+            "creusot_std::logic::Seq::subsequence",
+            "creusot_std::logic::seq::Seq::subsequence",
+            "creusot_std::Seq::subsequence",
+        ],
+        seq::specs::SUBSEQUENCE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::concat",
+            "trust_wp_std::logic::seq::Seq::concat",
+            "trust_wp_std::Seq::concat",
+            "creusot_std::logic::Seq::concat",
+            "creusot_std::logic::seq::Seq::concat",
+            "creusot_std::Seq::concat",
+        ],
+        seq::specs::CONCAT,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::set",
+            "trust_wp_std::logic::seq::Seq::set",
+            "trust_wp_std::Seq::set",
+            "creusot_std::logic::Seq::set",
+            "creusot_std::logic::seq::Seq::set",
+            "creusot_std::Seq::set",
+        ],
+        seq::specs::SET,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::contains",
+            "trust_wp_std::logic::seq::Seq::contains",
+            "trust_wp_std::Seq::contains",
+            "creusot_std::logic::Seq::contains",
+            "creusot_std::logic::seq::Seq::contains",
+            "creusot_std::Seq::contains",
+        ],
+        seq::specs::CONTAINS,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::reverse",
+            "trust_wp_std::logic::seq::Seq::reverse",
+            "trust_wp_std::Seq::reverse",
+            "creusot_std::logic::Seq::reverse",
+            "creusot_std::logic::seq::Seq::reverse",
+            "creusot_std::Seq::reverse",
+        ],
+        seq::specs::REVERSE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::ext_eq",
+            "trust_wp_std::logic::seq::Seq::ext_eq",
+            "trust_wp_std::Seq::ext_eq",
+            "creusot_std::logic::Seq::ext_eq",
+            "creusot_std::logic::seq::Seq::ext_eq",
+            "creusot_std::Seq::ext_eq",
+        ],
+        seq::specs::EXT_EQ,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::Seq::into_inner",
+            "trust_wp_std::logic::seq::Seq::into_inner",
+            "trust_wp_std::Seq::into_inner",
+            "creusot_std::logic::Seq::into_inner",
+            "creusot_std::logic::seq::Seq::into_inner",
+            "creusot_std::Seq::into_inner",
+        ],
+        seq::specs::INTO_INNER,
+    ),
+    // Seq::to_owned_seq — convert Seq<&T> to Seq<T> (identity in pearlite)
+    (
+        &[
+            "trust_wp_std::logic::Seq::to_owned_seq",
+            "trust_wp_std::logic::seq::Seq::to_owned_seq",
+            "trust_wp_std::Seq::to_owned_seq",
+            "creusot_std::logic::Seq::to_owned_seq",
+            "creusot_std::logic::seq::Seq::to_owned_seq",
+            "creusot_std::Seq::to_owned_seq",
+        ],
+        seq::specs::TO_OWNED_SEQ,
+    ),
+    // Seq::sorted — ascending order check on entire sequence
+    (
+        &[
+            "trust_wp_std::logic::Seq::sorted",
+            "trust_wp_std::logic::seq::Seq::sorted",
+            "trust_wp_std::Seq::sorted",
+            "creusot_std::logic::Seq::sorted",
+            "creusot_std::logic::seq::Seq::sorted",
+            "creusot_std::Seq::sorted",
+        ],
+        seq::specs::SORTED,
+    ),
+    // Seq::sorted_range — ascending order check on subsequence
+    (
+        &[
+            "trust_wp_std::logic::Seq::sorted_range",
+            "trust_wp_std::logic::seq::Seq::sorted_range",
+            "trust_wp_std::Seq::sorted_range",
+            "creusot_std::logic::Seq::sorted_range",
+            "creusot_std::logic::seq::Seq::sorted_range",
+            "creusot_std::Seq::sorted_range",
+        ],
+        seq::specs::SORTED_RANGE,
+    ),
+    // Seq::permutation_of — same multiset of elements
+    (
+        &[
+            "trust_wp_std::logic::Seq::permutation_of",
+            "trust_wp_std::logic::seq::Seq::permutation_of",
+            "trust_wp_std::Seq::permutation_of",
+            "creusot_std::logic::Seq::permutation_of",
+            "creusot_std::logic::seq::Seq::permutation_of",
+            "creusot_std::Seq::permutation_of",
+        ],
+        seq::specs::PERMUTATION_OF,
+    ),
+    // Seq::count — number of occurrences of an element
+    (
+        &[
+            "trust_wp_std::logic::Seq::count",
+            "trust_wp_std::logic::seq::Seq::count",
+            "trust_wp_std::Seq::count",
+            "creusot_std::logic::Seq::count",
+            "creusot_std::logic::seq::Seq::count",
+            "creusot_std::Seq::count",
+        ],
+        seq::specs::COUNT,
+    ),
+    // Seq::exchange — swap two elements check
+    (
+        &[
+            "trust_wp_std::logic::Seq::exchange",
+            "trust_wp_std::logic::seq::Seq::exchange",
+            "trust_wp_std::Seq::exchange",
+            "creusot_std::logic::Seq::exchange",
+            "creusot_std::logic::seq::Seq::exchange",
+            "creusot_std::Seq::exchange",
+        ],
+        seq::specs::EXCHANGE,
+    ),
+    // Seq Index trait — `seq[i]` syntax with Int/i32 index
+    (
+        &[
+            "trust_wp_std::logic::Seq::index",
+            "trust_wp_std::logic::seq::Seq::index",
+            "trust_wp_std::Seq::index",
+            "<trust_wp_std::logic::seq::Seq as core::ops::Index>::index",
+            "<trust_wp_std::logic::Seq as core::ops::Index>::index",
+            "<trust_wp_std::Seq as core::ops::Index>::index",
+            "<trust_wp_std::logic::seq::Seq as std::ops::Index>::index",
+            "<trust_wp_std::logic::Seq as std::ops::Index>::index",
+            "<trust_wp_std::Seq as std::ops::Index>::index",
+            "creusot_std::logic::Seq::index",
+            "creusot_std::logic::seq::Seq::index",
+            "creusot_std::Seq::index",
+            "<creusot_std::logic::seq::Seq as core::ops::Index>::index",
+            "<creusot_std::logic::Seq as core::ops::Index>::index",
+            "<creusot_std::Seq as core::ops::Index>::index",
+            "<creusot_std::logic::seq::Seq as std::ops::Index>::index",
+            "<creusot_std::logic::Seq as std::ops::Index>::index",
+            "<creusot_std::Seq as std::ops::Index>::index",
+        ],
+        seq::specs::INDEX,
+    ),
+    // Seq Index trait with usize — `seq[i]` syntax with usize index (#2689)
+    (
+        &[
+            "trust_wp_std::logic::Seq::index_usize",
+            "trust_wp_std::logic::seq::Seq::index_usize",
+            "trust_wp_std::Seq::index_usize",
+            "<trust_wp_std::logic::seq::Seq as core::ops::Index<usize>>::index",
+            "<trust_wp_std::logic::Seq as core::ops::Index<usize>>::index",
+            "<trust_wp_std::Seq as core::ops::Index<usize>>::index",
+            "<trust_wp_std::logic::seq::Seq as std::ops::Index<usize>>::index",
+            "<trust_wp_std::logic::Seq as std::ops::Index<usize>>::index",
+            "<trust_wp_std::Seq as std::ops::Index<usize>>::index",
+            "creusot_std::logic::Seq::index_usize",
+            "creusot_std::logic::seq::Seq::index_usize",
+            "creusot_std::Seq::index_usize",
+            "<creusot_std::logic::seq::Seq as core::ops::Index<usize>>::index",
+            "<creusot_std::logic::Seq as core::ops::Index<usize>>::index",
+            "<creusot_std::Seq as core::ops::Index<usize>>::index",
+            "<creusot_std::logic::seq::Seq as std::ops::Index<usize>>::index",
+            "<creusot_std::logic::Seq as std::ops::Index<usize>>::index",
+            "<creusot_std::Seq as std::ops::Index<usize>>::index",
+        ],
+        seq::specs::INDEX_USIZE,
+    ),
+    // ── Resource Algebra specs (separation logic) ───────────────────
+    // Agree RA (Ag<T>): composition succeeds iff values are equal
+    (
+        &[
+            "trust_wp_std::logic::ra::Ag::op",
+            "trust_wp_std::logic::ra::agree::Ag::op",
+            "trust_wp_std::Ag::op",
+            "creusot_std::logic::ra::Ag::op",
+            "creusot_std::logic::ra::agree::Ag::op",
+            "creusot_std::Ag::op",
+        ],
+        agree::specs::OP,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Ag::can_update",
+            "trust_wp_std::logic::ra::agree::Ag::can_update",
+            "trust_wp_std::Ag::can_update",
+            "creusot_std::logic::ra::Ag::can_update",
+            "creusot_std::logic::ra::agree::Ag::can_update",
+            "creusot_std::Ag::can_update",
+        ],
+        agree::specs::CAN_UPDATE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Ag::core",
+            "trust_wp_std::logic::ra::agree::Ag::core",
+            "trust_wp_std::Ag::core",
+            "creusot_std::logic::ra::Ag::core",
+            "creusot_std::logic::ra::agree::Ag::core",
+            "creusot_std::Ag::core",
+        ],
+        agree::specs::CORE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Ag::incl",
+            "trust_wp_std::logic::ra::agree::Ag::incl",
+            "trust_wp_std::Ag::incl",
+            "creusot_std::logic::ra::Ag::incl",
+            "creusot_std::logic::ra::agree::Ag::incl",
+            "creusot_std::Ag::incl",
+        ],
+        agree::specs::INCL,
+    ),
+    // Exclusive RA (Excl<T>): composition always fails
+    (
+        &[
+            "trust_wp_std::logic::ra::Excl::op",
+            "trust_wp_std::logic::ra::excl::Excl::op",
+            "trust_wp_std::Excl::op",
+            "creusot_std::logic::ra::Excl::op",
+            "creusot_std::logic::ra::excl::Excl::op",
+            "creusot_std::Excl::op",
+        ],
+        excl::specs::OP,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Excl::can_update",
+            "trust_wp_std::logic::ra::excl::Excl::can_update",
+            "trust_wp_std::Excl::can_update",
+            "creusot_std::logic::ra::Excl::can_update",
+            "creusot_std::logic::ra::excl::Excl::can_update",
+            "creusot_std::Excl::can_update",
+        ],
+        excl::specs::CAN_UPDATE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Excl::core",
+            "trust_wp_std::logic::ra::excl::Excl::core",
+            "trust_wp_std::Excl::core",
+            "creusot_std::logic::ra::Excl::core",
+            "creusot_std::logic::ra::excl::Excl::core",
+            "creusot_std::Excl::core",
+        ],
+        excl::specs::CORE,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Excl::incl",
+            "trust_wp_std::logic::ra::excl::Excl::incl",
+            "trust_wp_std::Excl::incl",
+            "creusot_std::logic::ra::Excl::incl",
+            "creusot_std::logic::ra::excl::Excl::incl",
+            "creusot_std::Excl::incl",
+        ],
+        excl::specs::INCL,
+    ),
+    // Fractional permission RA (Frac<T>)
+    (
+        &[
+            "trust_wp_std::logic::ra::Frac::op",
+            "trust_wp_std::logic::ra::frac::Frac::op",
+            "trust_wp_std::Frac::op",
+            "creusot_std::logic::ra::Frac::op",
+            "creusot_std::logic::ra::frac::Frac::op",
+            "creusot_std::Frac::op",
+        ],
+        frac::specs::OP,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Frac::split",
+            "trust_wp_std::logic::ra::frac::Frac::split",
+            "trust_wp_std::Frac::split",
+            "creusot_std::logic::ra::Frac::split",
+            "creusot_std::logic::ra::frac::Frac::split",
+            "creusot_std::Frac::split",
+        ],
+        frac::specs::SPLIT,
+    ),
+    (
+        &[
+            "trust_wp_std::logic::ra::Frac::is_full",
+            "trust_wp_std::logic::ra::frac::Frac::is_full",
+            "trust_wp_std::Frac::is_full",
+            "creusot_std::logic::ra::Frac::is_full",
+            "creusot_std::logic::ra::frac::Frac::is_full",
+            "creusot_std::Frac::is_full",
+        ],
+        frac::specs::IS_FULL,
+    ),
+];

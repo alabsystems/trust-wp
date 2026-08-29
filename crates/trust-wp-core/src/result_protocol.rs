@@ -96,6 +96,11 @@ pub const WIRE_FIELDS_V1: &[(&str, WireFieldPresence)] = &[
     ("evidence_gaps", WireFieldPresence::Required),
     // Optional: absent from records emitted before this field existed.
     ("proof_assert_verified", WireFieldPresence::Optional),
+    // Optional for the same reason: contractless proof_asserts the solver could
+    // not decide. Counted as a soundness gap (#143) -- previously incremented a
+    // field that reached no outcome column, so a test could report a clean pass
+    // while carrying an undecided obligation.
+    ("proof_assert_inconclusive", WireFieldPresence::Optional),
     // Optional for the same reason: absent from records emitted before it
     // existed, and absent from producers that cannot determine it.
     ("verified_native_only", WireFieldPresence::Optional),
@@ -190,6 +195,8 @@ pub struct StructuredVerificationResult {
     pub vacuous: u64,
     /// Verified-shaped results that lacked accepted proof evidence.
     pub evidence_gaps: u64,
+    /// Contractless proof_asserts the solver could not decide (#143).
+    pub proof_assert_inconclusive: u64,
     /// `proof_assert` statements that were proved.
     ///
     /// Carried so a consumer can tell "examined nothing" apart from "examined
@@ -276,6 +283,7 @@ impl StructuredVerificationResult {
             "vacuous" => self.vacuous.to_string(),
             "evidence_gaps" => self.evidence_gaps.to_string(),
             "proof_assert_verified" => self.proof_assert_verified.to_string(),
+            "proof_assert_inconclusive" => self.proof_assert_inconclusive.to_string(),
             "verified_native_only" => self.verified_native_only.to_string(),
             "proof_assert_failed" => self.proof_assert_failed.to_string(),
             "proof_assert_errors" => self.proof_assert_errors.to_string(),
@@ -310,6 +318,7 @@ impl StructuredVerificationResult {
             "vacuous" => self.vacuous = value.parse().ok()?,
             "evidence_gaps" => self.evidence_gaps = value.parse().ok()?,
             "proof_assert_verified" => self.proof_assert_verified = value.parse().ok()?,
+            "proof_assert_inconclusive" => self.proof_assert_inconclusive = value.parse().ok()?,
             "verified_native_only" => self.verified_native_only = value.parse().ok()?,
             "proof_assert_failed" => self.proof_assert_failed = value.parse().ok()?,
             "proof_assert_errors" => self.proof_assert_errors = value.parse().ok()?,
@@ -783,6 +792,7 @@ mod tests {
             unverified_axioms: 2,
             vacuous: 4,
             evidence_gaps: 5,
+            proof_assert_inconclusive: 6,
             proof_assert_verified: 3,
             verified_native_only: 0,
             proof_assert_failed: 1,

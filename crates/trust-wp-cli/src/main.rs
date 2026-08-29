@@ -2477,11 +2477,11 @@ fn run_doctor(json: bool) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// The version this binary reports, with build metadata when it was built
-/// from a git checkout: `0.2.0+gc1645cf`, or `0.2.0` from a tarball.
+/// from a git checkout: `0.3.0+gc1645cf`, or `0.3.0` from a tarball.
 ///
 /// The `+g…` form is the repository's documented dev-build spelling and, being
-/// SemVer build metadata, is ignored for version comparison — `0.2.0+gc1645cf`
-/// still satisfies `version = "0.2"` and `"=0.2.0"`.
+/// SemVer build metadata, is ignored for version comparison — `0.3.0+gc1645cf`
+/// still satisfies `version = "0.3"` and `"=0.3.0"`.
 pub(crate) fn build_version() -> String {
     match option_env!("TRUST_WP_BUILD") {
         Some(build) => format!("{}+{build}", env!("CARGO_PKG_VERSION")),

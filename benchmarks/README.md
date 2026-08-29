@@ -26,6 +26,11 @@ docker compose up --build
 
 Tracked in #2147. SWE-bench measures AI agent performance on real software engineering tasks.
 
+No `evals/` tree is tracked in this repository, and neither is the methodology
+report cited below. The config paths, result paths, and `python -m evals…`
+commands in this section record how the run was driven in the private tree;
+they are provenance, not steps a clone of this repository can execute.
+
 | Date | Run ID | Model | Instances | Resolved | Accuracy | Notes |
 |------|--------|-------|-----------|----------|----------|-------|
 | early baseline | baseline-10-final | opus | small sample | none | none | all instances exceeded the configured per-instance timeout |
