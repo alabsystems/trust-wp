@@ -4,7 +4,7 @@
 # INTERFACE-v1 — the frozen specification-language interface
 
 **Status: FROZEN (v1), 2026-07-06.** Additive evolution only; a breaking change requires
-v2 and a migration note. Reference implementation: `iface/trust-spec-iface` (not included in this snapshot)
+v2 and a migration note. Reference implementation: `iface/trust-spec-iface`
 (compiling types + invariant tests). Normative sources: the internal design spec
 (`design-trust-spec-language`, §3/§4/§6/§8/§10/§12), as corrected by the 2026-07-06
 design review — both internal notes of the private tree.

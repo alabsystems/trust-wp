@@ -131,12 +131,51 @@ those, the case with teeth is the **control**, and the adversarial twin is a sta
 That asymmetry is worth remembering when adding cases: decide which direction your defect moves
 before deciding which side of the pair carries the gate.
 
+## The `g_r4_*` family — the gate that must exist BEFORE R4 is closed
+
+Fix B M6 (`430aa45`) wired the projected-expiry lane into the `proof_assert` pipeline. Its census
+emitted **9 candidates, 0 pins**; two disarmed on **R4 (`root_unnamed`)** — the live `ghost_map`
+and `ghost_vec` shapes, where the `Option<&mut V>` carrier is consumed in scrutinee position
+(`if let Some(x) = map.get_mut_ghost(&1) { *x = 43 }`) and so has no source name for `is-Some(root)`
+to receive. R4's refusal is a soundness condition, and the M6 report made the order explicit:
+**the `Option<&mut>` negative corpus must exist before anyone closes R4 by naming the carrier.**
+That is this family — built adversary-first, as with the restore-route guard and `take_first_mut`.
+
+Four attacks (`none_branch_pin`, `scrutinee_stale_value`, `two_call_pin_fusion`,
+`seq_scrutinee_stale_value`) and six controls. Two things about it are unusual and deliberate:
+
+1. **Its `//@ teeth:` lines are PROSPECTIVE, not demonstrated.** R4 emits no pin at all today, so
+   every attack in this family is rejected *trivially* — there is nothing yet to be wrong. A case
+   that merely fails today is worthless, so each attack instead states, concretely, **what a wrong
+   R4 fix would have to do for it to start being accepted** (assert `is-Some(root)` as a base
+   premise rather than as the pin's antecedent; land the withheld `(^self)[key] == ^r` write-back
+   while `Final` still collapses onto the binder; key the pin on anything shared between two call
+   sites). Read those lines as the specification the fix is being held to.
+2. **Four of the six controls are `xfail`, and that is the finding, not an excuse.** The R4 lane
+   proves nothing yet, so every TRUE claim that *depends* on a pin is unprovable — including the
+   two obligations `ghost_map.rs`/`ghost_vec.rs` actually want. An XPASS on
+   `g_r4_scrutinee_value_control` or `g_r4_seq_value_control`, **with its adversarial twin still
+   rejecting**, is the signal that R4 was closed correctly. Each pair differs only in a literal
+   (`43` vs `21`, `42` vs `21`), so nothing but a pin carrying the correct *death* value can
+   separate them; a fix that flips both has landed the inversion.
+
+Because of (2), the family's non-blanket-refusal gate rests on the two controls that verify
+**today** — `g_r4_prior_obligation_control` and `g_r4_seq_prior_obligation_control`. Both hold an
+R4 candidate shape in the body while discharging an obligation placed *before* it. They are not
+decorative: pins are bound in `apply_mut_borrow_base_assertions`, i.e. into the **base** premise
+set, which carries no statement position and no path condition — so a pin emitted for a shape at
+the end of a body is in scope for an obligation at its start. A contradictory or carrier-stealing
+pin presents as *these breaking*, not as an adversarial case flipping, because the vacuity check
+demotes rather than accepts.
+
 ## Not covered yet
 
-* Prophecy pins in datatype carriers (Fix B). Before any pin lands, this corpus needs the four
-  probes in `memory/fixb-prophecy-slots-design.md` §B.4 — `optmut_premature_resolve`,
-  `optmut_id_distinct`, `optmut_none_branch_pin`, plus the pin/resolve consistency self-check.
-  `a1`/`a3` are the first two of that family.
+* Prophecy pins in datatype carriers (Fix B). `memory/fixb-prophecy-slots-design.md` §B.4 lists
+  four probes — `optmut_premature_resolve`, `optmut_id_distinct`, `optmut_none_branch_pin`, plus
+  the pin/resolve consistency self-check. `a1`/`a3` cover the first two shapes;
+  `g_r4_none_branch_pin` covers the third. The pin/resolve consistency self-check is still open,
+  and cannot be written as a rejectable contract until a pin actually exists to be inconsistent
+  with.
 * The still-armed std axioms the Final-collapse audit listed (`GET_MUT_GENERIC`,
   `HASHMAP_ITER_MUT`, `CELL_SET`). They are consumer-masked today and refuse fail-closed under
   Fix A; a case per axiom would pin that.

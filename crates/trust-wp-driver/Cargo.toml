@@ -22,7 +22,7 @@ trust-spec-iface = { path = "../../iface/trust-spec-iface", optional = true }
 # clean-auto races the kernel lane's quantified goals (Nat.rec induction terms,
 # meter re-checked). default-features = false: NO ay/SMT backend — the lane's
 # term assembly is pure clean-kernel, decoupled from the ay workspace.
-clean-auto = { git = "https://github.com/alabsystems/clean.git", rev = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb", optional = true, default-features = false }
+clean-auto = { git = "https://github.com/alabsystems/clean.git", rev = "74811b174d8f7d5660c1c215ed775292b83a598c", optional = true, default-features = false }
 num-bigint = { workspace = true }
 trust-wp-core = { workspace = true, features = ["tracing-init"] }
 trust-wp-std = { workspace = true }

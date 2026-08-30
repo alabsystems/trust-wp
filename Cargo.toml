@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # rust-version omitted: requires nightly for rustc_private
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -53,8 +53,8 @@ trust-wp-cli = { path = "crates/trust-wp-cli" }
 # newest ledger-mapped release at export time. The development layout
 # builds against a sibling the pinned ay release checkout instead; publish/transforms.sh
 # rewrites these pins and records the provenance in the stage attestation.
-ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "b8a8be6d198e0bbd1a1eef9f533204ac83b99762" }
-ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "b8a8be6d198e0bbd1a1eef9f533204ac83b99762" }
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "fdce86bec02aceeb314a7c045b874a30d2fe2d3d" }
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "fdce86bec02aceeb314a7c045b874a30d2fe2d3d" }
 
 # trust-ir: universal proof-carrying IR. Provides typed
 # NativeVerificationRequest::TrustWp bundles consumed by the optional

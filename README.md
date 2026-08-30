@@ -98,7 +98,7 @@ Then ask the tool whether it believes you:
 
 ```console
 $ trust-wp doctor
-trust-wp 0.3.0+g58a37601 (https://github.com/alabsystems/trust-wp)
+trust-wp 0.4.0+g2627e22f (https://github.com/alabsystems/trust-wp)
 
   checkout          /path/to/trust-wp
   trust-wp-rustc    .../target/release/trust-wp-rustc (via .../target/release)
@@ -194,13 +194,24 @@ the verified std specs (`crates/trust-wp-std`), the WP/formula core
 `cargo trust-wp`) and the `trust-wp` command itself (`crates/trust-wp-cli`,
 core-only) — together with the test harness, examples and reference docs.
 
-The executable verifier lanes — the SMT encoder (`crates/trust-wp-ay`), the
-rustc driver (`crates/trust-wp-driver`) and the library facade
-(`crates/trust-wp-lib`) — depend on the `ay` solver and the `trust-ir` proof IR,
-and are not part of this snapshot. The WP-core crates build standalone, and the
-in-process verbs run here with nothing installed; `verify` reports exactly what
-is missing (`trust-wp doctor`). End-to-end verification of a `.rs` file, and the
-`demo/` tour that exercises it, live in the full tree.
+The executable verifier lanes ship too: the SMT encoder (`crates/trust-wp-ay`),
+the rustc driver (`crates/trust-wp-driver`) and the library facade
+(`crates/trust-wp-lib`), with their `ay`, `clean` and `trust-ir` dependencies
+pinned to public releases in the snapshot's `Cargo.toml`. Not everything that
+ships is claimed buildable everywhere: the public check is scoped to what a
+stock-toolchain consumer can compile —
+
+```sh
+cargo check --locked -p trust-wp -p trust-wp-core -p trust-wp-ay \
+  -p trust-wp-macros -p trust-wp-std -p creusot-contracts -p creusot-std
+```
+
+— while the remaining crates build only against the Trust fork with its
+`rustc-dev` components (see Install). The WP-core crates build standalone, and
+the in-process verbs run here with nothing installed; `verify` reports exactly
+what is missing (`trust-wp doctor`). End-to-end verification of a `.rs` file,
+and the `demo/` tour that exercises it, run from this snapshot once the
+toolchain is provisioned.
 
 ## Documentation
 
@@ -235,9 +246,9 @@ status column is what this tree actually prints today, not an aspiration.
 | `examples/mut_borrow.rs` | RustHorn `&mut` contracts (`^v`, `old(*v)`) | 3 verified — exit 0 |
 | `examples/verified_math/` | a small verified crate — run `trust-wp` inside it | 6 verified |
 
-`demo/` — in the full tree, not this snapshot — is a guided tour of the same
-ground from the command line: contracts, counterexamples, loop invariants, the
-emitted SMT query, and what trust-wp refuses to claim. Every step asserts an
-exit code and part of the output (16 checks on a full `./demo/run.sh`;
-`--quick` skips the crate-mode one), so the tour doubles as a regression test
-for the CLI's user-visible contract. `demo/README.md` is the written version.
+`demo/` is a guided tour of the same ground from the command line: contracts,
+counterexamples, loop invariants, the emitted SMT query, and what trust-wp
+refuses to claim. Every step asserts an exit code and part of the output
+(16 checks on a full `./demo/run.sh`; `--quick` skips the crate-mode one), so
+the tour doubles as a regression test for the CLI's user-visible contract.
+`demo/README.md` is the written version.

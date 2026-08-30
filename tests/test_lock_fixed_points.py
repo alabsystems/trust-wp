@@ -7,8 +7,14 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
+import time
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
+
+import pytest
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +65,269 @@ def test_repair_preserves_existing_resolutions_before_locked_recheck() -> None:
     command = LOCK_GATE.cargo_metadata_command(locked=False, offline=True)
     assert command[-4:] == ["metadata", "--offline", "--format-version", "1"]
     assert "generate-lockfile" not in command
+
+
+def test_failed_repair_can_restore_every_lock_byte_for_byte(tmp_path: Path) -> None:
+    first = Path("Cargo.lock")
+    second = Path("nested/Cargo.lock")
+    (tmp_path / second.parent).mkdir()
+    (tmp_path / first).write_bytes(b"first\r\n")
+    (tmp_path / second).write_bytes(b"second\n")
+
+    snapshot = LOCK_GATE.snapshot_lockfiles([first, second], tmp_path)
+    (tmp_path / first).write_bytes(b"changed first\n")
+    (tmp_path / second).write_bytes(b"changed second\n")
+    LOCK_GATE.restore_lockfiles(snapshot, tmp_path)
+
+    assert (tmp_path / first).read_bytes() == b"first\r\n"
+    assert (tmp_path / second).read_bytes() == b"second\n"
+
+
+class _FakeHermeticRoot:
+    def __init__(self, *, keep: bool = False) -> None:
+        self.keep = keep
+
+    def close(self) -> None:
+        pass
+
+
+def _patch_transaction_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lockfiles: list[Path]
+) -> None:
+    monkeypatch.setattr(LOCK_GATE, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(LOCK_GATE, "discover_lockfiles", lambda: lockfiles)
+    monkeypatch.setattr(LOCK_GATE, "read_pins", lambda: {"ay": "a" * 40})
+    monkeypatch.setattr(LOCK_GATE, "HermeticRoot", _FakeHermeticRoot)
+    monkeypatch.setattr(
+        LOCK_GATE,
+        "workspace_repair_lock",
+        lambda _root, **_kwargs: nullcontext(),
+    )
+
+
+def test_repair_rolls_back_when_a_late_lock_is_unverifiable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = Path("Cargo.lock")
+    second = Path("nested/Cargo.lock")
+    (tmp_path / second.parent).mkdir()
+    (tmp_path / first).write_text("first\n", encoding="utf-8")
+    (tmp_path / second).write_text("second\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [first, second])
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        assert kwargs["write_back"] is True
+        (tmp_path / first).write_text("changed\n", encoding="utf-8")
+        return [
+            LOCK_GATE.Outcome(first, LOCK_GATE.VERIFIED, True),
+            LOCK_GATE.Outcome(second, LOCK_GATE.UNVERIFIABLE, True, "late failure"),
+        ]
+
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    assert LOCK_GATE.main(["--repair"]) == LOCK_GATE.EXIT_UNVERIFIABLE
+    assert (tmp_path / first).read_text(encoding="utf-8") == "first\n"
+    assert (tmp_path / second).read_text(encoding="utf-8") == "second\n"
+
+
+def test_repair_keeps_drift_distinct_while_rolling_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lockfile = Path("Cargo.lock")
+    (tmp_path / lockfile).write_text("old\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [lockfile])
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        assert kwargs["write_back"] is True
+        (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
+        return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.DRIFTED, True, "drift")]
+
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    assert LOCK_GATE.main(["--repair"]) == LOCK_GATE.EXIT_DRIFTED
+    assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+
+
+def test_repair_rolls_back_and_stays_unverifiable_when_final_check_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lockfile = Path("Cargo.lock")
+    (tmp_path / lockfile).write_text("old\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [lockfile])
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        if kwargs["write_back"]:
+            (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
+            return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.VERIFIED, True)]
+        assert (tmp_path / lockfile).read_text(encoding="utf-8") == "new\n"
+        return [
+            LOCK_GATE.Outcome(
+                lockfile, LOCK_GATE.UNVERIFIABLE, True, "late network failure"
+            )
+        ]
+
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    assert (
+        LOCK_GATE.main(["--repair", "--allow-unverifiable"])
+        == LOCK_GATE.EXIT_UNVERIFIABLE
+    )
+    assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+
+
+def test_repair_rolls_back_when_reporting_raises_after_both_sweeps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lockfile = Path("Cargo.lock")
+    (tmp_path / lockfile).write_text("old\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [lockfile])
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        if kwargs["write_back"]:
+            (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
+        return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.VERIFIED, True)]
+
+    def fail_after_repair(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("injected post-repair reporting failure")
+
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    monkeypatch.setattr(LOCK_GATE, "report", fail_after_repair)
+    with pytest.raises(RuntimeError, match="post-repair reporting"):
+        LOCK_GATE.main(["--repair"])
+    assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+
+
+def test_repair_rolls_back_when_hermetic_close_raises_after_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lockfile = Path("Cargo.lock")
+    (tmp_path / lockfile).write_text("old\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [lockfile])
+
+    class FailingClose(_FakeHermeticRoot):
+        def close(self) -> None:
+            raise RuntimeError("injected close failure")
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        if kwargs["write_back"]:
+            (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
+        return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.VERIFIED, True)]
+
+    monkeypatch.setattr(LOCK_GATE, "HermeticRoot", FailingClose)
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    with pytest.raises(RuntimeError, match="close failure"):
+        LOCK_GATE.main(["--repair"])
+    assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+
+
+def test_repair_dry_run_is_repeatable_and_never_persists_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lockfile = Path("Cargo.lock")
+    (tmp_path / lockfile).write_text("old\n", encoding="utf-8")
+    _patch_transaction_inputs(monkeypatch, tmp_path, [lockfile])
+    repairs = 0
+
+    def sweep(lockfiles: list[Path], **kwargs: object) -> list[object]:
+        nonlocal repairs
+        if kwargs["write_back"]:
+            repairs += 1
+            assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+            (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
+        else:
+            assert (tmp_path / lockfile).read_text(encoding="utf-8") == "new\n"
+        return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.VERIFIED, True)]
+
+    monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
+    for _ in range(2):
+        assert LOCK_GATE.main(["--repair", "--dry-run"]) == LOCK_GATE.EXIT_OK
+        assert (tmp_path / lockfile).read_text(encoding="utf-8") == "old\n"
+    assert repairs == 2
+
+
+def test_dry_run_requires_repair() -> None:
+    assert LOCK_GATE.main(["--dry-run"]) == LOCK_GATE.EXIT_DRIFTED
+
+
+@pytest.mark.parametrize(
+    "waiter_mode", ["exclusive", "shared"], ids=["repair-vs-repair", "repair-vs-check"]
+)
+def test_workspace_repair_lock_serializes_concurrent_processes(
+    tmp_path: Path, waiter_mode: str
+) -> None:
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(tmp_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    first_acquired = tmp_path / "first-acquired"
+    release_first = tmp_path / "release-first"
+    second_acquired = tmp_path / "second-acquired"
+    holder = """
+import pathlib, runpy, sys, time
+gate = runpy.run_path(sys.argv[1])["workspace_repair_lock"]
+with gate(pathlib.Path(sys.argv[2]), exclusive=True):
+    pathlib.Path(sys.argv[3]).write_text("acquired\\n")
+    while not pathlib.Path(sys.argv[4]).exists():
+        time.sleep(0.01)
+"""
+    waiter = """
+import pathlib, runpy, sys
+gate = runpy.run_path(sys.argv[1])["workspace_repair_lock"]
+with gate(pathlib.Path(sys.argv[2]), exclusive=sys.argv[4] == "exclusive"):
+    pathlib.Path(sys.argv[3]).write_text("acquired\\n")
+"""
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            holder,
+            str(SCRIPT),
+            str(tmp_path),
+            str(first_acquired),
+            str(release_first),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while not first_acquired.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert first_acquired.exists(), first.communicate(timeout=1)
+
+        second = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                waiter,
+                str(SCRIPT),
+                str(tmp_path),
+                str(second_acquired),
+                waiter_mode,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        assert second.poll() is None
+        assert not second_acquired.exists()
+
+        release_first.write_text("release\n", encoding="utf-8")
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        second_stdout, second_stderr = second.communicate(timeout=5)
+        assert first.returncode == 0, (first_stdout, first_stderr)
+        assert second.returncode == 0, (second_stdout, second_stderr)
+        assert second_acquired.is_file()
+    finally:
+        release_first.touch(exist_ok=True)
+        if first.poll() is None:
+            first.kill()
+            first.wait()
+        if second is not None and second.poll() is None:
+            second.kill()
+            second.wait()
 
 
 def test_spike_suite_invokes_lock_fixed_point_gate() -> None:
@@ -188,6 +457,115 @@ def test_declared_pin_rejects_moving_selector_with_matching_fragment() -> None:
     assert LOCK_GATE.lands_on_declared_pin(
         "trust-ir", {("0.11.0", exact)}
     )
+
+
+def _cargo_bare_database(
+    tmp_path: Path,
+    database: Path,
+    candidate_name: str,
+    github_repository: str,
+) -> tuple[Path, str]:
+    worktree = tmp_path / f"work-{candidate_name}"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(worktree)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "user.email", "db-test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "user.name", "Cargo DB Test"],
+        check=True,
+    )
+    (worktree / "marker").write_text(f"{candidate_name}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(worktree), "add", "marker"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-q", "-m", "marker"],
+        check=True,
+    )
+    revision = subprocess.check_output(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"], text=True
+    ).strip()
+    candidate = database / candidate_name
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(worktree), str(candidate)],
+        check=True,
+    )
+    (candidate / "FETCH_HEAD").write_text(
+        f"{revision}\t\t'{revision}' of "
+        f"https://github.com/{github_repository}.git\n",
+        encoding="utf-8",
+    )
+    return candidate, revision
+
+
+@pytest.mark.parametrize("collision", ["trust-cg", "trust-ir"])
+def test_cargo_database_prefix_collision_cannot_impersonate_trust(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, collision: str
+) -> None:
+    database = tmp_path / "cargo" / "git" / "db"
+    candidate, revision = _cargo_bare_database(
+        tmp_path,
+        database,
+        f"{collision}-0123456789abcdef",
+        f"{LOCK_GATE.FIRST_PARTY_ORG}/{collision}",
+    )
+    monkeypatch.setattr(LOCK_GATE, "cargo_git_database", lambda: database)
+    search_root = tmp_path / "siblings"
+    search_root.mkdir()
+
+    assert LOCK_GATE.object_source("trust", search_root, revision) is None
+    assert LOCK_GATE.object_source(collision, search_root, revision) == candidate
+
+
+def test_cargo_database_search_continues_until_requested_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    database = tmp_path / "cargo" / "git" / "db"
+    _first, first_revision = _cargo_bare_database(
+        tmp_path,
+        database,
+        "trust-0000000000000000",
+        "alabsystems/trust",
+    )
+    second, requested_revision = _cargo_bare_database(
+        tmp_path,
+        database,
+        "trust-1111111111111111",
+        "alabsystems/trust",
+    )
+    monkeypatch.setattr(LOCK_GATE, "cargo_git_database", lambda: database)
+    search_root = tmp_path / "siblings"
+    search_root.mkdir()
+
+    assert first_revision != requested_revision
+    assert (
+        LOCK_GATE.object_source("trust", search_root, requested_revision) == second
+    )
+
+
+def test_cargo_database_rejects_foreign_same_basename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    database = tmp_path / "cargo" / "git" / "db"
+    _candidate, revision = _cargo_bare_database(
+        tmp_path,
+        database,
+        "trust-0123456789abcdef",
+        "someone-else/trust",
+    )
+    monkeypatch.setattr(LOCK_GATE, "cargo_git_database", lambda: database)
+    search_root = tmp_path / "siblings"
+    search_root.mkdir()
+
+    assert LOCK_GATE.object_source("trust", search_root, revision) is None
 
 
 def test_verdicts_and_exit_codes_keep_unverifiable_distinct_from_both() -> None:
