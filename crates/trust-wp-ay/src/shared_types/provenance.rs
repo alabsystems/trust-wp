@@ -16,7 +16,8 @@
 use std::time::Duration;
 
 use super::solve_types::{
-    ProofAssertSliceCertificate, SolveEvidenceSnapshot, SolveStatisticsSnapshot, UnknownReason,
+    ProofAssertSliceCertificate, SolveEvidenceSnapshot, SolveStatisticsSnapshot,
+    StrictProofReplayObservation, UnknownReason,
 };
 
 /// Provenance metadata attached to verification results.
@@ -79,6 +80,31 @@ pub struct VerificationProvenance {
 
     /// Ordered strict proof-authority certificates for `proof_assert` slices.
     pub proof_assert_slice_certificates: Vec<ProofAssertSliceCertificate>,
+
+    /// What the strict proof-producing replay MEASURED, when one ran.
+    ///
+    /// Diagnostics only — see [`StrictProofReplayObservation`] for why this is a
+    /// separate field rather than an overwrite of `solve_evidence` /
+    /// `solver_statistics`. Read this, not those, when asking "did ay build a
+    /// derivation for this obligation?": on lanes where the long-lived
+    /// incremental encoder supplied the pair, those two report the encoder's
+    /// proof-production CONFIGURATION (`Trusted` / `false`) rather than any
+    /// measurement of ay.
+    ///
+    /// `None` means no strict replay ran on this obligation — it never means
+    /// "no proof was built".
+    pub strict_proof_replay: Option<StrictProofReplayObservation>,
+
+    /// How many strict-replay observations were refused because they belonged to
+    /// a DIFFERENT obligation slice than the one this provenance reports.
+    ///
+    /// `strict_proof_replay = None` with a non-zero count here means "a strict
+    /// replay ran nearby, but not on this obligation" — a materially different
+    /// statement from "no strict replay ran" (count zero). Keeping the two apart
+    /// is the point: reporting a sibling slice's accepted certificate on a
+    /// blocked obligation is what manufactured a phantom "certified but blocked"
+    /// class. Diagnostics only.
+    pub strict_proof_replay_unbound: u32,
 }
 
 impl VerificationProvenance {
@@ -101,6 +127,8 @@ impl VerificationProvenance {
             replay_artifact: None,
             native_replay_json: None,
             proof_assert_slice_certificates: Vec::new(),
+            strict_proof_replay: None,
+            strict_proof_replay_unbound: 0,
         }
     }
 
@@ -177,6 +205,29 @@ impl VerificationProvenance {
         self
     }
 
+    /// Set the strict proof-producing replay's observation.
+    ///
+    /// Diagnostics only: nothing on the verdict, gate, or acceptance path reads
+    /// this field.
+    #[must_use]
+    pub fn with_strict_proof_replay(
+        mut self,
+        observation: Option<StrictProofReplayObservation>,
+    ) -> Self {
+        self.strict_proof_replay = observation;
+        self
+    }
+
+    /// Set the count of strict-replay observations refused for scope mismatch.
+    ///
+    /// Diagnostics only: nothing on the verdict, gate, or acceptance path reads
+    /// this field.
+    #[must_use]
+    pub fn with_strict_proof_replay_unbound(mut self, unbound: u32) -> Self {
+        self.strict_proof_replay_unbound = unbound;
+        self
+    }
+
     /// Set the VC hash.
     #[must_use]
     pub fn with_vc_hash(mut self, hash: [u8; 32]) -> Self {
@@ -200,6 +251,8 @@ impl Default for VerificationProvenance {
             replay_artifact: None,
             native_replay_json: None,
             proof_assert_slice_certificates: Vec::new(),
+            strict_proof_replay: None,
+            strict_proof_replay_unbound: 0,
         }
     }
 }

@@ -187,7 +187,8 @@ pub use crate::{
         LoopVerificationOutcome, LoopVerificationResult, MutBorrowRequest, PostconditionInfo,
         ProofAssertModeGuard, ProofCertificateSummary, SolveEvidenceSnapshot,
         SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
-        SolveVerificationLevelSnapshot, SolveVerificationSnapshot, UnknownReason, VarOrigin,
+        SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
+        UnknownReason, VarOrigin,
         VerificationOutcome, VerificationProvenance, VerificationRequest, VerificationResult,
     },
 };

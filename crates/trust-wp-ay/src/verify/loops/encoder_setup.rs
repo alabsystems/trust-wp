@@ -689,7 +689,7 @@ pub(in crate::verify::loops) fn resolve_sat_result_lightweight_outcome_timed(
 
 fn outcome_from_continue(
     result: VerificationResult,
-    encoder: &AYEncoder,
+    encoder: &mut AYEncoder,
     elapsed: std::time::Duration,
 ) -> VerificationOutcome {
     if continue_result_without_solver_run(&result) {

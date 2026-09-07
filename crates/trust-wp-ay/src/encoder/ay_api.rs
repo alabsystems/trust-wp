@@ -219,27 +219,85 @@ impl AYEncoder {
         })
     }
 
+    /// Install the strict replay as proof authority when it qualifies, and
+    /// ALWAYS retain what it measured.
+    ///
+    /// The authority decision is unchanged — same four conditions, same order,
+    /// same `None` on any failure. What changed is that the replay's own
+    /// `SolveDetails` are no longer *destroyed* by a failing decision.
+    ///
+    /// Why that matters: on the certification-blocked lane (ay builds a complete
+    /// derivation, then refuses to certify it — `step tN uses unverified trust
+    /// rule`) every early return below fires, so nothing was recorded and the
+    /// only snapshot left for provenance came from the long-lived incremental
+    /// encoder. That encoder is built with `set_produce_proofs(false)` and never
+    /// calls `set_verification_level`, so its `verification_level = Trusted` and
+    /// `unsat_proof_available = false` are CONSTANTS OF ITS CONSTRUCTION, not
+    /// measurements — identical for a genuine refusal and for a fully proved
+    /// query. Censuses that read them as measurements concluded "N obligations
+    /// have no proof object" when the derivations existed and were complete.
+    ///
+    /// The observation is written to its own cache slot and never touches
+    /// `solve_evidence` / `solver_statistics`, the pair the proof-authority
+    /// boundary judges. Recording it cannot grant authority: the sole authority
+    /// write remains `set_strict_unsat_authority`, still gated on all four
+    /// conditions.
     fn install_strict_unsat_authority(
         &mut self,
         strict_replay: StrictNativeReplay,
     ) -> Option<crate::verify::ProofCertificateSummary> {
-        let details = strict_replay.details;
-        if !solve_details_have_complete_unsat_proof(&details) {
-            return None;
-        }
-        let summary = crate::verify::proof_summary_from_artifact(strict_replay.proof_artifact?);
-        if !summary.is_fully_verified() {
-            return None;
-        }
+        let StrictNativeReplay {
+            details,
+            proof_artifact,
+            native_problem_json,
+        } = strict_replay;
+
         let evidence = SolveEvidenceSnapshot::from_solve_details(&details);
-        if !evidence.accepted_for_consumer {
-            return None;
-        }
-        self.encoding_cache.set_strict_unsat_authority(
-            SolveStatisticsSnapshot::from(&details.statistics),
-            evidence,
-            strict_replay.native_problem_json,
+        let statistics = SolveStatisticsSnapshot::from(&details.statistics);
+        // `None` today for every native-API solve: ay's decline vocabulary is
+        // still text/parsed-source-centric. Carried so the day it does cover
+        // this path the census reads a mechanism instead of inferring one.
+        let unsat_proof_decline = details
+            .verification
+            .unsat_proof_decline
+            .map(|mechanism| mechanism.tag().to_string());
+        // The reason ay DID record. `unsat_proof_decline` above is `None` for
+        // every native-API solve — its mechanisms need a parsed SMT-LIB surface
+        // AST this path never builds — and that `None` was twice misread as "ay
+        // refused and recorded nothing". It records an instance-specific reason
+        // on this same envelope; `unknown_summary()` is the stable accessor for
+        // it. Dropping it here is what forced downstream censuses to infer a
+        // mechanism, and the inference conflated "a verdict was computed and
+        // withheld by a soundness gate" with "no verdict was ever reached".
+        let unknown_summary = details.unknown_summary();
+        let unknown_reason = unknown_summary
+            .as_ref()
+            .map(|summary| summary.reason_code.to_string());
+        let unknown_detail = unknown_summary.and_then(|summary| summary.detail);
+
+        // Identical predicate chain to the pre-#2706 form, folded into one
+        // expression so the observation below can be written on every path.
+        let authorized = solve_details_have_complete_unsat_proof(&details)
+            .then(|| {
+                let summary = crate::verify::proof_summary_from_artifact(proof_artifact?);
+                (summary.is_fully_verified() && evidence.accepted_for_consumer).then_some(summary)
+            })
+            .flatten();
+
+        self.encoding_cache.set_strict_proof_replay_observation(
+            crate::shared_types::StrictProofReplayObservation {
+                evidence: evidence.clone(),
+                statistics: statistics.clone(),
+                authority_accepted: authorized.is_some(),
+                unsat_proof_decline,
+                unknown_reason,
+                unknown_detail,
+            },
         );
+
+        let summary = authorized?;
+        self.encoding_cache
+            .set_strict_unsat_authority(statistics, evidence, native_problem_json);
         Some(summary)
     }
 

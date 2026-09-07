@@ -60,7 +60,9 @@ supplies it. The front-door binary links nothing but libSystem, so `--help`,
 (`trust-wp-rustc`) links `rustc_private` and needs a Trust sysroot at runtime.
 
 `TRUST_WP_BIN=/path/to/trust-wp ./demo/run.sh` runs the tour against a binary
-from somewhere else — a Trust bundle install, for instance.
+from somewhere else — a release build in another checkout, for instance. There
+is no packaged install: as of 2026-08-30 the Trust toolchain's `bin/` ships no
+`trust-wp`, so the build above is how you get one.
 
 ---
 

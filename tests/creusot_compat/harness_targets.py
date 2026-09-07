@@ -91,11 +91,20 @@ def _skip_harness_prebuild_requested() -> bool:
 def _missing_harness_binaries(workspace: Path) -> list[Path]:
     """Return required harness binaries that are absent from candidate targets."""
     required = ("cargo-trust-wp", "trust-wp-rustc")
+    # Search at the run's pinned profile, not a hardcoded `debug`: under
+    # `TRUST_WP_HARNESS_PROFILE=release` a debug-only binary is NOT the one the
+    # run will use, so reporting it as present would skip the build the run
+    # needs. Non-raising by design — this runs BEFORE the build, where "absent"
+    # is the normal state and must stay a build trigger rather than an error.
+    profiles = harness_binary_profile_order(workspace)
     missing: list[Path] = []
     for binary_name in required:
-        binary_path = _workspace_target_binary(workspace, binary_name)
-        if not binary_path.exists():
-            missing.append(binary_path)
+        candidates = [
+            _workspace_target_binary(workspace, binary_name, profile=profile)
+            for profile in profiles
+        ]
+        if not any(candidate.exists() for candidate in candidates):
+            missing.append(candidates[0])
     return missing
 
 
@@ -242,6 +251,72 @@ def _harness_source_fingerprint(workspace: Path) -> str:
 HARNESS_PROFILE_ENV = "TRUST_WP_HARNESS_PROFILE"
 
 
+def _requested_harness_profile() -> str:
+    """Return the validated raw `TRUST_WP_HARNESS_PROFILE` request."""
+    requested = (os.environ.get(HARNESS_PROFILE_ENV) or "auto").strip().lower()
+    if requested not in ("auto", "release", "debug"):
+        raise RuntimeError(
+            f"{HARNESS_PROFILE_ENV}={requested!r} is not one of: auto, release, debug"
+        )
+    return requested
+
+
+def harness_binary_profile_order(workspace: Path) -> tuple[str, ...]:
+    """Profiles to search for COMPANION harness binaries, most-preferred first.
+
+    Companion binaries (`cargo-trust-wp`) are not the verifier, so they were
+    historically resolved with a hardcoded ``profile="debug"`` default while the
+    driver honoured the pin. That mismatch is not cosmetic:
+
+    * ``TRUST_WP_HARNESS_PROFILE=release`` did not actually pin the run — it
+      pinned the driver and left every companion silently on ``target/debug``,
+      so the promise this env var makes ("one profile, or a hard error") was
+      only half true.
+    * It created an undeclared dependency on ``target/debug`` surviving a
+      release run. Pruning that directory mid-run — reasonable to do when the
+      pinned profile is release — made 210 of 278 tests error at 0ms with
+      ``missing cargo-trust-wp``, which reads exactly like a mass regression.
+
+    ``auto`` keeps searching ``debug`` first, which is byte-for-byte the
+    historical behaviour. That is deliberate and NOT an oversight: ``auto``
+    exists to preserve every previously measured number, so it must not start
+    selecting a different companion binary than the runs those baselines came
+    from. Only an explicit pin changes which binary is used — and an explicit
+    pin is exactly the case that was silently half-honoured before.
+    """
+    requested = _requested_harness_profile()
+    if requested != "auto":
+        return (requested,)
+    return ("debug", "release")
+
+
+def resolve_harness_binary(workspace: Path, name: str) -> Path:
+    """Resolve a companion harness binary at this run's pinned profile.
+
+    Fails closed on an explicit-but-absent profile for the same reason
+    [`resolve_driver_profile`] does: silently substituting the other profile's
+    binary produces a run that is not the one the caller asked for.
+    """
+    profiles = harness_binary_profile_order(workspace)
+    for profile in profiles:
+        candidate = _workspace_target_binary(workspace, name, profile=profile)
+        if candidate.is_file():
+            return candidate
+
+    if _requested_harness_profile() != "auto":
+        pinned = _workspace_target_binary(workspace, name, profile=profiles[0])
+        raise RuntimeError(
+            f"{HARNESS_PROFILE_ENV}={profiles[0]} was requested but {pinned} "
+            f"does not exist. Refusing to fall back to another profile: the "
+            f"run would not be the one that was pinned. Build it first "
+            f"(cargo build --{profiles[0]} -p cargo-trust-wp), or unset "
+            f"{HARNESS_PROFILE_ENV}."
+        )
+    # auto with nothing built: return the preferred path so callers report a
+    # useful "not built" message rather than raising here.
+    return _workspace_target_binary(workspace, name, profile=profiles[0])
+
+
 def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
     """Resolve which trust-wp-rustc build profile this run uses.
 
@@ -262,11 +337,7 @@ def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
         silently produce a number from a different verifier, which is the
         defect this function exists to prevent.
     """
-    requested = (os.environ.get(HARNESS_PROFILE_ENV) or "auto").strip().lower()
-    if requested not in ("auto", "release", "debug"):
-        raise RuntimeError(
-            f"{HARNESS_PROFILE_ENV}={requested!r} is not one of: auto, release, debug"
-        )
+    requested = _requested_harness_profile()
 
     release_driver = _workspace_target_binary(
         workspace, "trust-wp-rustc", profile="release"
@@ -291,7 +362,7 @@ def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
 
 
 def _selected_harness_binaries(workspace: Path) -> dict[str, Path]:
-    cargo_binary = _workspace_target_binary(workspace, "cargo-trust-wp")
+    cargo_binary = resolve_harness_binary(workspace, "cargo-trust-wp")
     _profile, driver_binary = resolve_driver_profile(workspace)
     return {
         "cargo-trust-wp": cargo_binary.resolve(),

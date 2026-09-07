@@ -915,7 +915,7 @@ fn verification_diagnostic_wire_line(
          ay_result={} accepted_for_consumer={} model_validated={} unsat_proof_available={} \
          verification_level={} replay_present={} replay_bytes={} replay_sha256={} \
          native_replay_present={} native_replay_bytes={} native_replay_sha256={} \
-         native_replay_schema={} native_replay_path={} native_replay_write_error={}",
+         native_replay_schema={} native_replay_path={} native_replay_write_error={} {}",
         trust_wp_core::result_protocol::DIAGNOSTIC_WIRE_PREFIX,
         encode_wire_value(def_path),
         encode_wire_value(obligation_kind),
@@ -942,6 +942,128 @@ fn verification_diagnostic_wire_line(
         }),
         encode_wire_value(&native_replay_path),
         encode_wire_value(&native_replay_write_error),
+        // Appended last so every existing key keeps its position and meaning:
+        // this change adds an instrument, it does not redefine one.
+        strict_proof_replay_wire_fields(
+            provenance.and_then(|provenance| provenance.strict_proof_replay.as_ref()),
+            provenance.map_or(0, |provenance| provenance.strict_proof_replay_unbound),
+        ),
+    )
+}
+
+/// Render what the STRICT proof-producing replay measured, for the diagnostic
+/// wire line.
+///
+/// # Read these keys, not `verification_level=` / `unsat_proof_available=`
+///
+/// Those two keys report whatever solver's snapshot landed in
+/// `provenance.solve_evidence`. On the certification-blocked lane that is the
+/// long-lived incremental encoder, which is constructed with
+/// `set_produce_proofs(false)` and never calls `set_verification_level`, so it
+/// answers `Trusted` / `false` for EVERY query — including ones ay proved with a
+/// complete derivation. A control replaying a genuine `Unsat` through it is
+/// byte-identical to a real refusal. Three separate corpus censuses read those
+/// keys as measurements and reported counts of "obligations with no proof
+/// object" that were really counts of the encoder's configuration.
+///
+/// The `strict_replay_*` keys below come from a solver that actually had proof
+/// production on, so `strict_replay_proof_checked_steps=51`
+/// `strict_replay_proof_total_steps=51` next to
+/// `strict_replay_authority_accepted=false` reports a replay that checked every
+/// step it had and still was not installed as authority.
+///
+/// `strict_replay=none` means no strict replay ran on this obligation. It does
+/// NOT mean no proof exists — absence of measurement, not measurement of
+/// absence.
+///
+/// # Equal step counters do NOT mean "ay built a derivation and refused it"
+///
+/// `checked == total > 0` with `skipped_hole_steps=0` was read as establishing a
+/// complete derivation, and it does not: `strict_replay_proof_complete=` is an
+/// INDEPENDENT flag, and the proof-authority boundary requires it separately
+/// from the step counters. A replay can report `checked=17 total=17` holes 0
+/// with `proof_complete=false`, because those counters describe the steps that
+/// exist, not whether they reach the empty clause.
+///
+/// This matters because the two cases need opposite responses and were being
+/// counted as one population. Split them on
+/// `strict_replay_unknown_reason=`:
+///
+/// * `self_check_rejected` / `proof_trusted` — a verdict WAS computed and a
+///   soundness gate withheld it. A genuine certification refusal; the
+///   derivation is real and the gate is the thing to study.
+/// * `quantifier_cegqi_incomplete` and the other `quantifier_*` codes — the
+///   solve never established UNSAT at all, so nothing was withheld and no
+///   refusal occurred. Nothing here is recoverable by improving certification.
+///
+/// A census keying on the step counters alone mixes these, and the mixed
+/// population reads as a much larger "certification is blocking us" class than
+/// exists. Always pair the counters with `strict_replay_proof_complete=` and
+/// `strict_replay_unknown_reason=`.
+///
+/// # `strict_replay_proof_decline=` is almost always `none`, and that is not a
+/// finding
+///
+/// It carries ay's `ProofDeclineMechanism`, whose four mechanisms are reachable
+/// only through a parsed SMT-LIB surface AST. This replay uses the native API
+/// and never builds one, so the field is structurally `none` here. It does not
+/// mean ay declined without recording a reason — ay records one on every
+/// withheld solve, and `strict_replay_unknown_reason=` /
+/// `strict_replay_unknown_detail=` are where it lands.
+///
+/// # `strict_replay_unbound=` — read it WITH `strict_replay=`
+///
+/// A strict replay is bound to the obligation slice that produced it, and a
+/// capture reporting a different slice is refused. `strict_replay_unbound=N`
+/// counts those refusals for this obligation, so:
+///
+/// * `strict_replay=none strict_replay_unbound=0` — no strict replay ran here.
+/// * `strict_replay=none strict_replay_unbound=1` — one ran on a SIBLING slice
+///   of the same function and is deliberately not reported here.
+///
+/// Before the binding existed, the second row printed as the first row's
+/// opposite: the sibling's measurement, `authority_accepted=true` and all, on a
+/// blocked obligation's line. That produced a "certified but blocked" class that
+/// did not exist, in a report that had already been filed.
+fn strict_proof_replay_wire_fields(
+    observation: Option<&trust_wp_ay::StrictProofReplayObservation>,
+    unbound: u32,
+) -> String {
+    let Some(observation) = observation else {
+        return format!("strict_replay=none strict_replay_unbound={unbound}");
+    };
+    let extra = |key: &str| {
+        observation
+            .statistics
+            .extra_ints
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key).then_some(*value))
+    };
+    let int = |key: &str| extra(key).map_or_else(|| "none".to_string(), |value| value.to_string());
+    format!(
+        "strict_replay=present strict_replay_result={} strict_replay_accepted_for_consumer={} \
+         strict_replay_verification_level={:?} strict_replay_unsat_proof_available={} \
+         strict_replay_authority_accepted={} strict_replay_proof_decline={} \
+         strict_replay_unknown_reason={} strict_replay_unknown_detail={} \
+         strict_replay_proof_complete={} strict_replay_proof_checked_steps={} \
+         strict_replay_proof_total_steps={} strict_replay_proof_trust={} \
+         strict_replay_proof_skipped_hole_steps={} strict_replay_proof_checker_failures={} \
+         strict_replay_unbound={}",
+        encode_wire_value(&observation.evidence.result),
+        observation.evidence.accepted_for_consumer,
+        observation.evidence.verification_level,
+        observation.evidence.verification.unsat_proof_available,
+        observation.authority_accepted,
+        encode_wire_value(observation.unsat_proof_decline.as_deref().unwrap_or("none")),
+        encode_wire_value(observation.unknown_reason.as_deref().unwrap_or("none")),
+        encode_wire_value(observation.unknown_detail.as_deref().unwrap_or("none")),
+        observation.statistics.proof_complete,
+        int("proof_checker_checked_steps"),
+        int("proof_checker_total_steps"),
+        int("proof_trust"),
+        int("proof_checker_skipped_hole_steps"),
+        int("proof_checker_failures"),
+        unbound,
     )
 }
 

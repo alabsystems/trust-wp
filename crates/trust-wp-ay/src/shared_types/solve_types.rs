@@ -239,6 +239,112 @@ impl SolveEvidenceSnapshot {
     }
 }
 
+/// What the STRICT, proof-producing replay actually MEASURED — recorded whether
+/// or not it went on to clear the proof-authority bar.
+///
+/// # Why this exists (it is an instrument, not a verdict)
+///
+/// The long-lived incremental encoder is deliberately built with
+/// `set_produce_proofs(false)` (`encoder/constructors.rs`, intentional, #2629)
+/// and never calls `set_verification_level`. Its `SolveDetails` therefore report
+/// `verification_level = Trusted` and `unsat_proof_available = false` as
+/// **constants for every query**, whatever the proof machinery did — ay's own
+/// `VerificationSummary::unsat_proof_available` docs call this out as a
+/// presentation flag, not a statement about whether a derivation could be built.
+///
+/// On the `Unknown(ProofTrusted)` lane — the certification-blocked case a
+/// proof-authority census most needs to see — the strict replay's own
+/// `SolveDetails` used to be discarded by `install_strict_unsat_authority` the
+/// moment the authority check failed, leaving provenance holding the incremental
+/// encoder's constants. Reading those constants as a measurement produced three
+/// separate wrong census results ("N obligations have no proof object"): the
+/// figure was counting the encoder's configuration, not ay's behaviour. A
+/// control replaying a genuine `Unsat` reported `level=Trusted
+/// available=false` — indistinguishable from a real refusal.
+///
+/// This snapshot closes that hole by keeping the replay's measurement. It is
+/// populated **iff a strict proof-producing replay actually ran**, so absence is
+/// itself honest ("no replay happened here"), never a fabricated `false`.
+///
+/// # Strictly observation-only
+///
+/// No gate, predicate, or acceptance path reads this. It is deliberately a
+/// SEPARATE field from `VerificationProvenance::solve_evidence` /
+/// `solver_statistics` rather than an overwrite of them: that pair is what the
+/// mandatory proof-authority boundary judges, and several engine-side consumers
+/// (`function::legacy_result_from_outcome`, `loops`, `mut_borrow`,
+/// `obligation_slices`) demote a `Verified` outcome to `Unknown` precisely when
+/// its `solve_evidence` is not `accepted_for_consumer`. A declined strict replay
+/// is by construction not accepted, and on this lane the result is still
+/// `Verified(None)` when those predicates run (the `ProofTrusted` demotion
+/// happens later, at the driver's `apply_strict_trust` boundary). Overwriting
+/// the pair would therefore feed a non-accepted snapshot straight into live
+/// demotion predicates and move verdicts. Extending leaves them untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StrictProofReplayObservation {
+    /// Evidence as the strict proof-producing replay reported it.
+    pub evidence: SolveEvidenceSnapshot,
+    /// Statistics from that same replay, read at the same instant.
+    pub statistics: SolveStatisticsSnapshot,
+    /// Whether this replay went on to be installed as proof authority. `false`
+    /// is the certification-blocked case: ay built a derivation and then refused
+    /// to certify it.
+    pub authority_accepted: bool,
+    /// `ay_dpll::ProofDeclineMechanism::tag()` when ay actively declined to
+    /// record a derivation.
+    ///
+    /// Read it WITH `evidence.verification.unsat_proof_available`, per ay's
+    /// documented table: `(true, None)` = proof built and exposed;
+    /// `(false, Some(m))` = machinery ran and declined via `m`; `(false, None)`
+    /// = proof output was never requested. That last row is exactly the
+    /// ambiguity that caused the wrong censuses.
+    ///
+    /// Expect `None` from us today: ay's decline vocabulary is currently
+    /// text/parsed-source-centric (`authored-source-*`,
+    /// `preprocessor-fold-to-false`) and does not yet cover the native-API path
+    /// this replay uses. Carried for future-proofing — it is not the answer, and
+    /// a `None` here must NOT be read as "nothing was declined".
+    pub unsat_proof_decline: Option<String>,
+    /// `ay_dpll::UnknownReason::code()` for this replay — the stable reason ay
+    /// recorded for withholding a verdict.
+    ///
+    /// # This is the field `unsat_proof_decline` is not
+    ///
+    /// `unsat_proof_decline` answers "why is there NO derivation" and is
+    /// `None` on every native-API solve (its four mechanisms are reachable only
+    /// through a parsed-SMT-LIB surface AST this path never builds). Reading
+    /// that `None` as "ay refused and recorded no reason" was wrong twice: ay
+    /// records an instance-specific reason on *every* withheld solve, on this
+    /// same object, in a different field. This carries it.
+    ///
+    /// Read it WITH `statistics.proof_complete`, because the codes partition a
+    /// population that was previously conflated:
+    ///
+    /// * `self_check_rejected` / `proof_trusted` — a verdict WAS computed and a
+    ///   soundness gate took it away. This is the certification-blocked lane.
+    /// * `quantifier_*` — no verdict was ever reached, so nothing was withheld
+    ///   and no refusal occurred. `checked == total > 0 && holes == 0` does NOT
+    ///   exclude this case: those counters can be fully satisfied while
+    ///   `proof_complete` is `false`.
+    ///
+    /// A census keying only on the step counters therefore mixes the two, and
+    /// ay's own docs warn twice never to fold `ProofTrusted` or
+    /// `SelfCheckRejected` back into `Incomplete` for exactly this reason.
+    pub unknown_reason: Option<String>,
+    /// `ay_dpll::UnknownDiagnostic::detail` for this replay — the human-readable
+    /// detail recorded alongside [`Self::unknown_reason`], e.g. `"computed UNSAT
+    /// rejected by mandatory strict certification: step t0 uses unverified trust
+    /// rule"`.
+    ///
+    /// Instance-specific where the reason code is categorical, so this is what
+    /// names the offending step. Note it degrades to a static per-reason default
+    /// for the terminal-trust exit, which records no diagnostic of its own — a
+    /// byte-identical detail across obligations means that exit, not a lost
+    /// message.
+    pub unknown_detail: Option<String>,
+}
+
 /// The authority path used to discharge one retained `proof_assert` slice.
 ///
 /// `NativeEncoded` means the replay artifact contains the encoded negation of

@@ -33,6 +33,7 @@ try:
     from tests.creusot_compat.harness_targets import (
         HARNESS_PROFILE_ENV,
         _workspace_target_binary,
+        resolve_harness_binary,
         resolve_driver_profile,
         resolved_source_revisions,
     )
@@ -47,6 +48,7 @@ except ModuleNotFoundError:
     from harness_targets import (
         HARNESS_PROFILE_ENV,
         _workspace_target_binary,
+        resolve_harness_binary,
         resolve_driver_profile,
         resolved_source_revisions,
     )
@@ -272,7 +274,7 @@ def run_trust_wp_on_project(
 ) -> tuple[bool, str, int, int | None]:
     """Run cargo trust-wp on a synthesized test project."""
     harness = _resolve_harness_facade(facade)
-    cargo_trust_wp = _workspace_target_binary(workspace, "cargo-trust-wp")
+    cargo_trust_wp = resolve_harness_binary(workspace, "cargo-trust-wp")
 
     if not cargo_trust_wp.exists():
         return False, f"cargo-trust-wp not built at {cargo_trust_wp}", 0, None
@@ -508,7 +510,7 @@ def _warmup_shared_target(
         # skip), the wrapper only COMPILES deps (no verification), so this stays
         # cheap. Falls back to plain cargo if the wrapper bin isn't built yet.
         try:
-            _cargo_trust_wp = _workspace_target_binary(workspace, "cargo-trust-wp")
+            _cargo_trust_wp = resolve_harness_binary(workspace, "cargo-trust-wp")
             if _cargo_trust_wp.exists():
                 _bin_dir = _stable_harness_bin_dir(workspace, _cargo_trust_wp, harness)
                 _wrapper = _bin_dir / "trust-wp-rustc"

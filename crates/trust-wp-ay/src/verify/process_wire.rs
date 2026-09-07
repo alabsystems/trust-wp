@@ -20,8 +20,8 @@ use super::{
         Counterexample, CounterexampleValue, PostconditionInfo, ProofAssertSliceCertificate,
         ProofAssertSliceDerivation, ProofCertificateSummary, SolveEvidenceSnapshot,
         SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
-        SolveVerificationLevelSnapshot, SolveVerificationSnapshot, UnknownReason, VarOrigin,
-        VerificationOutcome, VerificationProvenance, VerificationResult,
+        SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
+        UnknownReason, VarOrigin, VerificationOutcome, VerificationProvenance, VerificationResult,
     },
     LoopVerificationOutcome,
 };
@@ -803,6 +803,56 @@ struct WireVerificationProvenance {
     native_replay_json: Option<String>,
     #[serde(default)]
     proof_assert_slice_certificates: Vec<WireProofAssertSliceCertificate>,
+    /// Diagnostics-only strict-replay observation. `#[serde(default)]` so a
+    /// worker built before this field existed still deserializes (it simply
+    /// reports "no strict replay observed").
+    #[serde(default)]
+    strict_proof_replay: Option<WireStrictProofReplayObservation>,
+    /// Diagnostics-only count of observations refused for scope mismatch.
+    /// `#[serde(default)]` for the same reason as the field above.
+    #[serde(default)]
+    strict_proof_replay_unbound: u32,
+}
+
+/// Wire form of [`StrictProofReplayObservation`]. Diagnostics only — no gate,
+/// verdict, or acceptance path reads it on either side of the boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireStrictProofReplayObservation {
+    evidence: WireSolveEvidenceSnapshot,
+    statistics: WireSolveStatisticsSnapshot,
+    authority_accepted: bool,
+    unsat_proof_decline: Option<String>,
+    /// `#[serde(default)]` so a worker built before these fields existed still
+    /// deserializes — it simply reports no recorded reason, which is exactly
+    /// what it measured.
+    #[serde(default)]
+    unknown_reason: Option<String>,
+    #[serde(default)]
+    unknown_detail: Option<String>,
+}
+
+impl WireStrictProofReplayObservation {
+    fn from_observation(observation: &StrictProofReplayObservation) -> Self {
+        Self {
+            evidence: WireSolveEvidenceSnapshot::from_snapshot(&observation.evidence),
+            statistics: WireSolveStatisticsSnapshot::from_snapshot(&observation.statistics),
+            authority_accepted: observation.authority_accepted,
+            unsat_proof_decline: observation.unsat_proof_decline.clone(),
+            unknown_reason: observation.unknown_reason.clone(),
+            unknown_detail: observation.unknown_detail.clone(),
+        }
+    }
+
+    fn into_observation(self) -> Result<StrictProofReplayObservation, String> {
+        Ok(StrictProofReplayObservation {
+            evidence: self.evidence.into_snapshot()?,
+            statistics: self.statistics.into_snapshot(),
+            authority_accepted: self.authority_accepted,
+            unsat_proof_decline: self.unsat_proof_decline,
+            unknown_reason: self.unknown_reason,
+            unknown_detail: self.unknown_detail,
+        })
+    }
 }
 
 impl WireVerificationProvenance {
@@ -833,6 +883,11 @@ impl WireVerificationProvenance {
                 .iter()
                 .map(WireProofAssertSliceCertificate::from_certificate)
                 .collect(),
+            strict_proof_replay: provenance
+                .strict_proof_replay
+                .as_ref()
+                .map(WireStrictProofReplayObservation::from_observation),
+            strict_proof_replay_unbound: provenance.strict_proof_replay_unbound,
         }
     }
 
@@ -859,6 +914,11 @@ impl WireVerificationProvenance {
                 .into_iter()
                 .map(WireProofAssertSliceCertificate::into_certificate)
                 .collect::<Result<Vec<_>, _>>()?,
+            strict_proof_replay: self
+                .strict_proof_replay
+                .map(WireStrictProofReplayObservation::into_observation)
+                .transpose()?,
+            strict_proof_replay_unbound: self.strict_proof_replay_unbound,
         })
     }
 }
@@ -1470,6 +1530,108 @@ mod tests {
             Some(proof_text.as_str()),
             "alethe_text must roundtrip verbatim through serde wire layer"
         );
+    }
+
+    /// The strict replay's recorded WITHHOLDING REASON must survive the worker
+    /// process boundary.
+    ///
+    /// The parent process is where a corpus census actually reads these keys, so
+    /// a reason captured in the worker and dropped on the wire is indistinguishable
+    /// from one that was never recorded — which is precisely the confusion these
+    /// fields exist to end. Pins `unknown_reason`/`unknown_detail` across the
+    /// serde boundary alongside `unsat_proof_decline`, whose structural `None`
+    /// was previously the only thing a census could see.
+    #[test]
+    fn wire_strict_proof_replay_roundtrips_the_recorded_unknown_reason() {
+        let evidence = SolveEvidenceSnapshot {
+            result: "unknown".to_string(),
+            model_validated: false,
+            accepted_for_consumer: false,
+            consumer_rejection: None,
+            verification: SolveVerificationSnapshot::default(),
+            verification_level: SolveVerificationLevelSnapshot::ProofChecked,
+            resource_usage: SolveResourceSnapshot::default(),
+        };
+        let observation = StrictProofReplayObservation {
+            evidence,
+            statistics: SolveStatisticsSnapshot::default(),
+            authority_accepted: false,
+            unsat_proof_decline: None,
+            unknown_reason: Some("self_check_rejected".to_string()),
+            unknown_detail: Some(
+                "computed UNSAT rejected by mandatory strict certification: \
+                 step t0 uses unverified trust rule"
+                    .to_string(),
+            ),
+        };
+        let provenance = VerificationProvenance::with_solve_time(Duration::from_millis(3))
+            .with_strict_proof_replay(Some(observation.clone()));
+        let outcome = VerificationOutcome::new(
+            VerificationResult::Unknown(UnknownReason::ProofTrusted),
+            Some(provenance),
+        );
+
+        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
+        let decoded: WireVerificationOutcome =
+            serde_json::from_str(&encoded).expect("decode wire outcome");
+        let roundtrip = decoded.into_outcome().expect("wire outcome conversion");
+
+        let replayed = roundtrip
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.strict_proof_replay.as_ref())
+            .expect("the strict replay observation must survive the wire");
+        assert_eq!(replayed, &observation, "the observation must roundtrip verbatim");
+        assert_eq!(replayed.unknown_reason.as_deref(), Some("self_check_rejected"));
+        assert!(
+            replayed
+                .unknown_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("unverified trust rule")),
+            "the instance-specific detail names the offending step and must not be \
+             truncated to the categorical code"
+        );
+    }
+
+    /// A worker built before these fields existed still deserializes, reporting
+    /// no recorded reason — which is exactly what it measured.
+    ///
+    /// Built by stripping the two keys from a CURRENT payload rather than by
+    /// pasting a frozen legacy document, so the test keeps testing the thing it
+    /// names when unrelated wire fields change.
+    #[test]
+    fn wire_strict_proof_replay_defaults_unknown_reason_when_absent() {
+        let observation = StrictProofReplayObservation {
+            evidence: SolveEvidenceSnapshot {
+                result: "unknown".to_string(),
+                model_validated: false,
+                accepted_for_consumer: false,
+                consumer_rejection: None,
+                verification: SolveVerificationSnapshot::default(),
+                verification_level: SolveVerificationLevelSnapshot::ProofChecked,
+                resource_usage: SolveResourceSnapshot::default(),
+            },
+            statistics: SolveStatisticsSnapshot::default(),
+            authority_accepted: false,
+            unsat_proof_decline: None,
+            unknown_reason: Some("proof_trusted".to_string()),
+            unknown_detail: Some("detail".to_string()),
+        };
+        let wire = WireStrictProofReplayObservation::from_observation(&observation);
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&wire).expect("encode observation");
+        let object = encoded.as_object_mut().expect("observation is a JSON object");
+        assert!(
+            object.remove("unknown_reason").is_some() && object.remove("unknown_detail").is_some(),
+            "precondition: the current payload carries both keys"
+        );
+
+        let decoded: WireStrictProofReplayObservation =
+            serde_json::from_value(encoded).expect("a payload without the keys must still decode");
+        let roundtrip = decoded.into_observation().expect("observation must convert");
+        assert!(roundtrip.unknown_reason.is_none());
+        assert!(roundtrip.unknown_detail.is_none());
     }
 
     /// Legacy payloads that omit `alethe_text` deserialize to `None` thanks

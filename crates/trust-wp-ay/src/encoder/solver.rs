@@ -697,6 +697,11 @@ impl AYEncoder {
         // Clear cached solve diagnostics from any previous call so stale data
         // is never observed by consumers. (#2639)
         self.encoding_cache.clear_solve_diagnostics();
+        // Name this solve so a strict-replay observation can be bound to it.
+        // Counted HERE rather than inside `clear_solve_diagnostics` because
+        // `drop_stale_unknown_diagnostics_after_definitive_retry` clears and
+        // restores the SAME solve's diagnostics through that method.
+        self.encoding_cache.begin_solve();
 
         if self.assertion_pipeline.is_panicked() {
             self.replay_recorder.record_check_sat("check_sat");
@@ -3226,9 +3231,22 @@ impl AYEncoder {
     /// externally by the verification pipeline). The remaining fields are
     /// read from the solver's cached statistics and configuration. (#2729)
     pub(crate) fn capture_provenance(
-        &self,
+        &mut self,
         solve_time: std::time::Duration,
     ) -> crate::shared_types::VerificationProvenance {
+        // Taken FIRST: the mutable borrow must end before the immutable reads
+        // below begin. Diagnostics only — carried alongside the
+        // evidence/statistics pair, never in place of it, so nothing on the
+        // acceptance path can see it. (#strict-replay-observation-survival)
+        //
+        // BOUND, not merely taken: an observation stamped with a different
+        // obligation/slice scope measured a different query and is refused here.
+        // See `EncodingCacheState::take_strict_proof_replay_observation_bound_to`.
+        let scope = self.encoding_cache.strict_replay_scope();
+        let strict_proof_replay = self
+            .encoding_cache
+            .take_strict_proof_replay_observation_bound_to(scope);
+        let strict_proof_replay_unbound = self.encoding_cache.strict_replay_unbound();
         let stats = self.encoding_cache.solve_statistics().cloned();
         let mut evidence = self.encoding_cache.solve_evidence().cloned();
         let structural_details = self.encoding_cache.structural_ground_consequence_details();
@@ -3260,6 +3278,26 @@ impl AYEncoder {
                     .native_replay_json()
                     .map(ToOwned::to_owned),
             )
+            // Diagnostics only. Carried ALONGSIDE the pair above, never in place
+            // of it: on the certification-blocked lane the pair holds the
+            // incremental encoder's `set_produce_proofs(false)` constants, and
+            // this holds what the strict replay actually measured.
+            .with_strict_proof_replay(strict_proof_replay)
+            .with_strict_proof_replay_unbound(strict_proof_replay_unbound)
+    }
+
+    /// Open a new obligation batch for strict-replay observation binding.
+    ///
+    /// See `EncodingCacheState::begin_obligation`.
+    pub(crate) fn begin_strict_replay_obligation(&mut self) {
+        self.encoding_cache.begin_obligation();
+    }
+
+    /// Open the next obligation slice for strict-replay observation binding.
+    ///
+    /// See `EncodingCacheState::begin_obligation_slice`.
+    pub(crate) fn begin_strict_replay_obligation_slice(&mut self) {
+        self.encoding_cache.begin_obligation_slice();
     }
 
     /// Get counterexample model (if SAT).

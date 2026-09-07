@@ -7866,12 +7866,14 @@ class TestSoundnessGapOnlyExitProofAssertEvidence:
 # consumed a full session before the profile turned out to be the variable.
 
 
-def _profile_workspace(tmp_path, *, release: bool, debug: bool):
+def _profile_workspace(tmp_path, *, release: bool, debug: bool, companions: bool = False):
     for profile, present in (("release", release), ("debug", debug)):
         if present:
             d = tmp_path / "target" / profile
             d.mkdir(parents=True, exist_ok=True)
             (d / "trust-wp-rustc").write_text("#!/bin/sh\n")
+            if companions:
+                (d / "cargo-trust-wp").write_text("#!/bin/sh\n")
     return tmp_path
 
 
@@ -7906,6 +7908,69 @@ def test_profile_unknown_value_is_refused_not_ignored(monkeypatch, tmp_path):
     ws = _profile_workspace(tmp_path, release=True, debug=True)
     with pytest.raises(RuntimeError):
         harness_targets.resolve_driver_profile(ws)
+
+
+# --- the pin must cover COMPANION binaries too -------------------------------
+# `resolve_driver_profile` pinned the driver; `cargo-trust-wp` was resolved with
+# a hardcoded `profile="debug"`, so `TRUST_WP_HARNESS_PROFILE=release` produced a
+# MIXED-profile run while reporting itself as pinned. Two costs, both real:
+# the env var's fail-closed promise was only half true, and the release lane
+# carried an undeclared dependency on `target/debug` surviving. Pruning that
+# directory during a pinned-release run -- a reasonable thing to do -- made 210
+# of 278 tests error at 0ms with `missing cargo-trust-wp`, which reads exactly
+# like a mass regression and cost a full gate.
+
+
+def test_pinned_profile_also_selects_the_companion_binary(monkeypatch, tmp_path):
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "release")
+    ws = _profile_workspace(tmp_path, release=True, debug=True, companions=True)
+    resolved = harness_targets.resolve_harness_binary(ws, "cargo-trust-wp")
+    assert resolved.parent.name == "release", (
+        "a pinned run must not silently take its companion from the other profile"
+    )
+
+
+def test_companion_pin_fails_closed_when_absent(monkeypatch, tmp_path):
+    """A debug companion is NOT a substitute for the release one that was pinned."""
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "release")
+    ws = _profile_workspace(tmp_path, release=True, debug=True, companions=False)
+    (tmp_path / "target" / "debug" / "cargo-trust-wp").write_text("#!/bin/sh\n")
+    with pytest.raises(RuntimeError, match="Refusing to fall back"):
+        harness_targets.resolve_harness_binary(ws, "cargo-trust-wp")
+
+
+def test_auto_keeps_the_historical_companion_profile(monkeypatch, tmp_path):
+    """`auto` must not move: it exists to preserve previously measured numbers.
+
+    Historically the companion always came from `target/debug`, even when the
+    driver resolved to release. Making `auto` mirror the driver would be more
+    coherent and would silently change which binaries every existing baseline
+    was produced with -- so `auto` stays on debug and only an explicit pin moves.
+    """
+    monkeypatch.delenv(harness_targets.HARNESS_PROFILE_ENV, raising=False)
+    ws = _profile_workspace(tmp_path, release=True, debug=True, companions=True)
+    assert harness_targets.resolve_driver_profile(ws)[0] == "release"
+    assert harness_targets.resolve_harness_binary(ws, "cargo-trust-wp").parent.name == "debug"
+
+
+def test_prebuild_check_looks_at_the_pinned_profile(monkeypatch, tmp_path):
+    """A debug-only build must still count as MISSING under a release pin.
+
+    Otherwise the prebuild step reports everything present, skips the build the
+    run actually needs, and the run then fails on a binary that was never built.
+    """
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "release")
+    ws = _profile_workspace(tmp_path, release=False, debug=True, companions=True)
+    missing = harness_targets._missing_harness_binaries(ws)
+    assert [p.parent.name for p in missing] == ["release", "release"]
+    assert {p.name for p in missing} == {"cargo-trust-wp", "trust-wp-rustc"}
+
+
+def test_prebuild_check_does_not_raise_before_anything_is_built(monkeypatch, tmp_path):
+    """Absent is the NORMAL pre-build state and must stay a build trigger."""
+    monkeypatch.setenv(harness_targets.HARNESS_PROFILE_ENV, "release")
+    ws = _profile_workspace(tmp_path, release=False, debug=False)
+    assert len(harness_targets._missing_harness_binaries(ws)) == 2
 
 
 # --- source-revision recording (#146) ---------------------------------------

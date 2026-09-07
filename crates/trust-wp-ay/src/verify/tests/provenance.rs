@@ -57,7 +57,7 @@ fn test_outcome_unknown_with_provenance() {
 fn test_capture_provenance_from_encoder() {
     use crate::encoder::AYEncoder;
 
-    let encoder = AYEncoder::new();
+    let mut encoder = AYEncoder::new();
     let provenance = encoder.capture_provenance(Duration::from_millis(100));
     assert_eq!(provenance.solve_time, Duration::from_millis(100));
     // Fresh encoder has no solve statistics (no check_sat call yet).

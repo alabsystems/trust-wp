@@ -31,8 +31,8 @@ pub(crate) use crate::shared_types::ClosureCaptureInfo;
 pub use crate::shared_types::{
     ProofAssertSliceCertificate, ProofAssertSliceDerivation, SolveEvidenceSnapshot,
     SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
-    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, UnknownReason,
-    VerificationProvenance,
+    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
+    UnknownReason, VerificationProvenance,
 };
 
 /// Complete verification outcome bundling the result with provenance metadata.

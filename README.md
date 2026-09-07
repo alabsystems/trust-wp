@@ -65,12 +65,27 @@ runtime, so it is not relocatable on its own. Expect to build three things.
 **1. The Trust toolchain.** A self-hosted rustc fork. Stock nightly will not
 work: the driver reads internals whose shapes differ from upstream's, so it
 does not merely fail to build, it would read the wrong thing. Build it, then
-register it under the name `rust-toolchain.toml` asks for:
+seal the finished stage2 and point rustup at the sealed artifact — that is the
+default lane, and it is the one this repo needs:
 
 ```sh
-rustup toolchain link trust <trust-checkout>/build/host/stage2
-rustup toolchain list | grep trust      # should print: trust
+# in the trust checkout, after `x.py build --stage 2`
+scripts/promote-toolchain.sh            # seals stage2, flips the `trust` channel
+rustup toolchain list -v | grep trust   # should print: trust  <toolchain root>
 ```
+
+Linking rustup straight at `build/host/stage2` also registers the channel, but
+that directory is a live build tree: every `x.py` run empties it, and a plain
+link loses the paired `rustc-private-sysroots` that an out-of-tree
+`rustc_private` driver — this one — resolves beside the compiler. The Trust
+repo's `INSTALL.md` covers both lanes and says the same thing.
+
+trust-wp's own build compiles with the Trust verification pass switched off
+(`-Ztrust-verify=off`, in `.cargo/config.toml`): building the verifier is not
+itself a verification run. Today that switch is blanket — it covers this
+project's crates as well as its dependencies — and narrowing it (host units
+off, first-party units at `-Ztrust-policy=advisory`, third-party scoped off per
+unit) is open work, not something this snapshot already does.
 
 **2. The `ay` solver, as a sibling checkout.** trust-wp consumes it by path,
 not by version — `ay-core = { path = "../ay/crates/ay-core" }` — so `ay` must
@@ -98,7 +113,7 @@ Then ask the tool whether it believes you:
 
 ```console
 $ trust-wp doctor
-trust-wp 0.4.0+g2627e22f (https://github.com/alabsystems/trust-wp)
+trust-wp 0.5.0+g<sha> (https://github.com/alabsystems/trust-wp)
 
   checkout          /path/to/trust-wp
   trust-wp-rustc    .../target/release/trust-wp-rustc (via .../target/release)
@@ -107,7 +122,7 @@ trust-wp 0.4.0+g2627e22f (https://github.com/alabsystems/trust-wp)
   trust_wp          .../deps/libtrust_wp-<hash>.rlib
   creusot_contracts .../deps/libcreusot_contracts-<hash>.rlib
   cargo             cargo 1.99.0-dev
-  active sysroot    .../build/aarch64-apple-darwin/stage2
+  active sysroot    .../toolchains/trust-<rev>
 
 ready. try:  trust-wp example > demo.rs && trust-wp demo.rs
 ```
@@ -116,9 +131,15 @@ ready. try:  trust-wp example > demo.rs && trust-wp demo.rs
 works as a setup check in a script. Only the `verify` path needs any of the
 above: the in-process verbs need nothing but `trust-wp-cli`.
 
-trust-wp reaches users inside the `trust` sysroot bundle, which exposes
-`trust-wp`, `trust-wp-driver` and `targo-trust-wp` (with back-compat aliases
-`trust-wp-rustc` and `cargo-trust-wp`).
+Building it here is currently the only way to get it. Checked 2026-08-30
+against the sealed Trust toolchain in use: its `bin/` carries `trustc`,
+`targo`, `targo-trust`, `trustd`, `trustdoc`, `ay`, `clean`, `ty` and the rest
+of the compiler's own tools, and no `trust-wp`, `trust-wp-driver` or
+`targo-trust-wp`. The Trust tree does contain a crate *named* `trust-wp`, but
+its own header describes it as a standalone compatibility boundary that the
+compiler's verifier pass does not call — it is not this engine. Distributing
+these binaries with the toolchain is an intention, not a fact; treat any
+sentence that says otherwise as stale.
 
 ## How it works
 
@@ -198,16 +219,23 @@ The executable verifier lanes ship too: the SMT encoder (`crates/trust-wp-ay`),
 the rustc driver (`crates/trust-wp-driver`) and the library facade
 (`crates/trust-wp-lib`), with their `ay`, `clean` and `trust-ir` dependencies
 pinned to public releases in the snapshot's `Cargo.toml`. Not everything that
-ships is claimed buildable everywhere: the public check is scoped to what a
-stock-toolchain consumer can compile —
+ships is claimed buildable: the release gate's check is scoped to seven
+crates —
 
 ```sh
 cargo check --locked -p trust-wp -p trust-wp-core -p trust-wp-ay \
   -p trust-wp-macros -p trust-wp-std -p creusot-contracts -p creusot-std
 ```
 
-— while the remaining crates build only against the Trust fork with its
-`rustc-dev` components (see Install). The WP-core crates build standalone, and
+— and `crates/trust-wp-driver` is deliberately outside it, because it is the
+one crate that links `rustc_private` and so needs the Trust fork *with* its
+`rustc-dev` components, which are not publicly distributed (see Install). The
+scoping axis is `rustc-dev`, not the fork: `rust-toolchain.toml` pins
+`channel = "trust"` here too, so every crate in the list is checked under the
+Trust toolchain. `trust-wp-cli`, `targo-trust-wp`, `trust-wp-lib` and
+`trust-wp-test-utils` link no compiler internals either but are not in the
+checked list, so this snapshot makes no claim about them in a bare clone.
+The WP-core crates build standalone, and
 the in-process verbs run here with nothing installed; `verify` reports exactly
 what is missing (`trust-wp doctor`). End-to-end verification of a `.rs` file,
 and the `demo/` tour that exercises it, run from this snapshot once the

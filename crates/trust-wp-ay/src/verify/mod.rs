@@ -144,8 +144,9 @@ pub use types::{
     Counterexample, CounterexampleType, CounterexampleValue, LoopVerificationOutcome,
     LoopVerificationResult, MutBorrowRequest, PostconditionInfo, ProofCertificateSummary,
     SolveEvidenceSnapshot, SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
-    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, UnknownReason, VarOrigin,
-    VerificationOutcome, VerificationProvenance, VerificationRequest, VerificationResult,
+    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
+    UnknownReason, VarOrigin, VerificationOutcome, VerificationProvenance, VerificationRequest,
+    VerificationResult,
 };
 
 /// Extract the strict proof authority produced by an AY solver's most recent

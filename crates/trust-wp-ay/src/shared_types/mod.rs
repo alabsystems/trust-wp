@@ -23,5 +23,6 @@ pub use provenance::VerificationProvenance;
 pub use solve_types::{
     proof_assert_native_replay_metadata, ProofAssertSliceCertificate, ProofAssertSliceDerivation,
     SolveEvidenceSnapshot, SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
-    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, UnknownReason,
+    SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
+    UnknownReason,
 };

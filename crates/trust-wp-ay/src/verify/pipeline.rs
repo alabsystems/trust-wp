@@ -185,6 +185,13 @@ where
         }),
     )?;
     let mut encoder = setup_result.encoder;
+    // Obligation entry for strict-replay observation binding. Placed HERE, at
+    // the top of the pipeline, rather than beside the slice loop: two of this
+    // function's provenance captures (the empty-obligation-set shortcut and the
+    // proof-assert slice-count mismatch) return before the loop is reached, and
+    // an obligation boundary that some of the obligation's own exits precede is
+    // not a boundary. Every capture below is now inside this batch's scope.
+    encoder.begin_strict_replay_obligation();
     let effective_logic_fns = setup_result.filtered_logic_fns.as_deref();
     let effective_mode_overrides = setup_result.filtered_mode_overrides.as_deref();
 
@@ -511,6 +518,13 @@ where
     const MIN_SLICE_TIMEOUT: Duration = Duration::from_secs(3);
 
     for (slice_position, slice) in slices.iter().enumerate() {
+        // Name this slice so a strict replay run inside it is bound to it. A
+        // multi-`ensures` function solves several unrelated queries against one
+        // encoder; without this, whichever slice happened to record last was
+        // reported on every one of them. (`vector/09_capacity` reported its
+        // quantifier-free slice's accepted certificate under the `forall`
+        // slice's refusal.)
+        encoder.begin_strict_replay_obligation_slice();
         let slice_ordinal = u64::try_from(slice_position).unwrap_or(u64::MAX);
         let prepared_claim = if proof_assert_mode {
             prepared_slice_claims[slice_position].clone()
@@ -1004,6 +1018,14 @@ where
                         // solve evidence for the proven goal was recorded in
                         // the caller's thread-local slot BEFORE the base
                         // recheck ran.
+                        //
+                        // Same aggregate rule as the normal completion path
+                        // below: this provenance reports a verdict aggregated
+                        // over this slice plus every skipped one, so no single
+                        // slice's strict replay describes it.
+                        if slices.len() > 1 {
+                            encoder.begin_strict_replay_obligation_slice();
+                        }
                         encoder.ensure_structural_provenance("base-recheck-abort-rescued-slice");
                         let mut provenance = encoder.capture_provenance(solve_start.elapsed());
                         if proof_assert_mode {
@@ -1050,6 +1072,17 @@ where
         }
     }
 
+    // Leave the per-slice scopes before capturing the AGGREGATE provenance.
+    //
+    // With one slice the aggregate IS that slice's result, so the slice's own
+    // strict-replay observation legitimately describes what is being reported
+    // and the scope is left alone. With two or more, the reported verdict is an
+    // aggregate over queries no single replay measured: advancing the scope one
+    // more step means no slice's observation can claim it, and the refusal is
+    // counted in `strict_proof_replay_unbound` rather than silently dropped.
+    if slices.len() > 1 {
+        encoder.begin_strict_replay_obligation_slice();
+    }
     // Capture provenance from the encoder after all slices complete (#2729).
     encoder.ensure_structural_provenance("completed-obligation-slices");
     let result = obligation_slices::aggregate_slice_results(slice_results);

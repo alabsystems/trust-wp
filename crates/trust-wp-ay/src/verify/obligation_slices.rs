@@ -250,6 +250,39 @@ pub(crate) struct SliceOutcome {
 /// When `results` is empty, returns `Verified(None)`; callers that want proof
 /// authority must discharge the empty conjunction through the checked trivial
 /// proof lane.
+///
+/// # The deciding slice, and why reporting it here does not work
+///
+/// 760fac2 named a follow-up: attribute a multi-slice obligation's diagnostic
+/// strict-replay measurement to the slice that decided its verdict, which
+/// "needs the deciding slice index out of `aggregate_slice_results`". Both parts
+/// were built and measured. Recording the outcome so it is not attempted a
+/// third time:
+///
+/// * The deciding slice IS well-defined, for `Failed`, `Unknown` and `Assumed`:
+///   each returns one slice's payload verbatim (`first_failed`'s counterexample,
+///   `first_unknown`'s reason, `first_assumed`'s reason), and the `_idx` those
+///   arms already discard identifies it. It is NOT well-defined for a `Verified`
+///   aggregate over two or more slices, whose summary is the conjunction of every
+///   verified slice's summary via [`combine_proof_summaries`] — no single replay
+///   measured that, and one accepted conjunct is not a certificate for the
+///   conjunction.
+/// * ★ The index to thread out is the POSITION, never [`SliceResult::index`].
+///   [`split_ensures`] gives every top-level conjunct of one `ensures` clause the
+///   SAME source index, so `a && b` yields two independent slices both reporting
+///   `index = 0`. Keying a per-slice measurement by that number re-fuses the two
+///   conjuncts and lets one answer for the other — 760fac2's defect rebuilt on a
+///   different key.
+/// * It recovers nothing anyway. The observation is bound on
+///   (obligation, slice, SOLVE) and a later `check_sat` on the same slice — the
+///   base/vacuity recheck — unbinds it before the slice ends, so no measurement
+///   survives to the slice boundary for the aggregate to attribute. Measured:
+///   `vector/09_capacity::change_capacity` and `closures/13_ref_box::test7` each
+///   produced two such refusals and still reported `strict_replay=none`. See
+///   `solve_details_tests::test_a_later_solve_on_the_same_slice_already_unbinds_the_observation`.
+///
+/// The blocker is the `solve` component, not slice attribution. Relaxing it is a
+/// scope loosening, which is the regression the binding exists to prevent.
 pub(crate) fn aggregate_slice_results(results: Vec<SliceResult>) -> VerificationResult {
     let mut first_failed: Option<(usize, Counterexample)> = None;
     let mut first_unknown: Option<(usize, UnknownReason)> = None;

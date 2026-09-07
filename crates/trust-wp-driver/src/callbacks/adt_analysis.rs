@@ -266,7 +266,7 @@ fn collect_adt_decls_from_ty<'tcx>(
             }
 
             let adt_name = tcx.item_name(did).to_string();
-            if is_builtin_adt_model_name(&adt_name) {
+            if builtin_adt_model_sort(&adt_name).is_some() {
                 for inner in substs.types() {
                     collect_adt_decls_from_ty(tcx, inner, seen_adts, decls);
                 }
@@ -720,6 +720,66 @@ pub fn touch(a: Rc<RcPayload>, b: Arc<ArcPayload>) {
         assert!(
             decls.get("ArcPayload").is_some(),
             "the Arc payload type must still be declared; got keys: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn test_model_carrier_types_emit_no_decl_but_keep_the_payload() {
+        // The seven names in `builtin_adt_model_sort` are modelled on a
+        // canonical CARRIER sort (Seq / FMap / Mapping), not on a datatype
+        // built from their private fields. Emitting an `AdtDecl` for one is
+        // never useful — `sort_from_expr_sort` refuses to consult it for these
+        // names (`is_primary_model_name`, resolution.rs) — and for the
+        // single-field wrappers it is actively fatal: `FMap { map: HashMap }`
+        // maps its one field back to the FMap carrier, producing the
+        // self-referential `FMap ::= FMap(fmap_map: FMap)` with no base case,
+        // which ay's renderer correctly refuses. The whole obligation is then
+        // poisoned ("total selector definitions withheld") and the test can
+        // only report Unknown(Incomplete). `Seq { elements: Vec }` has the
+        // identical shape.
+        //
+        // Skipping them also stops the descent through their PRIVATE fields
+        // into allocator/hashbrown internals (RawVec, RawVecInner, Unique,
+        // PhantomData, RawTable, ...) which carry zero logical content, while
+        // the generic ARGUMENTS are still walked so real payload types keep
+        // their declarations.
+        let source = r#"
+use std::collections::HashMap;
+
+pub struct Elem { pub v: i32 }
+pub struct Key { pub k: i32 }
+
+pub fn touch(a: Vec<Elem>, b: HashMap<Key, Elem>) {
+    let _ = a;
+    let _ = b;
+}
+"#;
+
+        let decls = collect_adt_decls(source, "touch");
+        let keys: Vec<_> = decls.keys().collect();
+
+        for carrier in ["Vec", "HashMap", "Seq", "FMap"] {
+            assert!(
+                decls.get(carrier).is_none(),
+                "{carrier} is a canonical model carrier and must NOT produce an \
+                 AdtDecl; got keys: {keys:?}"
+            );
+        }
+        for internal in ["RawVec", "RawVecInner", "Unique", "PhantomData"] {
+            assert!(
+                decls.get(internal).is_none(),
+                "{internal} is an allocator internal reached only through a model \
+                 carrier's private fields and must NOT be declared; got keys: {keys:?}"
+            );
+        }
+
+        assert!(
+            decls.get("Elem").is_some(),
+            "the element payload must still be declared; got keys: {keys:?}"
+        );
+        assert!(
+            decls.get("Key").is_some(),
+            "the key payload must still be declared; got keys: {keys:?}"
         );
     }
 
