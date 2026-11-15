@@ -179,17 +179,17 @@ fn record_projected_write_alias_mapping(
 }
 
 fn projected_write_alias_name(name: &str) -> Option<String> {
-    if let Some(local_id) = name.strip_prefix("_local_") {
+    if let Some(local_id) = name.strip_prefix("$local_") {
         return local_id
             .chars()
             .all(|ch| ch.is_ascii_digit())
-            .then(|| format!("call_{local_id}"));
+            .then(|| format!("$call_{local_id}"));
     }
-    if let Some(local_id) = name.strip_prefix("call_") {
+    if let Some(local_id) = name.strip_prefix("$call_") {
         return local_id
             .chars()
             .all(|ch| ch.is_ascii_digit())
-            .then(|| format!("_local_{local_id}"));
+            .then(|| format!("$local_{local_id}"));
     }
     None
 }

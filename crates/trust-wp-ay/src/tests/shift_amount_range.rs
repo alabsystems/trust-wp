@@ -164,8 +164,8 @@ fn test_verify_shift_unconstrained_amount_not_verified() {
 /// End-to-end RED, the exact int-shift-full shape: an over-wide LITERAL
 /// amount with an EMPTY postcondition set must fail. This pins the pipeline's
 /// empty-ensures path: body side obligations must be proved even when there
-/// is no user postcondition (previously the empty-obligation-set shortcut
-/// returned Verified without consulting them).
+/// is no user postcondition; an empty-obligation-set shortcut that returns
+/// Verified without consulting them is a false accept.
 #[test]
 #[timeout(30000)]
 fn test_verify_over_wide_literal_shift_with_empty_ensures_not_verified() {
@@ -174,7 +174,7 @@ fn test_verify_over_wide_literal_shift_with_empty_ensures_not_verified() {
     let result =
         verify_function_with_modes(VerificationRequest::new(&[], &[]).return_expr(Some(&body)));
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "1u8 >> 8 with an empty postcondition set must fail, got: {result:?}"
     );
 }
@@ -200,8 +200,8 @@ fn test_verify_shift_with_range_preconditions_succeeds() {
 }
 
 /// End-to-end GREEN: an in-range literal amount with an empty postcondition
-/// set keeps the historical empty-obligation-set Verified result — no
-/// obligation is collected, so the trivial-goal substitution stays inert.
+/// set is Verified — no obligation is collected, so the trivial-goal
+/// substitution stays inert.
 #[test]
 #[timeout(30000)]
 fn test_verify_in_range_literal_shift_with_empty_ensures_succeeds() {
@@ -220,9 +220,9 @@ fn test_verify_in_range_literal_shift_with_empty_ensures_succeeds() {
 /// the amount provably in range ONLY under the else condition, must VERIFY.
 ///
 /// `assert_guarded_result_branch_equality` re-encodes each branch body
-/// outside `encode_pure_impl`'s Ite traversal; before the path-condition
-/// fix its obligation was collected UNGUARDED, so the solver "failed" the
-/// range check at `n == 0` — a branch the model never takes.
+/// outside `encode_pure_impl`'s Ite traversal, so its side obligations must
+/// carry the branch's path condition; collected UNGUARDED, the range check
+/// "fails" at `n == 0` — a branch the model never takes.
 #[test]
 #[timeout(30000)]
 fn test_verify_ite_else_branch_obligation_is_branch_guarded() {
@@ -239,7 +239,7 @@ fn test_verify_ite_else_branch_obligation_is_branch_guarded() {
     let result = verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures).return_expr(Some(&body)),
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
+    // KNOWN-CLASS PIN (upstream proof-trusted certification gap): the verdict
     // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.

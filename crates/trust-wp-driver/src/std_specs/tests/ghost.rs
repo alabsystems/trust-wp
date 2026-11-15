@@ -245,7 +245,32 @@ fn test_lookup_std_spec_trust_wp_ghost_module_path() {
 fn test_lookup_std_spec_trust_wp_facade_perm() {
     let perm_new = lookup_std_spec("trust_wp::Perm::<i32>::new")
         .expect("trust_wp::Perm::new facade path should resolve via normalization");
-    assert_eq!(perm_new.ensures, vec!["result.0 == *result.1"]);
+    assert_eq!(
+        perm_new.ensures,
+        vec!["result.0 == *result.1", "*result.1.ward() == result.0"]
+    );
+}
+
+/// Each raw-pointer permission call owes Creusot's `ptr == *own.ward()`, and
+/// each constructor states the ward that discharges it.
+#[test]
+fn test_perm_pointer_calls_owe_the_guarded_pointer() {
+    for method in ["as_ref", "as_mut", "to_box"] {
+        let spec = lookup_std_spec(&format!("creusot_std::ghost::perm::Perm::{method}"))
+            .unwrap_or_else(|| panic!("Perm::{method} spec should exist"));
+        assert_eq!(spec.requires, vec!["ptr == *own.ward()"], "Perm::{method}");
+    }
+    for method in ["new", "from_box", "from_ref", "from_mut"] {
+        let spec = lookup_std_spec(&format!("creusot_std::ghost::perm::Perm::{method}"))
+            .unwrap_or_else(|| panic!("Perm::{method} spec should exist"));
+        assert!(
+            spec.ensures
+                .iter()
+                .any(|e| e == "*result.1.ward() == result.0"),
+            "Perm::{method} should state the ward it returns, got {:?}",
+            spec.ensures
+        );
+    }
 }
 
 /// Facade-root `trust_wp::Seq::*` logic-type paths resolve via normalization (#2335).
@@ -541,10 +566,10 @@ fn test_lookup_std_spec_snapshot_fmap_insert() {
 /// Resource::alloc — the allocated resource's view is the snapshot payload.
 ///
 /// Spec's own law: Creusot `creusot-std/src/ghost/resource.rs`
-/// `Resource::alloc`: `#[ensures(result@ == *r)]`. Unfixed (empty spec) the
+/// `Resource::alloc`: `#[ensures(result@ == *r)]`. Without it (empty spec) the
 /// `result@` view is completely free and `Authority::new`-style wrappers get
-/// fabricated counterexamples. (ce-census 2026-08-20,
-/// resource_algebras/fmap_view_view.rs `new`)
+/// fabricated counterexamples (Creusot `resource_algebras/fmap_view_view.rs`
+/// `new`).
 #[test]
 fn test_lookup_std_spec_resource_alloc_view_law() {
     for path in [

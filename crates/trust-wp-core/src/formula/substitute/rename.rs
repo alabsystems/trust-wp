@@ -104,7 +104,7 @@ pub(super) fn fresh_var_name(
     depth_limit: Option<usize>,
 ) -> String {
     for index in 0u32.. {
-        let candidate = format!("{base}_\u{03b1}{index}");
+        let candidate = format!("{base}$\u{03b1}{index}");
         if !binding.contains_key(&candidate)
             && !binding.visible_value_mentions(&candidate, depth_limit)
             && !avoid_in
@@ -344,4 +344,131 @@ pub(super) fn rename_free_var_inner(
         | PureExpr::Exists { .. }
         | PureExpr::Closure { .. } => expr.clone(),
     }
+}
+
+impl PureExpr {
+    /// This expression with every binder (`forall`, `exists`, `let`, a
+    /// `match` arm's pattern, a closure parameter) of a name `apart` accepts
+    /// renamed to a fresh name, with the occurrences it binds. A pass that
+    /// reads a name as a program variable (a parameter's sort, a `&mut`
+    /// parameter's final value) then cannot reach a binder that shadows it.
+    #[must_use]
+    pub fn rename_binders_apart(&self, apart: impl Fn(&str) -> bool) -> PureExpr {
+        let options = CaptureAvoidingSubstOptions::default();
+        let mut counter = 0usize;
+        let mut fresh = |name: &str, scope: &[&PureExpr]| loop {
+            let candidate = format!("{name}$b{counter}");
+            counter += 1;
+            if !scope
+                .iter()
+                .any(|expr| expr_has_free_occurrence(expr, &candidate, &options))
+            {
+                return candidate;
+            }
+        };
+        self.rewrite_bottom_up(|node| match node {
+            PureExpr::Forall {
+                var,
+                var_sort,
+                body,
+                triggers,
+            } if apart(&var) => {
+                let (var, body, triggers) =
+                    rename_quantifier(&var, &body, &triggers, &mut fresh, &options);
+                PureExpr::Forall {
+                    var,
+                    var_sort,
+                    body,
+                    triggers,
+                }
+            }
+            PureExpr::Exists {
+                var,
+                var_sort,
+                body,
+                triggers,
+            } if apart(&var) => {
+                let (var, body, triggers) =
+                    rename_quantifier(&var, &body, &triggers, &mut fresh, &options);
+                PureExpr::Exists {
+                    var,
+                    var_sort,
+                    body,
+                    triggers,
+                }
+            }
+            PureExpr::Let { var, value, body } if apart(&var) => {
+                let renamed = fresh(&var, &[&body]);
+                PureExpr::Let {
+                    body: Arc::new(rename_free_var(&body, &var, &renamed, &options)),
+                    var: renamed,
+                    value,
+                }
+            }
+            PureExpr::Match { scrutinee, arms }
+                if arms
+                    .iter()
+                    .any(|arm| arm.pattern.bound_names().into_iter().any(&apart)) =>
+            {
+                PureExpr::Match {
+                    scrutinee,
+                    arms: arms
+                        .into_iter()
+                        .map(|arm| {
+                            let mut pattern = arm.pattern.clone();
+                            let mut body = arm.body;
+                            for name in arm.pattern.bound_names() {
+                                if apart(name) {
+                                    let renamed = fresh(name, &[&body]);
+                                    body = rename_free_var(&body, name, &renamed, &options);
+                                    pattern = pattern.rename_binding(name, &renamed);
+                                }
+                            }
+                            MatchArm { pattern, body }
+                        })
+                        .collect(),
+                }
+            }
+            PureExpr::Closure { mut params, body }
+                if params.iter().any(|(param, _)| apart(param)) =>
+            {
+                let mut body = body.as_ref().clone();
+                for (param, _) in &mut params {
+                    if apart(param) {
+                        let renamed = fresh(param, &[&body]);
+                        body = rename_free_var(&body, param, &renamed, &options);
+                        *param = renamed;
+                    }
+                }
+                PureExpr::Closure {
+                    params,
+                    body: Arc::new(body),
+                }
+            }
+            node => node,
+        })
+    }
+}
+
+fn rename_quantifier(
+    var: &str,
+    body: &PureExpr,
+    triggers: &[Vec<PureExpr>],
+    fresh: &mut impl FnMut(&str, &[&PureExpr]) -> String,
+    options: &CaptureAvoidingSubstOptions,
+) -> (String, Arc<PureExpr>, Vec<Vec<PureExpr>>) {
+    let mut scope: Vec<&PureExpr> = vec![body];
+    scope.extend(triggers.iter().flatten());
+    let renamed = fresh(var, &scope);
+    let body = Arc::new(rename_free_var(body, var, &renamed, options));
+    let triggers = triggers
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|expr| rename_free_var(expr, var, &renamed, options))
+                .collect()
+        })
+        .collect();
+    (renamed, body, triggers)
 }

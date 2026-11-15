@@ -163,9 +163,9 @@ fn inc_max_repeat_preservation_full_pipeline() {
     let elem = PureExpr::Var("elem".to_string(), None);
 
     // Range iterator state variables
-    let iter_state = PureExpr::Var("__trust_wp_for_iter_state_5".to_string(), None);
-    let iter_state_next = PureExpr::Var("__trust_wp_for_iter_state_next_5".to_string(), None);
-    let iter_old = PureExpr::Var("__trust_wp_for_iter_old_5".to_string(), None);
+    let iter_state = PureExpr::Var("$for_iter_state_5".to_string(), None);
+    let iter_state_next = PureExpr::Var("$for_iter_state_next_5".to_string(), None);
+    let iter_old = PureExpr::Var("$for_iter_old_5".to_string(), None);
 
     // Helper: method call
     fn mc(receiver: &PureExpr, method: &str) -> PureExpr {
@@ -332,12 +332,9 @@ fn inc_max_repeat_preservation_full_pipeline() {
         },
     );
     // iter_state' = iter_state_next
-    body_effect.insert(
-        "__trust_wp_for_iter_state_5".to_string(),
-        iter_state_next.clone(),
-    );
+    body_effect.insert("$for_iter_state_5".to_string(), iter_state_next.clone());
 
-    let modified_vars: Vec<&str> = vec!["a", "b", "produced", "__trust_wp_for_iter_state_5"];
+    let modified_vars: Vec<&str> = vec!["a", "b", "produced", "$for_iter_state_5"];
     let transition_facts = vec![tf_end, tf_guard, tf_step];
     let config = LoopEncoderConfig::default()
         .with_transition_facts(&transition_facts)

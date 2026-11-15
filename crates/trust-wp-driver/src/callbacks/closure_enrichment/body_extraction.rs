@@ -284,7 +284,7 @@ pub(in crate::callbacks) fn try_extract_closure_body_with_effects(
     };
     for bb_data in closure_body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
-            if let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+            if let rustc_middle::mir::StatementKind::Assign((place, rvalue)) = &stmt.kind {
                 if !place.projection.is_empty() {
                     continue;
                 }
@@ -315,7 +315,7 @@ pub(in crate::callbacks) fn try_extract_closure_body_with_effects(
         changed = false;
         for bb_data in closure_body.basic_blocks.iter() {
             for stmt in &bb_data.statements {
-                if let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+                if let rustc_middle::mir::StatementKind::Assign((place, rvalue)) = &stmt.kind {
                     if !place.projection.is_empty() || local_to_capture.contains_key(&place.local) {
                         continue;
                     }
@@ -385,7 +385,7 @@ pub(in crate::callbacks) fn try_extract_closure_body_with_effects(
     use crate::mir_analysis::translate::translate_rvalue;
     for bb_data in closure_body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
-            if let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+            if let rustc_middle::mir::StatementKind::Assign((place, rvalue)) = &stmt.kind {
                 let projs: Vec<_> = place.projection.iter().collect();
                 if !projs.is_empty() && projs.iter().all(|p| matches!(p, ProjectionElem::Deref)) {
                     let Some(&capture_idx) = local_to_capture.get(&place.local) else {
@@ -463,7 +463,7 @@ pub(in crate::callbacks) fn try_extract_closure_body_with_effects(
                 }
             }
             // Track intermediate local assignments for RHS translation context
-            if let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+            if let rustc_middle::mir::StatementKind::Assign((place, rvalue)) = &stmt.kind {
                 if place.projection.is_empty() {
                     if let Some(expr) = translate_rvalue(rvalue, &local_exprs, Some(closure_body)) {
                         local_exprs.insert(place.local, expr);
@@ -564,4 +564,99 @@ fn capture_field_eventually_contains_mut_ref<'tcx>(
         return false;
     };
     crate::mir_analysis::type_eventually_contains_mut_ref(tcx, *field_ty)
+}
+
+/// Whether `name` is `<integer type>::MIN` or `<integer type>::MAX`, the
+/// spelling every encoder reads as that constant. A Rust identifier cannot
+/// contain `::`, so no formal, capture or temp is spelled this way.
+fn is_integer_bound_constant(name: &str) -> bool {
+    const INTEGER_TYPES: &[&str] = &[
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    ];
+    name.rsplit_once("::")
+        .is_some_and(|(ty, bound)| matches!(bound, "MIN" | "MAX") && INTEGER_TYPES.contains(&ty))
+}
+
+/// The weakest precondition of a closure's own body, over its formals.
+///
+/// Returns `(formals, wp)`, or `None` when the WP cannot be computed in full —
+/// the body did not extract, a spec clause was dropped, or an obligation names
+/// something other than a formal (a capture, a call temp), which no caller-side
+/// term denotes. A PARTIAL weakest precondition is strictly weaker than the
+/// real one, i.e. a false credit, so there is no partial answer here. An
+/// integer type's bound (`isize::MAX`, which a std spec's panic precondition
+/// names) is not a name at all: it denotes the same constant on both sides.
+///
+/// Creusot makes a closure WITHOUT a user contract transparent: its
+/// `precondition` predicate is DEFINED as this WP with the argument tuple
+/// destructured into the formals — `closure_pre`'s contract-free branch, under
+/// a `let` binding the argument tuple. `true` is the one answer that is never
+/// right: the callee preconditions the body owes would then be owed by nobody.
+pub(in crate::callbacks) fn closure_body_precondition_over_formals(
+    tcx: TyCtxt<'_>,
+    closure_def_id: DefId,
+    user_specs: &HashMap<DefId, StdSpec>,
+    trait_specs: &HashMap<DefId, StdSpec>,
+    extern_specs: &HashMap<String, StdSpec>,
+) -> Option<(Vec<String>, PureExpr)> {
+    if !matches!(tcx.def_kind(closure_def_id), DefKind::Closure) {
+        return None;
+    }
+    if !tcx.is_mir_available(closure_def_id) {
+        return None;
+    }
+    let Ok(closure_body) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tcx.optimized_mir(closure_def_id)
+    })) else {
+        return None;
+    };
+    if effective_basic_block_count(closure_body) > TRUST_WP_CLOSURE_INLINE_BB_THRESHOLD {
+        return None;
+    }
+    let param_names = resolve_arg_names_or_warn(tcx, closure_def_id, None);
+    let mir_param_names = closure_mir_arg_names(&param_names);
+    let outcome = crate::mir_analysis::extract_return_expr_with_context_detailed(
+        tcx,
+        closure_body,
+        &mir_param_names,
+        user_specs,
+        trait_specs,
+        extern_specs,
+    );
+    // Anything the walk could not model, and any clause it had to drop, leaves
+    // an obligation list that is only part of what the body owes. A partial
+    // weakest precondition is a weaker one, i.e. a false credit.
+    if !outcome.diagnostics.entries.is_empty() || outcome.effects.dropped_spec_clauses > 0 {
+        return None;
+    }
+    // A body that returns `()` has no return expression to extract; for any
+    // other return type a missing one means the walk stopped short.
+    if outcome.value.is_none()
+        && !closure_body.local_decls[rustc_middle::mir::Local::from_u32(0)]
+            .ty
+            .is_unit()
+    {
+        return None;
+    }
+    let formals: std::collections::HashSet<&str> = param_names.iter().map(String::as_str).collect();
+    let mut conjunction = PureExpr::Bool(true);
+    for obligation in &outcome.effects.obligations {
+        let mut names_only_formals = true;
+        obligation.for_each_recursive(|node| {
+            if let PureExpr::Var(name, _) = node {
+                names_only_formals &=
+                    formals.contains(name.as_str()) || is_integer_bound_constant(name);
+            }
+        });
+        if !names_only_formals {
+            return None;
+        }
+        conjunction = match conjunction {
+            PureExpr::Bool(true) => obligation.clone(),
+            existing => {
+                PureExpr::BinOp(Arc::new(existing), BinOp::And, Arc::new(obligation.clone()))
+            }
+        };
+    }
+    Some((param_names, conjunction))
 }

@@ -10,7 +10,7 @@ use std::{
 };
 
 use rustc_middle::mir::{BasicBlock, Body, Local, Operand, SwitchTargets};
-use trust_wp_core::formula::{BinOp, PureExpr};
+use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
 
 use super::{
     super::super::translate::{
@@ -98,19 +98,36 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
             );
         }
 
+        // Each branch's path carries its own condition and the negation of
+        // every condition tested before it, the order `merge_branch_values`
+        // resolves the arms in. An arm filtered out above as a loop exit adds
+        // no conjunct: the path it leaves out does not continue the iteration.
         let mut branch_results: Vec<(Option<PureExpr>, BodyExtractionState)> =
             Vec::with_capacity(in_loop_branches.len());
+        let mut earlier_conditions_false: Vec<PureExpr> = Vec::new();
         for branch in in_loop_branches {
+            let mut branch_entry = state.clone();
+            branch_entry
+                .path_guard
+                .extend(earlier_conditions_false.iter().cloned());
+            if let Some(condition) = &branch.condition {
+                branch_entry.path_guard.push(condition.clone());
+                earlier_conditions_false
+                    .push(PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())));
+            }
             let branch_state = self.extract_from_block(
                 branch.target,
                 entered_header,
-                state.clone(),
+                branch_entry,
                 visited.clone(),
             )?;
             branch_results.push((branch.condition, branch_state));
         }
 
-        merge_branch_states(branch_results, self.local_to_name)
+        let mut merged = merge_branch_states(branch_results, self.local_to_name)?;
+        merged.path_guard = state.path_guard;
+        merged.path_guard_opaque = state.path_guard_opaque;
+        Some(merged)
     }
 
     /// Walk all in-loop SwitchInt targets when the discriminant is opaque.
@@ -139,11 +156,18 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
             return self.extract_from_block(in_loop_targets[0], entered_header, state, visited);
         }
 
+        // No condition names these arms, so nothing recorded inside one can
+        // be guarded by it.
+        let mut branch_entry = state.clone();
+        branch_entry.path_guard_opaque = true;
         let mut branch_states: Vec<BodyExtractionState> = Vec::with_capacity(in_loop_targets.len());
         for target in in_loop_targets {
-            if let Some(bs) =
-                self.extract_from_block(target, entered_header, state.clone(), visited.clone())
-            {
+            if let Some(bs) = self.extract_from_block(
+                target,
+                entered_header,
+                branch_entry.clone(),
+                visited.clone(),
+            ) {
                 branch_states.push(bs);
             }
             // Branches that fail extraction are skipped — the conservative
@@ -153,11 +177,14 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
         if branch_states.is_empty() {
             return None;
         }
-        if branch_states.len() == 1 {
-            return branch_states.into_iter().next();
-        }
-
-        Some(merge_branch_states_conservative(&branch_states))
+        let mut merged = if branch_states.len() == 1 {
+            branch_states.into_iter().next()?
+        } else {
+            merge_branch_states_conservative(&branch_states)
+        };
+        merged.path_guard = state.path_guard;
+        merged.path_guard_opaque = state.path_guard_opaque;
+        Some(merged)
     }
 }
 
@@ -348,19 +375,47 @@ fn merge_branch_states(
     let length_only_mode = branches
         .iter()
         .any(|(_, state)| state.index_mut_length_only_on_value_failure);
+    let branch_states: Vec<BodyExtractionState> =
+        branches.iter().map(|(_, state)| state.clone()).collect();
+    let (call_facts, dropped_premises) = union_branch_premises(&branch_states);
     Some(BodyExtractionState {
         working_exprs: merged_working_exprs,
         effects: merged_effects,
         deref_effects: merged_deref_effects,
         double_deref_effects: merged_double_deref_effects,
-        pending_index_mut: merge_pending_index_mut_conservative(
-            &branches
-                .iter()
-                .map(|(_, state)| state.clone())
-                .collect::<Vec<_>>(),
-        ),
+        pending_index_mut: merge_pending_index_mut_conservative(&branch_states),
         index_mut_length_only_on_value_failure: length_only_mode,
+        // The caller restores the pre-switch path.
+        path_guard: Vec::new(),
+        path_guard_opaque: false,
+        call_facts,
+        dropped_premises,
     })
+}
+
+/// Every branch's facts and dropped premises, once each.
+///
+/// A fact is guarded by the path that recorded it, so it stays true on every
+/// path of the merged state; a premise dropped on any path is dropped for the
+/// iteration.
+fn union_branch_premises(
+    branches: &[BodyExtractionState],
+) -> (Vec<PureExpr>, Vec<super::DroppedPremise>) {
+    let mut call_facts: Vec<PureExpr> = Vec::new();
+    let mut dropped: Vec<super::DroppedPremise> = Vec::new();
+    for branch in branches {
+        for fact in &branch.call_facts {
+            if !call_facts.contains(fact) {
+                call_facts.push(fact.clone());
+            }
+        }
+        for premise in &branch.dropped_premises {
+            if !dropped.contains(premise) {
+                dropped.push(premise.clone());
+            }
+        }
+    }
+    (call_facts, dropped)
 }
 
 /// Conservative merge for opaque-condition branches: keep only effects that
@@ -415,6 +470,7 @@ fn merge_branch_states_conservative(branches: &[BodyExtractionState]) -> BodyExt
         }
     }
 
+    let (call_facts, dropped_premises) = union_branch_premises(branches);
     BodyExtractionState {
         working_exprs,
         effects,
@@ -424,6 +480,11 @@ fn merge_branch_states_conservative(branches: &[BodyExtractionState]) -> BodyExt
         index_mut_length_only_on_value_failure: branches
             .iter()
             .any(|state| state.index_mut_length_only_on_value_failure),
+        // The caller restores the pre-switch path.
+        path_guard: Vec::new(),
+        path_guard_opaque: false,
+        call_facts,
+        dropped_premises,
     }
 }
 

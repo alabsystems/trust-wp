@@ -301,27 +301,6 @@ impl SwitchTarget {
         format!("Adt_{}", names.join("_"))
     }
 
-    /// The constructor name for wrapping a single value (e.g., `Some` for
-    /// `OptionInt`, `Ok` for `ResultIntInt`).
-    ///
-    /// For user-defined enums, returns the first constructor with arity >= 1.
-    ///
-    /// Used when re-wrapping a scalar body result that MIR unwrapped. (#1055)
-    pub(crate) fn value_constructor_name(&self) -> &str {
-        match self {
-            Self::OptionInt | Self::OptionPayload(_) => "Some",
-            Self::ResultIntInt => "Ok",
-            Self::UserDefined { constructors, .. } => {
-                let ctor = constructors
-                    .iter()
-                    .find(|(_, sorts)| !sorts.is_empty())
-                    .or(constructors.first())
-                    .expect("UserDefined must have at least one constructor");
-                short_constructor_name(&ctor.0)
-            }
-        }
-    }
-
     /// Build the ay `DatatypeSort` for this switch target.
     pub(crate) fn datatype(&self) -> DatatypeSort {
         match self {

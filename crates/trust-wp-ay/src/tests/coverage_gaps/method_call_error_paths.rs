@@ -5,9 +5,9 @@
 use super::*;
 use crate::verify::{verify_function_with_modes, VerificationRequest, VerificationResult};
 
-/// Unknown method calls now return EncodingError instead of silently
-/// creating an Int-returning UF (#1820). This converts potential unsoundness
-/// (wrong return sort) into an explicit failure.
+/// Unknown method calls return EncodingError rather than silently creating an
+/// Int-returning UF (#1820): a fallback with the wrong return sort would be a
+/// hidden unsoundness, so it is an explicit failure instead.
 #[test]
 #[timeout(30000)]
 fn test_unknown_method_call_returns_error() {
@@ -26,9 +26,9 @@ fn test_unknown_method_call_returns_error() {
     );
 }
 
-/// Wrong-arity method calls on Int-sorted receivers now return errors (#1820).
-/// E.g., `x.contains()` (0 args) — dispatch has `"contains" if args.len() == 1`.
-/// Previously fell through to Int UF; now returns EncodingError.
+/// Wrong-arity method calls on Int-sorted receivers return EncodingError (#1820).
+/// E.g., `x.contains()` (0 args) — dispatch has `"contains" if args.len() == 1`,
+/// so nothing matches, and the call must not fall through to an Int UF.
 #[test]
 #[timeout(30000)]
 fn test_contains_wrong_arity_returns_error() {
@@ -43,8 +43,8 @@ fn test_contains_wrong_arity_returns_error() {
     );
 }
 
-/// `x.subsequence(0)` with 1 arg (expected 2) now returns error (#1820).
-/// Previously fell through to Int UF.
+/// `x.subsequence(0)` with 1 arg (expected 2) returns EncodingError rather
+/// than falling through to an Int UF (#1820).
 #[test]
 #[timeout(30000)]
 fn test_subsequence_wrong_arity_returns_error() {
@@ -59,11 +59,10 @@ fn test_subsequence_wrong_arity_returns_error() {
     );
 }
 
-/// Unknown method on a Seq-sorted View receiver now returns error (#1820).
+/// Unknown method on a Seq-sorted View receiver returns EncodingError (#1820).
 ///
-/// Previously this tested the sort-inference fix from #1128 (UF with correct
-/// Seq sort tag). With the #1820 fix, unknown methods are rejected entirely
-/// instead of creating a fallback UF.
+/// Sort inference (#1128) gives the receiver its Seq sort, but an unknown
+/// method is rejected outright rather than becoming a Seq-tagged fallback UF.
 #[test]
 #[timeout(30000)]
 fn test_unknown_method_on_seq_view_receiver_returns_error() {
@@ -73,7 +72,7 @@ fn test_unknown_method_on_seq_view_receiver_returns_error() {
     let hint_expr = method_call(view(var("v")), "push_back", vec![int(0)]);
     encoder.register_sort_hints(&[hint_expr]);
 
-    // Unknown method on Seq-sorted view receiver now returns error.
+    // Unknown method on Seq-sorted view receiver must be an error.
     let expr = method_call(view(var("v")), "unknown_method", vec![]);
     let result = encoder.encode_pure(&expr);
     assert!(
@@ -120,12 +119,11 @@ fn test_sort_mismatch_double_deref_view_tail_eq_no_panic() {
         VerificationRequest::new(&[], &[ensures])
             .timeout(Some(std::time::Duration::from_millis(500))),
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): ay now reports
-    // the sharper non-proof reason `QuantifierUnhandled` where it used to report
-    // a plain `Timeout`. Both are non-proofs, which is exactly what this test
-    // demands ("accepting Verified would be unsound"), so the accepted set gains
-    // the more precise reason and loses nothing: `Verified` and `Assumed` still
-    // fail, and so does the sort-mismatch panic this test was written for (#1805).
+    // KNOWN-CLASS PIN: ay may report the sharper non-proof reason
+    // `QuantifierUnhandled` in place of a plain `Timeout`. Both are non-proofs,
+    // which is exactly what this test demands ("accepting Verified would be
+    // unsound"), so accepting either loses nothing: `Verified` and `Assumed`
+    // still fail, and so does the sort-mismatch panic this test guards (#1805).
     assert!(
         matches!(
             result,

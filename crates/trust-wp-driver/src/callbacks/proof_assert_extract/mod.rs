@@ -29,8 +29,11 @@ pub(super) use simplification::{
     reduce_concrete_matches, simplify_proof_assert_expr, synthesize_constructor_equalities,
     synthesize_ground_equality_substitution_facts,
 };
+#[cfg(test)]
+pub(super) use substitutions::resolve_internal_references;
 pub(super) use substitutions::{
-    is_deref_precondition, resolve_internal_references, substitution_assumptions,
+    is_deref_precondition, resolve_internal_references_at_current_state, substitution_assumptions,
+    without_current_pointee_keys,
 };
 use tracing::debug;
 use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
@@ -129,7 +132,7 @@ pub(super) fn extract_body_for_proof_assert(
     let trait_specs = ctx.trait_specs;
     let verbose = ctx.verbose;
 
-    // Trigger borrow checking to populate MIR_BODIES cache (#414)
+    // Ensure borrow checking has run within the active MIR-retention scope.
     if tcx.is_mir_available(containing_fn.to_def_id()) {
         // Skip bodyless trait method declarations (#2205). `is_mir_available`
         // returns true for these but `mir_borrowck` panics in `body_owned_by`.
@@ -151,7 +154,7 @@ pub(super) fn extract_body_for_proof_assert(
         let _ = tcx.mir_borrowck(root);
     }
 
-    let Some(body_with_facts) = try_get_body_with_context(containing_fn) else {
+    let Some(body_with_facts) = try_get_body_with_context(tcx, containing_fn) else {
         return (
             None,
             NameSubstitutions::default(),
@@ -161,7 +164,7 @@ pub(super) fn extract_body_for_proof_assert(
             Vec::new(),
         );
     };
-    let mir_body = get_mir_body(body_with_facts);
+    let mir_body = get_mir_body(&body_with_facts);
 
     // Extract unified program-point state: return expression, call effects,
     // and substitutions in a single coordinated pass. (#2497)
@@ -212,6 +215,27 @@ pub(super) fn extract_body_for_proof_assert(
             }
         }
     }
+    // A ghost block's own walk and its closures' effects read a parameter's
+    // name as its value at the block; the main walk's values read it as the
+    // entry value, which the lane names apart from the current one for a
+    // parameter whose name means nothing else in them (D-241). Read in the
+    // main walk's terms, the ghost values join the map that renaming then
+    // treats as one.
+    let entry_terms_of_current = ghost_entry_terms_of_current(
+        tcx,
+        mir_body,
+        arg_names,
+        proof_assert_location,
+        proof_assert_ghost_block.is_some(),
+        &program_point_state.substitutions,
+    );
+    let in_entry_terms = |expr: PureExpr| -> PureExpr {
+        if entry_terms_of_current.is_empty() {
+            expr
+        } else {
+            expr.substitute(&entry_terms_of_current)
+        }
+    };
     if let Some(ghost_block) = proof_assert_ghost_block {
         for closure_def_id in find_ghost_closure_def_ids_in_mir(mir_body, ghost_block.span) {
             let capture_names = closure_capture_names(tcx, closure_def_id);
@@ -224,13 +248,17 @@ pub(super) fn extract_body_for_proof_assert(
                 ctx.extern_specs,
             );
             for fact in closure_effects.assumptions {
-                let fact = rewrite_ghost_closure_capture_vars(&fact, &capture_names);
+                let fact =
+                    in_entry_terms(rewrite_ghost_closure_capture_vars(&fact, &capture_names));
                 if !phase1_assumptions.contains(&fact) {
                     phase1_assumptions.push(fact);
                 }
             }
             for obligation in closure_effects.obligations {
-                let obligation = rewrite_ghost_closure_capture_vars(&obligation, &capture_names);
+                let obligation = in_entry_terms(rewrite_ghost_closure_capture_vars(
+                    &obligation,
+                    &capture_names,
+                ));
                 if !phase1_obligations.contains(&obligation) {
                     phase1_obligations.push(obligation);
                 }
@@ -253,6 +281,7 @@ pub(super) fn extract_body_for_proof_assert(
             proof_assert_span,
             proof_assert_location,
             ghost_block,
+            &in_entry_terms,
             &mut substitutions,
         );
     }
@@ -299,6 +328,7 @@ fn augment_proof_assert_ghost_block_substitutions(
     proof_assert_span: Span,
     proof_assert_location: Location,
     ghost_block: &GhostBlock,
+    in_entry_terms: &dyn Fn(PureExpr) -> PureExpr,
     substitutions: &mut NameSubstitutions,
 ) {
     if let Some(mut ghost_block_substitutions) = extract_name_substitutions_until_location_in_region(
@@ -312,6 +342,9 @@ fn augment_proof_assert_ghost_block_substitutions(
         ghost_block.span,
     ) {
         derive_final_deref_ghost_substitutions(&mut ghost_block_substitutions);
+        for value in ghost_block_substitutions.values_mut() {
+            *value = in_entry_terms(value.clone());
+        }
         substitutions.extend(ghost_block_substitutions);
     }
 
@@ -328,9 +361,40 @@ fn augment_proof_assert_ghost_block_substitutions(
             let capture_names = closure_capture_names(mir_ctx.tcx, closure_def_id);
             rewrite_closure_substitution_capture_names(&mut closure_substitutions, &capture_names);
             derive_final_deref_ghost_substitutions(&mut closure_substitutions);
+            for value in closure_substitutions.values_mut() {
+                *value = in_entry_terms(value.clone());
+            }
             substitutions.extend(closure_substitutions);
         }
     }
+}
+
+/// For an assertion in a ghost block, each parameter the `proof_assert` lane
+/// may name apart from its entry value
+/// ([`crate::mir_analysis::params_with_renamable_entry`]) mapped to its
+/// binding at the assertion in the main walk (D-241). A ghost block cannot
+/// write a program parameter, so the parameter's value at the block is that
+/// binding, whose own name is the entry value. Empty outside a ghost block
+/// and in a closure, whose lane names no entry value apart.
+fn ghost_entry_terms_of_current<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &rustc_middle::mir::Body<'tcx>,
+    arg_names: &[String],
+    at: Location,
+    in_ghost_block: bool,
+    main_substitutions: &NameSubstitutions,
+) -> HashMap<String, PureExpr> {
+    if !in_ghost_block || tcx.is_closure_like(mir_body.source.def_id()) {
+        return HashMap::new();
+    }
+    crate::mir_analysis::params_with_renamable_entry(tcx, mir_body, at)
+        .into_keys()
+        .filter_map(|local| {
+            let name = arg_names.get(local.as_usize().checked_sub(1)?)?;
+            let binding = main_substitutions.get(name)?;
+            Some((name.clone(), binding.clone()))
+        })
+        .collect()
 }
 
 pub(super) fn format_proof_assert_extraction_message(

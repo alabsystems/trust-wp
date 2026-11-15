@@ -66,7 +66,7 @@ fn sequential_mutations_without_ssa_are_contradictory() {
     .expect("encoding should succeed");
 
     // Contradiction: push_back(v@, 1) == push_back(v@, 2) can only hold
-    // if 1 == 2 (which is false). Vacuity guard (#2414) now catches this
+    // if 1 == 2 (which is false). The vacuity guard (#2414) catches this
     // instead of letting it through as a false Verified.
     // Phase 5b SSA renaming would fix the root cause by giving each
     // mutation its own v_current_N.
@@ -91,8 +91,8 @@ fn sequential_mutations_without_ssa_are_contradictory() {
 /// because the solver chains: v_final_view == push_back(v_ssa_1_view, 2)
 /// == push_back(push_back(v_current_view, 1), 2).
 ///
-/// This test models the CORRECT output that Phase 5b should produce.
-/// It passes today because we manually construct the SSA-renamed assumptions.
+/// This test models the CORRECT output that Phase 5b should produce; the
+/// SSA-renamed assumptions are constructed by hand, independent of the driver.
 #[test]
 #[timeout(30000)]
 fn ssa_renamed_sequential_mutations_verify() {
@@ -196,9 +196,9 @@ fn ssa_renamed_deref_based_sequential_mutations_verify() {
     )
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the mut-borrow
-    // vacuity gate refuses this verdict fail-closed when ay answers `Incomplete`
-    // on the fresh base re-solve. See `tests::helpers::verified_or_unvalidated_sat_base`.
+    // KNOWN-CLASS PIN (unvalidated SAT base): the mut-borrow vacuity gate
+    // refuses this verdict fail-closed when ay answers `Incomplete` on the
+    // fresh base re-solve. See `tests::helpers::verified_or_unvalidated_sat_base`.
     assert!(
         crate::tests::helpers::verified_or_unvalidated_sat_base(&result),
         "Phase 5c bridge should connect Deref-based SSA chain to postcondition \

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use trust_wp_core::formula::PureExpr;
+use trust_wp_core::formula::{ExprSort, PureExpr};
 
 /// Diagnostic record for synthesized trigger patterns used while encoding a quantifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +13,14 @@ pub(crate) struct SynthesizedTriggerDiagnostic {
     pub vars: Vec<String>,
     /// Trigger patterns selected by synthesis before ay term encoding.
     pub patterns: Vec<Vec<PureExpr>>,
+}
+
+/// The sort recorded for a written binder. An unknown sort remains distinct
+/// from the absence of a written binder, which the lookup's outer Option names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrittenBinderSort<'a> {
+    Unannotated,
+    Annotated(&'a ExprSort),
 }
 
 /// Quantifier variable naming and scope tracking state (#840, #2655).
@@ -62,6 +70,14 @@ pub(crate) struct QuantifierState {
     /// projection asserts the inversion `^v == *v` (take_first_mut). The
     /// logic-fn-formal collapse lane is driver-split and stays untouched.
     match_binder_vars: HashMap<String, usize>,
+    /// Subset of `bound_vars` bound by a `forall`/`exists` the contract text
+    /// writes, innermost scope last, each with the sort the text wrote for it.
+    /// Such a binder ranges over every value of its type, a borrow's final
+    /// value included, so `^q` of one is never the binder itself unless that
+    /// sort certainly holds no borrow (D-127); a logic-fn formal or an
+    /// instantiation parameter is bound elsewhere and keeps the driver-split
+    /// reading.
+    written_binder_vars: HashMap<String, Vec<Option<ExprSort>>>,
     /// Nesting depth of BINDER-ERASING SUBSTITUTION scopes (tract19).
     ///
     /// Several lanes discharge a logically-bound expression by substituting a
@@ -97,6 +113,7 @@ impl QuantifierState {
             quantifier_depth: 0,
             exists_quantifier_depth: 0,
             match_binder_vars: HashMap::new(),
+            written_binder_vars: HashMap::new(),
             binder_substitution_depth: 0,
         }
     }
@@ -167,6 +184,42 @@ impl QuantifierState {
     /// Check if a variable is currently a match-arm pattern binder.
     pub(in crate::encoder) fn is_match_binder(&self, var: &str) -> bool {
         self.match_binder_vars.get(var).copied().unwrap_or(0) > 0
+    }
+
+    /// Record a variable as bound by a written `forall`/`exists`, with the
+    /// sort the text wrote for it (`None` where it wrote none or the parser
+    /// did not keep it).
+    pub(in crate::encoder) fn bind_written_binder(&mut self, var: String, sort: Option<ExprSort>) {
+        self.written_binder_vars.entry(var).or_default().push(sort);
+    }
+
+    /// Pop the innermost written binding of `var`; removes the entry when
+    /// none is left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable is not currently marked (invariant violation).
+    pub(in crate::encoder) fn unbind_written_binder(&mut self, var: &str) {
+        let scopes = self
+            .written_binder_vars
+            .get_mut(var)
+            .expect("invariant: written binder must exist during quantifier cleanup");
+        scopes.pop();
+        if scopes.is_empty() {
+            self.written_binder_vars.remove(var);
+        }
+    }
+
+    /// The innermost written binding of `var`, keeping an unannotated written
+    /// `forall`/`exists` distinct from an absent written binder.
+    pub(in crate::encoder) fn written_binder(&self, var: &str) -> Option<WrittenBinderSort<'_>> {
+        self.written_binder_vars
+            .get(var)
+            .and_then(|scopes| scopes.last())
+            .map(|sort| match sort {
+                None => WrittenBinderSort::Unannotated,
+                Some(sort) => WrittenBinderSort::Annotated(sort),
+            })
     }
 
     /// Check if any variables are currently bound in a quantifier scope.
@@ -252,5 +305,43 @@ impl QuantifierState {
     #[cfg(test)]
     pub(in crate::encoder) fn set_quantifier_depth(&mut self, depth: usize) {
         self.quantifier_depth = depth;
+    }
+}
+
+#[cfg(test)]
+mod written_binder_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_inner_binder_never_inherits_an_outer_sort() {
+        let mut state = QuantifierState::new();
+        assert_eq!(state.written_binder("q"), None);
+        state.bind_written_binder("q".into(), Some(ExprSort::Int));
+        assert_eq!(
+            state.written_binder("q"),
+            Some(WrittenBinderSort::Annotated(&ExprSort::Int))
+        );
+        state.bind_written_binder("q".into(), None);
+        assert_eq!(
+            state.written_binder("q"),
+            Some(WrittenBinderSort::Unannotated)
+        );
+        state.bind_written_binder("q".into(), Some(ExprSort::Bool));
+        assert_eq!(
+            state.written_binder("q"),
+            Some(WrittenBinderSort::Annotated(&ExprSort::Bool))
+        );
+        state.unbind_written_binder("q");
+        assert_eq!(
+            state.written_binder("q"),
+            Some(WrittenBinderSort::Unannotated)
+        );
+        state.unbind_written_binder("q");
+        assert_eq!(
+            state.written_binder("q"),
+            Some(WrittenBinderSort::Annotated(&ExprSort::Int))
+        );
+        state.unbind_written_binder("q");
+        assert_eq!(state.written_binder("q"), None);
     }
 }

@@ -514,8 +514,9 @@ impl<A, B> Seq<(A, B)> {
 
     /// Returns `true` if every pair in the sequence is present in `map`.
     ///
-    /// This direct loop form is cheaper for proof search than a nested
-    /// iterator witness and is used by the `HashMap::from_iter_post` bridge.
+    /// This checks one direction only and ignores duplicate keys, so it is
+    /// NOT `HashMap::from_iter_post` (which follows Creusot's last-occurrence
+    /// semantics; see `std/iter/mod.rs`).
     pub fn matches_map(&self, map: &HashMap<A, B>) -> bool
     where
         A: Eq + Hash,

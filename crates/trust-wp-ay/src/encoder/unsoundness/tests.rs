@@ -543,7 +543,7 @@ fn test_total_production_sites_across_all_categories() {
     // This is the full observability budget. Track it explicitly so any
     // addition of increment sites is noticed and reviewed.
     //
-    // Current total: 18 (demoting) + 60 (non-demoting) = 78
+    // Current total: 18 (demoting) + 61 (non-demoting) = 79
     // (demoting went 17 -> 18 with the tract19 constant-carrier arm of the
     // Fix A Final-collapse guard: `refuse_prophecy_over_constant`)
     // Non-demoting breakdown: UnsupportedConstructSkip(5) + CatchUnwindFallback(1)
@@ -551,13 +551,13 @@ fn test_total_production_sites_across_all_categories() {
     // InvariantTrueShortCircuit(3) + SortFallbackToIntFromMethodCall(13) +
     // BoolCoercionFromNonBool(1) + PhantomVariableUpgrade(8) +
     // SortCoercionBridge(15) + SortFallbackToIntFromCatchAll(4) +
-    // PremiseNeutralizedEq(1) = 60
+    // PremiseNeutralizedEq(2) = 61
     let total: usize = UnsoundnessCategory::ALL
         .iter()
         .map(|c| c.expected_production_sites())
         .sum();
     assert_eq!(
-        total, 78,
+        total, 79,
         "total production sites across all categories changed — \
          review new/removed sites: {total}"
     );
@@ -598,7 +598,7 @@ fn test_per_category_production_site_values() {
         ("phantom_variable_upgrade", 8),
         ("sort_coercion_bridge", 15),
         ("sort_fallback_to_int_from_catch_all", 4),
-        ("premise_neutralized_eq", 1),
+        ("premise_neutralized_eq", 2),
     ];
 
     for cat in UnsoundnessCategory::ALL {

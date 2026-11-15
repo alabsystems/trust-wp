@@ -128,7 +128,9 @@ fn non_collection_tuple() {
 #[test]
 #[timeout(5000)]
 fn non_collection_float() {
-    assert!(!is_collection_expr_sort(&ExprSort::Float));
+    assert!(!is_collection_expr_sort(&ExprSort::Float(
+        trust_wp_core::formula::FloatWidth::F64
+    )));
 }
 
 #[test]

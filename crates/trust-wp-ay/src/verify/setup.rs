@@ -209,7 +209,7 @@ pub(super) fn setup_verification_encoder(
                 adt_decls: *adt_decls,
                 // Apply field ranges during bootstrap so the range axioms fire
                 // when the datatype is first declared. The function path's later
-                // `set_adt_field_ranges` call is now redundant for axiom
+                // `set_adt_field_ranges` call is redundant for axiom
                 // emission but harmless (it re-sets the same ranges). (#2702)
                 adt_field_ranges: *adt_field_ranges,
             })
@@ -685,8 +685,7 @@ fn encode_and_assert_requires_inner(
         // (e.g. spec'd `such_that` assumptions like `(*predicate).get(*x)`)
         // can return Int-sorted terms when the chained Mapping closure body
         // loses its Bool context. Coerce via `!= 0` to recover the truth
-        // value. (#5, design 2026-05-19-such-that-strict-pass-residual.md
-        // Gap 1 §1)
+        // value. (#5)
         let bool_term = encoder.coerce_bool_operand(term);
         encoder.assert_term(bool_term);
     }
@@ -707,7 +706,7 @@ fn encode_and_assert_requires_inner(
         // in ay, causing spurious counterexamples. (#2675)
         let req_ref = &simplified_requires[index];
         if is_standard_data_structure_precondition_forall(req_ref) {
-            // Ground-then-drop coherence (ce-census 2026-08-20, ghost_set):
+            // Ground-then-drop coherence (ghost_set):
             // the instantiator EXEMPTS negative-contains foralls (e.g. FSet
             // EMPTY's `forall<k> !result.contains(k)`) from grounding, so
             // skipping them here would drop the premise entirely — neither
@@ -748,8 +747,7 @@ fn encode_and_assert_requires_inner(
                 // the second `such_that` witness in `such_that.rs`) can produce
                 // Int-sorted terms when sort inference loses the Bool context
                 // through Deref+MethodCall. Coercing via `!= 0` recovers the
-                // right Bool truth value. (#5, design
-                // 2026-05-19-such-that-strict-pass-residual.md Gap 1 §1)
+                // right Bool truth value. (#5)
                 let term = encoder.coerce_bool_operand(term);
                 encoder.assert_term(term);
                 record_positive_nameable_view_aliases(encoder, &expanded_req);

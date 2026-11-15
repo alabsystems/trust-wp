@@ -28,8 +28,10 @@ use trust_wp_core::{
 
 // Re-export for test access via `use super::*`.
 use self::text_scan::collect_logic_references_from_text;
+#[cfg(test)]
+use self::variant::requires_proven_unsatisfiable_for_test;
 use self::{
-    call_edges::collect_parsed_logic_call_edges,
+    call_edges::{collect_parsed_logic_call_edges, collect_variant_proof_call_edges},
     graph::{
         build_logic_call_graph, build_logic_name_lookup, collect_logic_references,
         resolve_logic_call_targets, LogicNameLookup,
@@ -68,8 +70,10 @@ pub(super) struct LogicRecursionNode {
     pub(super) name: String,
     pub(super) params: Vec<String>,
     pub(super) param_sort_hints: Vec<Option<ExprSort>>,
+    pub(super) param_int_widths: Vec<Option<super::discovery::MachineIntWidth>>,
     pub(super) mode: LogicMode,
     pub(super) is_trait_method: bool,
+    pub(super) is_associated_fn: bool,
     pub(super) body: PureExpr,
     pub(super) body_text: String,
     pub(super) requires: Vec<PureExpr>,
@@ -146,8 +150,10 @@ fn build_logic_recursion_nodes(logic_functions: &[LogicFunction]) -> Vec<LogicRe
                     name: logic_fn.name.clone(),
                     params: logic_fn.params.clone(),
                     param_sort_hints: logic_fn.param_sort_hints.clone(),
+                    param_int_widths: logic_fn.param_int_widths.clone(),
                     mode: logic_fn.mode,
                     is_trait_method: logic_fn.is_trait_method,
+                    is_associated_fn: logic_fn.is_associated_fn,
                     body: parsed.take_body(),
                     body_text: logic_fn.body_text.clone().unwrap_or_default(),
                     requires: parsed.take_requires(),
@@ -173,8 +179,10 @@ fn build_logic_recursion_nodes(logic_functions: &[LogicFunction]) -> Vec<LogicRe
                         name: logic_fn.name.clone(),
                         params: logic_fn.params.clone(),
                         param_sort_hints: logic_fn.param_sort_hints.clone(),
+                        param_int_widths: logic_fn.param_int_widths.clone(),
                         mode: logic_fn.mode,
                         is_trait_method: logic_fn.is_trait_method,
+                        is_associated_fn: logic_fn.is_associated_fn,
                         // Use a dummy True body -- text-based scanning from
                         // body_text will still detect call references.
                         body: PureExpr::Bool(true),
@@ -219,6 +227,9 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
     let graph = build_logic_call_graph(nodes);
     let lookup = build_logic_name_lookup(nodes);
     let parsed_edges = collect_parsed_logic_call_edges(nodes, &lookup);
+    // Match binders renamed apart, pattern facts as path conditions: the only
+    // edge view a decrease proof may be stated over.
+    let variant_edges = collect_variant_proof_call_edges(nodes, &lookup);
     let mut analysis = LogicRecursionAnalysis::default();
 
     for component in strongly_connected_components(&graph) {
@@ -255,7 +266,7 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
                 continue;
             }
 
-            match validate_supported_mutual_recursion_scc(&component, nodes, &graph, &parsed_edges)
+            match validate_supported_mutual_recursion_scc(&component, nodes, &graph, &variant_edges)
             {
                 Ok(()) => {
                     for idx in component {
@@ -348,6 +359,23 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
                              function always calls itself with no decreasing argument"
                             .to_string(),
                     });
+                } else if !nodes[idx].is_associated_fn {
+                    // Creusot `validate/terminates.rs`: a self-recursive logic
+                    // function with no #[variant] that is not structurally
+                    // recursive is an error (a non-terminating logic function
+                    // can define `false`; bug/1966 `nested`). Restricted to
+                    // FREE functions: associated-function self-edges (trait
+                    // declarations, trait impls, inherent impls) are resolved
+                    // by name and can be false (should_succeed/termination/
+                    // custom_variant: `<CustomVariant as WellFounded>::
+                    // no_infinite_decreasing_sequence` calls u32's impl), so
+                    // those keep the historical path below.
+                    analysis.errors.push(LogicRecursionError {
+                        full_path: nodes[idx].full_path.clone(),
+                        message: "Recursive logic function without a #[variant] clause or a \
+                             structurally decreasing argument"
+                            .to_string(),
+                    });
                 } else {
                     // Conditional self-recursion without #[variant]: Creusot does
                     // not require #[variant] for structurally recursive logic fns.
@@ -359,17 +387,33 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
                     );
                 }
             } else {
-                // #[variant(...)] is present. Try a solver-backed variant-decrease
-                // obligation on the supported integer fragment (closes the
-                // false-accept in terminates/incorrect_variant.rs where the text
-                // heuristic accepted a variant that does not decrease). The proof
-                // is only attempted when the variant AND every structured self-call
-                // edge are inside the supported fragment; otherwise we fall back to
-                // the prior text heuristic so legitimate should_succeed logic fns
-                // with method/struct/Self::-dispatch/match variants are not
-                // newly rejected (spans::quux/find_ptr_in_seq, bug/vcgen::set_max,
-                // list_reversal_lasso::pigeon, ...).
-                match try_prove_self_variant_decrease(idx, nodes, &graph, &parsed_edges) {
+                // #[variant(...)] is present. Credit the recursion ONLY on a
+                // solver-checked decrease proof of every structured self-call
+                // (Creusot's `vc_<f>`). Anything the prover cannot model or
+                // does not discharge is rejected below; no text heuristic can
+                // accept or reject in place of the proof.
+                if let Some(shadowed) =
+                    self_call_under_parameter_shadowing_binder(idx, nodes, &parsed_edges)
+                {
+                    // A match-arm, quantifier or closure binder that reuses a
+                    // parameter name hides which value the recursive call
+                    // passes (`match Some(x + 1) { Some(x) => f(x - 1) }`
+                    // recurses on the binder, not on the parameter). Edge
+                    // arguments are compared against the parameters BY NAME,
+                    // so no decrease can be read off them: reject instead of
+                    // falling through to the permissive Unsupported arm.
+                    analysis.errors.push(LogicRecursionError {
+                        full_path: nodes[idx].full_path.clone(),
+                        message: format!(
+                            "self-recursive logic function variant does not strictly \
+                             decrease: a binder shadows parameter `{shadowed}` around a \
+                             recursive call, so the call's arguments cannot be related to \
+                             the variant"
+                        ),
+                    });
+                    continue;
+                }
+                match try_prove_self_variant_decrease(idx, nodes, &graph, &variant_edges) {
                     SelfVariantDecrease::Failed(reason) => {
                         analysis.errors.push(LogicRecursionError {
                             full_path: nodes[idx].full_path.clone(),
@@ -379,20 +423,34 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
                             ),
                         });
                     }
-                    SelfVariantDecrease::Proven | SelfVariantDecrease::Unsupported => {
-                        // Either proven to decrease, or outside the supported
-                        // fragment. Preserve the prior negated-argument heuristic
-                        // as a belt-and-suspenders reject (keeps bug/1204 `evil`
-                        // rejected even though its `#[requires(false)]` makes the
-                        // decrease obligation vacuously valid).
-                        if body_text_has_negating_self_call(&nodes[idx]) {
-                            analysis.errors.push(LogicRecursionError {
-                                full_path: nodes[idx].full_path.clone(),
-                                message: "self-recursive logic function calls itself with a \
-                                     negated variant argument; variant decrease cannot be proven"
-                                    .to_string(),
-                            });
-                        }
+                    SelfVariantDecrease::Proven => {
+                        // Every structured self-call was PROVEN to strictly
+                        // decrease the variant under the function's own
+                        // `#[requires]` (Creusot's `vc_<f>`: requires ->
+                        // well_founded_relation(variant, variant[args])). This
+                        // is exactly Creusot's termination rule, so no textual
+                        // heuristic may overrule it. bug/1204 `evil`
+                        // (`#[requires(false)]`, `evil(-x)`) is accepted by
+                        // Creusot on this basis; its defining axiom is guarded
+                        // by that same requires (`forall x. false -> evil x =
+                        // evil(-x) + 1`, registration.rs `guard_with_requires`),
+                        // so accepting it adds no usable fact, and the failure
+                        // lands in `wrong`, as in Creusot.
+                    }
+                    SelfVariantDecrease::Unsupported(reason) => {
+                        // No checked decrease proof. A `#[variant]` recursion
+                        // is never credited on a textual heuristic: an edge
+                        // under a match, closure or quantifier scope, a
+                        // non-integer variant, or an Unknown solver verdict
+                        // leaves the defining equation possibly inconsistent
+                        // (`f(x) = f(x) + 1`), so reject fail-closed.
+                        analysis.errors.push(LogicRecursionError {
+                            full_path: nodes[idx].full_path.clone(),
+                            message: format!(
+                                "self-recursive logic function variant decrease could not be \
+                                 proven: {reason}"
+                            ),
+                        });
                     }
                 }
             }
@@ -410,13 +468,23 @@ fn analyze_logic_fn_recursion_nodes(nodes: &[LogicRecursionNode]) -> LogicRecurs
     analysis
 }
 
-fn body_text_has_negating_self_call(node: &LogicRecursionNode) -> bool {
-    let compact = node
-        .body_text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    compact.contains(&format!("{}(-", node.name))
+/// The first caller parameter shadowed by a binder (match-arm pattern,
+/// quantifier, closure parameter) enclosing a structured self-call of `idx`.
+fn self_call_under_parameter_shadowing_binder(
+    idx: usize,
+    nodes: &[LogicRecursionNode],
+    parsed_edges: &[call_edges::LogicCallEdge],
+) -> Option<String> {
+    let params = &nodes[idx].params;
+    parsed_edges
+        .iter()
+        .filter(|edge| edge.caller_idx == idx && edge.callee_idx == idx)
+        .find_map(|edge| {
+            edge.enclosing_binders
+                .iter()
+                .find(|binder| params.contains(binder))
+                .cloned()
+        })
 }
 
 fn body_text_has_self_dispatch(body_text: &str) -> bool {

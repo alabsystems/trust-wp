@@ -40,8 +40,10 @@ fn node(name: &str, params: &[&str], body: PureExpr) -> LogicRecursionNode {
         name: name.to_string(),
         params: params.iter().map(|s| (*s).to_string()).collect(),
         param_sort_hints: params.iter().map(|_| None).collect(),
+        param_int_widths: Vec::new(),
         mode: LogicMode::Default,
         is_trait_method: false,
+        is_associated_fn: false,
         body,
         body_text: String::new(),
         requires: vec![],
@@ -277,4 +279,141 @@ fn direct_strict_subterm_recursion_is_structural() {
         is_structurally_recursive(&n),
         "strict-subterm direct recursion must be structural"
     );
+}
+
+/// Binder shadowing: `match l { Some(t) => { let t = Wrap(l); f(t) }, None => 0 }`.
+/// The inner `t` is NOT a substructure of `l` (it is larger), so the stale
+/// strict mapping of the outer `t` must be dropped. REJECT.
+#[test]
+fn let_shadowing_a_strict_binder_with_a_larger_value_is_rejected() {
+    let call = PureExpr::LogicFnCall {
+        name: "f".to_string(),
+        args: vec![var("t")],
+    };
+    let body = PureExpr::Match {
+        scrutinee: Arc::new(var("l")),
+        arms: vec![
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "Some".to_string(),
+                    inner: Some(Box::new(Pattern::Binding("t".to_string()))),
+                },
+                body: PureExpr::Let {
+                    var: "t".to_string(),
+                    value: Arc::new(PureExpr::LogicFnCall {
+                        name: "Wrap".to_string(),
+                        args: vec![var("l")],
+                    }),
+                    body: Arc::new(call),
+                },
+            },
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "None".to_string(),
+                    inner: None,
+                },
+                body: PureExpr::Int(0),
+            },
+        ],
+    };
+    assert!(!is_structurally_recursive(&node("f", &["l"], body)));
+}
+
+/// Control: the same body without the shadowing `let` recurses on the strict
+/// subterm `t`. ACCEPT.
+#[test]
+fn match_bound_strict_subterm_without_shadowing_is_accepted() {
+    let body = PureExpr::Match {
+        scrutinee: Arc::new(var("l")),
+        arms: vec![
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "Some".to_string(),
+                    inner: Some(Box::new(Pattern::Binding("t".to_string()))),
+                },
+                body: PureExpr::LogicFnCall {
+                    name: "f".to_string(),
+                    args: vec![var("t")],
+                },
+            },
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "None".to_string(),
+                    inner: None,
+                },
+                body: PureExpr::Int(0),
+            },
+        ],
+    };
+    assert!(is_structurally_recursive(&node("f", &["l"], body)));
+}
+
+fn cons_nil_match(
+    scrutinee: &str,
+    cons_binder: &str,
+    cons_body: PureExpr,
+    nil_body: PureExpr,
+) -> PureExpr {
+    PureExpr::Match {
+        scrutinee: Arc::new(var(scrutinee)),
+        arms: vec![
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "Cons".to_string(),
+                    inner: Some(Box::new(Pattern::Tuple(vec![
+                        Pattern::Wildcard,
+                        Pattern::Binding(cons_binder.to_string()),
+                    ]))),
+                },
+                body: cons_body,
+            },
+            MatchArm {
+                pattern: Pattern::Constructor {
+                    name: "Nil".to_string(),
+                    inner: None,
+                },
+                body: nil_body,
+            },
+        ],
+    }
+}
+
+fn f_call(args: Vec<PureExpr>) -> PureExpr {
+    PureExpr::LogicFnCall {
+        name: "f".to_string(),
+        args,
+    }
+}
+
+/// Review v2 p5: `match l { Cons(_, t) => 0, Nil => f(t, t) + 1 }` with a
+/// PARAMETER `t`. The Cons-arm binder `t` must not leak into the Nil arm.
+#[test]
+fn match_arm_binding_does_not_leak_into_sibling_arm() {
+    let body = cons_nil_match("l", "t", PureExpr::Int(0), f_call(vec![var("t"), var("t")]));
+    assert!(!is_structurally_recursive(&node("f", &["l", "t"], body)));
+}
+
+/// Review v2 p6: `Cons(_, tl) => { let t = *tl; 0 }, Nil => f(t, t)`.
+#[test]
+fn let_binding_does_not_leak_out_of_its_body() {
+    let cons_body = PureExpr::Let {
+        var: "t".to_string(),
+        value: Arc::new(PureExpr::Deref(Arc::new(var("tl")))),
+        body: Arc::new(PureExpr::Int(0)),
+    };
+    let body = cons_nil_match("l", "tl", cons_body, f_call(vec![var("t"), var("t")]));
+    assert!(!is_structurally_recursive(&node("f", &["l", "t"], body)));
+}
+
+/// Control: per-arm scoping keeps the binding visible inside its own arm, so
+/// `Cons(_, t) => f(*t)` is still a strict structural decrease.
+#[test]
+fn scoped_arm_binding_still_supports_structural_call() {
+    let body = cons_nil_match(
+        "l",
+        "t",
+        f_call(vec![PureExpr::Deref(Arc::new(var("t")))]),
+        PureExpr::Int(0),
+    );
+    assert!(is_structurally_recursive(&node("f", &["l"], body)));
 }

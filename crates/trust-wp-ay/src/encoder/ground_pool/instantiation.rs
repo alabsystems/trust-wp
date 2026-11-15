@@ -406,8 +406,9 @@ fn eval_ground_int_expr(expr: &PureExpr) -> Option<i64> {
                 BinOp::Add => left.checked_add(right),
                 BinOp::Sub => left.checked_sub(right),
                 BinOp::Mul => left.checked_mul(right),
-                BinOp::Div => left.checked_div(right),
-                BinOp::Mod => left.checked_rem(right),
+                // `Div`/`Mod` are EUCLIDEAN; only the `*Trunc` ops truncate.
+                BinOp::Div => left.checked_div_euclid(right),
+                BinOp::Mod => left.checked_rem_euclid(right),
                 BinOp::DivTrunc => left.checked_div(right),
                 BinOp::RemTrunc => left.checked_rem(right),
                 _ => None,
@@ -1174,7 +1175,7 @@ impl super::super::AYEncoder {
         let bucket_ix_decl =
             self.get_or_declare_logic_func("logic_bucket__ix", &[map_sort, Sort::Int], Sort::Int);
 
-        let mut count = 0;
+        let mut count = 0usize;
         for get_entry in get_entries {
             if self.ground_entry_contains_quantifier_var(
                 get_entry.application,
@@ -1210,7 +1211,7 @@ impl super::super::AYEncoder {
 
             let implication = self.solver.implies(guard, conclusion);
             self.assert_solver_term("ground_pool/hashmap_list_good_bucket", implication);
-            count += 1;
+            count = count.saturating_add(1);
         }
 
         Ok(count)
@@ -1239,7 +1240,7 @@ impl super::super::AYEncoder {
         let buckets_len = self.seq_len_term(buckets)?;
         let zero = self.solver.int_const(0);
 
-        let mut count = 0;
+        let mut count = 0usize;
         if assert_len_positive {
             let len_positive = self.solver.lt(zero, buckets_len);
             let mut guards = Vec::with_capacity(path_conditions.len() + 1);
@@ -1248,7 +1249,7 @@ impl super::super::AYEncoder {
             if let Some(guard) = self.conjoin_ground_terms(&guards) {
                 let fact = self.solver.implies(guard, len_positive);
                 self.assert_solver_term("ground_pool/hashmap_list_invariant::len", fact);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -1369,7 +1370,7 @@ impl super::super::AYEncoder {
             for conclusion in [good_app, no_double_app] {
                 let fact = self.solver.implies(guard, conclusion);
                 self.assert_solver_term("ground_pool/hashmap_list_invariant", fact);
-                count += 1;
+                count = count.saturating_add(1);
             }
             self.ground_pool
                 .register_term_application_with_path_conditions(
@@ -1459,7 +1460,7 @@ impl super::super::AYEncoder {
             .per_slice_budget()
             .unwrap_or(TRUST_WP_TOTAL_INSTANCE_BUDGET);
 
-        let mut count = 0;
+        let mut count = 0usize;
         let mut instantiated_apps: Vec<(usize, Term)> = Vec::new();
 
         for _round in 0..TRUST_WP_MAX_GROUND_POOL_FLUSH_ROUNDS {
@@ -1812,7 +1813,7 @@ impl super::super::AYEncoder {
                         );
                     }
                     instantiated_apps.push((*axiom_index, *application));
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -1836,7 +1837,7 @@ impl super::super::AYEncoder {
     /// the remaining budget, so a single Seq/FMap/FSet/Mapping cross-product
     /// cannot exceed the global cap before the next family runs.
     pub(crate) fn assert_standard_ground_instances(&mut self) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         let mut remaining = TRUST_WP_MAX_CROSS_PRODUCT_INSTANCES;
 
         // Seq instances are asserted first (highest priority for iterator/

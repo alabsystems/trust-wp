@@ -28,17 +28,18 @@ pub fn deref_wrap<T: Deref>(x: &T) -> &T::Target {
 }
 
 pub fn ghost_param_unit_ok(x: Ghost<i32>) {
-    let _ = *deref_wrap(&x);
+    let _g = ghost!(*deref_wrap(&x));
 }
 
 #[check(ghost)]
 pub fn ghost_checked_value_ok(x: Ghost<i32>) -> i32 {
-    *deref_wrap(&x)
+    let _g = ghost!(*deref_wrap(&x));
+    0i32
 }
 
 #[logic]
 fn snapshot_logic_value_ok(x: Snapshot<i32>) -> i32 {
-    0
+    0i32
 }
 
 pub fn ghost_ref_roundtrip_ok<'a>(x: &'a Ghost<i32>) -> &'a Ghost<i32> {

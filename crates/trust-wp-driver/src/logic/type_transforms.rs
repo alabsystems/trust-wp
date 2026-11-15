@@ -87,7 +87,7 @@ pub(super) fn simplify_newtype_view_in_expr_for_params(
 
 /// Check if an expression tree contains any tuple field access with index > 0.
 ///
-/// Used in test-only legacy invariant extraction to distinguish single-field
+/// Used by the test-only invariant extraction to distinguish single-field
 /// newtypes from multi-field tuple structs. (#359)
 #[cfg(test)]
 fn has_higher_tuple_field_access(expr: &PureExpr) -> bool {
@@ -163,7 +163,7 @@ fn newtype_field_int_viewable_sort<'tcx>(
         return None;
     }
     let field = variant.fields.iter().next()?;
-    let field_ty = field.ty(tcx, substs).skip_norm_wip();
+    let field_ty = field.ty(tcx, *substs).skip_norm_wip();
     let field_sort = ty_to_expr_sort_enriched(tcx, field_ty)?;
     // Only override when the field sort is itself Int-viewable. For
     // Datatype/MutRef/Ref/Seq/Tuple fields, retain the user-provided
@@ -228,7 +228,7 @@ pub(super) fn unit_field_constraints_for_logic_fn(
 
         let variant = adt_def.non_enum_variant();
         for field in &variant.fields {
-            let field_ty = field.ty(tcx, substs).skip_norm_wip();
+            let field_ty = field.ty(tcx, *substs).skip_norm_wip();
             // Check if the field type is unit `()`
             if !field_ty.is_unit() {
                 continue;
@@ -319,8 +319,8 @@ fn to_type_invariant_def(logic_fn: &LogicFunction) -> Option<TypeInvariantDef> {
     // invariant must also operate on scalars to avoid a sort mismatch between
     // the Datatype postcondition and the Int result_expr. (#2669)
     //
-    // For this legacy path we keep the old heuristic so the existing unit
-    // tests continue to document the body rewrite behavior in isolation.
+    // This test-only path has no TyCtxt, so it keeps the syntactic newtype
+    // heuristic and the unit tests exercise the body rewrite in isolation.
     let is_newtype = !has_higher_tuple_field_access(&body);
     let body = if is_newtype {
         simplify_newtype_view_in_body(body, &self_param)
@@ -505,9 +505,42 @@ pub(crate) fn extract_type_invariant_defs(tcx: TyCtxt<'_>) -> Vec<TypeInvariantD
             let sig = tcx.fn_sig(def_id).instantiate_identity();
             let sig = sig.skip_binder();
             let self_ty = sig.inputs().first().copied()?;
-            to_type_invariant_def_with_self_ty(tcx, self_ty, logic_fn)
+            let mut def = to_type_invariant_def_with_self_ty(tcx, self_ty, logic_fn)?;
+            // PLACEMENT. A type-invariant body is specification text parsed
+            // here and registered with the encoder as a defining axiom; the
+            // contract-rewriting path never sees it. `rewrite_invariant_def_named_fields`
+            // reaches a placement only for `DefKind::Struct` types whose body
+            // contains a field ACCESS, so a body whose only named-field
+            // construct is a match PATTERN would otherwise never be placed
+            // (D-31, s82v4_typeinv_body_field_reorder.rs). Here every invariant
+            // body is placed, against the declarations in scope at the
+            // invariant method itself so `Self` and the impl's own spellings
+            // resolve.
+            place_named_field_ctors_in_invariant(tcx, def_id, &mut def, &logic_fn.full_path);
+            Some(def)
         })
         .collect()
+}
+
+/// Place the named-field constructors and patterns in one type-invariant body.
+///
+/// A body that cannot be placed is left AS WRITTEN, keeping the parser's
+/// `{a,b}` metadata, and `trust_wp_ay::verify::placement_gate` refuses every
+/// request that carries it. Leaving it is therefore fail-closed, not a
+/// fallback to source order.
+fn place_named_field_ctors_in_invariant(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    def: &mut TypeInvariantDef,
+    full_path: &str,
+) {
+    match crate::callbacks::place_named_field_ctors_in_expr(tcx, def_id, def.body()) {
+        Ok(placed) => def.set_body(placed),
+        Err(why) => eprintln!(
+            "trust-wp: type invariant `{full_path}`: {why}; the body is left as written and \
+             the encoder will refuse it rather than bind the fields in the order they appear"
+        ),
+    }
 }
 
 #[cfg(test)]

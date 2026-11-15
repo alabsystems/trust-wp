@@ -190,6 +190,12 @@ def _summarize_subset(
     # Tier-aware metrics (#2510).
     tier_counts: dict[str, int] = {
         "tier0": 0, "tier1": 0, "tier2": 0, "tier3": 0, "legacy_unknown": 0,
+        "tier2-source-trusted": 0,
+        # Creusot's .coma for the row carries no obligation (D-19). Counted
+        # here so the row is never silently absent from the tier histogram,
+        # and NEVER folded into tier2_verified / tier2_rate; the gate counts
+        # it clean only through zero-goal parity (D-88).
+        "tier0-no-obligation": 0,
     }
     for result in results:
         vtier = getattr(result, "verification_tier", None)
@@ -197,6 +203,9 @@ def _summarize_subset(
             tier_counts[vtier] += 1
     summary["verification_tiers"] = tier_counts
     summary["tier2_verified"] = tier_counts["tier2"]
+    # Reported SEPARATELY, never folded into tier2_verified/tier2_rate: these
+    # passes rest on source-declared #[trusted] axioms (Creusot parity).
+    summary["tier2_source_trusted"] = tier_counts["tier2-source-trusted"]
     tier2_plus_tier3 = tier_counts["tier2"] + tier_counts["tier3"]
     summary["tier2_rate"] = (
         round(tier_counts["tier2"] / tier2_plus_tier3, 4)

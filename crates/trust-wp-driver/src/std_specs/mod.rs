@@ -27,8 +27,7 @@
 //! 4. Preconditions are added to the current verification obligation
 //! 5. Postconditions are used to model the return value
 
-#[cfg(test)]
-use trust_wp_core::formula::PureExpr;
+use trust_wp_core::{closure::CaptureInvariant, formula::PureExpr};
 
 /// Contract specs for a standard library function
 #[derive(Debug, Clone)]
@@ -37,6 +36,30 @@ pub struct StdSpec {
     pub requires: Vec<String>,
     /// Postconditions that hold after the call
     pub ensures: Vec<String>,
+    /// Synthesized type-invariant preconditions for this callee's own
+    /// parameters, as structured expressions over the parameter names.
+    ///
+    /// WHY IT LIVES ON THE CALLEE'S SPEC: the same clause is a PREMISE when
+    /// this function's own body is verified and an OBLIGATION at every call
+    /// site. Computing it twice lets the grant and the obligation drift apart
+    /// the moment either computation's inputs differ, which is the free grant
+    /// this field exists to close. Both consumers read THIS vector.
+    ///
+    /// Empty for std and extern-spec entries: their invariants have no
+    /// interpretable body here, so nothing is granted and nothing is owed.
+    pub inv_requires: Vec<PureExpr>,
+    /// Synthesized type invariants for a CLOSURE's captures, one entry per
+    /// invariant-bearing capture.
+    ///
+    /// WHY IT LIVES ON THE CLOSURE'S SPEC: the closure's body is verified
+    /// holding `inv(capture)` for each of these, and the site that BUILDS the
+    /// closure is the hand-over that owes them — the same relation
+    /// `inv_requires` has to a call site. Both consumers read THIS vector, so
+    /// a capture cannot be granted a premise the construction site does not
+    /// pay for.
+    ///
+    /// Empty for everything that is not a local closure.
+    pub capture_inv_requires: Vec<CaptureInvariant>,
     /// Parameter names for positional-to-named substitution.
     ///
     /// Standard library functions are not local to the crate, so `arg_names_for_def_id`
@@ -153,6 +176,8 @@ impl StdSpec {
         Self {
             requires,
             ensures,
+            inv_requires: Vec::new(),
+            capture_inv_requires: Vec::new(),
             param_names,
         }
     }
@@ -245,10 +270,6 @@ fn lookup_std_spec(path: &str) -> Option<StdSpec> {
 /// can resolve it to a concrete value — even when `type_constants` is not set
 /// (which happens when verifying user functions that call integer methods).
 fn resolve_self_type_constants_in_spec(callee_path: &str, spec: &mut StdSpec) {
-    const INT_TYPES: &[&str] = &[
-        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
-    ];
-
     // Extract integer type from the callee path.
     let int_type = INT_TYPES.iter().find(|&&ty| {
         callee_path
@@ -270,16 +291,48 @@ fn resolve_self_type_constants_in_spec(callee_path: &str, spec: &mut StdSpec) {
         return;
     }
 
-    for s in &mut spec.ensures {
-        *s = s
-            .replace("Self::MIN", &format!("{int_type}::MIN"))
-            .replace("Self::MAX", &format!("{int_type}::MAX"));
+    for s in spec.ensures.iter_mut().chain(spec.requires.iter_mut()) {
+        *s = self_constants_at(s, int_type);
     }
-    for s in &mut spec.requires {
-        *s = s
-            .replace("Self::MIN", &format!("{int_type}::MIN"))
-            .replace("Self::MAX", &format!("{int_type}::MAX"));
+}
+
+/// The integer types whose `MIN`/`MAX` a table clause's `Self::MIN`/`Self::MAX`
+/// can be spelled at.
+const INT_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+];
+
+/// `clause` with `Self::MIN`/`Self::MAX` spelled at `int_type`.
+fn self_constants_at(clause: &str, int_type: &str) -> String {
+    clause
+        .replace("Self::MIN", &format!("{int_type}::MIN"))
+        .replace("Self::MAX", &format!("{int_type}::MAX"))
+}
+
+/// Every clause text the built-in tables can hand the contract parser: each
+/// clause of the std tables and of trust-wp-std's built-in extern specs, and
+/// each with `Self::MIN`/`Self::MAX` spelled at every integer type, as a
+/// lookup resolves it. No type check of the crate being verified reads one,
+/// so none may take the reading a type check gives a clause spelled the same
+/// (`callbacks::spec_arith`).
+pub fn builtin_clause_texts() -> std::collections::BTreeSet<String> {
+    let mut texts = std::collections::BTreeSet::new();
+    let specs = STD_SPEC_TABLES
+        .iter()
+        .flat_map(|table| table.iter())
+        .map(|(_, spec)| StdSpec::from_spec_string(spec))
+        .chain(crate::extern_specs::builtin_trust_wp_std_specs().into_values());
+    for spec in specs {
+        for clause in spec.requires.iter().chain(spec.ensures.iter()) {
+            if clause.contains("Self::MIN") || clause.contains("Self::MAX") {
+                for int_type in INT_TYPES {
+                    texts.insert(self_constants_at(clause, int_type));
+                }
+            }
+            texts.insert(clause.clone());
+        }
     }
+    texts
 }
 
 /// Normalize a path by removing generic parameters and the `::` before them.
@@ -544,6 +597,17 @@ pub fn lookup_spec_with_extern(
 
     // Fall back to hardcoded std_specs
     lookup_std_spec(path)
+}
+
+/// Look up ONLY the discovered `extern_spec!` table (no builtin std tables).
+///
+/// Used for callees from foreign crates that are neither std nor a spec
+/// library: user extern specs may describe them, the builtin tables never do.
+pub fn lookup_extern_spec_only(
+    extern_specs: &std::collections::HashMap<String, StdSpec>,
+    path: &str,
+) -> Option<StdSpec> {
+    crate::extern_specs::lookup_extern_spec(extern_specs, path)
 }
 
 #[cfg(test)]

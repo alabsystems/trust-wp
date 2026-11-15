@@ -9,8 +9,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use trust_wp_test_utils::workspace_root;
-
 use super::*;
 
 const TEST_CRATE_NAME: &str = "trust_wp_discovery_trait_default_test";
@@ -187,64 +185,8 @@ fn probe_contract_discovery_with_args(
     callbacks
 }
 
-fn workspace_target_dir() -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(target_dir) => {
-            let target_dir = PathBuf::from(target_dir);
-            if target_dir.is_absolute() {
-                target_dir
-            } else {
-                workspace_root().join(target_dir)
-            }
-        }
-        None => workspace_root().join("target"),
-    }
-}
-
 fn dependency_artifact(crate_name: &str, extensions: &[&str]) -> PathBuf {
-    let deps_dir = workspace_target_dir().join("debug").join("deps");
-    let prefix = format!("lib{crate_name}-");
-    let mut matches: Vec<PathBuf> = fs::read_dir(&deps_dir)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", deps_dir.display()))
-        .filter_map(Result::ok)
-        .filter(|entry| entry.metadata().map(|m| m.len() > 0).unwrap_or(false))
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(&prefix)
-                        && std::path::Path::new(name)
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| extensions.contains(&ext))
-                })
-        })
-        .collect();
-    // Newest first, preferring a linkable artifact over metadata. Sorting by
-    // name and taking the last picks a hash, not a build: after a few
-    // rebuilds `deps` holds many `lib<crate>-<hash>` files and only the newest
-    // matches the current compilation, so any other one fails as "can't find
-    // crate" — which reads as a defect in the code under test rather than in
-    // the harness. Same rule as
-    // `callbacks/verification/tests/rustc_callback_harness.rs`.
-    matches.sort_by_key(|path| {
-        let ext_priority: u8 = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rlib" | "dylib" | "so" | "dll") => 0,
-            Some("rmeta") => 1,
-            _ => 2,
-        };
-        let mtime = fs::metadata(path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        (ext_priority, std::cmp::Reverse(mtime))
-    });
-    matches.into_iter().next().unwrap_or_else(|| {
-        panic!(
-            "failed to find compiled {crate_name} artifact under {}",
-            deps_dir.display()
-        )
-    })
+    trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe().artifact(crate_name, extensions)
 }
 
 fn trust_wp_macros_proc_macro_artifact() -> PathBuf {
@@ -257,30 +199,28 @@ fn trust_wp_lib_artifact() -> PathBuf {
 }
 
 fn proc_macro_probe_args() -> Vec<String> {
-    let deps_dir = workspace_target_dir().join("debug").join("deps");
     let macro_artifact = trust_wp_macros_proc_macro_artifact();
-    vec![
+    let mut args = vec![
         "--extern".to_string(),
         format!("trust_wp_macros={}", macro_artifact.display()),
-        "-L".to_string(),
-        format!("dependency={}", deps_dir.display()),
-    ]
+    ];
+    args.extend(trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe().search_args());
+    args
 }
 
 fn trust_wp_probe_args() -> Vec<String> {
-    let deps_dir = workspace_target_dir().join("debug").join("deps");
     let trust_wp_artifact = trust_wp_lib_artifact();
     let macro_artifact = trust_wp_macros_proc_macro_artifact();
-    vec![
+    let mut args = vec![
         "--extern".to_string(),
         // Crate-name form (underscore) — `--extern` consumes the rust crate
         // name, not the hyphenated package name.
         format!("trust_wp={}", trust_wp_artifact.display()),
         "--extern".to_string(),
         format!("trust_wp_macros={}", macro_artifact.display()),
-        "-L".to_string(),
-        format!("dependency={}", deps_dir.display()),
-    ]
+    ];
+    args.extend(trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe().search_args());
+    args
 }
 
 fn trait_default_fixture_source() -> &'static str {

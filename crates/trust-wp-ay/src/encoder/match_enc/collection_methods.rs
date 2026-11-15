@@ -107,7 +107,7 @@ impl AYEncoder {
         }
 
         match method {
-            "contains" => {
+            "contains" if args.len() == 1 => {
                 let elem_term = self.encode_pure_impl(&args[0], prefix)?;
                 if self.solver.get_sort(elem_term) != Sort::Int {
                     return self.encode_bool_method_predicate(receiver, method, args, prefix);
@@ -224,6 +224,44 @@ impl AYEncoder {
         }
     }
 
+    /// Encode `FSet::map(f)` / `FSet::filter(f)`.
+    ///
+    /// Only an Int-carried receiver (the FSet UF carrier) whose argument
+    /// encodes at the `Mapping` sort takes the dedicated UF lane:
+    /// - `s.map(f)`    -> `fset_map(s, f)`    (Why3 `set.Fset.map`)
+    /// - `s.filter(p)` -> `fset_filter(s, p)` (Why3 `set.Fset.filter`)
+    ///
+    /// Everything else keeps the previous opaque Int-UF encoding, so no
+    /// other `map`/`filter` receiver changes meaning.
+    pub(in crate::encoder) fn encode_fset_map_filter(
+        &mut self,
+        receiver: &PureExpr,
+        method: &str,
+        args: &[PureExpr],
+        prefix: Option<crate::encoder::sort_context::DerivedKind>,
+    ) -> Result<Term, EncodingError> {
+        let receiver_term = self.encode_pure_impl(receiver, prefix)?;
+        let mapping = mapping_sort();
+        if self.solver.get_sort(receiver_term) != Sort::Int
+            || self.is_seq_receiver(receiver, prefix)
+        {
+            return self.encode_int_method_uf(receiver, method, args, prefix);
+        }
+        let f_term = self.encode_pure_impl(&args[0], prefix)?;
+        if self.solver.get_sort(f_term) != mapping {
+            return self.encode_int_method_uf(receiver, method, args, prefix);
+        }
+        let name = match method {
+            "map" => "fset_map",
+            "filter" => "fset_filter",
+            _ => return self.encode_int_method_uf(receiver, method, args, prefix),
+        };
+        let func = self.get_or_declare_spec_fn(name, &[Sort::Int, mapping], Sort::Int);
+        let result = self.safe_apply(name, &func, &[receiver_term, f_term])?;
+        self.register_standard_ground_application(name, result, vec![receiver_term, f_term]);
+        Ok(result)
+    }
+
     /// Encode FMap method calls as uninterpreted functions.
     ///
     /// FMap operations are encoded as UFs constrained by postcondition axioms
@@ -250,7 +288,7 @@ impl AYEncoder {
         let receiver_actual_sort = self.solver.get_sort(receiver_term);
 
         match method {
-            "contains" => {
+            "contains" if args.len() == 1 => {
                 let key_term = self.encode_fmap_key_expr(&args[0], prefix)?;
                 let key_actual_sort = self.solver.get_sort(key_term);
                 if receiver_actual_sort != fmap {
@@ -270,7 +308,7 @@ impl AYEncoder {
                 );
                 Ok(result)
             }
-            "lookup" | "index_logic" | "index" | "get" => {
+            "lookup" | "index_logic" | "index" | "get" if args.len() == 1 => {
                 let key_term = self.encode_fmap_key_expr(&args[0], prefix)?;
                 let key_actual_sort = self.solver.get_sort(key_term);
                 if receiver_actual_sort != fmap {
@@ -398,7 +436,7 @@ impl AYEncoder {
         let receiver_actual_sort = self.solver.get_sort(receiver_term);
 
         match method {
-            "get" | "index_logic" | "index" => {
+            "get" | "index_logic" | "index" if args.len() == 1 => {
                 let key_term = self.encode_pure_impl(&args[0], prefix)?;
                 let key_actual_sort = self.solver.get_sort(key_term);
                 if key_actual_sort != Sort::Int {

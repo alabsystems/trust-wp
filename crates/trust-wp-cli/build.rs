@@ -37,13 +37,13 @@ fn main() {
     let dirty =
         git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|out| !out.is_empty());
     let suffix = if dirty { ".dirty" } else { "" };
-    println!("cargo:rustc-env=TRUST_WP_BUILD=g{sha}{suffix}");
+    println!("cargo:rustc-env=TWP_BUILD=g{sha}{suffix}");
 
     // The manual page's date. Convention is the date the content last
     // changed, which is the commit date — not the build date, which would
     // make the same commit render a different page every time it is built.
     if let Some(date) = git(&["log", "-1", "--format=%cs"]) {
-        println!("cargo:rustc-env=TRUST_WP_COMMIT_DATE={date}");
+        println!("cargo:rustc-env=TWP_COMMIT_DATE={date}");
     }
 }
 

@@ -1,0 +1,97 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "state-elaboration-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "call_old_dialect_false"
+path = "src/call_old_dialect_false.rs"
+
+[[bin]]
+name = "call_old_dialect_true"
+path = "src/call_old_dialect_true.rs"
+
+[[bin]]
+name = "call_pre_state_false"
+path = "src/call_pre_state_false.rs"
+
+[[bin]]
+name = "closure_contracts_false"
+path = "src/closure_contracts_false.rs"
+
+[[bin]]
+name = "closure_contracts_true"
+path = "src/closure_contracts_true.rs"
+
+[[bin]]
+name = "held_mut_ref_params"
+path = "src/held_mut_ref_params.rs"
+
+[[bin]]
+name = "call_lent_false"
+path = "src/call_lent_false.rs"
+
+[[bin]]
+name = "call_lent_true"
+path = "src/call_lent_true.rs"
+
+[[bin]]
+name = "value_param_old"
+path = "src/value_param_old.rs"
+
+[[bin]]
+name = "call_lent_box_cell_false"
+path = "src/call_lent_box_cell_false.rs"
+
+[[bin]]
+name = "interior_write_false"
+path = "src/interior_write_false.rs"
+
+[[bin]]
+name = "lent_elsewhere_false"
+path = "src/lent_elsewhere_false.rs"
+
+[[bin]]
+name = "unmentioned_argument"
+path = "src/unmentioned_argument.rs"
+
+[[bin]]
+name = "final_read_logic_false"
+path = "src/final_read_logic_false.rs"
+
+[[bin]]
+name = "lent_projection_false"
+path = "src/lent_projection_false.rs"
+
+[[bin]]
+name = "interior_route_false"
+path = "src/interior_route_false.rs"
+
+[[bin]]
+name = "final_denoted_false"
+path = "src/final_denoted_false.rs"
+
+[[bin]]
+name = "foreign_call_instance_true"
+path = "src/foreign_call_instance_true.rs"
+
+[[bin]]
+name = "foreign_call_instance_lent_false"
+path = "src/foreign_call_instance_lent_false.rs"
+
+[[bin]]
+name = "resolve_by_value_false"
+path = "src/resolve_by_value_false.rs"

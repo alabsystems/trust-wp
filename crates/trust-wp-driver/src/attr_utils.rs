@@ -9,14 +9,26 @@
 
 #![allow(clippy::doc_markdown)]
 
-use rustc_hir::Attribute;
-use rustc_span::Symbol;
+use rustc_ast::attr::AttributeExt;
+use rustc_attr_ir::{Attribute, AttributeKind};
+use rustc_span::{Span, Symbol};
+
+/// The span of the whole attribute, for the two shapes a marker takes: a
+/// parsed `#[doc = "..."]` and an unparsed tool attribute. rustc keeps no
+/// span for every parsed attribute kind, so any other kind has none here.
+pub(crate) fn attr_span(attr: &Attribute) -> Option<Span> {
+    match attr {
+        Attribute::Tool(item) | Attribute::DeriveHelper(item) => Some(item.span),
+        Attribute::Parsed(AttributeKind::DocComment { span, .. }) => Some(*span),
+        Attribute::Parsed(_) => None,
+    }
+}
 
 /// Read the string payload of a `#[doc = "..."]` marker.
 ///
 /// The Trust toolchain parses `#[doc = "..."]` into
 /// `Attribute::Parsed(AttributeKind::DocComment { .. })`, for which
-/// `value_str()` returns `None` (it only reads `Attribute::Unparsed`
+/// `value_str()` returns `None` (it only reads `Attribute::Tool` and `Attribute::DeriveHelper`
 /// key-value attrs) — only `doc_str()` returns the comment. Older / unparsed
 /// representations expose it via `value_str()`. Trying `doc_str()` first then
 /// `value_str()` makes the contract-marker extraction robust across both, which
@@ -58,7 +70,7 @@ pub(crate) fn get_contract_attrs_from_doc(attrs: &[Attribute], name: &str) -> Ve
 /// extracts the contract text from those attributes.
 pub(crate) fn get_contract_attrs_from_proc_macro(attrs: &[Attribute], name: &str) -> Vec<String> {
     use rustc_ast_pretty::pprust;
-    use rustc_hir::AttrArgs;
+    use rustc_attr_ir::AttrArgs;
 
     let mut values = Vec::new();
 
@@ -69,7 +81,7 @@ pub(crate) fn get_contract_attrs_from_proc_macro(attrs: &[Attribute], name: &str
         }
 
         // Check if this is an unparsed (custom) attribute
-        let Attribute::Unparsed(item) = attr else {
+        let (Attribute::Tool(item) | Attribute::DeriveHelper(item)) = attr else {
             continue;
         };
 
@@ -113,14 +125,14 @@ pub(crate) fn has_check_mode(attrs: &[Attribute], mode: &str) -> bool {
     }
 
     use rustc_ast_pretty::pprust;
-    use rustc_hir::AttrArgs;
+    use rustc_attr_ir::AttrArgs;
 
     for attr in attrs {
         if attr.is_doc_comment().is_some() {
             continue;
         }
 
-        let Attribute::Unparsed(item) = attr else {
+        let (Attribute::Tool(item) | Attribute::DeriveHelper(item)) = attr else {
             continue;
         };
 

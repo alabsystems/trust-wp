@@ -8,12 +8,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::trust_wp_rustc_path;
+use trust_wp_test_utils::{nested_cargo, trust_wp_rustc_path};
 
 fn run_mut_borrow_fixture() -> Output {
     let unique = SystemTime::now()
@@ -105,14 +105,14 @@ pub fn write_inner_borrow<'a>(x: &mut &'a mut i32, b: &'a mut i32, value: i32) {
     let target_dir: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/proof_assert_tests_verify_mut_borrow");
 
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(&fixture_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", "--verify")
-        .args(["check", "--quiet"])
+        .args(["--quiet"])
         .output()
-        .expect("failed to run cargo check for mut-borrow fixture");
+        .expect("failed to run targo check for mut-borrow fixture");
     let _ = fs::remove_dir_all(&fixture_dir);
     output
 }
@@ -123,8 +123,10 @@ fn proof_assert_mut_borrow_patterns_compile_and_verify() {
     let output = run_mut_borrow_fixture();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // The crate's one refused assertion (`write_inner_borrow`, below) fails
+    // the build; rustc itself must report no error.
     assert!(
-        output.status.success(),
+        output.status.success() || !stderr.contains("error["),
         "fixture should compile without borrowck regression; stderr: {stderr}"
     );
     assert!(
@@ -140,21 +142,33 @@ fn proof_assert_mut_borrow_patterns_compile_and_verify() {
         "proof_assert_mut_borrow_fixture::inspect_no_gen",
         "proof_assert_mut_borrow_fixture::place_mention_no_gen",
         "proof_assert_mut_borrow_fixture::shallow_borrow_no_gen",
-        "proof_assert_mut_borrow_fixture::write_inner_borrow",
     ] {
         assert!(
             stderr.contains(&format!("proof_assert in {fn_path} verified")),
             "expected verified proof_assert output for {fn_path}; stderr: {stderr}"
         );
     }
+    // `write_inner_borrow` reads the borrow `r` after `**x = value` writes
+    // through `x`, whose alias class `r` (a reborrow of `**x`) is in. Which
+    // memory that store reaches depends on the redirect `*x = b` before it,
+    // which the alias analysis does not follow, so the assertion reads `r`
+    // at a state the lane does not know and is refused (D-185): a TRUE
+    // assertion, not credited and not refuted.
+    assert!(
+        stderr.contains(
+            "proof_assert in proof_assert_mut_borrow_fixture::write_inner_borrow error: stale \
+             read refused (fail-closed)"
+        ),
+        "expected write_inner_borrow's read of `r` refused as stale (D-185); stderr: {stderr}"
+    );
 
     let proof_assert_summary = stderr
         .lines()
         .find(|line| line.starts_with("trust-wp: proof_assert:"))
         .expect("expected proof_assert summary line");
     assert!(
-        proof_assert_summary.contains("0 failed, 0 errors"),
-        "expected proof_assert summary with no failures/errors; stderr: {stderr}"
+        proof_assert_summary.contains("0 failed, 1 errors"),
+        "expected proof_assert summary with no failures and the one refusal; stderr: {stderr}"
     );
     assert!(
         !stderr.lines().any(|line| {

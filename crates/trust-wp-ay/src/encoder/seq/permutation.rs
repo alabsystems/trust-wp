@@ -202,16 +202,18 @@ impl AYEncoder {
         let fr_axiom = self
             .solver
             .forall_with_triggers(&[fr_k], fr_body, &[&[t_at_k]]);
-        // assemble the exchange consequent (frame is asserted as its own
-        // quantifier so its trigger is independent of the exchange trigger)
-        let ex_conj1 = self.solver.and(ex_perm, ex_len_eq);
-        let ex_conj2 = self.solver.and(ex_conj1, swap_guarded);
-        let ex_conj = self.solver.and(ex_conj2, fr_axiom);
-        let ex_body = self.solver.implies(ex_app, ex_conj);
-        let ex_axiom =
-            self.solver
-                .forall_with_triggers(&[ex_t, ex_s, ex_i, ex_j], ex_body, &[&[ex_app]]);
-        self.solver.assert_term(ex_axiom);
+        // Distribute the exchange implication over its consequences. The
+        // permutation and length laws do not require the nested frame
+        // quantifier to be instantiated or supported by the array solver.
+        // Keeping their proof dependencies separate also gives each law an
+        // independent E-matching instance with the same exchange trigger.
+        for consequence in [ex_perm, ex_len_eq, swap_guarded, fr_axiom] {
+            let body = self.solver.implies(ex_app, consequence);
+            let axiom =
+                self.solver
+                    .forall_with_triggers(&[ex_t, ex_s, ex_i, ex_j], body, &[&[ex_app]]);
+            self.solver.assert_term(axiom);
+        }
 
         // ── COUNT-NONNEG: forall s, x. count(s, x) >= 0 ────────────────
         let cn_s = self.solver.fresh_var("seq_cnt_s", seq_sort.clone());

@@ -21,6 +21,7 @@
 //@ teeth: gate (2026-08-14, execution-log entry "THIRD LIVE FALSE ACCEPT"), and rejected at the
 //@ teeth: fix arm 437233e/8d7bf70 with the TRUE exists-wrapped control passing both arms.
 //@ teeth: Recorded per method (i) rather than re-running the historical build.
+//@ also-verified: touch
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0

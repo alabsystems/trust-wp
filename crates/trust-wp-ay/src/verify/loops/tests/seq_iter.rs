@@ -195,14 +195,13 @@ fn ghost_seq_iter_reverse_preservation_verifies() {
     // obligation is TRUE, so the only unsound outcome would be `Failed` (a
     // spurious counterexample to a valid goal).
     //
-    // Historically ay-dpll's congruence-free core could not propagate the full
-    // projector chain in budget: it timed out (Unknown) at the default budget
-    // and, with a larger budget, produced a SPURIOUS model (a fake
-    // counterexample where a Seq length/offset went negative). The ground
-    // field-range facts asserted per program term (#2097, the retired-quantified
-    // -axiom → ground migration in encoder/match_enc/field_range.rs) now prune
-    // exactly those out-of-range spurious models, so the solver closes the chain
-    // and returns a genuine `Verified` — a sound proof of a true obligation, the
+    // ay-dpll's congruence-free core may not propagate the full projector
+    // chain within budget (Unknown), and an unpruned model over the chain is
+    // SPURIOUS (a fake counterexample where a Seq length/offset goes
+    // negative). The ground field-range facts asserted per program term
+    // (#2097, `encoder::match_enc::field_range`) prune exactly those
+    // out-of-range models, so the solver closes the chain and returns a
+    // genuine `Verified` — a sound proof of a true obligation, the
     // strictly-better resting state. We therefore accept `Verified` OR `Unknown`
     // (both sound for a true goal; Unknown just means "still too hard in budget")
     // and reject only `Failed`. Verified via added SOUND range facts cannot be an
@@ -277,10 +276,10 @@ fn ghost_seq_iter_reverse_initialization_verifies() {
     let result =
         verify_loop_invariant(&ctx).expect("loop verification should encode without errors");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result.initialization),
         "initialization of `result == produced.reverse()` with both seq_empty should \
@@ -509,14 +508,12 @@ fn ghost_seq_iter_variant_decrease_verifies() {
 /// `ghost/seq_iter::reverse_ghost`:
 ///   - `let mut result = Seq::new().into_inner();` is captured as a
 ///     `pre_loop_assignments["result"] = seq_empty()` binding.
-///   - The for-loop ghost state synthesizer
-///     (`build_for_loop_init_facts`, `for_loop_facts.rs:438`) emits the
-///     `produced@ == seq_empty()` init fact.
+///   - The for-loop ghost state synthesizer (`build_for_loop_init_facts`)
+///     emits the `produced@ == seq_empty()` init fact.
 ///
-/// If the encoder threads `pre_loop_assignments` into the initialization VC
-/// the same way it threads `init_extra_facts`, this test verifies. Otherwise
-/// the test demonstrates the gap described in
-/// `designs/2026-05-20-ghost-iter-init-fact-propagation.md`.
+/// The encoder must thread `pre_loop_assignments` into the initialization VC
+/// the same way it threads `init_extra_facts`; without that the VC lacks
+/// `result == seq_empty()` and initialization cannot verify.
 #[test]
 #[timeout(30000)]
 fn ghost_seq_iter_reverse_initialization_via_pre_loop_assignment() {

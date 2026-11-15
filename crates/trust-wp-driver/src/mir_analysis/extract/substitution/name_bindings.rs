@@ -171,6 +171,30 @@ pub(super) fn current_name_exprs<'tcx>(
         .collect()
 }
 
+/// The current value of every non-reference source name whose binding is a
+/// value of its own rather than the name itself: what a `snapshot!` taken
+/// now freezes. A by-name read (`Var(name)`) in a capture result means the
+/// name's CURRENT binding to every later reader (the internal-reference
+/// resolution, the substitution facts), so a snapshot left holding it
+/// follows every later write of the name (D-241,
+/// snapshot_follows_later_write_unseen.rs). A reference keeps its identity:
+/// a snapshot of one freezes the reference, which
+/// `recover_snapshot_capture_current_pointee` handles.
+pub(super) fn snapshot_frozen_name_values<'tcx>(
+    body: &Body<'tcx>,
+    arg_names: &[String],
+    local_exprs: &HashMap<Local, PureExpr>,
+) -> HashMap<String, PureExpr> {
+    current_name_bindings(body, arg_names, local_exprs)
+        .into_iter()
+        .filter(|(name, (local, expr))| {
+            !body.local_decls[*local].ty.is_any_ptr()
+                && !matches!(expr, PureExpr::Var(var, _) if var == name)
+        })
+        .map(|(name, (_, expr))| (name, expr))
+        .collect()
+}
+
 fn current_name_bindings<'tcx>(
     body: &Body<'tcx>,
     arg_names: &[String],

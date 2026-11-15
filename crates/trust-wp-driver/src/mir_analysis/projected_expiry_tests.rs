@@ -34,6 +34,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn install_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(
@@ -43,7 +44,9 @@ fn install_mir_borrowck_cache(config: &mut Config) {
                 return Err(guar);
             }
             copy_mir_bodies(tcx, local_id);
-            (rustc_interface::DEFAULT_QUERY_PROVIDERS.queries.mir_borrowck)(tcx, local_id)
+            (rustc_interface::DEFAULT_QUERY_PROVIDERS
+                .queries
+                .mir_borrowck)(tcx, local_id)
         };
     });
 }
@@ -68,25 +71,29 @@ impl Callbacks for ExpiryCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let suffix = format!("::{}", self.fn_name);
-        for owner in tcx.hir_body_owners() {
-            let def_id = owner.to_def_id();
-            let path = tcx.def_path_str(def_id);
-            if path != self.fn_name && !path.ends_with(&suffix) {
-                continue;
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let suffix = format!("::{}", self.fn_name);
+            for owner in tcx.hir_body_owners() {
+                let def_id = owner.to_def_id();
+                let path = tcx.def_path_str(def_id);
+                if path != self.fn_name && !path.ends_with(&suffix) {
+                    continue;
+                }
+                let root = tcx.typeck_root_def_id(def_id).expect_local();
+                let _ = tcx.mir_borrowck(root);
+                let Some(body_with_facts) = try_get_body_with_context(tcx, owner) else {
+                    continue;
+                };
+                let body = super::get_mir_body(&body_with_facts);
+                self.captured.report =
+                    Some(collect_projected_expiry_pins(tcx, body, &self.arg_names));
+                self.captured.ran = true;
+                break;
             }
-            let root = tcx.typeck_root_def_id(def_id).expect_local();
-            let _ = tcx.mir_borrowck(root);
-            let Some(body_with_facts) = try_get_body_with_context(owner) else {
-                continue;
-            };
-            let body = super::get_mir_body(body_with_facts);
-            self.captured.report = Some(collect_projected_expiry_pins(tcx, body, &self.arg_names));
-            self.captured.ran = true;
-            break;
-        }
-        Compilation::Stop
+            Compilation::Stop
+        })
     }
 }
 
@@ -151,31 +158,33 @@ impl Callbacks for PathCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let suffix = format!("::{}", self.type_alias_fn);
-        for owner in tcx.hir_body_owners() {
-            let def_id = owner.to_def_id();
-            let path = tcx.def_path_str(def_id);
-            if path != self.type_alias_fn && !path.ends_with(&suffix) {
-                continue;
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let suffix = format!("::{}", self.type_alias_fn);
+            for owner in tcx.hir_body_owners() {
+                let def_id = owner.to_def_id();
+                let path = tcx.def_path_str(def_id);
+                if path != self.type_alias_fn && !path.ends_with(&suffix) {
+                    continue;
+                }
+                // The probe function takes the type of interest as its ONLY
+                // parameter, so `_1`'s declared type is the type under test.
+                let root = tcx.typeck_root_def_id(def_id).expect_local();
+                let _ = tcx.mir_borrowck(root);
+                let Some(body_with_facts) = try_get_body_with_context(tcx, owner) else {
+                    continue;
+                };
+                let body = super::get_mir_body(&body_with_facts);
+                let ty = body.local_decls[rustc_middle::mir::Local::from_u32(1)].ty;
+                self.pin_paths = Some(collect_mut_ref_pin_paths_with_tcx(tcx, ty));
+                self.legacy_paths =
+                    Some(super::mut_borrow::type_analysis::collect_mut_ref_paths_with_tcx(tcx, ty));
+                self.ran = true;
+                break;
             }
-            // The probe function takes the type of interest as its ONLY
-            // parameter, so `_1`'s declared type is the type under test.
-            let root = tcx.typeck_root_def_id(def_id).expect_local();
-            let _ = tcx.mir_borrowck(root);
-            let Some(body_with_facts) = try_get_body_with_context(owner) else {
-                continue;
-            };
-            let body = super::get_mir_body(body_with_facts);
-            let ty = body.local_decls[rustc_middle::mir::Local::from_u32(1)].ty;
-            self.pin_paths = Some(collect_mut_ref_pin_paths_with_tcx(tcx, ty));
-            self.legacy_paths = Some(
-                super::mut_borrow::type_analysis::collect_mut_ref_paths_with_tcx(tcx, ty),
-            );
-            self.ran = true;
-            break;
-        }
-        Compilation::Stop
+            Compilation::Stop
+        })
     }
 }
 
@@ -333,7 +342,11 @@ fn option_payload_written_once_in_the_arm_emits_a_guarded_pin() {
         report.disarms
     );
     let pin = &report.pins[0];
-    assert_eq!(pin.value, PureExpr::Int(43), "death value is the last write");
+    assert_eq!(
+        pin.value,
+        PureExpr::Int(43),
+        "death value is the last write"
+    );
     match &pin.target {
         FinalPinTarget::Projection { root, path, .. } => {
             assert_eq!(root, "res", "the pin must address the NAMED root");
@@ -445,8 +458,7 @@ fn non_ground_death_value_is_disarmed() {
         report.pins
     );
     assert!(
-        reasons(&report).contains(&DisarmReason::ValueNotGround)
-            || report.disarms.is_empty(),
+        reasons(&report).contains(&DisarmReason::ValueNotGround) || report.disarms.is_empty(),
         "when a candidate was seen at all, the reason must be the ground-value \
          refusal, got {:?}",
         report.disarms
@@ -514,7 +526,6 @@ fn ordinary_bodies_produce_no_candidates() {
     assert!(report.pins.is_empty());
     assert!(report.disarms.is_empty());
 }
-
 
 // ── (4) The ghost-cluster shapes the M6 wiring newly REACHES ────────────────
 //
@@ -675,7 +686,10 @@ fn or_pattern_arm_guards_each_downcast_separately() {
     let report = analyze(source, "caller", &["a"]);
     for pin in &report.pins {
         let FinalPinTarget::Projection { path, .. } = &pin.target else {
-            panic!("enum payload pins must be guarded projections: {:?}", pin.target);
+            panic!(
+                "enum payload pins must be guarded projections: {:?}",
+                pin.target
+            );
         };
         assert!(
             matches!(path.as_slice(), [PinStep::Variant { ctor, .. }] if ctor == "A" || ctor == "B"),

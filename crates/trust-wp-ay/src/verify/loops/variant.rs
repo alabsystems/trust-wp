@@ -21,9 +21,9 @@ use super::{
         VerificationResult,
     },
     encoder_setup::{
-        assert_loop_current_chain_alias_constraints, collect_loop_sort_plan,
-        encode_and_assert_condition, resolve_sat_result_lightweight_outcome_timed,
-        setup_loop_encoder,
+        assert_condition_facts, assert_loop_current_chain_alias_constraints,
+        collect_loop_sort_plan, encode_and_assert_condition,
+        resolve_sat_result_lightweight_outcome_timed, setup_loop_encoder,
     },
     prime_substitutions::build_prime_substitutions,
     LoopVcBase,
@@ -114,6 +114,7 @@ pub(in crate::verify::loops) fn verify_variant_nonneg_outcome(
     if let Some(ref eff_cond) = effective_condition {
         encode_and_assert_condition(&mut encoder, eff_cond)?;
     }
+    assert_condition_facts(&mut encoder, config)?;
 
     let variant_stripped = strip_variant_datatype_sort(variant);
 
@@ -126,6 +127,7 @@ pub(in crate::verify::loops) fn verify_variant_nonneg_outcome(
     if let Some(ref eff_cond) = effective_condition {
         base_exprs.push(eff_cond.clone());
     }
+    base_exprs.extend(config.condition_facts.iter().cloned());
     if condition_is_body_break {
         for (var, effect_expr) in effects.direct {
             let prime_name = DerivedKind::Prime.format_name(var);
@@ -176,7 +178,7 @@ pub(in crate::verify::loops) fn verify_variant_nonneg_outcome(
 
     // Assert negated goal before axioms so two-phase probe can fire (#2116).
     // SMT assertion order does not affect semantics (conjunction).
-    encoder.assert_term(neg_nonneg);
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(neg_nonneg));
 
     // Pre-assert Seq ground instances before axiom probe. (#2323)
     if !matches!(encoder.logic(), ay_dpll::api::Logic::QfLia) {
@@ -280,6 +282,7 @@ pub(in crate::verify::loops) fn verify_variant_decrease_outcome(
     if let Some(ref eff_cond) = effective_condition {
         encode_and_assert_condition(&mut encoder, eff_cond)?;
     }
+    assert_condition_facts(&mut encoder, config)?;
 
     for fact in &config.transition_facts {
         let fact_term = encoder.encode_pure(fact)?;
@@ -296,6 +299,7 @@ pub(in crate::verify::loops) fn verify_variant_decrease_outcome(
             base_exprs.push(eff_cond.clone());
         }
         base_exprs.extend(config.transition_facts.iter().cloned());
+        base_exprs.extend(config.condition_facts.iter().cloned());
         if condition_is_body_break {
             for (var, effect_expr) in effects.direct {
                 let prime_name = DerivedKind::Prime.format_name(var);
@@ -352,7 +356,7 @@ pub(in crate::verify::loops) fn verify_variant_decrease_outcome(
 
     // Assert negated goal before axioms so two-phase probe can fire (#2116).
     // SMT assertion order does not affect semantics (conjunction).
-    encoder.assert_term(not_decrease);
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(not_decrease));
 
     // Pre-assert Seq ground instances before axiom probe. (#2323)
     if !matches!(encoder.logic(), ay_dpll::api::Logic::QfLia) {

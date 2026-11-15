@@ -173,9 +173,9 @@ fn collect_reborrow_leaves(
             out.push((idx, path.clone()));
             true
         }
-        PureExpr::Var(name, _) if name.starts_with("call_") => {
+        PureExpr::Var(name, _) if name.starts_with("$call_") => {
             let Some(local) = name
-                .strip_prefix("call_")
+                .strip_prefix("$call_")
                 .and_then(|s| s.parse::<u32>().ok())
             else {
                 return false;

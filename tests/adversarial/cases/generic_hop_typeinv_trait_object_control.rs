@@ -1,0 +1,49 @@
+//@ expect: verify
+//@ xfail: the price of refusing an instantiation at a trait object. `caller` writes 3 and 7,
+//@ xfail: which keep the invariant, and the call is refused all the same: no clause at
+//@ xfail: `dyn Total` can state what the erased type's impl was granted (D-141), and a second
+//@ xfail: fail-closed site on this spelling refuses it too. Retire this directive when a
+//@ xfail: trait-object instantiation charges the invariant of the value's concrete type.
+//@ mechanism: the value twin of generic_hop_typeinv_trait_object.
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+extern crate creusot_std;
+use creusot_std::prelude::*;
+
+pub struct Sum10 {
+    pub a: i32,
+    pub b: i32,
+}
+
+impl Invariant for Sum10 {
+    #[logic(open)]
+    fn invariant(self) -> bool {
+        pearlite! { self.a@ + self.b@ == 10 }
+    }
+}
+
+pub trait Total {
+    #[ensures(result@ == 10)]
+    fn total(&self) -> i32;
+}
+
+impl Total for Sum10 {
+    fn total(&self) -> i32 {
+        self.a + self.b
+    }
+}
+
+#[ensures(result@ == 10)]
+pub fn via<T: Total + ?Sized>(t: &T) -> i32 {
+    t.total()
+}
+
+#[ensures(result@ == 10)]
+pub fn caller(mut s: Sum10) -> i32 {
+    s.a = 3;
+    s.b = 7;
+    let d: &dyn Total = &s;
+    via(d)
+}

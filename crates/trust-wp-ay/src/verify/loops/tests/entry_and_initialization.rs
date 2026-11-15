@@ -1045,7 +1045,7 @@ fn verify_initialization_transitively_includes_iter_state_view_chain() {
     let init_extra_facts = vec![
         PureExpr::BinOp(
             Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_7".to_string(),
+                "$for_iter_state_7".to_string(),
                 seq_sort.clone(),
             )),
             BinOp::Eq,
@@ -1053,18 +1053,18 @@ fn verify_initialization_transitively_includes_iter_state_view_chain() {
         ),
         PureExpr::BinOp(
             Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_old_7".to_string(),
+                "$for_iter_old_7".to_string(),
                 seq_sort.clone(),
             )),
             BinOp::Eq,
             Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_7".to_string(),
+                "$for_iter_state_7".to_string(),
                 seq_sort.clone(),
             )),
         ),
         PureExpr::BinOp(
             Arc::new(PureExpr::View(Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_7".to_string(),
+                "$for_iter_state_7".to_string(),
                 seq_sort.clone(),
             )))),
             BinOp::Eq,

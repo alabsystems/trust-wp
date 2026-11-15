@@ -33,12 +33,17 @@ try:
     from tests.creusot_compat.harness_targets import (
         HARNESS_PROFILE_ENV,
         _workspace_target_binary,
+        build_tool_argv,
         resolve_harness_binary,
         resolve_driver_profile,
         resolved_source_revisions,
     )
     from tests.creusot_compat.harness_verification_tier import (
-        classify_verification_tier,
+        extract_trusted_def_paths,
+        recompute_record_grade,
+        compute_goal_coverage,
+        driver_report_lines,
+        resolve_trusted_def_path,
     )
 except ModuleNotFoundError:
     # Running as a script (`python3 tests/creusot_compat/harness.py`) puts this
@@ -48,24 +53,31 @@ except ModuleNotFoundError:
     from harness_targets import (
         HARNESS_PROFILE_ENV,
         _workspace_target_binary,
+        build_tool_argv,
         resolve_harness_binary,
         resolve_driver_profile,
         resolved_source_revisions,
     )
-    from harness_verification_tier import classify_verification_tier
+    from harness_verification_tier import (
+        recompute_record_grade,
+        compute_goal_coverage,
+        driver_report_lines,
+        extract_trusted_def_paths,
+        resolve_trusted_def_path,
+    )
 
 _TEST_TIMEOUT_OVERRIDES_SEC = {
     # #2116: these iterator-heavy compat crates still need a larger wall-clock
     # budget than the default 120s harness cap to surface the post-fix result
     # instead of a harness-side timeout.
     "tests/should_succeed/cc/fmap.rs": 300,
-    # #2694: fmap_iter axiom overhead regression — previously errored at ~72s, now
-    # needs more time due to accumulated axiom assertions (type invariant, trait
-    # postcondition, generic container layout, ground sub-expression extraction).
+    # #2694: fmap_iter carries a heavy axiom load (type invariant, trait
+    # postcondition, generic container layout, ground sub-expression
+    # extraction) and needs far more than the default budget.
     "tests/should_succeed/ghost/fmap_iter.rs": 600,
     "tests/should_succeed/ghost/seq_iter.rs": 300,
-    # cell/02_fib verifies at ~294s — barely exceeds 120s default.
-    # #2701: factory session 3/4 axiom additions pushed solve time past 300s.
+    # cell/02_fib: the accumulated axiom assertions (#2701) put its solve time
+    # past 300s.
     "tests/should_succeed/cell/02_fib.rs": 600,
     # result/own.rs finishes at ~164s; timeout override for accurate classification.
     "tests/should_succeed/result/own.rs": 300,
@@ -83,9 +95,8 @@ _TEST_TIMEOUT_OVERRIDES_SEC = {
     # #2674: binary_search_list.rs has user-defined enum List<T> with recursive
     # logic functions and complex quantifier-based loop invariants.
     "tests/should_succeed/binary_search_list.rs": 300,
-    # #2674: ghost_vec.rs regressed from 12s to >120s after ay pivot strategy
-    # change (ay#8404). Needs larger budget until ay upstream fix.
-    # #2701: factory session 3/4 axiom additions pushed solve time past 300s.
+    # #2674: ghost_vec.rs exceeds 120s under ay's pivot strategy (ay#8404);
+    # the accumulated axiom assertions (#2701) put it past 300s.
     "tests/should_succeed/ghost/ghost_vec.rs": 600,
     # #2674: inferred_invariants.rs has nested loops with mutable borrow
     # invariant inference. Each loop adds verification overhead.
@@ -101,16 +112,13 @@ _TEST_TIMEOUT_OVERRIDES_SEC = {
     # nested Option unwrapping — ground pool instantiation for tree axioms
     # consumes significant solver time.
     "tests/should_succeed/rusthorn/inc_some_2_tree.rs": 300,
-    # #2674: ay bump (eede84ad → 18802b68) caused performance regression
-    # on loop invariant verification. bug/164 has nested loops with break
-    # statements — previously solved in <1s, now exceeds 120s.
+    # #2674: bug/164 has nested loops with break statements; its loop
+    # invariant verification exceeds 120s.
     "tests/should_succeed/bug/164.rs": 300,
-    # #2674: ay bump caused performance regression on termination checking.
-    # incorrect_variant has recursive functions with modular arithmetic
-    # variants — previously solved in <1s, now exceeds 120s.
-    # #2686: Increased from 300s to 600s — the test has 3 functions
-    # (2 recursive + 1 loop variant), each requiring separate solver
-    # invocations for variant decrease checks plus body verification.
+    # #2674/#2686: incorrect_variant has 3 functions (2 recursive with modular
+    # arithmetic variants + 1 loop variant), each requiring separate solver
+    # invocations for variant decrease checks plus body verification; the
+    # termination checks alone exceed 120s.
     "tests/should_fail/terminates/incorrect_variant.rs": 600,
 }
 
@@ -129,6 +137,49 @@ def _effective_timeout_for_test(test_path: Path, timeout_sec: int) -> int:
             return max(timeout_sec, override_sec)
     return timeout_sec
 
+def _run_cargo_build(harness, cmd, workspace, verbose):
+    """Run a targo build, degrading to `--offline` only on a lock-resolution failure.
+
+    `--locked` is the right check whenever the committed lock CAN be satisfied.
+    It cannot be in every layout: the root manifest path-depends on its
+    first-party siblings, so the lock records the versions of whichever
+    siblings sat beside the checkout that resolved it, and a tree whose
+    sibling differs fails to resolve through no fault of the run. Falling back
+    is announced, never silent, and the lock the fallback rewrites is restored
+    -- a dirty lock stamps `.dirty` into the CLI's version and would then
+    describe the binary this very run measures.
+    """
+
+    def _go(argv):
+        if verbose:
+            return harness.subprocess.run(argv, cwd=workspace, text=True)
+        return harness.subprocess.run(argv, cwd=workspace, capture_output=True, text=True)
+
+    result = _go(cmd)
+    if result.returncode == 0:
+        return result
+    text = (result.stderr or "") + (result.stdout or "")
+    if "cannot update the lock file" not in text:
+        return result
+    print(
+        "harness: the committed lock does not resolve in this layout; "
+        "building --offline (sibling versions differ from the ones the lock records)"
+    )
+    offline = [a for a in cmd if a != "--locked"]
+    # After the subcommand: `targo --unverified build` names its lane first.
+    offline.insert(offline.index("build") + 1, "--offline")
+    result = _go(offline)
+    lock = workspace / "Cargo.lock"
+    try:
+        harness.subprocess.run(
+            ["git", "checkout", "--", str(lock)], cwd=workspace,
+            capture_output=True, text=True,
+        )
+    except Exception:  # restoring is best-effort; the build result still stands
+        pass
+    return result
+
+
 def ensure_harness_binaries(
     workspace: Path, verbose: bool, facade: object | None = None
 ) -> None:
@@ -136,22 +187,17 @@ def ensure_harness_binaries(
     harness = _resolve_harness_facade(facade)
 
     # Always build debug profile.
-    cmd = [
-        "cargo",
+    cmd = build_tool_argv(
         "build",
         "--locked",
         "-p",
         "trust-wp-driver",
         "-p",
         "targo-trust-wp",
-    ]
+    )
     if verbose:
         print("Building harness binaries (trust-wp-driver, cargo-trust-wp)...")
-        result = harness.subprocess.run(cmd, cwd=workspace, text=True)
-    else:
-        result = harness.subprocess.run(
-            cmd, cwd=workspace, capture_output=True, text=True
-        )
+    result = _run_cargo_build(harness, cmd, workspace, verbose)
 
     if result.returncode != 0:
         error_text = (result.stderr or "").strip() or (result.stdout or "").strip()
@@ -167,9 +213,13 @@ def ensure_harness_binaries(
         workspace, "trust-wp-rustc", profile="release"
     )
     _requested = (os.environ.get(HARNESS_PROFILE_ENV) or "auto").strip().lower()
-    if release_binary.is_file() or _requested == "release":
-        release_cmd = [
-            "cargo",
+    # An existing release binary only matters in `auto` mode, where selection
+    # prefers release (#972). When the profile is pinned to debug, the driver
+    # and every companion binary resolve at debug, so a leftover release
+    # binary is inert; rebuilding it anyway would double every harness run's
+    # build cost.
+    if _requested == "release" or (_requested == "auto" and release_binary.is_file()):
+        release_cmd = build_tool_argv(
             "build",
             "--locked",
             "--release",
@@ -177,16 +227,12 @@ def ensure_harness_binaries(
             "trust-wp-driver",
             "--bin",
             "trust-wp-rustc",
-        ]
+        )
         if verbose:
             print("Rebuilding release binaries (stale release binary detected)...")
-            release_result = harness.subprocess.run(
-                release_cmd, cwd=workspace, text=True
-            )
-        else:
-            release_result = harness.subprocess.run(
-                release_cmd, cwd=workspace, capture_output=True, text=True
-            )
+        release_result = _run_cargo_build(
+            harness, release_cmd, workspace, verbose
+        )
         if release_result.returncode != 0:
             error_text = (
                 (release_result.stderr or "").strip()
@@ -344,14 +390,13 @@ _SOLVER_TIMEOUT_ENV = "TRUST_WP_HARNESS_SOLVER_TIMEOUT"
 def _derive_solver_timeout_sec(wall_timeout_sec: int) -> int:
     """Derive the driver's per-obligation solver budget from the test wall.
 
-    Restores the watchdog-fires-inside-the-wall invariant (#2708).  The
-    harness historically passed the per-test wall ``-t N`` as BOTH the
-    process kill-timeout AND ``cargo-trust-wp --timeout N``.  The driver
-    treats ``--timeout`` as the per-obligation solver budget and aborts a
-    stuck obligation only at ``1.5 x N + 0.1s`` — after the harness has
-    already killed the process at ``N``.  One obligation running to budget
-    therefore killed the whole test, and raising ``-t`` only gave it more
-    rope.
+    Keeps the watchdog-fires-inside-the-wall invariant (#2708).  Passing the
+    per-test wall ``-t N`` as ``cargo-trust-wp --timeout N`` too would break
+    it: the driver treats ``--timeout`` as the per-obligation solver budget
+    and aborts a stuck obligation only at ``1.5 x N + 0.1s`` — after the
+    harness has already killed the process at ``N``.  One obligation running
+    to budget then kills the whole test, and raising ``-t`` only gives it
+    more rope.
 
     The wall must contain everything the driver's own design says a run may
     cost for a solver budget ``B``:
@@ -501,14 +546,15 @@ def _warmup_shared_target(
         }
         # Make the warmup compile dependencies through the SAME trust-wp-rustc
         # wrapper the per-test builds use. Cargo's dependency fingerprint
-        # includes RUSTC_WRAPPER, so a plain `cargo check` warmup produces dep
+        # includes RUSTC_WRAPPER, so a plain `targo check` warmup produces dep
         # artifacts the per-test (cargo-trust-wp → RUSTC_WRAPPER=<stable-bin>/
         # trust-wp-rustc) cannot reuse — it recompiles the whole stack inside
         # its own budget and times out. Pointing the warmup at the identical
         # wrapper makes the warm dep cache reusable. With
         # `-Z trust-verify-target` set (deps are non-target → DependencyBoundary
         # skip), the wrapper only COMPILES deps (no verification), so this stays
-        # cheap. Falls back to plain cargo if the wrapper bin isn't built yet.
+        # cheap. Falls back to a plain `targo --unverified check` if the wrapper
+        # bin isn't built yet.
         try:
             _cargo_trust_wp = resolve_harness_binary(workspace, "cargo-trust-wp")
             if _cargo_trust_wp.exists():
@@ -526,7 +572,7 @@ def _warmup_shared_target(
             pass
         with _shared_target_lock(shared_target):
             warmup_result = harness.subprocess.run(
-                ["cargo", "check", "--locked"],
+                build_tool_argv("check", "--locked"),
                 cwd=warmup_project,
                 capture_output=True,
                 text=True,
@@ -589,11 +635,17 @@ def _invalidate_test_crate_cache(shared_target: Path) -> None:
                 shutil.rmtree(entry, ignore_errors=True)
 
     # Clean build script output (#2107). Proc macros may cache state across
-    # test crate invocations.
+    # test crate invocations. Under cargo's build-dir layout (always on since
+    # cargo 1.100) `build/<package>/` also holds every unit of the package --
+    # its fingerprints and compiled artifacts -- and there is no `deps/` or
+    # `.fingerprint/`, so the package's directory goes whole.
     build_dir = debug_dir / "build"
     if build_dir.is_dir():
         for entry in build_dir.iterdir():
-            if entry.name.startswith("creusot_test-"):
+            if entry.name.startswith("creusot_test-") or entry.name in (
+                "creusot_test",
+                "creusot-test",
+            ):
                 shutil.rmtree(entry, ignore_errors=True)
 
 
@@ -695,7 +747,7 @@ def _classify_outcome(
     Returns ``(status, message, skip_reason, error_category, message_truncated)``.
     """
     if harness._is_should_fail_test(test_name):
-        status, skip_reason = harness.classify_should_fail_result(
+        status, skip_reason, credit = harness.classify_should_fail_result_with_credit(
             success, output, source, test_name, exit_code=exit_code
         )
         error_cat = _classify_error_or_unknown_category(harness, status, output, exit_code)
@@ -707,34 +759,45 @@ def _classify_outcome(
             if backend_reason is not None:
                 msg = f"{harness.BACKEND_PASS_PREFIX} {backend_reason}"
                 return status, msg, None, None, False
-            return status, "Correctly rejected", skip_reason, None, False
+            # The pass row discards the driver output, so the
+            # stored message names the gate that credited the rejection
+            # (``Correctly rejected (validated counterexample: f proof_assert)``,
+            # ``(frontend: ...)``).
+            return (
+                status,
+                harness.rejection_pass_message(credit),
+                skip_reason,
+                None,
+                False,
+            )
         message, message_truncated = harness._truncate_output_with_flag(output, workspace)
         return status, message, skip_reason, error_cat, message_truncated
 
-    # NO_REPLAY tests used to be syntax-only passes.  Strict Creusot
-    # compatibility requires replayable verification, so the marker fails
-    # closed before the normal success path can accept it -- unless the
-    # aggregate telemetry shows a clean run (no failures, errors, or panics
-    # and zero exit), in which case the gate is satisfied and the test
-    # passes as a parse-only success.
+    # NO_REPLAY tests (Creusot only translates them, never proves). Credit
+    # policy (D-21): a NO_REPLAY test is a pass only when trust-wp VERIFIES it
+    # (tier2, verified>0, zero trust counters), or when it is on the
+    # translate-only allowlist -- every Creusot goal unprovable or contentless --
+    # and translated with a clean frontend (tier3, reported separately).
     if harness._is_no_replay_source(source):
-        # Pass test_name so the genuinely-unprovable translate-only allowlist
-        # (bug/653, traits/04, spec_tests) can match — it is keyed on the test
-        # path. Without this the allowlist never fired through the main harness
-        # path and every allowlisted NO_REPLAY test errored on its expected
-        # failed-prover exit.
-        status, skip_reason = harness.classify_no_replay_result(
+        # Pass test_name: the translate-only allowlist is keyed on the exact
+        # test path.
+        status, skip_reason, mode = harness.classify_no_replay_result_with_mode(
             output, exit_code=exit_code, test_name=test_name
         )
         error_cat = _classify_error_or_unknown_category(harness, status, output, exit_code)
         if status == "pass":
-            return (
-                status,
-                f"{harness.NO_REPLAY_PASS_PREFIX} syntax-only test",
-                None,
-                None,
-                False,
-            )
+            # A NO_REPLAY test trust-wp actually VERIFIED (clean telemetry,
+            # zero exit, verified>0, zero trust counters) is a real proof and is
+            # graded tier2; only translate-only passes (the allowlist) keep the
+            # parse-only prefix and tier3.
+            if mode == "verified":
+                message = (
+                    f"{harness.NO_REPLAY_VERIFIED_PREFIX} verified with clean "
+                    "telemetry (strictly more than Creusot's translate-only check)"
+                )
+            else:
+                message = f"{harness.NO_REPLAY_PASS_PREFIX} syntax-only test"
+            return (status, message, None, None, False)
         if status == "error" and skip_reason is None and error_cat == "unknown":
             return (
                 status,
@@ -744,6 +807,9 @@ def _classify_outcome(
                 False,
             )
         message, message_truncated = harness._truncate_output_with_flag(output, workspace)
+        if status == "error" and isinstance(skip_reason, str) and skip_reason:
+            # Keep the named refusal (e.g. a verified refutable goal) visible.
+            message = f"{skip_reason}\n{message}"
         return status, message, None, error_cat, message_truncated
 
     if success:
@@ -759,8 +825,8 @@ def _classify_outcome(
         # trust-wp's REJECTION is the known-correct outcome (e.g. Creusot only
         # warns on a non-decreasing variant). A non-zero verifier exit is the
         # EXPECTED transport for that rejection, so the exit!=0 fail-closed
-        # short-circuit in classify_failure() (12d0fdc) returns "error" instead
-        # of "fail" and would otherwise erase this long-standing whitelist.
+        # short-circuit in classify_failure() returns "error" instead of "fail"
+        # and would otherwise erase this whitelist.
         # Re-derive the SEMANTIC status without the exit-code override, for
         # whitelisted tests ONLY; honor the whitelist only on a genuine "fail"
         # (never a crash/panic/infra "error"). Per-test + should_succeed-only =>
@@ -794,45 +860,6 @@ def _extract_telemetry(output: str) -> Any:
     return last_telemetry
 
 
-def _message_with_telemetry_for_tier(message: str, telemetry: Any) -> str:
-    """Append structured counters so tiering can fail closed on generic passes."""
-    if telemetry is None:
-        return message
-    pairs = " ".join(
-        f"{key}={value}" for key, value in telemetry.to_dict().items()
-    )
-    return f"{message}\n{WIRE_PREFIX} {pairs}"
-
-
-# Driver-emitted proof_assert verification summary, e.g.
-# ``trust-wp: proof_assert: 3 verified, 0 failed, 2 errors`` (reporting.rs:370).
-_PROOF_ASSERT_SUMMARY_RE = re.compile(
-    r"proof_assert:\s*\d+\s+verified,\s+\d+\s+failed,\s+\d+\s+errors"
-)
-
-
-def _tier_message_with_proof_assert_summary(
-    message: str, telemetry: Any, output: str
-) -> str:
-    """Tier-classification message that also surfaces the proof_assert summary.
-
-    The structured wire line carries ``proof_assert_failed``/``proof_assert_errors``
-    but not the count of *verified* proof_asserts, so a proof_assert-only crate
-    (zero contract-level obligations) reports ``verified=0`` and never reaches
-    tier2 even though ay genuinely discharged every assertion. Re-attaching the
-    driver's human-readable ``proof_assert: N verified, …`` line lets the tier
-    classifier credit those proven assertions as tier2 review-grade evidence.
-    The appended structured counters still hold the crate at tier3 when any
-    proof_assert failed/errored or produced an evidence gap (see the tier guards
-    in harness_verification_tier), so this never masks an unproven assertion.
-    """
-    tier_message = _message_with_telemetry_for_tier(message, telemetry)
-    summary = _PROOF_ASSERT_SUMMARY_RE.search(output)
-    if summary is not None:
-        tier_message = f"{tier_message}\n{summary.group(0)}"
-    return tier_message
-
-
 def _run_single_test(
     harness: Any,
     workspace: Path,
@@ -864,13 +891,23 @@ def _run_single_test(
                 harness, workspace, test_name, source, success, output, exit_code
             )
             telemetry = _extract_telemetry(output)
-            tier = classify_verification_tier(
-                test_name,
-                status,
-                _tier_message_with_proof_assert_summary(message, telemetry, output),
-                skip_reason,
-                source,
-            )
+            trusted_def_paths = extract_trusted_def_paths(output)
+            report_lines = driver_report_lines(output)
+            goal_coverage = None
+            if test_name.startswith("tests/should_succeed/"):
+                goal_coverage = _goal_coverage_for(
+                    test_name, report_lines, source, trusted_def_paths
+                )
+            tier = None
+            if status != "skip" and not test_name.startswith("tests/should_fail/"):
+                tier = recompute_record_grade(
+                    {
+                        "name": test_name, "status": status, "message": message,
+                        "telemetry": telemetry.to_dict() if telemetry is not None else None,
+                        "driver_report": report_lines, "trusted_def_paths": trusted_def_paths,
+                    },
+                    workspace,
+                ).tier
             result = harness.TestResult(
                 name=test_name,
                 status=status,
@@ -881,6 +918,9 @@ def _run_single_test(
                 message_truncated=message_truncated,
                 verification_tier=tier,
                 telemetry=telemetry,
+                trusted_def_paths=trusted_def_paths or None,
+                driver_report=report_lines,
+                goal_coverage=goal_coverage,
             )
         except Exception as exc:  # pragma: no cover - retained behavior
             result = harness.TestResult(
@@ -896,6 +936,21 @@ def _run_single_test(
             status_str += f" ({result.skip_reason})"
         print(f"{status_str} ({result.duration_ms}ms)")
     return result
+
+
+def _goal_coverage_for(
+    test_name: str, report_lines: list[str], source: str, trusted_def_paths: list[str]
+) -> dict:
+    """Creusot goal coverage; an extractor crash is recorded, never a pass."""
+    try:
+        trusted_source = [
+            p for p in trusted_def_paths or [] if resolve_trusted_def_path(p, source)
+        ]
+        return compute_goal_coverage(
+            test_name, report_lines, trusted_source_paths=trusted_source
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"inventory": "error", "error": repr(exc), "covered": [], "uncovered": []}
 
 
 def run_harness(

@@ -5,13 +5,9 @@
 //! Data-only state structs used by the AY encoder.
 //!
 //! These structs are pure state containers with no `AYEncoder` method
-//! implementations. They are used across encoder submodules and extracted
-//! here to keep `mod.rs` focused on core encoder logic.
-//!
-//! Extracted from `encoder/mod.rs` per design doc
-//! `designs/2026-03-07-method-call-encoder-mod-decomposition.md` Step 1 and
-//! split into subsystem-owned leaf modules per
-//! `designs/2026-03-14-1584-encoder-state-module-decomposition.md`.
+//! implementations. They are used across encoder submodules and live here,
+//! one leaf module per owning subsystem, to keep `mod.rs` focused on core
+//! encoder logic.
 
 mod adt;
 mod arithmetic_mode;
@@ -34,7 +30,7 @@ pub(crate) use closure::ClosureState;
 pub(crate) use declarations::DeclarationState;
 pub(crate) use dedup_snapshot::DedupSnapshot;
 pub(crate) use encoding_cache::EncodingCacheState;
-pub(crate) use quantifier::QuantifierState;
+pub(crate) use quantifier::{QuantifierState, WrittenBinderSort};
 #[cfg(test)]
 pub(crate) use quantifier::SynthesizedTriggerDiagnostic;
 #[cfg(any(test, feature = "sep-logic"))]

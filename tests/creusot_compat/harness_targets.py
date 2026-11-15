@@ -144,10 +144,11 @@ def _git_root(path: Path) -> Path | None:
         return None
 
 
-def _workspace_source_roots(workspace: Path) -> list[Path]:
-    """Return git roots that can contribute bytes to the harness binaries."""
+def _workspace_source_root_labels(workspace: Path) -> dict[Path, str]:
+    """Keep physical Git identity and the manifest's logical checkout names."""
     workspace = workspace.resolve()
-    roots = {_git_root(workspace)}
+    workspace_root = _git_root(workspace)
+    labels = {workspace_root: workspace.name}
     manifest_path = workspace / "Cargo.toml"
     try:
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
@@ -162,12 +163,34 @@ def _workspace_source_roots(workspace: Path) -> list[Path]:
             raw_path = dependency.get("path")
             if not isinstance(raw_path, str):
                 continue
-            dependency_root = _git_root((workspace / raw_path).resolve())
-            roots.add(dependency_root)
+            declared_path = workspace / raw_path
+            physical_path = declared_path.resolve()
+            dependency_root = _git_root(physical_path)
+            if dependency_root is None:
+                raise RuntimeError(f"harness source is not in a git checkout: {declared_path}")
+            # Locate the declared checkout alias above its package subpath.
+            # Resolve only to find the physical Git boundary, HEAD and dirt;
+            # the alias supplies a display label, never source authority.
+            declared_root = declared_path
+            while declared_root.parent != declared_root:
+                parent = declared_root.parent
+                if not parent.resolve().is_relative_to(dependency_root):
+                    break
+                declared_root = parent
+            label = declared_root.name
+            if dependency_root != workspace_root:
+                labels[dependency_root] = min(labels.get(dependency_root, label), label)
 
-    if None in roots:
+    if None in labels:
         raise RuntimeError(f"harness source is not in a git checkout: {workspace}")
-    return sorted((root for root in roots if root is not None), key=str)
+    if len(set(labels.values())) != len(labels):
+        raise RuntimeError("ambiguous source revision label for distinct Git roots")
+    return dict(sorted(labels.items(), key=lambda item: str(item[0])))
+
+
+def _workspace_source_roots(workspace: Path) -> list[Path]:
+    """Return physical Git roots that can contribute harness binary bytes."""
+    return list(_workspace_source_root_labels(workspace))
 
 
 def _git_source_state(repo: Path) -> bytes:
@@ -203,7 +226,7 @@ def resolved_source_revisions(workspace: Path) -> dict[str, str]:
     Reported alongside every run so a number always carries its backend sha.
     """
     revisions: dict[str, str] = {}
-    for root in _workspace_source_roots(workspace):
+    for root, label in _workspace_source_root_labels(workspace).items():
         try:
             head = _git_output(root, "rev-parse", "HEAD").strip().decode()[:10]
         except (subprocess.CalledProcessError, OSError, UnicodeDecodeError):
@@ -214,17 +237,120 @@ def resolved_source_revisions(workspace: Path) -> dict[str, str]:
                 dirty = "-dirty"
         except (subprocess.CalledProcessError, OSError):
             dirty = "-unknown"
-        revisions[root.name] = f"{head}{dirty}"
+        revisions[label] = f"{head}{dirty}"
     return revisions
+
+
+# The Trust toolchain's build tool and compiler. `$CARGO` / `$RUSTC` win when
+# the caller set them; the defaults are the Trust names. Never a bare `cargo` /
+# `rustc`: on a Trust machine those names are not the Trust tools, and a silent
+# fallback to them would build the verifier with another compiler.
+COMPILATION_SUBCOMMANDS = frozenset(
+    {"build", "check", "fix", "clippy", "test", "run", "bench", "doc", "rustc", "rustdoc",
+     "install"}
+)
+
+
+def build_tool() -> str:
+    return os.environ.get("CARGO") or "targo"
+
+
+def compiler_tool() -> str:
+    return os.environ.get("RUSTC") or "trustc"
+
+
+def build_tool_argv(subcommand: str, *args: str) -> list[str]:
+    """`<build tool> [--unverified] <subcommand> <args>`.
+
+    targo refuses a compilation command without a lane and refuses
+    `--unverified` on anything else (`metadata`), so the lane depends on the
+    verb. These builds make no Trust proof claim: the harness measures
+    trust-wp's own verifier.
+    """
+    tool = build_tool()
+    lane = (
+        ["--unverified"]
+        if Path(tool).stem == "targo" and subcommand in COMPILATION_SUBCOMMANDS
+        else []
+    )
+    return [tool, *lane, subcommand, *args]
 
 
 def _tool_identity(command: str) -> bytes:
     try:
+        # Trust's native entry admits this exact metadata query without a GNU
+        # scheduler. Extra arguments select compiler work and require custody.
         return subprocess.check_output(
-            [command, "--version", "--verbose"], stderr=subprocess.STDOUT
+            [command, "-vV"], stderr=subprocess.STDOUT
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise RuntimeError(f"cannot fingerprint build tool {command}: {error}") from error
+
+
+def source_state_detail(workspace: Path) -> dict[str, object]:
+    """The fingerprint's ingredients, named — for diagnosis, never for gating.
+
+    The fingerprint is one hash, so a mismatch says only "something moved".
+    Which something matters: a dirty crate is a rebuild, a moved path
+    dependency is a different backend, and an untracked scratch file that a
+    second worker in the same checkout wrote is neither — it is a race the
+    caller can simply retry. Reporting the delta is the difference between
+    diagnosing that in one run and in four.
+    """
+    detail: dict[str, object] = {}
+    for root in _workspace_source_roots(workspace):
+        detail[str(root)] = {
+            "head": _git_output(root, "rev-parse", "HEAD").strip().decode(errors="replace"),
+            "tracked-diff": hashlib.sha256(
+                _git_output(root, "diff", "--no-ext-diff", "--binary", "HEAD", "--")
+            ).hexdigest(),
+            "untracked": {
+                os.fsdecode(name): (
+                    _sha256_file(root / os.fsdecode(name))
+                    if (root / os.fsdecode(name)).is_file()
+                    else "non-file"
+                )
+                for name in sorted(
+                    n
+                    for n in _git_output(
+                        root, "ls-files", "-z", "--others", "--exclude-standard"
+                    ).split(b"\0")
+                    if n
+                )
+            },
+        }
+    return detail
+
+
+def describe_source_state_change(
+    before: dict[str, object], after: dict[str, object]
+) -> str:
+    """One line per ingredient that moved between two `source_state_detail`s."""
+    lines: list[str] = []
+    for root in sorted(set(before) | set(after)):
+        old = before.get(root) or {}
+        new = after.get(root) or {}
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            continue
+        for key in ("head", "tracked-diff"):
+            if old.get(key) != new.get(key):
+                lines.append(f"  {root}: {key} {old.get(key)} -> {new.get(key)}")
+        old_u = old.get("untracked") or {}
+        new_u = new.get("untracked") or {}
+        if isinstance(old_u, dict) and isinstance(new_u, dict) and old_u != new_u:
+            added = sorted(set(new_u) - set(old_u))
+            removed = sorted(set(old_u) - set(new_u))
+            edited = sorted(k for k in set(old_u) & set(new_u) if old_u[k] != new_u[k])
+            for label, names in (
+                ("untracked added", added),
+                ("untracked removed", removed),
+                ("untracked edited", edited),
+            ):
+                if names:
+                    shown = ", ".join(names[:8])
+                    more = f" (+{len(names) - 8} more)" if len(names) > 8 else ""
+                    lines.append(f"  {root}: {label}: {shown}{more}")
+    return "\n".join(lines) or "  (no ingredient differs; the tool identity or build env moved)"
 
 
 def _harness_source_fingerprint(workspace: Path) -> str:
@@ -235,8 +361,12 @@ def _harness_source_fingerprint(workspace: Path) -> str:
         digest.update(b"\0")
         digest.update(_git_source_state(root))
         digest.update(b"\0")
-    for command in ("cargo", "rustc"):
-        digest.update(command.encode())
+    # Keyed by role, not by how the command is spelled: under targo `$CARGO` is
+    # its absolute path, from a shell it is bare `targo`, and the same toolchain
+    # must fingerprint the same from both. The closed `-vV` query carries the
+    # commit hash, which is the identity that matters.
+    for role, command in (("build-tool", build_tool()), ("compiler", compiler_tool())):
+        digest.update(role.encode())
         digest.update(b"\0")
         digest.update(_tool_identity(command))
         digest.update(b"\0")
@@ -309,12 +439,85 @@ def resolve_harness_binary(workspace: Path, name: str) -> Path:
             f"{HARNESS_PROFILE_ENV}={profiles[0]} was requested but {pinned} "
             f"does not exist. Refusing to fall back to another profile: the "
             f"run would not be the one that was pinned. Build it first "
-            f"(cargo build --{profiles[0]} -p cargo-trust-wp), or unset "
+            f"(targo --unverified build --{profiles[0]} -p targo-trust-wp), or unset "
             f"{HARNESS_PROFILE_ENV}."
         )
     # auto with nothing built: return the preferred path so callers report a
     # useful "not built" message rather than raising here.
     return _workspace_target_binary(workspace, name, profile=profiles[0])
+
+
+ALLOW_STALE_DRIVER_ENV = "TRUST_WP_HARNESS_ALLOW_STALE_DRIVER"
+_STALE_DRIVER_CACHE: dict[tuple[str, int], str | None] = {}
+_DEPINFO_SPLIT_RE = re.compile(r"(?<!\\)\s+")
+
+
+def stale_driver_source(binary: Path) -> str | None:
+    """Return a Rust source newer than ``binary``, per cargo's dep-info, or None.
+
+    Only a build refreshes a driver binary. The full harness builds first
+    (``ensure_harness_binaries``), but probe scripts that call
+    ``run_trust_wp_on_project`` directly do not, and ``auto`` prefers any
+    release binary that exists. On the 2026-09-12 campaign tree that silently
+    ran a release driver predating seven merged fixes, so probes of already
+    fixed false accepts read as live ones.
+
+    Cargo writes ``<binary>.d`` beside the binary listing every file compiled
+    into it. A listed ``.rs`` file that is newer than the binary, or missing,
+    means the binary was not built from the current sources. Non-``.rs``
+    entries (``.git`` refs and index files that build scripts watch) are
+    ignored: they change on unrelated git activity. With no dep-info there is
+    nothing to judge, so the result is None.
+    """
+    try:
+        bin_mtime = binary.stat().st_mtime_ns
+    except OSError:
+        return None
+    key = (str(binary), bin_mtime)
+    if key in _STALE_DRIVER_CACHE:
+        return _STALE_DRIVER_CACHE[key]
+    result: str | None = None
+    try:
+        depinfo = binary.with_name(binary.name + ".d").read_text(errors="replace")
+    except OSError:
+        depinfo = ""
+    for line in depinfo.splitlines():
+        _, sep, deps = line.partition(": ")
+        if not sep:
+            continue
+        for raw in _DEPINFO_SPLIT_RE.split(deps.strip()):
+            if not raw.endswith(".rs"):
+                continue
+            path = raw.replace("\\ ", " ")
+            try:
+                if os.stat(path).st_mtime_ns > bin_mtime:
+                    result = path
+                    break
+            except FileNotFoundError:
+                result = path
+                break
+            except OSError:
+                continue
+        if result is not None:
+            break
+    _STALE_DRIVER_CACHE[key] = result
+    return result
+
+
+def _refuse_stale_driver(profile: str, binary: Path) -> None:
+    """Fail closed when the selected driver predates its own sources."""
+    if (os.environ.get(ALLOW_STALE_DRIVER_ENV) or "").strip().lower() in _TRUTHY_ENV_VALUES:
+        return
+    stale = stale_driver_source(binary)
+    if stale is None:
+        return
+    raise RuntimeError(
+        f"trust-wp-harness: the {profile} driver {binary} is older than a source "
+        f"it was built from ({stale}); it is not the verifier in this tree. "
+        f"Build it (targo --unverified build --locked{' --release' if profile == 'release' else ''} "
+        f"-p trust-wp-driver), pin the other profile with {HARNESS_PROFILE_ENV}, "
+        f"or set {ALLOW_STALE_DRIVER_ENV}=1 to measure the old binary on purpose."
+    )
 
 
 def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
@@ -346,7 +549,10 @@ def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
 
     if requested == "auto":
         if release_driver.is_file():
+            _refuse_stale_driver("release", release_driver)
             return "release", release_driver
+        if debug_driver.is_file():
+            _refuse_stale_driver("debug", debug_driver)
         return "debug", debug_driver
 
     pinned = release_driver if requested == "release" else debug_driver
@@ -358,6 +564,7 @@ def resolve_driver_profile(workspace: Path) -> tuple[str, Path]:
             f"an incomparable result. Build it first, or unset "
             f"{HARNESS_PROFILE_ENV} to accept whichever profile is present."
         )
+    _refuse_stale_driver(requested, pinned)
     return requested, pinned
 
 
@@ -541,7 +748,7 @@ def _active_workspace_target_names(workspace: Path) -> set[str]:
         rf"{re.escape(str(target_root))}/([^/\s]+)(?=[/\s]|$)"
     )
     for line in result.stdout.splitlines():
-        if "cargo" not in line and "rustc" not in line:
+        if "cargo" not in line and "targo" not in line and "rustc" not in line:
             continue
         for match in target_pattern.finditer(line):
             target_name = match.group(1)

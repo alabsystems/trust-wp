@@ -178,9 +178,10 @@ pub(in crate::callbacks) fn infer_unsigned_nonneg_requires(
 fn references_fallback_arg_placeholder(expr: &PureExpr, real_arg_names: &[String]) -> bool {
     let vars = expr_referenced_vars(expr);
     vars.iter().any(|v| {
-        v.strip_prefix("arg")
-            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-            && !real_arg_names.iter().any(|real| real == v)
+        crate::mir_analysis::is_fallback_arg_placeholder(v)
+            || v.strip_prefix("arg")
+                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                && !real_arg_names.iter().any(|real| real == v)
     })
 }
 

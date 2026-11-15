@@ -10,8 +10,8 @@ use super::*;
 // =========================================================================
 // Logic Function Verification Tests (Issue #234)
 //
-// ay#1926 was fixed - quantifier instantiation now works correctly.
-// Use AUFLIA here to exercise the interface term propagation path (#1926).
+// Regression guards for ay#1926 (quantifier instantiation). Use AUFLIA here
+// to exercise the interface term propagation path.
 // =========================================================================
 
 #[test]
@@ -69,8 +69,7 @@ fn test_ay_quantifier_instantiation_direct() {
     solver.assert_term(f_c_ne_10);
 
     // With axiom: f(c) = c * 2, with c = 5: f(5) = 10
-    // But we asserted f(c) != 10, contradiction -> should be UNSAT
-    // ay#1926 was fixed - quantifier instantiation now works correctly.
+    // But we asserted f(c) != 10, contradiction -> should be UNSAT (ay#1926).
     let result = solver.check_sat().into_inner();
     assert!(
         matches!(result, SolveResult::Unsat(_)),
@@ -83,12 +82,12 @@ fn test_ay_quantifier_instantiation_direct() {
 fn test_ay_gt_with_uf_axiom_unsound() {
     // Regression test for ay#1975 soundness bug at the solver level (dup ay#1974).
     //
-    // The original quantified UF encoding:
+    // A quantified UF encoding:
     //   forall x. add_one(x) = x + 1
-    // is satisfiable here, but this ay pin deliberately fails closed to Unknown
-    // for SAT results involving universal quantifiers that are not fully
-    // certified. Use define-fun so add_one(y) expands to y + 1 and this remains
-    // a decidable quantifier-free arithmetic regression.
+    // is satisfiable here, but ay deliberately fails closed to Unknown for SAT
+    // results involving universal quantifiers that are not fully certified.
+    // Use define-fun so add_one(y) expands to y + 1 and this remains a
+    // decidable quantifier-free arithmetic regression.
     //
     // This formula is SATISFIABLE:
     //   - add_one(y) = y + 1 (from inline definition)
@@ -131,7 +130,7 @@ fn test_ay_gt_with_uf_axiom_unsound() {
 
     let result_check = solver.check_sat().into_inner();
 
-    // Fixed in ay#1975 (commit 443907a1): LIA now correctly handles UF Int terms
+    // Regression guard for ay#1975: LIA must handle UF Int terms.
     // Formula is satisfiable: NOT((y+1) > (y+1)) = NOT(false) = true
     assert!(
         matches!(result_check, SolveResult::Sat),
@@ -170,14 +169,14 @@ fn test_logic_fn_axiom_enables_verification() {
     // body: result = 10 (which equals double(5) = 5*2)
     let return_expr = int(10);
 
-    // Verify WITH logic functions - should pass now that ay#1926 is fixed
+    // Verify WITH logic functions - should pass
     let result_with_axiom = verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures)
             .return_expr(Some(&return_expr))
             .logic_fns(Some(std::slice::from_ref(&logic_fn))),
     );
 
-    // ay#1926 was fixed - axiom instantiation now works correctly
+    // Regression guard for ay#1926 (axiom instantiation).
     assert!(
         matches!(result_with_axiom, Ok(VerificationResult::Verified(_))),
         "Expected Verified (double(5)=10 via axiom), got: {result_with_axiom:?}"
@@ -189,7 +188,7 @@ fn test_logic_fn_axiom_enables_verification() {
     );
 
     assert!(
-        matches!(result_without_axiom, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result_without_axiom),
         "Without logic function axiom, double(x) is unconstrained UF — solver \
          should fail: got {result_without_axiom:?}"
     );
@@ -227,9 +226,9 @@ fn test_logic_fn_axiom_symbolic() {
     // body: result = x + 1
     let return_expr = add(var("x"), int(1));
 
-    // Verify WITH logic functions - should pass
-    // NOTE: Bug #259 (blocked on ay#1939) - registering multiple logic
-    // functions breaks quantifier instantiation. Only register the needed function.
+    // Verify WITH logic functions - should pass. Only the needed function is
+    // registered; multi-function registration is covered by
+    // `test_bug_259_multiple_logic_fns_registered`.
     let result_with_axiom = verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures)
             .return_expr(Some(&return_expr))
@@ -314,7 +313,7 @@ fn test_logic_fn_axiom_respects_requires_guard() {
     );
 
     assert!(
-        matches!(result_with_guard, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result_with_guard),
         "Expected Failed when logic function precondition is violated, got: {result_with_guard:?}"
     );
 
@@ -349,9 +348,8 @@ fn test_logic_fn_impossible_postcondition_ay_bug() {
     // Body: result = x + 1
     //
     // This should FAIL verification because (x+1) > (x+1) is always false.
-    //
-    // KNOWN BUG: ay#1975 (dup ay#1974) - E-matching fails to propagate equality for UF+LIA comparison.
-    // When ay#1975 is fixed, change the assertion below from Verified to Failed.
+    // E-matching must propagate equality through the UF+LIA comparison
+    // (ay#1975, dup ay#1974) for the solver to refute the goal.
     use crate::{verify_function_with_modes, VerificationRequest, VerificationResult};
 
     let logic_fn = LogicFnDef::new(
@@ -379,10 +377,10 @@ fn test_logic_fn_impossible_postcondition_ay_bug() {
             .logic_fns(Some(std::slice::from_ref(&logic_fn))),
     );
 
-    // Fixed in ay#1975 (commit 443907a1): LIA correctly handles UF Int terms.
+    // Regression guard for ay#1975: LIA must handle UF Int terms.
     // Postcondition `result > add_one(x)` is impossible: (x+1) > (x+1) is false.
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Postcondition `result > add_one(x)` is impossible and should fail. Got: {result:?}"
     );
 }

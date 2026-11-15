@@ -6,7 +6,7 @@
 // `#[cfg(any(test, feature = "sep-logic"))]` — compiled for tests but excluded
 // from production binaries. The production pipeline uses pure first-order logic
 // (PureExpr + encode_pure + encode_mut_borrow). This module is reserved for
-// future unsafe Rust support. See designs/2026-03-08-2129-separation-logic-identity-recommendation.md.
+// future unsafe Rust support. (#2129)
 //!
 //! Separation logic encoding for the AY encoder (experimental, feature-gated).
 //!
@@ -402,10 +402,6 @@ impl AYEncoder {
     /// 1. **Borrow return**: When a mutable borrow ends, we "apply" the wand
     ///    to regain permission: `(y ↦ v' -* x ↦ v')` becomes `x ↦ v'`
     /// 2. **Frame reasoning**: Track what resources are "owed" back
-    ///
-    /// # Reference
-    ///
-    /// See: designs/2026-01-31-separation-logic-encoding.md Section 5
     #[cfg(not(feature = "unsafe-heap"))]
     pub(super) fn encode_magic_wand(
         &mut self,
@@ -423,7 +419,6 @@ impl AYEncoder {
         // For unsafe Rust, use the heap operations (heap_read, heap_write, etc.)
         // and fresh_heap_extension() to construct full heap-based encoding:
         // `∀ h_ext. (P(h_ext) ∧ disjoint(h, h_ext)) → Q(h ∪ h_ext)`
-        // See: designs/2026-01-31-separation-logic-encoding.md Section 5
         let ante_term = self.encode(antecedent)?;
         let conseq_term = self.encode(consequent)?;
         Ok(self.solver.implies(ante_term, conseq_term))

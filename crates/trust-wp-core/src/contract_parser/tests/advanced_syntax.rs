@@ -535,11 +535,13 @@ fn test_struct_pattern_rest() {
     let result = parse_ok("match x { B { field1 : true, .. } => true, _ => false }");
     match &result {
         PureExpr::Match { arms, .. } => {
-            // B { field1: true, .. } → Constructor { name: "B", inner: Literal(true) }
+            // B { field1: true, .. } → Constructor { name: "B{field1,..}", inner: Literal(true) }
+            // The field list and the rest marker travel in the name so the
+            // driver can place `field1` from B's declaration and pad the rest.
             assert!(
                 matches!(&arms[0].pattern, Pattern::Constructor { name, inner: Some(_) }
-                    if name == "B"),
-                "expected B {{ .. }} constructor, got: {:?}",
+                    if name == "B{field1,..}"),
+                "expected B{{field1,..}} constructor, got: {:?}",
                 arms[0].pattern
             );
         }
@@ -602,32 +604,48 @@ fn test_struct_literal_update_with_field_expr() {
 // Destructuring closure parameters (#1513)
 // ====================================================================
 
+/// A destructuring parameter is ONE parameter whose value the body matches
+/// against the pattern, as `let pattern = param;` does: each name reads the
+/// field the pattern puts it at. Flattened into one parameter per name,
+/// `|(x @ y, _z)| y` read `y` as the second field and `|((a, b), c)| b` read
+/// `b` as the whole value's second field.
 #[test]
 fn test_closure_destructuring_tuple_param() {
-    // |(x, y)| x + y == 0
     let result = parse_contract("|(x, y)| x + y == 0").unwrap();
-    match &result {
-        PureExpr::Closure { params, .. } => {
-            assert_eq!(params.len(), 2, "expected 2 params from |(x, y)|");
-            assert_eq!(params[0].0, "x");
-            assert_eq!(params[1].0, "y");
-        }
-        _ => unreachable!("expected Closure, got: {result:?}"),
-    }
+    assert_eq!(
+        result.to_string(),
+        "|$cp0| let x = __trust_wp_tuple_get_0($cp0); let y = __trust_wp_tuple_get_1($cp0); \
+         ((x + y) == 0)"
+    );
 }
 
 #[test]
 fn test_closure_destructuring_nested() {
-    // |(a, (b, c))| a
-    let result = parse_contract("|(a, (b, c))| a").unwrap();
-    match &result {
-        PureExpr::Closure { params, .. } => {
-            assert_eq!(params.len(), 3, "expected 3 params from |(a, (b, c))|");
-            assert_eq!(params[0].0, "a");
-            assert_eq!(params[1].0, "b");
-            assert_eq!(params[2].0, "c");
-        }
-        _ => unreachable!("expected Closure, got: {result:?}"),
+    for (text, expected) in [
+        (
+            "|(a, (b, c))| b",
+            "|$cp0| let a = __trust_wp_tuple_get_0($cp0); let b = \
+             __trust_wp_tuple_get_0(__trust_wp_tuple_get_1($cp0)); let c = \
+             __trust_wp_tuple_get_1(__trust_wp_tuple_get_1($cp0)); b",
+        ),
+        (
+            "|((a, b), c)| b == 3",
+            "|$cp0| let a = __trust_wp_tuple_get_0(__trust_wp_tuple_get_0($cp0)); let b = \
+             __trust_wp_tuple_get_1(__trust_wp_tuple_get_0($cp0)); let c = \
+             __trust_wp_tuple_get_1($cp0); (b == 3)",
+        ),
+        (
+            "|(x @ y, _z)| y == 2",
+            "|$cp0| let x = __trust_wp_tuple_get_0($cp0); let _z = __trust_wp_tuple_get_1($cp0); \
+             (x == 2)",
+        ),
+    ] {
+        let result = parse_contract(text).unwrap();
+        let PureExpr::Closure { params, .. } = &result else {
+            unreachable!("expected Closure, got: {result:?}");
+        };
+        assert_eq!(params.len(), 1, "{text}");
+        assert_eq!(result.to_string(), expected, "{text}");
     }
 }
 
@@ -696,45 +714,27 @@ fn test_tuple_struct_pattern_only_rest() {
     }
 }
 
+/// `Foo(.., last)` names the LAST field, whose index is the declared arity
+/// minus one — a number specification text does not have. Dropping the `..`
+/// bound `last` at index 0 and read whichever field is declared first.
 #[test]
-fn test_tuple_struct_pattern_leading_rest() {
-    // match x { Foo(.., last) => last, _ => 0 }
-    let result = parse_ok("match x { Foo(.., last) => last, _ => 0 }");
-    match &result {
-        PureExpr::Match { arms, .. } => {
-            assert!(
-                matches!(&arms[0].pattern, Pattern::Constructor { name, inner: Some(inner) }
-                    if name == "Foo"
-                    && matches!(&**inner, Pattern::Binding(n) if n == "last")),
-                "expected Foo(last) after leading rest, got: {:?}",
-                arms[0].pattern
-            );
-        }
-        _ => unreachable!("expected Match, got: {result:?}"),
-    }
+fn test_tuple_struct_pattern_leading_rest_is_refused() {
+    let err = parse_contract("match x { Foo(.., last) => last, _ => 0 }").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a `..` rest pattern followed by further positional fields in `Foo(..)`"),
+        "the refusal must name the constructor: {err}"
+    );
 }
 
+/// `Foo(a, .., b)`: `a` is at index 0, but `b` is at the last index, which
+/// only the declaration knows. Refused for the same reason.
 #[test]
-fn test_tuple_struct_pattern_rest_between_bindings() {
-    // match x { Foo(a, .., b) => a, _ => 0 }
-    // Two surviving bindings collapse to Pattern::Tuple([a, b]).
-    let result = parse_ok("match x { Foo(a, .., b) => a, _ => 0 }");
-    match &result {
-        PureExpr::Match { arms, .. } => {
-            assert_eq!(
-                arms[0].pattern,
-                Pattern::Constructor {
-                    name: "Foo".into(),
-                    inner: Some(Box::new(Pattern::Tuple(vec![
-                        Pattern::Binding("a".into()),
-                        Pattern::Binding("b".into()),
-                    ]))),
-                },
-                "expected Foo(a, b) tuple after interior rest"
-            );
-        }
-        _ => unreachable!("expected Match, got: {result:?}"),
-    }
+fn test_tuple_struct_pattern_rest_between_bindings_is_refused() {
+    let err = parse_contract("match x { Foo(a, .., b) => a, _ => 0 }").unwrap_err();
+    assert!(err.to_string().contains("`Foo(..)`"), "{err}");
+    // The same shape through a `let` binding is the same parse.
+    assert!(parse_contract("{ let Foo(.., b) = x; b }").is_err());
 }
 
 #[test]

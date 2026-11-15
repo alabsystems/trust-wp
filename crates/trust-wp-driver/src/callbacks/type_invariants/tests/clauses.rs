@@ -12,7 +12,8 @@ use trust_wp_core::{
 };
 
 use super::super::{
-    build_closure_capture_invariant_requires, build_current_closure_self_invariant_requires,
+    build_capture_invariants, build_closure_capture_invariant_requires,
+    build_current_closure_self_invariant_requires,
 };
 
 #[path = "clauses/tuple_newtype_decomposition.rs"]
@@ -26,3 +27,9 @@ mod closure_capture_requires;
 
 #[path = "clauses/helper_tail.rs"]
 mod helper_tail;
+
+#[path = "clauses/type_parameter_clauses.rs"]
+mod type_parameter_clauses;
+
+#[path = "clauses/foreign_trait_impl_clauses.rs"]
+mod foreign_trait_impl_clauses;

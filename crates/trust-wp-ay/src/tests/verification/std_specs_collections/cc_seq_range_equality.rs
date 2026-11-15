@@ -21,10 +21,10 @@ fn test_cc_seq_g_full_suffix_eq_self_pipeline() {
     // subsequence(s, 0, s.len()) should have the same Array, Length,
     // and Offset components as `s` itself, so the decomposed equality
     // is deterministic.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()
@@ -47,10 +47,10 @@ fn test_cc_seq_g_full_range_eq_self_pipeline() {
     let ens = eq(subseq, var("s"));
 
     let result = verify_function_with_modes(VerificationRequest::new(&[req], &[ens]));
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()

@@ -72,12 +72,16 @@ impl<T> std::ops::Index<i32> for Seq<T> {
 // These match Creusot's `IndexLogic` trait impls on `Seq<T>`.
 // Reference: `creusot-std/src/logic/seq.rs:441-503`
 
-impl<T: Clone> IndexLogic<Int> for Seq<T> {
+// No `T: Clone` bound (Creusot has none: `Seq<&mut T>` is indexable in
+// logic). Taking the element out of the owned sequence returns the same
+// value the former clone did.
+impl<T> IndexLogic<Int> for Seq<T> {
     type Item = T;
 
     fn index_logic(self, idx: Int) -> Self::Item {
         let i = idx.0 as usize;
-        self.elements[i].clone()
+        let mut elements = self.elements;
+        elements.swap_remove(i)
     }
 }
 

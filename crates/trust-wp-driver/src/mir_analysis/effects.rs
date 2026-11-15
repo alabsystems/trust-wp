@@ -4,12 +4,11 @@
 
 //! Explicit call-effect context for extraction.
 //!
-//! Replaces implicit thread-local side channels (`CALL_ASSUMPTIONS`,
-//! `CALL_OBLIGATIONS`) with an explicit struct that extraction code
-//! writes into and callers read from. `SPEC_DROP_WARNINGS` was removed
-//! entirely in #1712.
-//!
-//! See: designs/2026-02-17-callbacks-mir-analysis-boundary.md
+//! An explicit struct that extraction code writes into and callers read
+//! from, so call-site assumptions and obligations stay scoped to the
+//! extraction (and the branch) that produced them rather than leaking
+//! through a process-wide side channel any caller could observe or forget
+//! to clear.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -47,7 +46,6 @@ pub(crate) struct DroppedClause {
 ///
 /// Recorded in `CallEffects` during MIR extraction so the encoder can emit
 /// a quantified axiom connecting the Mapping value to the closure's semantics.
-/// (#2316 Phase 2)
 #[derive(Debug, Clone)]
 pub(crate) struct MappingClosureInfo {
     /// The result variable representing the Mapping value.
@@ -115,10 +113,15 @@ impl MappingClosureInfo {
 ///    substitution would leave a dangling closure formal (the element or
 ///    snapshot binders) are dropped here — emitting them would assert a fact
 ///    with free variables, which is unsound. (See `to_view_axioms`.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MapInvClosureInfo {
-    /// The result variable representing the `MapInv` value (e.g., `call_3`).
+    /// The result variable representing the `MapInv` value. It names ONE
+    /// `map_inv` call site (`$call_<dest>_mapinv_bb<N>`), never the shared
+    /// destination local, so a collect receiver identifies its source call.
     pub(crate) result_var: PureExpr,
+    /// The block whose terminator is this `map_inv` call (the collect facts
+    /// require it to dominate the collect call and be acyclic).
+    pub(crate) call_block: rustc_middle::mir::BasicBlock,
     /// The produced-sequence length of the inner iterator, in `Int` space, if
     /// the handler could determine it soundly (e.g., `end - start` for a
     /// `Range`). When present, the length fact
@@ -150,25 +153,28 @@ impl MapInvClosureInfo {
     /// closure's formal parameters (the element / snapshot binders). Clauses
     /// that would leave a dangling formal are skipped — never asserted — so a
     /// false per-element fact can never reach the solver.
-    pub(crate) fn to_view_axioms(&self) -> Vec<PureExpr> {
+    ///
+    /// `collected_var` is the result of `Iterator::collect::<MapInv<..>,
+    /// Vec<_>>(result_var)` at ONE call site. Creusot's `collect` contract
+    /// gives `Vec::from_iter_post(prod, res) == (prod == res@)` for the
+    /// produced sequence `prod`, and `MapInv::produces` makes `prod` the
+    /// per-element closure outputs with the inner iterator's produced length.
+    /// The caller must pass a symbol that names only that call site's result
+    /// and must scope the facts to the path through that call (a return slot
+    /// `call_0` written on two branches is shared).
+    pub(crate) fn to_view_axioms(&self, collected_var: &PureExpr) -> Vec<PureExpr> {
         let mut axioms = Vec::new();
 
-        // The collected sequence value. After `.collect()`, the consuming code
-        // holds the result as `result_var@` (the iterator view bridged by
-        // `collect`'s `result@ == self@`): a `Seq` whose elements are the
-        // produced values. A downstream collection field assignment stores
-        // exactly that Seq, so the consumer reads `field` == `result_var@`.
-        // The per-element view is therefore rooted at `result_view =
-        // result_var@`; indexing it gives the i-th produced element, and a
-        // further `@` gives that element's own view.
-        let result_view = PureExpr::View(Arc::new(self.result_var.clone()));
+        // Root every fact at the COLLECTED Vec, never at the `MapInv` value:
+        // the `MapInv` iterator's own view is not the produced sequence, and the
+        // generic collect spec does not bridge the two.
+        // `collected@` is the produced sequence (Vec::from_iter_post); indexing
+        // it gives the i-th closure output, and a further `@` that element's
+        // own view.
+        let result_view = PureExpr::View(Arc::new(collected_var.clone()));
 
-        // The collected value's length is `result_var@.len()` — a single view.
-        // `field` IS `result_var@` (the collected Seq), and the consumer reads
-        // its length as `seq_len(field)`. Viewing once more (`result_var@@`)
-        // would be one level too deep — it would denote the length of the view
-        // of the collected Seq, not the collected Seq itself — and would not
-        // unify with the `seq_len(field)` the obligation reads. (#2170)
+        // The collected value's length is `collected@.len()` — a single view.
+        // Viewing once more would be one level too deep. (#2170)
         let collected_len = PureExpr::MethodCall {
             receiver: Arc::new(result_view.clone()),
             method: "len".to_string(),
@@ -303,10 +309,107 @@ pub(crate) struct CallEffects {
     pub(crate) mapping_closures: Vec<MappingClosureInfo>,
     /// Per-element closure ensures from `map_inv(iter, closure)` calls (#2170).
     pub(crate) map_inv_closures: Vec<MapInvClosureInfo>,
+    /// Every extraction of a `map_inv(..).collect::<Vec<_>>()` call site:
+    /// `(site symbol, facts)`, with an EMPTY fact list recorded whenever that
+    /// extraction could not state facts. Identical entries are deduplicated.
+    /// Only a site with exactly one distinct, non-empty entry contributes
+    /// function-level assumptions (see `map_inv_collect_assumptions`).
+    pub(crate) map_inv_collect_sites: Vec<(String, Vec<PureExpr>)>,
     /// Extraction-only map from mut-ref result temps to the receiver they
     /// mutate. Used to commit writes like `*call_16 = 2` back into the
     /// receiver state during successor extraction.
     pub(crate) mut_ref_result_receivers: HashMap<String, PureExpr>,
+    /// Facts that hold on every path that RETURNS from the function
+    /// (surviving-path facts): when a switch arm can never
+    /// return (a spinning `-> !` callee), the function only returns through
+    /// the other arms. These are NOT assumptions: an assumption premises every
+    /// goal, including call-precondition and panic-unreachability obligations
+    /// that must hold on the diverging arm itself or before it. They may only
+    /// premise the function's own postconditions (`facts ==> ensures`), and an
+    /// arm's facts are guarded by that arm's condition.
+    pub(crate) returning_path_facts: Vec<PureExpr>,
+    /// How many of `obligations` are a literal `false` a USER wrote: a
+    /// callee's own `#[requires(false)]`, substituted at this call site.
+    ///
+    /// The verdict gate asks whether the goal set carries a `false` trust-wp
+    /// injected because it could not model something, and it answers by
+    /// COUNTING falses, bare or behind the path guards a branch arm's
+    /// obligations are wrapped in (`trust_wp_ay::is_fail_closed_marker`) — a
+    /// scan cannot tell an injected marker from a written clause, because both
+    /// are spelled `PureExpr::Bool(false)`. So
+    /// the one kind that IS a clause a program can violate is counted where it
+    /// is written and subtracted before the question is asked (D-27). The
+    /// subtraction is the only direction that is safe: an injection lane this
+    /// crate forgets to name still lands in the total and still arms the gate.
+    pub(crate) user_written_false_obligations: usize,
+}
+
+/// The conjunction of `obligations` (ignoring literal `true`), or `None`.
+pub(crate) fn conjoin_obligations(obligations: &[PureExpr]) -> Option<PureExpr> {
+    obligations
+        .iter()
+        .filter(|ob| !matches!(ob, PureExpr::Bool(true)))
+        .cloned()
+        .reduce(|acc, ob| PureExpr::BinOp(Arc::new(acc), BinOp::And, Arc::new(ob)))
+}
+
+/// Rewrite every assumption `a` to `guard ==> a` (a literal `true` stays).
+/// SOUND: the guarded premise is implied by the unguarded one.
+pub(crate) fn guard_assumptions(assumptions: &mut [PureExpr], guard: Option<&PureExpr>) {
+    let Some(guard) = guard else {
+        return;
+    };
+    let guard_free = guard.free_vars();
+    for assumption in assumptions.iter_mut() {
+        if matches!(assumption, PureExpr::Bool(true)) {
+            continue;
+        }
+        let post = std::mem::replace(assumption, PureExpr::Bool(true));
+        *assumption = guard_under_leading_foralls(guard, &guard_free, post);
+    }
+}
+
+/// `guard ==> post`, with the implication moved under the universal binders
+/// `post` starts with: `guard ==> forall x. p` is `forall x. guard ==> p`
+/// whenever `x` is not free in `guard`. ay instantiates a quantifier it meets
+/// at the top of an assumption and answers `unknown` for one under an
+/// implication, so a call whose postcondition quantifies (`from_elem`,
+/// `reserve`) would otherwise make every goal after a precondition unknown.
+/// A binder the guard mentions stops the descent: renaming it is not needed
+/// for soundness, and the implication then stays outside, as it always was.
+fn guard_under_leading_foralls(
+    guard: &PureExpr,
+    guard_free: &std::collections::HashSet<String>,
+    post: PureExpr,
+) -> PureExpr {
+    match post {
+        PureExpr::Forall {
+            var,
+            var_sort,
+            body,
+            triggers,
+        } if !guard_free.contains(&var) => PureExpr::Forall {
+            body: Arc::new(guard_under_leading_foralls(
+                guard,
+                guard_free,
+                Arc::unwrap_or_clone(body),
+            )),
+            var,
+            var_sort,
+            triggers,
+        },
+        post => PureExpr::BinOp(Arc::new(guard.clone()), BinOp::Implies, Arc::new(post)),
+    }
+}
+
+/// The fail-closed `false` marker of a lane that builds it outside
+/// [`CallEffects::record_injected_fail_closed_obligation`], named for
+/// `TRUST_WP_AUTHORITY_TRACE`.
+pub(crate) fn fail_closed_marker(site: &'static str) -> PureExpr {
+    if std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some() {
+        eprintln!("[TWP_AUTH] driver injected fail-closed `false` obligation at lane `{site}`");
+    }
+    PureExpr::Bool(false)
 }
 
 impl CallEffects {
@@ -325,7 +428,50 @@ impl CallEffects {
         self.dropped_clauses.clear();
         self.mapping_closures.clear();
         self.map_inv_closures.clear();
+        self.map_inv_collect_sites.clear();
         self.mut_ref_result_receivers.clear();
+        self.returning_path_facts.clear();
+        self.user_written_false_obligations = 0;
+    }
+
+    /// Scope the postcondition assumptions ONE call just produced
+    /// (`assumptions[assumptions_before..]`) under that call's own
+    /// preconditions (`obligations[obligations_before..]`): each becomes
+    /// `pre_1 && .. && pre_n ==> post`.
+    ///
+    /// The primary extractor keeps call effects in flat lists, and the
+    /// verifier proves every obligation under every assumption. Without this
+    /// scoping a callee's postcondition is a premise of the proof of its own
+    /// precondition, although by the weakest-precondition rule
+    /// `wp(call) = pre && (post ==> Q)` the postcondition is only available
+    /// after the precondition holds. `v.remove(0)` on a possibly empty `Vec`
+    /// verifies that way: `(^v)@.len() == v@.len() - 1` with `len >= 0`
+    /// entails the owed `0 < v@.len()`.
+    ///
+    /// SOUND: the guarded premise is implied by the unguarded one, so this
+    /// only removes derivations. Whenever the preconditions are proved (their
+    /// own obligations), the guard is discharged and the postcondition is
+    /// available as if it had never been guarded.
+    pub(crate) fn scope_call_postconditions_under_preconditions(
+        &mut self,
+        obligations_before: usize,
+        assumptions_before: usize,
+    ) {
+        if assumptions_before >= self.assumptions.len() {
+            return;
+        }
+        // Every obligation recorded so far is a guard, not only this call's
+        // own preconditions: an obligation recorded BEFORE the call (an
+        // earlier call's precondition, a bounds check, a panic arm) must be
+        // proved from facts established at its own program point, never from
+        // a later call's postcondition (`let x = v[0]; nonempty(v);`). In the
+        // weakest-precondition sequence `ob_1 && (post_1 ==> ob_2 && (post_2
+        // ==> Q))` each postcondition is available only under every earlier
+        // obligation. The call's own preconditions are the suffix
+        // `obligations[obligations_before..]`.
+        let _ = obligations_before;
+        let guard = conjoin_obligations(&self.obligations);
+        guard_assumptions(&mut self.assumptions[assumptions_before..], guard.as_ref());
     }
 
     /// Record a `Mapping::from_closure` body extraction result (#2316).
@@ -346,6 +492,7 @@ impl CallEffects {
     pub(crate) fn record_map_inv_closure(
         &mut self,
         result_var: PureExpr,
+        call_block: rustc_middle::mir::BasicBlock,
         produced_len: Option<PureExpr>,
         produced_len_guard: Option<PureExpr>,
         ensures_exprs: Vec<PureExpr>,
@@ -353,11 +500,104 @@ impl CallEffects {
     ) {
         self.map_inv_closures.push(MapInvClosureInfo {
             result_var,
+            call_block,
             produced_len,
             produced_len_guard,
             ensures_exprs,
             closure_param_names,
         });
+    }
+
+    /// Every recorded `map_inv` info whose result symbol is the translated
+    /// collect receiver `source` (a plain variable). The caller must refuse
+    /// to state facts unless exactly one DISTINCT info matches: a symbol
+    /// recorded with different contents (the same `map_inv` block extracted
+    /// on paths with different bound expressions) is ambiguous.
+    pub(crate) fn map_inv_infos_for(&self, source: &PureExpr) -> Vec<&MapInvClosureInfo> {
+        let PureExpr::Var(source_name, _) = source else {
+            return Vec::new();
+        };
+        self.map_inv_closures
+            .iter()
+            .filter(
+                |info| matches!(&info.result_var, PureExpr::Var(name, _) if name == source_name),
+            )
+            .collect()
+    }
+
+    /// Record one extraction of a `map_inv` collect site (deduplicated).
+    /// `facts` is empty when this extraction could not state facts; that
+    /// entry then poisons the site.
+    pub(crate) fn record_map_inv_collect_site(&mut self, site: String, facts: Vec<PureExpr>) {
+        let entry = (site, facts);
+        if !self.map_inv_collect_sites.contains(&entry) {
+            self.map_inv_collect_sites.push(entry);
+        }
+    }
+
+    /// Function-level assumptions from `map_inv` collect sites. Fail closed:
+    /// a site contributes only when every recorded extraction
+    /// of it produced the SAME non-empty fact list. Two paths reaching one
+    /// collect terminator with different sources, or any extraction that
+    /// stated nothing, drop the site's facts entirely; the site symbol is
+    /// then unconstrained.
+    pub(crate) fn map_inv_collect_assumptions(&self) -> Vec<PureExpr> {
+        let mut out: Vec<PureExpr> = Vec::new();
+        for (site, facts) in &self.map_inv_collect_sites {
+            if facts.is_empty() {
+                continue;
+            }
+            let distinct = self
+                .map_inv_collect_sites
+                .iter()
+                .filter(|(other, _)| other == site)
+                .count();
+            if distinct != 1 {
+                continue;
+            }
+            for fact in facts {
+                if !out.contains(fact) {
+                    out.push(fact.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Push the fail-closed `false` obligation that marks a construct this
+    /// extractor could not model, and COUNT it.
+    ///
+    /// The marker is correct and must never be dropped: it is what makes the
+    /// caller unprovable instead of vacuously proved. What it must not do is
+    /// license a refutation — `false` is refutable in every model, so a SAT
+    /// answer over it refutes a clause trust-wp wrote, not one the program
+    /// broke. The verdict gate reads this COUNT (`ParsedContract::
+    /// injected_fail_closed_obligations`), which is why the marker is recorded
+    /// here rather than recovered later by scanning the obligation list: a
+    /// scan cannot tell this `false` from a callee's user-written
+    /// `#[requires(false)]`.
+    ///
+    /// `site` names the lane for `TRUST_WP_AUTHORITY_TRACE`.
+    pub(crate) fn record_injected_fail_closed_obligation(&mut self, site: &'static str) {
+        if std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some() {
+            eprintln!("[TWP_AUTH] driver injected fail-closed `false` obligation at lane `{site}`");
+        }
+        self.obligations.push(PureExpr::Bool(false));
+    }
+
+    /// Push a callee precondition the USER wrote, counting it when it is the
+    /// literal `false` the verdict gate would otherwise read as a marker.
+    pub(crate) fn record_user_written_obligation(&mut self, obligation: PureExpr) {
+        if matches!(obligation, PureExpr::Bool(false)) {
+            if std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some() {
+                eprintln!(
+                    "[TWP_AUTH] callee precondition substitutes to the literal `false`; \
+                     it is a clause somebody WROTE, not an injected marker"
+                );
+            }
+            self.user_written_false_obligations += 1;
+        }
+        self.obligations.push(obligation);
     }
 
     /// Record a dropped clause with provenance and emit a synthetic
@@ -369,6 +609,9 @@ impl CallEffects {
         clause: String,
         reason: String,
     ) {
+        if std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some() {
+            eprintln!("[TWP_AUTH] dropped {kind:?} clause `{clause}`: {reason}");
+        }
         self.dropped_clauses.push(DroppedClause {
             kind,
             clause,
@@ -378,14 +621,15 @@ impl CallEffects {
         // Fail-closed: a dropped obligation means verification is
         // incomplete. Insert `false` as an obligation so the solver
         // reports this function as failed rather than verified.
-        self.obligations.push(PureExpr::Bool(false));
+        self.record_injected_fail_closed_obligation("dropped-spec-clause");
     }
 }
 
 /// Explicit extraction session state shared across call-site helpers.
 ///
-/// This replaces callback-owned thread-locals with an explicit context
-/// passed through `mir_analysis` extraction code.
+/// Passed explicitly through `mir_analysis` extraction code so every helper
+/// reads and writes the same effects the caller drains; nothing is held in a
+/// thread-local.
 pub(crate) struct ExtractionSession<'a> {
     /// Extern specs available for call resolution during extraction.
     pub(crate) extern_specs: &'a HashMap<String, StdSpec>,
@@ -409,6 +653,42 @@ impl<'a> ExtractionSession<'a> {
 mod tests {
     use super::*;
 
+    fn forall(var: &str, body: PureExpr) -> PureExpr {
+        PureExpr::Forall {
+            var: var.to_string(),
+            var_sort: None,
+            body: Arc::new(body),
+            triggers: Vec::new(),
+        }
+    }
+
+    fn implies(left: PureExpr, right: PureExpr) -> PureExpr {
+        PureExpr::BinOp(Arc::new(left), BinOp::Implies, Arc::new(right))
+    }
+
+    fn var(name: &str) -> PureExpr {
+        PureExpr::Var(name.to_string(), None)
+    }
+
+    #[test]
+    fn a_guard_moves_under_the_universal_binders_it_does_not_mention() {
+        let guard = var("n_ok");
+        let mut assumptions = vec![forall("i", forall("j", var("p")))];
+        guard_assumptions(&mut assumptions, Some(&guard));
+        assert_eq!(
+            assumptions,
+            vec![forall("i", forall("j", implies(var("n_ok"), var("p"))))]
+        );
+    }
+
+    #[test]
+    fn a_binder_the_guard_mentions_keeps_the_implication_outside_it() {
+        let guard = var("i");
+        let mut assumptions = vec![forall("i", var("p"))];
+        guard_assumptions(&mut assumptions, Some(&guard));
+        assert_eq!(assumptions, vec![implies(var("i"), forall("i", var("p")))]);
+    }
+
     #[test]
     fn call_effects_default_is_empty() {
         let effects = CallEffects::new();
@@ -424,14 +704,54 @@ mod tests {
         assert!(effects.mut_ref_result_receivers.is_empty());
     }
 
+    fn site_fact(n: i64) -> PureExpr {
+        PureExpr::BinOp(
+            Arc::new(PureExpr::Var("call_1_collect_bb2".to_string(), None)),
+            BinOp::Eq,
+            Arc::new(PureExpr::Int(n)),
+        )
+    }
+
+    /// Two extractions of one collect site with DIFFERENT facts (two branch
+    /// sources) must contribute nothing.
+    #[test]
+    fn map_inv_collect_site_with_conflicting_entries_states_nothing() {
+        let mut effects = CallEffects::new();
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), vec![site_fact(3)]);
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), vec![site_fact(5)]);
+        assert!(effects.map_inv_collect_assumptions().is_empty());
+    }
+
+    /// An extraction that stated nothing poisons the site.
+    #[test]
+    fn map_inv_collect_site_with_empty_entry_states_nothing() {
+        let mut effects = CallEffects::new();
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), vec![site_fact(3)]);
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), Vec::new());
+        assert!(effects.map_inv_collect_assumptions().is_empty());
+    }
+
+    /// Identical repeated extractions keep the facts; other sites are
+    /// independent.
+    #[test]
+    fn map_inv_collect_site_consistent_entries_state_facts() {
+        let mut effects = CallEffects::new();
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), vec![site_fact(3)]);
+        effects.record_map_inv_collect_site("call_1_collect_bb2".into(), vec![site_fact(3)]);
+        effects.record_map_inv_collect_site("call_4_collect_bb9".into(), Vec::new());
+        assert_eq!(effects.map_inv_collect_assumptions(), vec![site_fact(3)]);
+    }
+
     #[test]
     fn call_effects_clear_resets_all_fields() {
         let mut effects = CallEffects {
             assumptions: vec![PureExpr::Bool(true)],
             obligations: vec![PureExpr::Bool(false)],
+            user_written_false_obligations: 0,
             has_mutating_call_effect: true,
             dropped_spec_clauses: 3,
             map_inv_closures: Vec::new(),
+            map_inv_collect_sites: vec![("s".to_string(), vec![PureExpr::Bool(true)])],
             dropped_clauses: vec![DroppedClause {
                 kind: DroppedClauseKind::Precondition,
                 clause: "x > 0".to_string(),
@@ -439,6 +759,7 @@ mod tests {
             }],
             mapping_closures: Vec::new(),
             mut_ref_result_receivers: HashMap::new(),
+            returning_path_facts: vec![PureExpr::Bool(true)],
         };
         effects.clear();
         assert!(effects.assumptions.is_empty());
@@ -447,6 +768,7 @@ mod tests {
         assert!(effects.dropped_clauses.is_empty());
         assert!(effects.mapping_closures.is_empty());
         assert!(effects.mut_ref_result_receivers.is_empty());
+        assert!(effects.returning_path_facts.is_empty());
     }
 
     #[test]

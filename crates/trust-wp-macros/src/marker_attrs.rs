@@ -448,7 +448,8 @@ pub(crate) fn process_open_inv_result(attr: &TokenStream, item: TokenStream) -> 
 /// - `mut x` in args → `* x` in requires, `^ x` in ensures
 ///
 /// This directly emits `trust-wp:requires:` and `trust-wp:ensures:` doc markers so
-/// the driver's contract discovery picks them up without special-casing maintains.
+/// the driver's contract discovery picks them up without special-casing maintains,
+/// and type-checks each clause as `#[requires]` / `#[ensures]` do.
 pub(crate) fn process_maintains(attr: &TokenStream, item: TokenStream) -> TokenStream {
     let attr_text = attr.to_string();
     if attr_text.is_empty() {
@@ -461,11 +462,42 @@ pub(crate) fn process_maintains(attr: &TokenStream, item: TokenStream) -> TokenS
     }
     let requires_text = maintains_transform_mut(&attr_text, "*");
     let ensures_text = maintains_transform_mut(&attr_text, "^");
-    let item_tokens: proc_macro2::TokenStream = item.into();
-    let req_marker = format!("trust-wp:requires:{requires_text}");
-    let ens_marker = format!("trust-wp:ensures:{ensures_text}");
+    let mut item_tokens: proc_macro2::TokenStream = item.into();
+    let mut helpers = proc_macro2::TokenStream::new();
+    let clauses = requires_text
+        .parse::<proc_macro2::TokenStream>()
+        .ok()
+        .zip(ensures_text.parse::<proc_macro2::TokenStream>().ok());
+    // Each clause is type-checked as the `requires` / `ensures` it stands for
+    // (`spec_tc`), and its marker carries the text its type-check body is
+    // tagged with, so the driver reads the clause's calls as rustc resolved
+    // them there (`trust-wp-driver` `logic::spec_calls`).
+    let (req_marker, ens_marker) = match clauses {
+        Some((requires, ensures)) => {
+            for (kind, clause) in [
+                (crate::spec_tc::FnClause::Requires, &requires),
+                (crate::spec_tc::FnClause::Ensures, &ensures),
+            ] {
+                if let Some(helper) =
+                    crate::spec_tc::trait_signature_helper(kind, clause, &item_tokens)
+                {
+                    helpers.extend(helper);
+                }
+                item_tokens = crate::spec_tc::insert_fn_clause(kind, clause, item_tokens);
+            }
+            (
+                format!("trust-wp:requires:{requires}"),
+                format!("trust-wp:ensures:{ensures}"),
+            )
+        }
+        None => (
+            format!("trust-wp:requires:{requires_text}"),
+            format!("trust-wp:ensures:{ensures_text}"),
+        ),
+    };
 
     quote! {
+        #helpers
         #[doc = #req_marker]
         #[doc = #ens_marker]
         #item_tokens
@@ -485,24 +517,33 @@ pub(crate) fn process_maintains(attr: &TokenStream, item: TokenStream) -> TokenS
 fn maintains_transform_mut(text: &str, op: &str) -> String {
     // Pattern: `(mut ` at any nesting level → `(op `
     // This handles `(mut self)`, `(mut a)`, etc.
-    let mut result = String::with_capacity(text.len() + 8);
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        // Check for `mut ` preceded by `(` or `,` (possibly with whitespace)
-        if i + 4 <= chars.len() && &text[i..i + 4] == "mut " {
-            // Look back to find the preceding non-whitespace character
-            let prev_non_ws = text[..i].chars().rev().find(|c| !c.is_whitespace());
-            let is_after_delimiter = matches!(prev_non_ws, Some('(' | ',') | None);
-            if is_after_delimiter {
+    // The previous body mixed two different index spaces: `i` counted CHARACTERS
+    // (it indexed `text.chars().collect()`), but was then used to slice `text`
+    // by BYTES in `text[i..i + 4]` and `text[..i]`. Those agree only while the
+    // input is ASCII; one multi-byte character and the comparison reads the
+    // wrong region, or lands off a char boundary and panics. Walking the string
+    // itself keeps one index space and makes every step total.
+    let mut result = String::with_capacity(text.len().saturating_add(8));
+    let mut rest = text;
+    let mut consumed = 0usize;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(after_mut) = rest.strip_prefix("mut ") {
+            // Look back to find the preceding non-whitespace character.
+            let prev_non_ws = text
+                .get(..consumed)
+                .and_then(|seen| seen.chars().rev().find(|c| !c.is_whitespace()));
+            if matches!(prev_non_ws, Some('(' | ',') | None) {
                 result.push_str(op);
                 result.push(' ');
-                i += 4; // skip "mut "
+                rest = after_mut;
+                consumed = consumed.saturating_add("mut ".len());
                 continue;
             }
         }
-        result.push(chars[i]);
-        i += 1;
+        result.push(ch);
+        let width = ch.len_utf8();
+        rest = rest.get(width..).unwrap_or("");
+        consumed = consumed.saturating_add(width);
     }
     result
 }
@@ -533,6 +574,25 @@ pub(crate) fn process_terminates(attr: &TokenStream, item: TokenStream) -> Token
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The old body indexed `text.chars().collect()` with `i` and then sliced
+    /// `text[i..i + 4]` with the same `i` — character positions used as byte
+    /// offsets. They agree only while the input is ASCII. With one multi-byte
+    /// character ahead of the `mut`, the byte slice reads the wrong region (so
+    /// the rewrite is missed) or lands off a char boundary (so it panics).
+    #[test]
+    fn maintains_transform_rewrites_mut_after_a_multibyte_character() {
+        // `é` is two bytes: every char index after it is one less than its byte
+        // offset, which is exactly the drift the old body had.
+        assert_eq!(maintains_transform_mut("f(é, mut x)", "*"), "f(é, * x)");
+        // A multi-byte character immediately before the delimiter, and several
+        // of them, so the drift accumulates.
+        assert_eq!(maintains_transform_mut("λλλ(mut s)", "^"), "λλλ(^ s)");
+        // ASCII behaviour is unchanged.
+        assert_eq!(maintains_transform_mut("(mut self)", "*"), "(* self)");
+        // Non-delimiter context is still left alone.
+        assert_eq!(maintains_transform_mut("permut ation", "*"), "permut ation");
+    }
 
     #[test]
     fn test_maintains_transform_no_mut_unchanged() {

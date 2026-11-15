@@ -63,7 +63,7 @@ pub(crate) fn extract_param_destructuring_substitutions<'tcx>(
     // These are typically `_2 = (_1.0: T)` — field projections on parameters.
     let bb0 = &body.basic_blocks[BasicBlock::from_u32(0)];
     for stmt in &bb0.statements {
-        if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+        if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
             if place.projection.is_empty() {
                 if let Some(expr) = translate_rvalue(rvalue, &local_exprs, Some(body)) {
                     local_exprs.insert(place.local, expr);

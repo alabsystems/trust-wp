@@ -89,6 +89,44 @@ impl AYEncoder {
                 )));
             }
         }
+        if std::env::var_os("TRUST_WP_LOGIC_IDENTITY_TRACE").is_some() {
+            eprintln!(
+                "trust-wp: logic-identity register [{}]",
+                logic_fns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, lf)| format!(
+                        "{}:{:?}:opaque={}:ens={}",
+                        lf.full_path(),
+                        mode_overrides
+                            .and_then(|m| m.get(i).copied())
+                            .unwrap_or(lf.mode()),
+                        lf.is_opaque(),
+                        lf.ensures().len()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        // One solver symbol per definition: two definitions with different
+        // full paths must never share a symbol (the first axiom would answer
+        // for both).
+        {
+            let mut owners: std::collections::HashMap<String, &str> =
+                std::collections::HashMap::new();
+            for logic_fn in logic_fns {
+                let smt_name = trust_wp_core::logic::logic_fn_smt_name(logic_fn.name());
+                if let Some(previous) = owners.insert(smt_name.clone(), logic_fn.full_path()) {
+                    if previous != logic_fn.full_path() {
+                        return Err(EncodingError::solver_error(format!(
+                            "logic functions `{previous}` and `{}` share the solver symbol \
+                             `{smt_name}`",
+                            logic_fn.full_path()
+                        )));
+                    }
+                }
+            }
+        }
         for (index, logic_fn) in logic_fns.iter().enumerate() {
             let mode = mode_overrides
                 .and_then(|modes| modes.get(index).copied())

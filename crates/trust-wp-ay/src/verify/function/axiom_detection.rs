@@ -4,112 +4,12 @@
 
 //! Axiom detection, existential witness extraction, and Skolemization.
 //!
-//! Contains the axiom-only function classifier, embedded existential
-//! instantiation with body-derived witnesses, and trust-wp-level Skolemization
-//! for negated universal postconditions.
-//!
-//! Extracted from `function.rs` per designs/2026-03-06-code-structure-execution-plan.md Phase D.
+//! Contains embedded existential instantiation with body-derived witnesses
+//! and trust-wp-level Skolemization for negated universal postconditions.
 
 use std::sync::Arc;
 
 use trust_wp_core::formula::{BinOp, PureExpr};
-
-/// Detect axiom-only functions: trivial body + all ensures are universal quantifiers
-/// + no supporting context that could make the quantifier provable.
-///
-/// Axiom-only functions are specification-level declarations where the postcondition
-/// defines an algebraic property rather than a verifiable consequence of the body.
-/// Example:
-/// ```text
-/// #[ensures(forall<i, j, k> FSet::interval(i, j).contains(k) == (i <= k && k < j))]
-/// pub fn interval_spec() {}
-/// ```
-///
-/// These have:
-/// - Trivial body: `None` or `__trust_wp_tuple0()` (unit return)
-/// - No preconditions (axioms are unconditional)
-/// - All ensures clauses are universally quantified
-/// - Ensures do not reference `result` (result-dependent formulas are lemmas,
-///   not pure axiom declarations)
-/// - No type invariants (their presence means the forall might be provable from
-///   the invariant definitions, making this a lemma rather than an axiom)
-/// - No ghost context (ghost facts could provide supporting hypotheses)
-///
-/// Since there is no computation in the body, the postcondition cannot be derived
-/// from the body — it IS the specification. ay cannot prove universal statements
-/// from nothing, so these always return `Unknown("quantifier-unhandled")`.
-///
-/// We detect this pattern and return `Verified` directly, treating the postcondition
-/// as an axiom declaration rather than a verification target. (#1753)
-///
-/// # Soundness
-///
-/// This function is a **soundness-critical gate**: a false positive causes the
-/// verifier to return `Verified` without generating any SMT query. Each guard
-/// condition above is designed to be conservative — when in doubt, the function
-/// returns `false` (safe direction: normal verification proceeds). The primary
-/// defense against unsound bypass is `expr_contains_result_var`, which prevents
-/// result-dependent postconditions from being classified as axioms.
-pub(in crate::verify) fn is_axiom_only_function(
-    requires: &[PureExpr],
-    ensures: &[PureExpr],
-    return_expr: Option<&PureExpr>,
-    type_invariants: Option<&[trust_wp_core::logic::TypeInvariantDef]>,
-    ghost_context: Option<&[PureExpr]>,
-    logic_fns: Option<&[trust_wp_core::logic::LogicFnDef]>,
-) -> bool {
-    // Must have postconditions (otherwise trivially verified already).
-    if ensures.is_empty() {
-        return false;
-    }
-
-    // Must have no preconditions (axioms are unconditional definitions).
-    if !requires.is_empty() {
-        return false;
-    }
-
-    // Must not mention `result`. Result-dependent postconditions should flow
-    // through normal verification, even when universally quantified.
-    if ensures.iter().any(super::super::expr_contains_result_var) {
-        return false;
-    }
-
-    // Must have no type invariants — if present, the quantified postcondition
-    // might be a lemma provable from the invariant body axioms.
-    if type_invariants.is_some_and(|ti| !ti.is_empty()) {
-        return false;
-    }
-
-    // Must have no ghost context — ghost facts provide supporting hypotheses.
-    if ghost_context.is_some_and(|gc| !gc.is_empty()) {
-        return false;
-    }
-
-    // Must have no logic functions with Open mode — their defining axioms
-    // provide equational reasoning that could make the postcondition provable.
-    // A function like `id_mono` with `ensures: forall i,j. i<=j => id(i)<=id(j)`
-    // is a lemma provable from `id(x) = x`, NOT an axiom declaration.
-    if logic_fns.is_some_and(|fns| {
-        fns.iter()
-            .any(|f| !f.is_opaque() && f.mode() == trust_wp_core::logic::LogicMode::Open)
-    }) {
-        return false;
-    }
-
-    // Body must be trivial: None or __trust_wp_tuple0() (unit value).
-    let tuple0_name = trust_wp_core::formula::internal::tuple_lowering::tuple_logic_fn_name(0);
-    let body_is_trivial = match return_expr {
-        None => true,
-        Some(PureExpr::LogicFnCall { name, args }) => args.is_empty() && name == &tuple0_name,
-        _ => false,
-    };
-    if !body_is_trivial {
-        return false;
-    }
-
-    // All ensures must be universally quantified (possibly nested).
-    ensures.iter().all(is_universal_quantifier)
-}
 
 /// Check if an expression is a universal quantifier (possibly nested).
 pub(in crate::verify) fn is_universal_quantifier(expr: &PureExpr) -> bool {
@@ -122,9 +22,10 @@ pub(in crate::verify) fn is_universal_quantifier(expr: &PureExpr) -> bool {
 /// postconditions provable. Their presence signals that Skolemization at the
 /// trust-wp level (for ground pool instantiation) is beneficial.
 ///
-/// Previously used by postcondition negation to gate Skolemization; now
-/// unconditional Skolemization is used for all universal postconditions (#2696).
-/// Retained for test coverage and potential future use.
+/// Skolemization of universal postconditions is unconditional and no longer
+/// gates on this predicate (#2696); it still selects the plain ay-level `not`
+/// branch for non-universal postconditions with open logic fns in
+/// `encode_negated_postcondition`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::verify) fn has_open_logic_fns(
     logic_fns: Option<&[trust_wp_core::logic::LogicFnDef]>,
@@ -238,9 +139,9 @@ fn extract_existential_witness(
 /// Find a constructor name in `X == Ctor(y)` patterns within the exists body,
 /// where X is any non-constructor expression (e.g., `result`, `*self`, `self`).
 ///
-/// Previously only matched `result == Ctor(y)`. Generalized to also match
-/// `Deref(Var("self")) == Ctor(y)` and other variable-like patterns, which
-/// occur in postconditions like `exists<e: E> *self == OwnResult::Err(e)`.
+/// Besides `result == Ctor(y)` this matches `Deref(Var("self")) == Ctor(y)`
+/// and other variable-like left sides, which occur in postconditions like
+/// `exists<e: E> *self == OwnResult::Err(e)`.
 fn find_constructor_matching_var(expr: &PureExpr, var: &str) -> Option<String> {
     /// Check if an expression is a "known value" side of an equality
     /// (i.e., not the constructor side). Matches:
@@ -354,7 +255,7 @@ pub(crate) fn skolemize_negated_universal(expr: &PureExpr) -> Option<PureExpr> {
     // as uninterpreted constants by the encoder.
     let mut substitutions = HashMap::new();
     for (var_name, sort) in &vars {
-        let skolem_name = format!("sk_{var_name}");
+        let skolem_name = format!("sk${var_name}");
         substitutions.insert(var_name.clone(), PureExpr::Var(skolem_name, sort.clone()));
     }
 

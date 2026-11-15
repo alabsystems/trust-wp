@@ -165,6 +165,8 @@ fn test_lookup_extern_spec() {
     specs.insert(
         "core::option::Option::unwrap".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["self.is_some()".to_string()],
             ensures: vec!["Some(result) == old(self)".to_string()],
             param_names: None,
@@ -194,11 +196,15 @@ fn test_lookup_extern_spec() {
 #[test]
 fn test_extern_specs_are_compatible_ignores_whitespace_and_clause_order() {
     let left = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec!["self.is_some()".to_string(), "x > 0".to_string()],
         ensures: vec!["Some(result) == old(self)".to_string()],
         param_names: Some(vec!["self".to_string()]),
     };
     let right = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec!["x>0".to_string(), "self . is_some ( )".to_string()],
         ensures: vec!["Some( result )==old( self )".to_string()],
         param_names: Some(vec!["self".to_string()]),
@@ -210,11 +216,15 @@ fn test_extern_specs_are_compatible_ignores_whitespace_and_clause_order() {
 #[test]
 fn test_extern_specs_are_not_compatible_when_contract_differs() {
     let builtin = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec!["self.is_some()".to_string()],
         ensures: vec!["Some(result) == old(self)".to_string()],
         param_names: None,
     };
     let local = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec!["true".to_string()],
         ensures: vec!["Some(result) == old(self)".to_string()],
         param_names: None,
@@ -229,6 +239,8 @@ fn test_merge_local_extern_specs_dedupes_compatible_builtin_duplicate() {
     specs.insert(
         "core::option::Option::unwrap".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["self.is_some()".to_string()],
             ensures: vec!["Some(result) == old(self)".to_string()],
             param_names: None,
@@ -239,6 +251,8 @@ fn test_merge_local_extern_specs_dedupes_compatible_builtin_duplicate() {
     local.insert(
         "core::option::Option::unwrap".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["self . is_some ( )".to_string()],
             ensures: vec!["Some( result ) == old( self )".to_string()],
             param_names: None,
@@ -262,6 +276,8 @@ fn test_merge_local_extern_specs_reports_incompatible_builtin_conflict() {
     specs.insert(
         "core::option::Option::unwrap".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["self.is_some()".to_string()],
             ensures: vec!["Some(result) == old(self)".to_string()],
             param_names: None,
@@ -272,6 +288,8 @@ fn test_merge_local_extern_specs_reports_incompatible_builtin_conflict() {
     local.insert(
         "core::option::Option::unwrap".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["true".to_string()],
             ensures: vec!["Some(result) == old(self)".to_string()],
             param_names: None,
@@ -297,6 +315,8 @@ fn test_merge_local_extern_specs_preserves_builtin_param_names() {
     specs.insert(
         "alloc::vec::Vec::push".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["(^self)@ == self@.push_back(value)".to_string()],
             param_names: Some(vec!["self".to_string(), "value".to_string()]),
@@ -307,6 +327,8 @@ fn test_merge_local_extern_specs_preserves_builtin_param_names() {
     local.insert(
         "alloc::vec::Vec::push".to_string(),
         StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["(^self)@==self@.push_back(value)".to_string()],
             param_names: None,

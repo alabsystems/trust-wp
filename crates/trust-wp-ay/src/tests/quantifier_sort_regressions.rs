@@ -752,16 +752,17 @@ fn deref_bound_var_collapses_to_bound_717() {
 /// Final(Var(y)) inside a quantifier body should collapse to the bound variable.
 ///
 /// Same rationale as deref_bound_var_collapses_to_bound_717: `^y` for a quantifier-
-/// bound variable has no separate final form. (#717)
+/// bound variable of a value sort has no separate final form. (#717) Unannotated,
+/// a written binder may range over borrows and its `^y` is refused (D-127).
 #[test]
 #[timeout(30000)]
 fn final_bound_var_collapses_to_bound_717() {
     let mut encoder = AYEncoder::new_pure_with_quantifiers();
 
-    // forall<y> ^y > 0
+    // forall<y: Int> ^y > 0
     let body = gt(final_expr(var("y")), int(0));
 
-    let expr = forall("y", body);
+    let expr = forall_with_sort("y", ExprSort::Int, body);
 
     let result = encoder.encode_pure(&expr);
     assert!(

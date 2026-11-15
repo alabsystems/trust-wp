@@ -7,10 +7,13 @@ use std::{collections::HashMap, sync::Arc};
 use rustc_middle::ty::TyCtxt;
 use trust_wp_core::{
     contract_parser::{parse_contract, parse_contract_spanned},
-    formula::{BinOp, PureExpr, UnOp},
+    formula::{BinOp, PureExpr},
 };
 
-use crate::contracts::FunctionContract;
+use crate::{
+    contracts::FunctionContract,
+    logic::{identity::ClausePosition, spec_calls::ClauseRef},
+};
 
 /// Error from parsing textual contract clauses into `PureExpr` values.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -70,6 +73,18 @@ impl ParsedClauseInputs {
         rewrite_expr_list(&mut self.variants, substitutions);
     }
 
+    /// Rewrite the clauses that are read inside the body (loop invariants and
+    /// variants), leaving `requires` and `ensures` untouched.
+    pub(super) fn rewrite_body_level_exprs(&mut self, substitutions: &HashMap<String, PureExpr>) {
+        if substitutions.is_empty() {
+            return;
+        }
+        rewrite_expr_list(&mut self.invariants, substitutions);
+        rewrite_nested_expr_lists(&mut self.per_loop_invariants, substitutions);
+        rewrite_nested_expr_lists(&mut self.per_loop_variants, substitutions);
+        rewrite_expr_list(&mut self.variants, substitutions);
+    }
+
     pub(super) fn has_explicit_clauses(&self) -> bool {
         !self.requires.is_empty()
             || !self.ensures.is_empty()
@@ -82,80 +97,62 @@ impl ParsedClauseInputs {
     }
 }
 
-/// Check if a top-level expression is structurally guaranteed to be non-boolean.
-///
-/// Used to reject malformed contract clauses where `parse_contract` succeeds
-/// but the result cannot be a boolean predicate. For example, a char literal
-/// `'a'` parses as `Int(97)` after #1513, but a bare integer is never a valid
-/// requires/ensures/invariant clause.
-///
-/// Conservative: returns `true` only when the expression is DEFINITELY not
-/// boolean. Returns `false` for ambiguous cases (variables, method calls, etc.)
-/// to avoid false rejections.
-fn is_definitely_non_boolean(expr: &PureExpr) -> bool {
-    match expr {
-        // Bare integer literals are never boolean predicates
-        PureExpr::Int(_) => true,
-        // Arithmetic and bitwise operators produce integers
-        PureExpr::BinOp(
-            _,
-            BinOp::Add
-            | BinOp::Sub
-            | BinOp::Mul
-            | BinOp::Div
-            | BinOp::Mod
-            | BinOp::Shl
-            | BinOp::Shr
-            | BinOp::BitAnd
-            | BinOp::BitXor
-            | BinOp::BitOr,
-            _,
-        ) => true,
-        // Negation (unary minus) produces an integer
-        PureExpr::UnOp(UnOp::Neg, _) => true,
-        // Wrappers inherit from inner expression
-        PureExpr::Old(inner) | PureExpr::Deref(inner) | PureExpr::Final(inner) => {
-            is_definitely_non_boolean(inner)
-        }
-        // Everything else is ambiguous — don't reject
-        _ => false,
-    }
-}
-
 pub(super) fn parse_clause_inputs(
     tcx: TyCtxt<'_>,
     contract: &FunctionContract,
     report_errors: bool,
 ) -> Option<ParsedClauseInputs> {
-    let requires: Vec<_> = contract
-        .requires
-        .iter()
-        .filter_map(|clause| parse_boolean_clause(clause, "requires", report_errors))
-        .collect();
+    // Each clause is resolved in the contract owner's scope as it is parsed,
+    // against the type-check body of the clause it is: its `trust-wp:`
+    // marker kind and text (`logic::spec_calls`). A `requires`/`ensures`
+    // stands at the top of the body, a loop clause somewhere inside it, after
+    // locals its text cannot place.
+    let resolved = |expr: PureExpr, kind: &str, text: &str| {
+        let position = if matches!(kind, "requires" | "ensures") {
+            ClausePosition::Signature
+        } else {
+            ClausePosition::Body
+        };
+        crate::logic::identity::resolve_logic_fn_paths_in_scope(
+            tcx,
+            contract.def_id,
+            &expr,
+            position,
+            &ClauseRef::written(kind, text),
+        )
+    };
+    let boolean = |clauses: &[String], label: &str, kind: &str| -> Vec<PureExpr> {
+        clauses
+            .iter()
+            .filter_map(|clause| {
+                parse_boolean_clause(clause, label, report_errors)
+                    .map(|expr| resolved(expr, kind, clause))
+            })
+            .collect()
+    };
+    let variant = |clauses: &[String], label: &str| -> Vec<PureExpr> {
+        clauses
+            .iter()
+            .filter_map(|clause| {
+                parse_variant_clause(clause, label, report_errors)
+                    .map(|expr| resolved(expr, "variant", clause))
+            })
+            .collect()
+    };
 
-    let ensures: Vec<_> = contract
-        .ensures
-        .iter()
-        .filter_map(|clause| parse_boolean_clause(clause, "ensures", report_errors))
-        .collect();
-
-    let invariants: Vec<_> = contract
-        .invariants
-        .iter()
-        .filter_map(|clause| parse_boolean_clause(clause, "invariant", report_errors))
-        .collect();
+    let requires = boolean(&contract.requires, "requires", "requires");
+    let ensures = boolean(&contract.ensures, "ensures", "ensures");
+    let invariants = boolean(&contract.invariants, "invariant", "invariant");
 
     let per_loop_invariants: Vec<(u32, u32, Vec<PureExpr>)> = contract
         .per_loop_invariants
         .iter()
         .map(|(start, end, invariants)| {
-            let parsed: Vec<PureExpr> = invariants
-                .iter()
-                .filter_map(|clause| {
-                    parse_boolean_clause(clause, "per-loop invariant", report_errors)
-                })
-                .collect();
-            (*start, *end, parsed)
+            (
+                *start,
+                *end,
+                boolean(invariants, "per-loop invariant", "invariant"),
+            )
         })
         .filter(|(_, _, invariants)| !invariants.is_empty())
         .collect();
@@ -163,25 +160,13 @@ pub(super) fn parse_clause_inputs(
     let per_loop_variants: Vec<(u32, u32, Vec<PureExpr>)> = contract
         .per_loop_variants
         .iter()
-        .map(|(start, end, variants)| {
-            let parsed: Vec<PureExpr> = variants
-                .iter()
-                .filter_map(|clause| {
-                    parse_variant_clause(clause, "per-loop variant", report_errors)
-                })
-                .collect();
-            (*start, *end, parsed)
-        })
+        .map(|(start, end, variants)| (*start, *end, variant(variants, "per-loop variant")))
         .filter(|(_, _, variants)| !variants.is_empty())
         .collect();
 
-    let variants: Vec<_> = contract
-        .variants
-        .iter()
-        .filter_map(|clause| parse_variant_clause(clause, "variant", report_errors))
-        .collect();
+    let variants = variant(&contract.variants, "variant");
 
-    let parsed = ParsedClauseInputs {
+    let mut parsed = ParsedClauseInputs {
         requires,
         ensures,
         invariants,
@@ -189,6 +174,12 @@ pub(super) fn parse_clause_inputs(
         per_loop_variants,
         variants,
     };
+
+    // Read each raw-pointer cast at its operand's type in the same owner, after the
+    // per-clause resolution above.
+    parsed.rewrite_each_expr(|expr| {
+        crate::logic::ptr_casts::classify_pointer_casts(tcx, contract.def_id, expr)
+    });
 
     if has_dropped_clauses(tcx, contract, &parsed) {
         return None;
@@ -234,7 +225,22 @@ pub(in crate::callbacks) fn conjoin_exprs(exprs: &[PureExpr]) -> PureExpr {
 
 fn parse_boolean_clause(clause: &str, clause_kind: &str, report_errors: bool) -> Option<PureExpr> {
     match parse_contract(clause) {
-        Ok(expr) if is_definitely_non_boolean(&expr) => {
+        // `is_refused_as_boolean_clause` is trust-wp-core's, deliberately NOT a
+        // local copy: `trust-wp-macros`' `spec_tc::driver_parses` skips its
+        // rustc type-check for exactly the clauses refused here, so the two
+        // must be one predicate. See its doc comment.
+        // A closure postcondition names the returned value: one parameter.
+        // With any other count no parameter is the returned value.
+        Ok(PureExpr::Closure { params, .. }) if clause_kind == "ensures" && params.len() != 1 => {
+            emit_clause_parse_error(
+                report_errors,
+                clause_kind,
+                clause,
+                "a closure postcondition takes exactly one parameter, the returned value",
+            );
+            None
+        }
+        Ok(expr) if expr.is_refused_as_boolean_clause() => {
             if report_errors {
                 crate::result_protocol_state::record_parse_error();
             }

@@ -268,8 +268,15 @@ fn test_own_result_transpose_pipeline_with_qualified_option_constructors() {
 }
 
 /// Minimal `transpose` Err-branch regression for the nested placeholder path:
-/// `Some(OwnResult::Err(_))` must be distinct from `None` even when the outer
+/// `Some(OwnResult::Err(_))` must never be read as `None`, even when the outer
 /// `Some` constructor cannot use the native `OptionInt` datatype path.
+///
+/// The `match` body encodes at `OptionInt` and reaches the result's
+/// `Option<OwnResult>` sort only through a structural bridge that carries no
+/// constructor, so `result != None` is not proved. It verified only while the
+/// datatype binding wrapped every non-constructor body in `Some`, which proved
+/// the same postcondition for a body returning `None` (D-165); what stays owed
+/// is that the Err branch is never refuted.
 #[test]
 #[timeout(90000)]
 fn test_own_result_transpose_err_branch_some_err_is_not_none() {
@@ -327,8 +334,71 @@ fn test_own_result_transpose_err_branch_some_err_is_not_none() {
     );
     let vr = result.unwrap();
     assert!(
-        matches!(vr, VerificationResult::Verified(_)),
+        !matches!(vr, VerificationResult::Failed(..)),
         "Some(OwnResult::Err(_)) must stay distinct from None on the transpose Err branch: {vr:?}"
+    );
+}
+
+/// The same `match` body under `self == OwnResult::Ok(7)` returns `None`, so
+/// `result != None` is false. A binding that wraps the body's `OptionInt` value
+/// in `Some` proves it (D-165).
+#[test]
+#[timeout(90000)]
+fn test_own_result_transpose_ok_branch_none_is_not_read_as_some() {
+    use trust_wp_core::logic::{AdtConstructorDecl, AdtDecl, AdtFieldDecl, AdtKind};
+
+    let req = eq(var("self"), logic_fn_call("OwnResult::Ok", vec![int(7)]));
+    let body = match_expr(
+        var("self"),
+        vec![
+            (
+                Pattern::Constructor {
+                    name: "OwnResult::Err".to_string(),
+                    inner: Some(Box::new(Pattern::Binding("e".to_string()))),
+                },
+                logic_fn_call(
+                    "Some",
+                    vec![logic_fn_call("OwnResult::Err", vec![var("e")])],
+                ),
+            ),
+            (Pattern::Wildcard, logic_fn_call("None", vec![])),
+        ],
+    );
+    let ens = ne(var("result"), logic_fn_call("None", vec![]));
+
+    let adt_decls = std::collections::HashMap::from([(
+        "OwnResult".to_string(),
+        AdtDecl::new(
+            "crate::OwnResult".to_string(),
+            "OwnResult".to_string(),
+            AdtKind::Enum,
+            vec![
+                AdtConstructorDecl::new(
+                    "OwnResult::Ok".to_string(),
+                    "Ok".to_string(),
+                    vec![AdtFieldDecl::new("ok".to_string(), ExprSort::Int)],
+                ),
+                AdtConstructorDecl::new(
+                    "OwnResult::Err".to_string(),
+                    "Err".to_string(),
+                    vec![AdtFieldDecl::new("err".to_string(), ExprSort::Int)],
+                ),
+            ],
+        ),
+    )]);
+
+    let result = verify_function_with_modes(
+        VerificationRequest::new(&[req], &[ens])
+            .return_expr(Some(&body))
+            .adt_decls(Some(adt_decls)),
+    );
+
+    assert!(
+        !matches!(
+            result,
+            Ok(VerificationResult::Verified(_) | VerificationResult::Assumed(_))
+        ),
+        "the Ok branch returns None, so result != None must not verify: {result:?}"
     );
 }
 

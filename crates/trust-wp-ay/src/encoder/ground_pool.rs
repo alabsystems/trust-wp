@@ -20,14 +20,6 @@
 //!    calls. Used for re-encoding axiom bodies with ground arguments (since
 //!    ay-dpll doesn't support SMT-level substitution).
 //!
-//! # Migration path (from design doc)
-//!
-//! - Phase 1: Infrastructure + collection wiring (done)
-//! - Phase 2: Register existing axioms (done — `register_axiom` + `assert_ground_pool_instances`)
-//! - Phase 3: Extend to new axiom families (Seq, type invariants, FSet)
-//! - Phase 4: Multi-trigger and cross-axiom chaining
-//!
-//! Design: `designs/2026-02-15-generalized-ground-term-seeding.md`
 //! Issues: #994, #1296, #1603
 
 use std::collections::{HashMap, HashSet};
@@ -49,7 +41,7 @@ pub(crate) struct GroundEntry {
 }
 
 /// Distinguishes defining axioms from spec (ensures) axioms for ground
-/// instantiation (#1965, Lane 5).
+/// instantiation (#1965).
 ///
 /// - `Defining`: produces `f(ground_args) = body_encoded` (equality)
 /// - `Spec`: produces `requires(ground_args) =>
@@ -129,9 +121,8 @@ pub(crate) struct GroundTermPool {
     /// referenced logic functions with >4 parameters or low priority scores
     /// may have their ground instances dropped, causing solver Unknown results.
     ///
-    /// The field retains the `postcondition_` prefix for historical reasons
-    /// (originally only ensures clauses were scanned). Since #1296, both
-    /// ensures and requires clauses contribute to this set.
+    /// Despite the `postcondition_` prefix, both ensures and requires clauses
+    /// contribute to this set.
     postcondition_symbols: HashSet<String>,
     /// Optional obligation-local axiom relevance filter (#2674).
     relevance_symbols: Option<HashSet<String>>,
@@ -267,7 +258,7 @@ impl GroundTermPool {
     ///
     /// The axiom's `fn_symbol` is matched against ground entries in the pool.
     /// During instantiation (before `check_sat`), matching ground entries are
-    /// used to re-encode the axiom body with concrete arguments.
+    /// used for re-encoding the axiom body with concrete arguments.
     pub(crate) fn register_axiom(&mut self, axiom: AxiomEntry) {
         self.axioms.push(axiom);
         self.revision = self.revision.saturating_add(1);
@@ -282,7 +273,7 @@ impl GroundTermPool {
 
     /// Number of registered axioms.
     ///
-    /// Non-test callers use this for profile instrumentation (#2674 Phase 1).
+    /// Non-test callers use this for profile instrumentation (#2674).
     pub(crate) fn axiom_count(&self) -> usize {
         self.axioms.len()
     }

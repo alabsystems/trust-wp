@@ -165,6 +165,7 @@ fn mut_borrow_obligation_grounds_open_logic_universal_negation() {
         mutation_continued_params: None,
         body_div_obligations: &[],
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -260,6 +261,7 @@ fn mut_borrow_obligation_eliminates_embedded_existential_from_first_assertion() 
         mutation_continued_params: None,
         body_div_obligations: &[],
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };

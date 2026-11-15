@@ -7,16 +7,13 @@
 //! This module implements the `pearlite!` macro which allows users to write
 //! specification expressions with extended syntax not available in standard Rust.
 //!
-//! # Design
-//!
-//! See `designs/2026-02-02-pearlite-dsl.md` for the full design document.
-//!
-//! # Current Status
+//! # Scope
 //!
 //! The pearlite! macro preprocesses Pearlite syntax and then validates the
 //! result through the shared contract-expression path used by proc-macro
-//! contracts.
-//! Currently supports:
+//! contracts — one validator, so `pearlite!` and contract clauses accept the
+//! same language.
+//! Supports:
 //! - `x.view()` or `x@` - View/model access
 //! - Quantifiers (`forall<...>`, `exists<...>`) and implication (`==>`)
 //! - Standard Rust boolean expressions (`&&`, `||`, `!`)

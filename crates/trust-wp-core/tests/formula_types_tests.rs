@@ -287,7 +287,7 @@ fn parse_named_struct_ctor_round_trip() {
 fn parse_named_struct_ctor_empty_fields() {
     let (type_name, fields) = parse_named_struct_ctor("Unit{}").expect("should parse");
     assert_eq!(type_name, "Unit");
-    assert!(fields.is_empty());
+    assert_eq!(fields, Vec::<&str>::new());
 }
 
 #[test]

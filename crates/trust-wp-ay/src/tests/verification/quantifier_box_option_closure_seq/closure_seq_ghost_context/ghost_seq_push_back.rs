@@ -50,10 +50,10 @@ fn test_ghost_seq_push_back_ghost_mutation_verifies() {
     );
     let vr = result.unwrap();
     // Vacuity guard (#2414): ghost context preconditions are over-constrained.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification. The legacy strict helper stays strict for its other call
-    // sites; the tolerance is opt-in here. See
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification. The strict
+    // `assert_verified_or_*` helpers stay strict for their other call sites;
+    // the tolerance is opt-in here. See
     // `tests::helpers::verified_or_known_proof_trusted`.
     crate::tests::helpers::assert_verified_or_known_proof_trusted(
         &vr,
@@ -100,10 +100,10 @@ fn test_ghost_seq_push_back_ghost_element_access() {
     );
     let vr = result.unwrap();
     // Vacuity guard (#2414) or sort_fallback_to_int (#2204).
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification. The legacy strict helper stays strict for its other call
-    // sites; the tolerance is opt-in here. See
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification. The strict
+    // `assert_verified_or_*` helpers stay strict for their other call sites;
+    // the tolerance is opt-in here. See
     // `tests::helpers::verified_or_known_proof_trusted`.
     crate::tests::helpers::assert_verified_or_known_proof_trusted(
         &vr,

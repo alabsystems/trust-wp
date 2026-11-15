@@ -17,27 +17,31 @@ impl Callbacks for ClosureCaptureResultExprProbe {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let contracts = find_contract_functions(tcx);
-        let Some(contract) = contracts
-            .iter()
-            .find(|contract| tcx.def_kind(contract.def_id) == DefKind::Closure)
-        else {
-            return Compilation::Stop;
-        };
-        let user_specs = HashMap::new();
-        let trait_specs = HashMap::new();
-        let extern_specs = HashMap::new();
-        let extraction_ctx =
-            ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, false, false);
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let contracts = find_contract_functions(tcx);
+            let Some(contract) = contracts
+                .iter()
+                .find(|contract| tcx.def_kind(contract.def_id) == DefKind::Closure)
+            else {
+                return Compilation::Stop;
+            };
+            let user_specs = HashMap::new();
+            let trait_specs = HashMap::new();
+            let extern_specs = HashMap::new();
+            let extraction_ctx =
+                ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, &[], false, false);
 
-        let parsed = parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
-            .expect("closure contract should parse and extract");
+            let parsed =
+                parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
+                    .expect("closure contract should parse and extract");
 
-        self.result_expr = parsed.result_expr.clone();
-        self.spanned_result_expr = parsed.result_expr_spanned.map(|sp| sp.expr);
-        self.ran = true;
-        Compilation::Stop
+            self.result_expr = parsed.result_expr.clone();
+            self.spanned_result_expr = parsed.result_expr_spanned.map(|sp| sp.expr);
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 

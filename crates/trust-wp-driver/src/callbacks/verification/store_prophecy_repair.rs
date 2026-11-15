@@ -460,9 +460,9 @@ fn canonicalize_stored_borrow_sides(
             };
             let binding = binding.clone();
             let current_var =
-                PureExpr::Var(format!("__twp_current_{binding}_{scrutinee_name}"), None);
+                PureExpr::Var(format!("$twp_current_{binding}_{scrutinee_name}"), None);
             let final_var =
-                PureExpr::Var(format!("__twp_prophecy_{binding}_{scrutinee_name}"), None);
+                PureExpr::Var(format!("$twp_prophecy_{binding}_{scrutinee_name}"), None);
             let mut current_changed = false;
             let mut final_changed = false;
             arm.body = arm.body.rewrite_bottom_up(|node| match &node {
@@ -537,7 +537,7 @@ fn canonicalize_stored_borrow_sides(
                     continue;
                 }
                 let sibling_var =
-                    PureExpr::Var(format!("__twp_payload_{sibling}_{scrutinee_name}"), None);
+                    PureExpr::Var(format!("$twp_payload_{sibling}_{scrutinee_name}"), None);
                 let mut sibling_changed = false;
                 arm.body = arm.body.rewrite_bottom_up(|node| match &node {
                     PureExpr::Deref(inner) | PureExpr::Final(inner)
@@ -583,7 +583,7 @@ fn sibling_annotation_may_embed_mut_ref(ann: Option<&trust_wp_core::formula::Exp
             | ExprSort::Seq
             | ExprSort::Unit
             | ExprSort::FMap
-            | ExprSort::Float,
+            | ExprSort::Float(_),
         ) => false,
         Some(_) => true,
     }
@@ -947,12 +947,12 @@ mod tests {
         };
         assert_eq!(
             cur_inner.as_ref(),
-            &var("__twp_current_rem_call_2"),
+            &var("$twp_current_rem_call_2"),
             "current-side canonical var"
         );
         assert_eq!(
             fin_inner.as_ref(),
-            &var("__twp_prophecy_rem_call_2"),
+            &var("$twp_prophecy_rem_call_2"),
             "final-side canonical var"
         );
 
@@ -962,12 +962,12 @@ mod tests {
         };
         let expected = PureExpr::BinOp(
             Arc::new(eq(
-                PureExpr::View(Arc::new(var("__twp_current_rem_call_2"))),
+                PureExpr::View(Arc::new(var("$twp_current_rem_call_2"))),
                 var("tail_of_current"),
             )),
             BinOp::And,
             Arc::new(eq(
-                PureExpr::View(Arc::new(var("__twp_prophecy_rem_call_2"))),
+                PureExpr::View(Arc::new(var("$twp_prophecy_rem_call_2"))),
                 var("tail_of_final"),
             )),
         );
@@ -1012,7 +1012,7 @@ mod tests {
         assert!(canonical.final_side.is_none());
         assert_eq!(canonical.sibling_bridges.len(), 1);
         let (fresh, projection) = &canonical.sibling_bridges[0];
-        assert_eq!(fresh, &var("__twp_payload_first_call_2"));
+        assert_eq!(fresh, &var("$twp_payload_first_call_2"));
         let expected_projection = PureExpr::LogicFnCall {
             name: "__trust_wp_tuple_get_0".to_string(),
             args: vec![PureExpr::LogicFnCall {
@@ -1026,7 +1026,7 @@ mod tests {
             panic!("expected Match");
         };
         let expected_body = eq(
-            PureExpr::View(Arc::new(var("__twp_payload_first_call_2"))),
+            PureExpr::View(Arc::new(var("$twp_payload_first_call_2"))),
             var("head"),
         );
         assert_eq!(arms[0].body, expected_body);

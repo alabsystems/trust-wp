@@ -91,6 +91,12 @@ fn generic_count_too_strong<T: Counter>(c: &T) -> i32 {
 // Phase 3: Trait refinement obligations
 // =============================================================================
 
+/// Every impl body below adds one only below `i32::MAX`: at the top of the
+/// range the addition panics, which D-18 makes a proof obligation of the body,
+/// so an unguarded `x + 1` fails for a reason other than the refinement these
+/// impls exist to exercise. The bound is written as a literal because a body's
+/// `i32::MAX` is not translated and the branch it decides is read as
+/// unconstrained (program_assoc_const_branch_control.rs).
 trait RefinedCounter {
     #[requires(x >= 0)]
     #[ensures(result >= 0)]
@@ -104,7 +110,11 @@ impl RefinedCounter for StrongerPost {
     #[requires(x >= 0)]
     #[ensures(result > 0)]
     fn refine(&self, x: i32) -> i32 {
-        x + 1
+        if x < 2147483647 {
+            x + 1
+        } else {
+            x
+        }
     }
 }
 
@@ -115,7 +125,11 @@ impl RefinedCounter for StrongerPre {
     #[requires(x > 0)]
     #[ensures(result > 0)]
     fn refine(&self, x: i32) -> i32 {
-        x + 1
+        if x < 2147483647 {
+            x + 1
+        } else {
+            x
+        }
     }
 }
 
@@ -126,7 +140,11 @@ impl RefinedCounter for WeakerPost {
     #[requires(x >= 0)]
     #[ensures(result >= -1)]
     fn refine(&self, x: i32) -> i32 {
-        x + 1
+        if x < 2147483647 {
+            x + 1
+        } else {
+            x
+        }
     }
 }
 

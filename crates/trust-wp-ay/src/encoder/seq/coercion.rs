@@ -32,7 +32,7 @@ pub(in crate::encoder) fn is_seq_iterator_sort_leaf(sort_name: &str) -> bool {
 /// `coerce_to_seq` (the injective `__vec_to_seq_*` bridge with its #2116
 /// View-anchor congruence) instead of falling through to `coerce_ite_sorts`,
 /// which mints a fresh unconstrained constant that discards the value.
-/// (ce-census 2026-08-20, ghost/seq_iter reverse_ghost loop_initialization)
+/// (ghost/seq_iter reverse_ghost loop_initialization)
 pub(in crate::encoder) fn sort_is_seq_iterator_carrier(sort: &Sort) -> bool {
     match sort {
         Sort::Uninterpreted(name) => is_seq_iterator_sort_leaf(name),
@@ -273,7 +273,7 @@ mod tests {
         assert!(matches!(result, SolveResult::Sat), "{result:?}");
     }
 
-    // --- restore-route audit (2026-08-26): the residual M4 named ---------
+    // --- restore route: reconstruction at a prophecy-carrier sort ----------
     //
     // `try_restore_seq_element_from_int` reconstructs a Seq element as
     // `__seq_index_restore_<sort>(seq, index)` — a function of the Seq and the
@@ -777,8 +777,8 @@ impl AYEncoder {
     /// exact source; indexed tokens get a stable reconstruction term plus an
     /// exact ground bridge equality. (#2316)
     ///
-    /// FAIL-CLOSED on mut-ref prophecy carriers (restore-route audit
-    /// 2026-08-26, the residual M4 named). See
+    /// FAIL-CLOSED on mut-ref prophecy carriers: reconstructing an element
+    /// there is a borrow-identity claim (bug/869). See
     /// [`Self::mint_seq_index_restore_unguarded`] for why.
     pub(crate) fn try_restore_seq_element_from_int(
         &mut self,
@@ -805,10 +805,9 @@ impl AYEncoder {
         // constant — strictly weaker than the restore, so this can only remove
         // information, never add a premise.
         //
-        // Measured live: 20 firings across `cc/seq` (a ghost `Seq<&mut usize>`),
-        // `take_first_mut` and `pair_bor_mut`, with byte-identical status and
-        // telemetry on all three (restore-route audit 2026-08-26). The route is
-        // reachable; the refusal is free.
+        // The route is reachable — `cc/seq` (a ghost `Seq<&mut usize>`),
+        // `take_first_mut` and `pair_bor_mut` all take it — and refusing there
+        // changes no verdict, so the refusal is free.
         if self.restore_target_carries_a_prophecy_slot(target_sort) {
             return None;
         }
@@ -852,11 +851,7 @@ impl AYEncoder {
     /// `id(a) == id(b)` — the bug/869 borrow-identity collapse, on a premise set
     /// that stays satisfiable (so no vacuity counter fires) whenever the ids are
     /// not separately pinned.
-    fn mint_seq_index_restore_unguarded(
-        &mut self,
-        term: Term,
-        target_sort: &Sort,
-    ) -> Option<Term> {
+    fn mint_seq_index_restore_unguarded(&mut self, term: Term, target_sort: &Sort) -> Option<Term> {
         let (seq_term, index_term) = *self.seq_state.get_seq_index_source(&term)?;
         let restore_key = seq_index_restore_key(target_sort);
         let restore_fn = if let Some(existing) =

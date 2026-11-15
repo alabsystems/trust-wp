@@ -12,13 +12,23 @@ use super::*;
 // Resolve predicate encoding tests (Phase 4, Part of #358)
 // =============================================================================
 
+fn declare_current_and_final(encoder: &mut AYEncoder, name: &str) {
+    for state in ["current", "final"] {
+        encoder
+            .get_or_declare_var(&format!("{name}_{state}"), ay_dpll::api::Sort::Int)
+            .expect("declare state");
+    }
+}
+
 #[test]
 #[timeout(30000)]
 fn test_encode_resolve_simple() {
     // resolve(x) encodes as x_current == x_final (Bool-sorted equality).
     // Without constraining x_current != x_final, this should be SAT
-    // because the solver can unify both fresh variables.
+    // because the solver can unify both variables. The lane names both
+    // states: a variable it names no final value of is refused (D-126).
     let mut encoder = AYEncoder::new();
+    declare_current_and_final(&mut encoder, "x");
 
     let expr = logic_fn_call("resolve", vec![var("x")]);
 
@@ -41,6 +51,7 @@ fn test_resolve_encodes_as_boolean() {
     // sort mismatch errors, which would occur if resolve returned Int.
     // Semantic: resolve(x) && true is Sat (same as resolve(x)). Part of #1990.
     let mut encoder = AYEncoder::new();
+    declare_current_and_final(&mut encoder, "x");
 
     let resolve_call = logic_fn_call("resolve", vec![var("x")]);
 
@@ -135,95 +146,69 @@ fn test_resolve_fails_when_value_changes() {
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &[ens], &final_values))
             .expect("resolve modification verification should not error");
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "resolve(v) should fail when body modifies v: {result:?}"
     );
 }
 
-/// Verify that resolve(*v) produces the same result as resolve(v) after
-/// the Deref-unwrapping fix (#508).
-///
-/// Before the fix, resolve(Deref(Var("v"))) would produce
-/// `v_current_current == v_current_final` (wrong double-wrapping).
-/// After the fix, it correctly unwraps to produce `v_current == v_final`.
-///
-/// We verify this by running the identity-ref scenario with resolve(*v)
-/// instead of resolve(v) — both should verify.
+/// `resolve(e)` is the resolve of `e` at `e`'s own type (D-127). The #508
+/// strip read `resolve(*v)` and `resolve(**v)` as the resolve of `v` itself,
+/// and a projection, a view or a constructor as `*e == ^e` distributed into
+/// the operand. Each is refused now: none of these ensures is credited
+/// (`!resolve(*v)` of `v: &mut i32` after a write verified, and so did
+/// `resolve(*v)` of an untouched `v: &mut &mut i32` whose inner borrow the
+/// caller decides).
 #[test]
 #[timeout(30000)]
-fn test_resolve_deref_var_equivalent_to_resolve_var() {
-    // Same setup as test_resolve_identity_verified, but using resolve(*v)
-    // instead of resolve(v).
-    //
-    // fn identity_ref(v: &mut i32) { /* no-op */ }
-    // ensures: resolve(*v)
-    //
-    // With the fix, resolve(*v) unwraps Deref to Var("v"), producing
-    // the same v_current == v_final constraint as resolve(v).
-    let ens = logic_fn_call("resolve", vec![deref(var("v"))]);
+fn test_resolve_of_an_operand_held_through_a_variable_is_not_its_holders() {
+    use std::sync::Arc;
 
-    let body_expr = deref(var("v"));
+    use trust_wp_core::formula::{
+        internal::tuple_lowering::tuple_field_logic_fn_name, ExprSort, UnOp,
+    };
 
-    let mut final_values = HashMap::new();
-    final_values.insert("v".to_string(), body_expr);
-
-    let result =
-        verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &[ens], &final_values))
-            .expect("resolve(*v) verification should not error");
-    assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "resolve(*v) should verify for identity body (same as resolve(v)): {result:?}"
-    );
-}
-
-/// Verify that resolve(**v) (nested Deref) still produces correct results.
-///
-/// The Deref-stripping loop should handle arbitrary nesting depth.
-#[test]
-#[timeout(30000)]
-fn test_resolve_nested_deref_var_equivalent() {
-    // resolve(**v) — double deref — should still produce v_current == v_final
-    let ens = logic_fn_call("resolve", vec![deref(deref(var("v")))]);
-
-    let body_expr = deref(var("v"));
-
-    let mut final_values = HashMap::new();
-    final_values.insert("v".to_string(), body_expr);
-
-    let result =
-        verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &[ens], &final_values))
-            .expect("resolve(**v) verification should not error");
-    assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "resolve(**v) should verify for identity body (strips all Deref layers): {result:?}"
-    );
-}
-
-/// Verify that resolve(*v) correctly fails when the body modifies v.
-///
-/// This is the negative case for the #508 fix — if the Deref unwrapping
-/// were wrong (e.g., stripping too aggressively), this test would catch it.
-#[test]
-#[timeout(30000)]
-fn test_resolve_deref_var_fails_when_value_changes() {
-    // fn increment_ref(v: &mut i32) { *v += 1; }
-    // ensures: resolve(*v)
-    //
-    // Body changes v, so v_final = v_current + 1. resolve(*v) → v_current == v_final → FAILS.
-    let ens = logic_fn_call("resolve", vec![deref(var("v"))]);
-
-    let body_expr = add(deref(var("v")), int(1));
-
-    let mut final_values = HashMap::new();
-    final_values.insert("v".to_string(), body_expr);
-
-    let result =
-        verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &[ens], &final_values))
-            .expect("resolve(*v) modification verification should not error");
-    assert!(
-        matches!(result, VerificationResult::Failed(_)),
-        "resolve(*v) should fail when body modifies v: {result:?}"
-    );
+    let borrow = |referent: ExprSort| {
+        PureExpr::Var("v".to_string(), Some(ExprSort::MutRef(Box::new(referent))))
+    };
+    let int_borrow = || borrow(ExprSort::Int);
+    let nested_borrow = || borrow(ExprSort::MutRef(Box::new(ExprSort::Int)));
+    let field = |base: PureExpr| PureExpr::LogicFnCall {
+        name: tuple_field_logic_fn_name(0),
+        args: vec![base],
+    };
+    let not = |e: PureExpr| PureExpr::UnOp(UnOp::Not, Arc::new(e));
+    let resolve = |e: PureExpr| logic_fn_call("resolve", vec![e]);
+    let cases = [
+        // The integer `*v` resolves trivially, so its negation holds of no run.
+        (
+            not(resolve(deref(int_borrow()))),
+            add(deref(var("v")), int(1)),
+        ),
+        (resolve(deref(nested_borrow())), deref(var("v"))),
+        (resolve(deref(deref(nested_borrow()))), deref(var("v"))),
+        (resolve(field(deref(int_borrow()))), deref(var("v"))),
+        (
+            not(resolve(PureExpr::View(Arc::new(int_borrow())))),
+            add(deref(var("v")), int(1)),
+        ),
+        (
+            not(resolve(logic_fn_call("Some", vec![deref(int_borrow())]))),
+            add(deref(var("v")), int(1)),
+        ),
+    ];
+    for (ens, body) in cases {
+        let mut final_values = HashMap::new();
+        final_values.insert("v".to_string(), body);
+        let result = verify_mut_borrow_function_with_modes(MutBorrowRequest::new(
+            &[],
+            std::slice::from_ref(&ens),
+            &final_values,
+        ));
+        assert!(
+            !matches!(result, Ok(VerificationResult::Verified(_))),
+            "{ens} was credited: {result:?}"
+        );
+    }
 }
 
 /// Verify that resolve(x) returns true for a by-value parameter that has no
@@ -232,7 +217,8 @@ fn test_resolve_deref_var_fails_when_value_changes() {
 /// In Creusot semantics, `resolve` on a non-mutable-reference (by-value)
 /// parameter is vacuously true — there is no borrow to resolve. Before the
 /// fix, the encoder would create unconstrained `x_final` variables, causing
-/// spurious counterexamples.
+/// spurious counterexamples. The parameter's sort says it is a value: an
+/// unannotated one is not known to be (D-126).
 #[test]
 #[timeout(30000)]
 fn test_resolve_by_value_is_true() {
@@ -246,7 +232,13 @@ fn test_resolve_by_value_is_true() {
         .expect("declare x");
 
     // resolve(x) should encode as `true` since there's no x_final.
-    let expr = logic_fn_call("resolve", vec![var("x")]);
+    let expr = logic_fn_call(
+        "resolve",
+        vec![PureExpr::Var(
+            "x".to_string(),
+            Some(trust_wp_core::formula::ExprSort::Int),
+        )],
+    );
     let term = encoder
         .encode_pure(&expr)
         .expect("resolve(x) by-value should encode without error");

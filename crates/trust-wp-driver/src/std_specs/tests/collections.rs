@@ -71,7 +71,11 @@ fn test_lookup_hashmap_clear() {
 fn test_lookup_hashmap_with_capacity() {
     let spec = lookup_std_spec("std::collections::HashMap::with_capacity")
         .expect("HashMap::with_capacity spec should exist");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "(3 * capacity@ + 16) * (__trust_wp_std_site_size_of_K_V() + 1)",
+        "HashMap::with_capacity",
+    );
     assert_ensures_contains(&spec, "result@.len() == 0", "HashMap::with_capacity");
 }
 
@@ -207,7 +211,11 @@ fn test_lookup_hashset_len() {
 fn test_lookup_hashset_with_capacity() {
     let spec = lookup_std_spec("std::collections::HashSet::with_capacity")
         .expect("HashSet::with_capacity spec should exist");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "(3 * capacity@ + 16) * (__trust_wp_std_site_size_of_T() + 1)",
+        "HashSet::with_capacity",
+    );
     assert_ensures_contains(&spec, "result@.len() == 0", "HashSet::with_capacity");
 }
 

@@ -8,7 +8,10 @@ use super::RefinementCounts;
 use crate::callbacks::{
     encoding_error_breakdown::EncodingErrorBreakdown,
     helpers::report_counterexample,
-    reporting::{emit_verification_diagnostic_if_requested, verified_evidence_gap_reason},
+    reporting::{
+        emit_verification_diagnostic_if_requested, verified_evidence_gap_reason,
+        withhold_unvalidated_refutation,
+    },
 };
 
 /// Outcome of a single refinement check (pre- or post-condition direction).
@@ -52,6 +55,10 @@ pub(super) fn report_refinement_outcome_result(
 ) -> RefinementOutcome {
     match result {
         Ok(outcome) => {
+            // No FAILED without a validated counterexample (front: honest
+            // refutations). A refinement check with no validated model is
+            // `unknown`, not a refuted refinement.
+            let outcome = withhold_unvalidated_refutation(outcome, &mut 0);
             let diagnostic_path = format!("{def_path}::{check_description}");
             emit_verification_diagnostic_if_requested(
                 &diagnostic_path,
@@ -131,7 +138,7 @@ fn report_refinement_verification_result(
 pub(super) fn aggregate_refinement_counts(
     pre_outcome: RefinementOutcome,
     post_outcome: RefinementOutcome,
-    verbose: bool,
+    precondition_only: bool,
     def_path: &str,
     encoding_errors: EncodingErrorBreakdown,
 ) -> RefinementCounts {
@@ -179,7 +186,14 @@ pub(super) fn aggregate_refinement_counts(
             encoding_errors,
         }
     } else {
-        if verbose {
+        // Always printed: the refinement verdict is an item-level result.
+        if precondition_only {
+            // Only the precondition direction was checked: no credit.
+            eprintln!(
+                "trust-wp: {def_path} refinement not checked in full: precondition \
+                 direction holds, postcondition direction has no trait-level contract"
+            );
+        } else {
             eprintln!("trust-wp: {def_path} refinement verified \u{2713}");
         }
         RefinementCounts {

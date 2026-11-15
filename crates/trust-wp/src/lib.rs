@@ -63,8 +63,17 @@
 //! }
 //! ```
 
-// Make `trust_wp_std` available as an extern crate so proc macro expansions
-// using `::trust_wp_std::...` paths resolve correctly in downstream crates.
+// `trust_wp_std` re-exported as an item, so `trust_wp::trust_wp_std::...` names
+// it and a downstream `use trust_wp::*;` brings the name into scope.
+//
+// It does NOT put `trust_wp_std` in a downstream crate's EXTERN PRELUDE — a
+// `pub extern crate` re-export never does — so it is not what makes the
+// ABSOLUTE `::trust_wp_std::...` paths that contract macros expand to
+// resolve. That is done by the trust-wp driver, which adds `--extern
+// trust_wp_std` to every crate it compiles with contracts
+// (`trust-wp-driver` `inject_spec_tc_extern`); the claim that this line did
+// it was false, and a crate depending on `trust-wp` alone failed every contract
+// with `error[E0433]: cannot find `trust_wp_std` in the crate root`.
 pub extern crate trust_wp_std;
 
 // --- Hidden internal macro (not re-exported by trust-wp-std) ---

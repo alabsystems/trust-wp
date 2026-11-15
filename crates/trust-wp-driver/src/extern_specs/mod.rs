@@ -24,11 +24,6 @@
 //!
 //! This module handles only step 1. Builtin `trust-wp-std` specs are bridged in
 //! separately instead of being discovered through local doc-marker parsing.
-//!
-//! # Design
-//!
-//! See `designs/2026-02-01-extern-spec.md` for the full design document.
-//! Related: Issue #160
 
 #![allow(clippy::doc_markdown)]
 
@@ -264,6 +259,8 @@ pub fn extern_specs_are_compatible(left: &StdSpec, right: &StdSpec) -> bool {
 
 fn merge_compatible_extern_spec(base_spec: StdSpec, local_spec: StdSpec) -> StdSpec {
     StdSpec {
+        inv_requires: Vec::new(),
+        capture_inv_requires: Vec::new(),
         requires: base_spec.requires,
         ensures: base_spec.ensures,
         param_names: base_spec.param_names.or(local_spec.param_names),
@@ -301,6 +298,8 @@ fn normalize_path_for_lookup(path: &str) -> String {
 impl From<ExternSpecEntry> for StdSpec {
     fn from(entry: ExternSpecEntry) -> Self {
         StdSpec {
+            inv_requires: Vec::new(),
+            capture_inv_requires: Vec::new(),
             requires: entry.requires,
             ensures: entry.ensures,
             param_names: entry.param_names,

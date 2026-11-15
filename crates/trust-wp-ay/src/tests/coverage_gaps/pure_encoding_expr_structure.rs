@@ -154,17 +154,30 @@ fn deref_bound_var_collapses_to_quantifier_var() {
     );
 }
 
-/// ^y for quantifier-bound y collapses to the bound variable itself.
+/// ^y for a quantifier-bound y of a value sort collapses to the bound
+/// variable itself.
 ///
 /// Same principle as Deref collapse: Final(Var(y)) for bound y should
-/// return the bound variable term, not create a free `y_final`. (#717)
+/// return the bound variable term, not create a free `y_final`. (#717) A
+/// written binder the parser gave no sort may range over borrows, and its
+/// `^y` is refused instead (D-127).
 #[test]
 #[timeout(30000)]
 fn final_bound_var_collapses_to_quantifier_var() {
     let mut encoder = AYEncoder::new();
+    let unannotated = forall("y", gt(final_expr(var("y")), int(0)));
+    assert!(
+        encoder.encode_pure(&unannotated).is_err(),
+        "^y of an unannotated written binder must be refused (D-127)"
+    );
 
-    // forall y. ^y > 0
-    let forall_expr = forall("y", gt(final_expr(var("y")), int(0)));
+    let mut encoder = AYEncoder::new();
+    // forall<y: Int> ^y > 0
+    let forall_expr = forall_with_sort(
+        "y",
+        trust_wp_core::formula::ExprSort::Int,
+        gt(final_expr(var("y")), int(0)),
+    );
     let forall_term = encoder
         .encode_pure(&forall_expr)
         .expect("forall y. ^y > 0 should encode with final collapse");

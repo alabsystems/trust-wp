@@ -70,41 +70,55 @@
 /// method bodies.
 pub trait FnOnceExt<Args> {
     type Output;
+
+    /// Creusot `FnOnceExt::precondition` (`creusot-std/src/std/ops.rs`).
+    /// Typing surface only: the verifier reads specification text, and this
+    /// body is never evaluated.
+    fn precondition(self, _args: Args) -> bool {
+        panic!("FnOnceExt::precondition is specification-only")
+    }
+
+    /// Creusot `FnOnceExt::postcondition_once`.
+    fn postcondition_once(self, _args: Args, _result: Self::Output) -> bool {
+        panic!("FnOnceExt::postcondition_once is specification-only")
+    }
 }
 
 /// Extension trait for `FnMut`, adding specification capabilities to closures.
-pub trait FnMutExt<Args>: FnOnceExt<Args> {}
+pub trait FnMutExt<Args>: FnOnceExt<Args> {
+    /// Creusot `FnMutExt::postcondition_mut`.
+    fn postcondition_mut(self, _args: Args, _result_state: Self, _result: Self::Output) -> bool
+    where
+        Self: Sized,
+    {
+        panic!("FnMutExt::postcondition_mut is specification-only")
+    }
+
+    /// Creusot `FnMutExt::hist_inv`.
+    fn hist_inv(self, _result_state: Self) -> bool
+    where
+        Self: Sized,
+    {
+        panic!("FnMutExt::hist_inv is specification-only")
+    }
+}
 
 /// Extension trait for `Fn`, adding specification capabilities to closures.
-pub trait FnExt<Args>: FnMutExt<Args> {}
-
-// Stable blanket impls for ordinary closures and function pointers.
-// Matches upstream Creusot arity envelope: 0..=9 arguments.
-impl<O, F: FnOnce() -> O> FnOnceExt<()> for F {
-    type Output = O;
-}
-impl<O, F: FnMut() -> O> FnMutExt<()> for F {}
-impl<O, F: Fn() -> O> FnExt<()> for F {}
-
-macro_rules! impl_fn_ext {
-    ( $( $tuple:tt ),+ ) => {
-        impl<$($tuple),+, O, F: FnOnce($($tuple),+) -> O> FnOnceExt<($($tuple),+,)> for F {
-            type Output = O;
-        }
-        impl<$($tuple),+, O, F: FnMut($($tuple),+) -> O> FnMutExt<($($tuple),+,)> for F {}
-        impl<$($tuple),+, O, F: Fn($($tuple),+) -> O> FnExt<($($tuple),+,)> for F {}
-    };
+pub trait FnExt<Args>: FnMutExt<Args> {
+    /// Creusot `FnExt::postcondition`.
+    fn postcondition(self, _args: Args, _result: Self::Output) -> bool {
+        panic!("FnExt::postcondition is specification-only")
+    }
 }
 
-impl_fn_ext! { A1 }
-impl_fn_ext! { A1, A2 }
-impl_fn_ext! { A1, A2, A3 }
-impl_fn_ext! { A1, A2, A3, A4 }
-impl_fn_ext! { A1, A2, A3, A4, A5 }
-impl_fn_ext! { A1, A2, A3, A4, A5, A6 }
-impl_fn_ext! { A1, A2, A3, A4, A5, A6, A7 }
-impl_fn_ext! { A1, A2, A3, A4, A5, A6, A7, A8 }
-impl_fn_ext! { A1, A2, A3, A4, A5, A6, A7, A8, A9 }
+// Blanket impls over the `Fn*` traits for every argument tuple (Creusot
+// `creusot-std/src/std/ops.rs`, nightly surface), so generic `F: Fn<A>`
+// bounds carry the specification methods too.
+impl<Args: core::marker::Tuple, F: ?Sized + FnOnce<Args>> FnOnceExt<Args> for F {
+    type Output = <F as FnOnce<Args>>::Output;
+}
+impl<Args: core::marker::Tuple, F: ?Sized + FnMut<Args>> FnMutExt<Args> for F {}
+impl<Args: core::marker::Tuple, F: ?Sized + Fn<Args>> FnExt<Args> for F {}
 
 // ── Range-helper facade ─────────────────────────────────────────────
 //
@@ -532,6 +546,7 @@ pub mod specs {
     /// first-match ordering in the spec table. (#2689)
     pub const INDEX: &str = r"
         params: self, index
+        requires: T::index.precondition((self, index))
         ensures: T::index.postcondition((self, index), result)
     ";
 
@@ -541,6 +556,7 @@ pub mod specs {
     /// Type-specific specs (Vec, slice) take precedence via first-match. (#2689)
     pub const INDEX_MUT: &str = r"
         params: self, index
+        requires: T::index_mut.precondition((self, index))
         ensures: T::index_mut.postcondition((self, index), result)
     ";
 
@@ -568,6 +584,7 @@ pub mod specs {
     /// specs in `primitives_checked` take precedence via first-match.
     pub const ADD: &str = r"
         params: self, rhs
+        requires: T::add.precondition((self, rhs))
         ensures: T::add.postcondition((self, rhs), result)
     ";
 
@@ -576,6 +593,7 @@ pub mod specs {
     /// Generic trait fallback for `-` operator.
     pub const SUB: &str = r"
         params: self, rhs
+        requires: T::sub.precondition((self, rhs))
         ensures: T::sub.postcondition((self, rhs), result)
     ";
 
@@ -584,14 +602,23 @@ pub mod specs {
     /// Generic trait fallback for `*` operator.
     pub const MUL: &str = r"
         params: self, rhs
+        requires: T::mul.precondition((self, rhs))
         ensures: T::mul.postcondition((self, rhs), result)
     ";
 
     /// Contract for `Rem::rem(self, rhs) -> Self::Output`
     ///
     /// Generic trait fallback for `%` operator.
+    ///
+    /// SOUNDNESS: the callee may panic (primitive `MIN % -1`, `% 0`, or a user
+    /// impl's own precondition). The fallback knows nothing about that
+    /// precondition, so it carries the uninterpreted obligation
+    /// `T::rem.precondition(..)`, which callers cannot discharge; a call
+    /// reaching this fallback is refused rather than assumed panic-free.
+    /// `REM_ASSIGN` / `DIV_ASSIGN` follow the same rule.
     pub const REM: &str = r"
         params: self, rhs
+        requires: T::rem.precondition((self, rhs))
         ensures: T::rem.postcondition((self, rhs), result)
     ";
 
@@ -600,6 +627,7 @@ pub mod specs {
     /// Generic trait fallback for unary `-` operator.
     pub const NEG: &str = r"
         params: self
+        requires: T::neg.precondition((self,))
         ensures: T::neg.postcondition((self,), result)
     ";
 
@@ -610,6 +638,7 @@ pub mod specs {
     /// Generic trait fallback for `&` operator.
     pub const BIT_AND: &str = r"
         params: self, rhs
+        requires: T::bitand.precondition((self, rhs))
         ensures: T::bitand.postcondition((self, rhs), result)
     ";
 
@@ -618,6 +647,7 @@ pub mod specs {
     /// Generic trait fallback for `|` operator.
     pub const BIT_OR: &str = r"
         params: self, rhs
+        requires: T::bitor.precondition((self, rhs))
         ensures: T::bitor.postcondition((self, rhs), result)
     ";
 
@@ -626,6 +656,7 @@ pub mod specs {
     /// Generic trait fallback for `^` operator.
     pub const BIT_XOR: &str = r"
         params: self, rhs
+        requires: T::bitxor.precondition((self, rhs))
         ensures: T::bitxor.postcondition((self, rhs), result)
     ";
 
@@ -634,6 +665,7 @@ pub mod specs {
     /// Generic trait fallback for `!` operator.
     pub const NOT: &str = r"
         params: self
+        requires: T::not.precondition((self,))
         ensures: T::not.postcondition((self,), result)
     ";
 
@@ -642,6 +674,7 @@ pub mod specs {
     /// Generic trait fallback for `<<` operator.
     pub const SHL: &str = r"
         params: self, rhs
+        requires: T::shl.precondition((self, rhs))
         ensures: T::shl.postcondition((self, rhs), result)
     ";
 
@@ -650,6 +683,7 @@ pub mod specs {
     /// Generic trait fallback for `>>` operator.
     pub const SHR: &str = r"
         params: self, rhs
+        requires: T::shr.precondition((self, rhs))
         ensures: T::shr.postcondition((self, rhs), result)
     ";
 
@@ -660,6 +694,7 @@ pub mod specs {
     /// Generic trait fallback for `+=` operator.
     pub const ADD_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::add_assign.precondition((self, rhs))
         ensures: T::add_assign.postcondition((self, rhs), result)
     ";
 
@@ -668,6 +703,7 @@ pub mod specs {
     /// Generic trait fallback for `-=` operator.
     pub const SUB_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::sub_assign.precondition((self, rhs))
         ensures: T::sub_assign.postcondition((self, rhs), result)
     ";
 
@@ -676,6 +712,7 @@ pub mod specs {
     /// Generic trait fallback for `*=` operator.
     pub const MUL_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::mul_assign.precondition((self, rhs))
         ensures: T::mul_assign.postcondition((self, rhs), result)
     ";
 
@@ -684,6 +721,7 @@ pub mod specs {
     /// Generic trait fallback for `/=` operator.
     pub const DIV_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::div_assign.precondition((self, rhs))
         ensures: T::div_assign.postcondition((self, rhs), result)
     ";
 
@@ -692,6 +730,7 @@ pub mod specs {
     /// Generic trait fallback for `%=` operator.
     pub const REM_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::rem_assign.precondition((self, rhs))
         ensures: T::rem_assign.postcondition((self, rhs), result)
     ";
 
@@ -728,6 +767,7 @@ pub mod specs {
     /// Generic trait fallback for `&=` operator.
     pub const BIT_AND_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::bitand_assign.precondition((self, rhs))
         ensures: T::bitand_assign.postcondition((self, rhs), result)
     ";
 
@@ -736,6 +776,7 @@ pub mod specs {
     /// Generic trait fallback for `|=` operator.
     pub const BIT_OR_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::bitor_assign.precondition((self, rhs))
         ensures: T::bitor_assign.postcondition((self, rhs), result)
     ";
 
@@ -744,6 +785,7 @@ pub mod specs {
     /// Generic trait fallback for `^=` operator.
     pub const BIT_XOR_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::bitxor_assign.precondition((self, rhs))
         ensures: T::bitxor_assign.postcondition((self, rhs), result)
     ";
 
@@ -752,6 +794,7 @@ pub mod specs {
     /// Generic trait fallback for `<<=` operator.
     pub const SHL_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::shl_assign.precondition((self, rhs))
         ensures: T::shl_assign.postcondition((self, rhs), result)
     ";
 
@@ -760,6 +803,7 @@ pub mod specs {
     /// Generic trait fallback for `>>=` operator.
     pub const SHR_ASSIGN: &str = r"
         params: self, rhs
+        requires: T::shr_assign.precondition((self, rhs))
         ensures: T::shr_assign.postcondition((self, rhs), result)
     ";
 

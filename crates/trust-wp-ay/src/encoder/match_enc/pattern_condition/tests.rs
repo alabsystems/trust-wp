@@ -183,17 +183,14 @@ fn some_binding_pattern(name: &str) -> Pattern {
 
 /// Does a tuple-field getter with this `(domain) -> range` signature exist?
 ///
-/// FIXED (#133 mass unit adjudication, 2026-08-27): both sides are now compared
-/// in TERM-SORT form. The expected sorts were already normalised with
-/// `Sort::as_term_sort()` (which lowers `Datatype(d)` to `Uninterpreted(d.name)`
-/// — the spelling the term store actually uses), but the DECLARED sorts were
-/// compared raw. The encoder is free to declare a getter's range either way for
-/// the same sort, and it does: the `OptionSeq` getter is declared with the
-/// uninterpreted spelling while the `OptionInt` getter is declared as
-/// `Datatype(OptionInt)`. That made this predicate answer `false` for a
-/// declaration that is present and correct — a defect in the check, not in the
-/// encoder, and the reason
-/// `tuple_none_field_still_uses_option_int_without_non_int_evidence` was red.
+/// Both sides are compared in TERM-SORT form via `Sort::as_term_sort()` (which
+/// lowers `Datatype(d)` to `Uninterpreted(d.name)` — the spelling the term
+/// store actually uses). The encoder is free to declare a getter's range either
+/// way for the same sort, and it does: the `OptionSeq` getter is declared with
+/// the uninterpreted spelling while the `OptionInt` getter is declared as
+/// `Datatype(OptionInt)`. Comparing the declared side raw would make this
+/// predicate answer `false` for a declaration that is present and correct (see
+/// `tuple_none_field_still_uses_option_int_without_non_int_evidence`).
 /// Normalising the declared side is exactly ay's own sort identity, so this
 /// neither accepts a getter of a different sort nor loosens the name match.
 fn tuple_getter_decl_exists(
@@ -632,7 +629,7 @@ fn test_constructor_equality_without_explicit_scrutinee_sort_uses_actual_datatyp
 /// an outer variable (parameter), payload-sort inference must NOT inherit the
 /// outer variable's sort. The binding is fresh and scoped to the arm.
 ///
-/// This bug previously broke `reference/creusot/tests/should_succeed/lang/or_pat.rs`:
+/// The shape, from `reference/creusot/tests/should_succeed/lang/or_pat.rs`:
 ///
 /// ```text
 /// #[logic]
@@ -645,11 +642,12 @@ fn test_constructor_equality_without_explicit_scrutinee_sort_uses_actual_datatyp
 /// }
 /// ```
 ///
-/// `infer_pattern_payload_sort(Some(Binding("x")))` was reading the outer
-/// parameter `x: Tuple2` from the var-sort registry and producing
-/// `Option<Tuple2>` as the tuple element sort, breaking the match encoding.
-/// The fix consults only sort *hints* (which describe expected binding
-/// payload sorts), not the actual var-sort registry. (#5 or_pat shadowing)
+/// Reading the outer parameter `x: Tuple2` from the var-sort registry in
+/// `infer_pattern_payload_sort(Some(Binding("x")))` would produce
+/// `Option<Tuple2>` as the tuple element sort and break the match encoding.
+/// Payload-sort inference therefore consults only sort *hints* (which describe
+/// expected binding payload sorts), never the var-sort registry. (#5 or_pat
+/// shadowing)
 #[test]
 #[timeout(30000)]
 fn outer_var_sort_does_not_leak_into_constructor_binding_payload_sort() {
@@ -705,9 +703,9 @@ fn outer_var_sort_does_not_leak_into_constructor_binding_payload_sort() {
 /// The M2 mechanism, pinned at its narrowest point: destructuring
 /// `Some((a, b))` on an `Option<(&mut T, &mut [T])>` scrutinee must bind `a`
 /// at the mutref RECORD sort (a real prophecy carrier), not at the `Int` the
-/// punned `Tuple2` lowering used to hand back. `b` is a `legacy` element (the
+/// punned `Tuple2` lowering would hand back. `b` is a `legacy` element (the
 /// driver cannot resolve a slice referent) and keeps the legacy inference —
-/// this milestone lowers only what it can lower exactly.
+/// the lane lowers only what it can lower exactly.
 #[test]
 #[timeout(30000)]
 fn m2_carrier_tuple_payload_binds_the_element_at_the_record_sort() {
@@ -786,8 +784,8 @@ fn m2_carrier_tuple_payload_binds_the_element_at_the_record_sort() {
 }
 
 /// Over-refusal control for the same shape: a tuple with NO `&mut` element
-/// keeps the byte-identical legacy `Tuple2` lowering, so nothing outside the
-/// new class changes sorts.
+/// keeps the legacy `Tuple2` lowering, so nothing outside the carrier class
+/// changes sorts.
 #[test]
 #[timeout(30000)]
 fn m2_plain_tuple_payload_keeps_the_legacy_lowering() {
@@ -971,9 +969,10 @@ fn m3_carrier_option_payload_getter_bridge_is_vacuous_on_none() {
 /// OVER-REACH CONTROL: a legacy `OptionInt` scrutinee is NOT a prophecy
 /// carrier family, so the M3 bridge must mint NOTHING for it — no guard
 /// clause and, decisively, no getter DECLARATION. This is what keeps the
-/// passing corpus byte-identical. (It deliberately does not claim the two
-/// spellings are unconnected: the legacy stdlib-Option lane has its own,
-/// older connections. The claim under test is that *this* bridge is inert.)
+/// bridge inert outside the carrier family. (It deliberately does not claim
+/// the two spellings are unconnected: the legacy stdlib-Option lane has its
+/// own, separate connections. The claim under test is that *this* bridge is
+/// inert.)
 #[test]
 #[timeout(30000)]
 fn m3_legacy_option_int_mints_no_payload_getter_bridge() {

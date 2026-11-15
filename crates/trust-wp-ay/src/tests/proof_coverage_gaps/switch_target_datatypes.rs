@@ -178,20 +178,6 @@ fn test_switch_target_non_recursive_adt_no_self_ref() {
     }
 }
 
-/// Empty constructors in UserDefined panics in value_constructor_name.
-/// This test verifies the panic is triggered (debug_assert at construction
-/// site, plus .expect() in value_constructor_name). (#1980)
-#[test]
-#[timeout(30000)]
-#[should_panic(expected = "UserDefined must have at least one constructor")]
-fn test_value_constructor_name_panics_on_empty_constructors() {
-    let target = SwitchTarget::UserDefined {
-        adt_name: "Empty".to_string(),
-        constructors: vec![],
-    };
-    let _ = target.value_constructor_name();
-}
-
 /// Verify that `SwitchTarget::datatype()` for OptionInt produces the expected
 /// structure (positive control for comparison with UserDefined).
 ///

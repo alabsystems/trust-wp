@@ -238,7 +238,7 @@ fn test_parse_complex_view_method_deref() {
     } = &expr
     {
         assert_eq!(method, "len");
-        assert!(args.is_empty());
+        assert_eq!(args.as_slice(), []);
         assert!(
             matches!(receiver.as_ref(), PureExpr::View(inner) if matches!(inner.as_ref(), PureExpr::Deref(_)))
         );
@@ -258,7 +258,7 @@ fn test_parse_final_view_method() {
     } = &expr
     {
         assert_eq!(method, "len");
-        assert!(args.is_empty());
+        assert_eq!(args.as_slice(), []);
         assert!(
             matches!(receiver.as_ref(), PureExpr::View(inner) if matches!(inner.as_ref(), PureExpr::Final(_)))
         );

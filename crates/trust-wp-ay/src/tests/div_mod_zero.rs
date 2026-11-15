@@ -284,6 +284,33 @@ fn test_div_with_total_int_arithmetic_verifies() {
     );
 }
 
+/// A division encoded in ASSUMPTION position collects no obligation (D-118):
+/// a precondition or an assumed callee postcondition divides in logic, and a
+/// body division's `divisor != 0` is owned by the body value encoding and the
+/// MIR `Assert(DivisionByZero)`. The same division outside assumption position
+/// still collects one, path-guarded as before.
+#[test]
+#[timeout(30000)]
+fn test_div_in_assumption_position_collects_no_obligation() {
+    let mut encoder = AYEncoder::new();
+    let _term = encoder
+        .with_assumption_position(|encoder| encoder.encode_pure(&div(var("x"), var("y"))))
+        .expect("x/y should encode in assumption position");
+    assert_eq!(
+        encoder.division_obligations_for_test().len(),
+        0,
+        "an assumed division must not owe `divisor != 0`"
+    );
+    let _term = encoder
+        .encode_pure(&div(var("x"), var("y")))
+        .expect("x/y should encode");
+    assert_eq!(
+        encoder.division_obligations_for_test().len(),
+        1,
+        "the same division as a value still owes `divisor != 0`"
+    );
+}
+
 /// Encoder-level: total_int_arithmetic suppresses obligation collection. (#1756)
 #[test]
 #[timeout(30000)]
@@ -344,7 +371,52 @@ fn test_mut_borrow_div_without_total_int_arithmetic_fails() {
     let result =
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &ensures, &final_values));
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "mut-borrow div by unconstrained y without total_int_arithmetic must fail with a counterexample, got: {result:?}"
+    );
+}
+
+/// Requires facts shaped like a callee `ensures` assumed at a call whose
+/// divisor is zero: `(y != 0) ==> r == x / y` and `(y == 0) ==> r == 0`,
+/// with `y == 0`. The guarded division is an ASSUMED formula and owes no
+/// `y != 0` (D-114); collecting it made the goal `r == 0` fail at `y == 0`.
+fn zero_divisor_callee_facts() -> [PureExpr; 3] {
+    [
+        eq(var("y"), int(0)),
+        implies(ne(var("y"), int(0)), eq(var("r"), div(var("x"), var("y")))),
+        implies(eq(var("y"), int(0)), eq(var("r"), int(0))),
+    ]
+}
+
+#[test]
+#[timeout(30000)]
+fn test_verify_div_in_requires_fact_collects_no_obligation() {
+    let requires = zero_divisor_callee_facts();
+    let ensures = [eq(var("r"), int(0))];
+    let body = int(0);
+
+    let result = verify_function_with_modes(
+        VerificationRequest::new(&requires, &ensures).return_expr(Some(&body)),
+    );
+    assert!(
+        matches!(result, Ok(VerificationResult::Verified(_))),
+        "a guarded division inside a requires fact must not charge `y != 0`, got: {result:?}"
+    );
+}
+
+/// The false twin of the test above: the same facts do not give `r == 1`.
+#[test]
+#[timeout(30000)]
+fn test_verify_div_in_requires_fact_false_goal_not_verified() {
+    let requires = zero_divisor_callee_facts();
+    let ensures = [eq(var("r"), int(1))];
+    let body = int(0);
+
+    let result = verify_function_with_modes(
+        VerificationRequest::new(&requires, &ensures).return_expr(Some(&body)),
+    );
+    assert!(
+        crate::tests::rejected_ok(&result),
+        "`r == 1` does not follow from the zero-divisor facts, got: {result:?}"
     );
 }

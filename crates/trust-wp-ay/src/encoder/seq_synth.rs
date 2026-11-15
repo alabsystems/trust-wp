@@ -35,6 +35,7 @@ impl AYEncoder {
         );
         let role = format!("seq_synth_{}", self.seq_state.next_fresh_seq_lit_id());
         let repaired_term = self.declare_derived_source_var(var_name, &role, seq_sort.clone());
+        self.var_env.record_split_source(var_name, var_term);
         self.rebind_var(var_name, repaired_term, seq_sort);
         Ok(repaired_term)
     }
@@ -226,7 +227,7 @@ impl AYEncoder {
                 let idx_term = self.solver.int_const(len);
                 let val_term = self.solver.int_const(val);
                 arr = self.solver.store(arr, idx_term, val_term);
-                len += 1;
+                len = len.saturating_add(1);
             }
 
             let len_term = self.solver.int_const(len);
@@ -352,7 +353,7 @@ impl AYEncoder {
             if !seen.insert(current.clone()) {
                 break;
             }
-            count += 1;
+            count = count.saturating_add(1);
             current = edges[0].0.clone();
         }
         count
@@ -401,7 +402,7 @@ impl AYEncoder {
             let write_index = self.solver.int_const(len);
             let value_term = self.solver.int_const(*value);
             arr = self.solver.store(arr, write_index, value_term);
-            len += 1;
+            len = len.saturating_add(1);
             let len_term = self.solver.int_const(len);
             let known_len = usize::try_from(len).ok();
 

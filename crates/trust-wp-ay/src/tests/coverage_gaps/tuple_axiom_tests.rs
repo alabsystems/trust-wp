@@ -649,3 +649,61 @@ fn test_tuple2_bool_element_get_0_axiom() {
         "get_0(tuple2(true, 5)) must equal 1 (ite(true,1,0)) after tuple axioms (#837)"
     );
 }
+
+/// A `Bool`-ranged getter over an `Int` tuple payload must NOT receive the
+/// quantified defining axiom.
+///
+/// `select_structural_sort_target(Bool, Int)` answers `Some(Bool)`, and
+/// `eq_term` bridges the pair as `ite(get_1(tuple2(x0, x1)), 1, 0) = x1`.
+/// Quantified over `x1: Int` that axiom says every integer is 0 or 1, so it is
+/// unsatisfiable ON ITS OWN and turns every obligation carrying it into a
+/// vacuous, genuinely checkable UNSAT. Measured on the checked-add tuple of
+/// tests/adversarial/cases/s34_field_nested_struct.rs, where the false
+/// `(^o).i.x == o.i.x` was credited `verified` (z3: the lone axiom is unsat).
+///
+/// Structural, not solver-outcome, on purpose: whether E-matching happens to
+/// refute the stack within a unit-test budget is not deterministic, while the
+/// emitted quantifier is. The companion arm pins that the legitimate `Int`
+/// getter over the same payload still gets its axiom, so the test fails if the
+/// emitter stops emitting altogether.
+#[test]
+#[timeout(30000)]
+fn test_tuple_axiom_bool_getter_over_int_payload_is_not_asserted() {
+    fn quantified_assertions(encoder: &AYEncoder) -> usize {
+        let solver = encoder.solver();
+        solver
+            .assertions()
+            .iter()
+            .filter(|&&term| {
+                matches!(
+                    solver.term_kind(term),
+                    ay_dpll::api::TermKind::Forall | ay_dpll::api::TermKind::Exists
+                )
+            })
+            .count()
+    }
+
+    let emitted_axioms = |getter_range: Sort| {
+        let mut encoder = AYEncoder::new_with_quantifiers();
+        let tuple_sort = Sort::Uninterpreted("Tuple2".to_string());
+        let ctor_name = trust_wp_core::logic::logic_fn_smt_name(&tuple_logic_fn_name(2));
+        let get_1_name = trust_wp_core::logic::logic_fn_smt_name(&tuple_field_logic_fn_name(1));
+        encoder.get_or_declare_logic_func(&ctor_name, &[Sort::Int, Sort::Int], tuple_sort.clone());
+        encoder.get_or_declare_logic_func(&get_1_name, &[tuple_sort], getter_range);
+        let before = quantified_assertions(&encoder);
+        encoder.assert_tuple_axioms();
+        quantified_assertions(&encoder) - before
+    };
+
+    assert_eq!(
+        emitted_axioms(Sort::Bool),
+        0,
+        "a Bool get_1 over an Int payload must not assert \
+         `forall x0 x1. ite(get_1(tuple2(x0, x1)), 1, 0) = x1` (every Int is 0 or 1)"
+    );
+    assert_eq!(
+        emitted_axioms(Sort::Int),
+        1,
+        "the sort-faithful Int get_1 over the same payload keeps its defining axiom"
+    );
+}

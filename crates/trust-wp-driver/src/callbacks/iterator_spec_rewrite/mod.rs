@@ -20,9 +20,6 @@
 //! This gives the solver content-equality semantics instead of length-only,
 //! enabling proofs about element identity and ordering through iterator chains
 //! while letting collection iterators stay on their existing `FMap` view model.
-//!
-//! See `designs/2026-03-12-2172-iterator-produces-lowering.md` and
-//! `designs/2026-03-18-694-concrete-produces-lowering.md`.
 
 mod collections;
 mod composite;

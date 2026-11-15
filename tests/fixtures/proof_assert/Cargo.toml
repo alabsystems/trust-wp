@@ -143,3 +143,11 @@ path = "src/seq_push_back_ghost_vacuity.rs"
 [[bin]]
 name = "deref_write_local_current_value_verify"
 path = "src/deref_write_local_current_value_verify.rs"
+
+[[bin]]
+name = "loop_body_local_written_later"
+path = "src/loop_body_local_written_later.rs"
+
+[[bin]]
+name = "assert_before_loop_test"
+path = "src/assert_before_loop_test.rs"

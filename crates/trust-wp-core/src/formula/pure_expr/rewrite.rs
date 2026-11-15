@@ -151,9 +151,10 @@ impl PureExpr {
             // identity binding `y == match x { .. => x }` becomes `y == x` and the
             // proof goal `x == y` is substituted to `call == call`, reduce it to a
             // literal `true` that the proof_assert verifier discharges WITHOUT the
-            // solver. SOUND: `a == a` holds for every value (trust-wp models Float
-            // as SMT Real — no NaN), and the `&&`/`||` cases are standard boolean
-            // identities.
+            // solver. SOUND: `BinOp::Eq` is logical equality, which holds of
+            // `a == a` for every value, a float NaN included (a program's IEEE
+            // `==` is a reserved call, never this node), and the `&&`/`||` cases
+            // are standard boolean identities.
             PureExpr::BinOp(l, op, r) => {
                 let reduced = match op {
                     BinOp::Eq if l == r => Some(PureExpr::Bool(true)),

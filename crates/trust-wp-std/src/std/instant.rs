@@ -11,17 +11,10 @@
 //!
 //! ## Design Notes
 //!
-//! `Instant` views as `Int` (abstract monotonic timestamp).
-//! The exact value is unspecified, but ordering is preserved:
-//! - `Instant::now()@` >= 0
-//! - Adding a positive Duration yields a strictly greater Instant
-//! - Subtracting a Duration yields a lesser Instant
-//!
-//! Duration arithmetic on Instants follows these rules:
-//! - `(instant + duration)@` == `instant@` + `duration@`
-//! - `(instant - duration)@` == `instant@` - `duration@` (saturates at 0)
-//! - `(instant1 - instant2)` as Duration: if instant1 >= instant2,
-//!   yields `Duration` with view `instant1@ - instant2@`; otherwise zero.
+//! `Instant` views as `Int` nanoseconds; the platform clock that bounds it is
+//! not in the view. The `+`/`-` operators are `checked_add`/`checked_sub`
+//! followed by `expect`, so each owes exactly the condition under which its
+//! checked twin's spec promises `Some` (D-137).
 
 // Allow raw string hashes for spec string literals
 #![allow(clippy::needless_raw_string_hashes)]
@@ -35,47 +28,34 @@ pub mod specs {
 
     /// Contract for `Instant::now()`
     ///
-    /// Returns a monotonic timestamp. View is non-negative.
+    /// Creusot's: the view is non-negative. A strictly positive reading is a
+    /// claim about the platform clock the view does not carry.
     pub const NOW: &str = r#"
-        ensures: result@ > 0
+        ensures: result@ >= 0
     "#;
 
     // ── Duration arithmetic ──────────────────────────────────────
 
     /// Contract for `Instant + Duration` (Add trait)
+    ///
+    /// `checked_add(rhs).expect("overflow when adding duration to instant")`:
+    /// `CHECKED_ADD` promises `Some` for a zero duration only, because the view
+    /// carries no clock bound, so a positive duration is owed and never
+    /// discharged (D-137).
     pub const ADD_DURATION: &str = r#"
+        requires: rhs@ == 0
         ensures: result@ == self@ + rhs@
-        ensures: rhs@ == 0 ==> result@ == self@
-        ensures: rhs@ > 0 ==> result@ > self@
     "#;
 
-    /// Contract for `Instant - Duration` (Sub<Duration> trait)
+    /// Contract for `Instant - Rhs`, both `Sub<Duration>` and `Sub<Instant>`.
     ///
-    /// Saturates at the epoch (cannot go below 0).
-    pub const SUB_DURATION: &str = r#"
-        ensures: result@ == self@ - rhs@
-        ensures: rhs@ == 0 ==> result@ == self@
-        ensures: rhs@ > 0 ==> result@ < self@
-    "#;
-
-    /// Contract for `Instant - Instant` (Sub<Instant> trait)
-    ///
-    /// Returns the duration between two instants. If self < rhs,
-    /// the result is zero (saturating subtraction).
-    pub const SUB_INSTANT: &str = r#"
-        ensures: self@ >= rhs@ ==> result@ == self@ - rhs@
-        ensures: self@ < rhs@ ==> result@ == 0
-    "#;
-
-    /// Combined contract for `Instant - X` (Sub<Duration> + Sub<Instant>).
-    ///
-    /// Path-based lookup cannot distinguish `Sub<Duration>` from `Sub<Instant>`
-    /// after generic normalization. This combined spec is sound for both:
-    /// - Duration rhs: clauses 1-2 hold (clause 2 is vacuously true for rhs@ > 0),
-    ///   clauses 3-4 give identity and monotonicity.
-    /// - Instant rhs: clauses 1-2 are the saturating semantics,
-    ///   clauses 3-4 hold when self >= rhs.
+    /// One path names both impls and the call site tells them apart:
+    /// `same_Self_Rhs()` is `true` for `Instant - Instant`, which saturates and
+    /// never panics, and `false` for `Instant - Duration`, which is
+    /// `checked_sub(rhs).expect("overflow when subtracting duration from
+    /// instant")` and owes what makes `CHECKED_SUB` return `Some` (D-137).
     pub const SUB_COMBINED: &str = r#"
+        requires: __trust_wp_std_site_same_Self_Rhs() || self@ >= rhs@
         ensures: self@ >= rhs@ ==> result@ == self@ - rhs@
         ensures: self@ < rhs@ ==> result@ == 0
         ensures: rhs@ == 0 ==> result@ == self@
@@ -86,20 +66,21 @@ pub mod specs {
 
     /// Contract for `Instant::checked_add(duration)`
     ///
-    /// The abstract Instant model uses unbounded Int, so `checked_add`
-    /// always succeeds (`None => false`). The `Some` arm provides the
-    /// value constraint. Duration views are always >= 0 so there is no
-    /// representable overflow in the abstract model.
+    /// `None` is the platform timestamp overflowing, and the view states no
+    /// bound for it: the view is unbounded, the clock is not
+    /// (`now().checked_add(Duration::MAX)` is `None`). So the `None` arm says
+    /// only that a zero duration cannot overflow (D-116).
     pub const CHECKED_ADD: &str = r#"
         ensures: match result {
             Some(v) => v@ == self@ + rhs@,
-            None => false,
+            None => rhs@ > 0,
         }
     "#;
 
     /// Contract for `Instant::checked_sub(duration)`
     ///
-    /// Returns `None` when subtraction would go below the epoch (time 0).
+    /// `None` exactly when the view would go below zero: exact when the view
+    /// counts nanoseconds from the least representable timestamp (D-116).
     pub const CHECKED_SUB: &str = r#"
         ensures: match result {
             Some(v) => v@ == self@ - rhs@ && self@ >= rhs@,
@@ -192,23 +173,19 @@ mod tests {
     }
 
     #[test]
-    fn test_instant_add_duration_spec_parses() {
+    fn test_instant_add_duration_owes_the_zero_duration_checked_add_promises() {
         let spec = test_shim::parse_spec_string(super::specs::ADD_DURATION);
-        assert!(spec.requires.is_empty());
-        assert_eq!(spec.ensures.len(), 3);
+        assert_eq!(spec.requires, ["rhs@ == 0"]);
+        assert_eq!(spec.ensures, ["result@ == self@ + rhs@"]);
     }
 
     #[test]
-    fn test_instant_sub_instant_spec_parses() {
-        let spec = test_shim::parse_spec_string(super::specs::SUB_INSTANT);
-        assert!(spec.requires.is_empty());
-        assert_eq!(spec.ensures.len(), 2);
-    }
-
-    #[test]
-    fn test_instant_sub_combined_spec_parses() {
+    fn test_instant_sub_owes_checked_sub_bound_unless_rhs_is_self() {
         let spec = test_shim::parse_spec_string(super::specs::SUB_COMBINED);
-        assert!(spec.requires.is_empty());
+        assert_eq!(
+            spec.requires,
+            ["__trust_wp_std_site_same_Self_Rhs() || self@ >= rhs@"]
+        );
         assert_eq!(spec.ensures.len(), 4);
     }
 

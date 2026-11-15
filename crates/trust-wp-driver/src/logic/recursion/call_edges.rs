@@ -7,9 +7,12 @@
 //! Walks `PureExpr` trees to extract structured call edges with actual arguments
 //! and path conditions, used by variant-decrease proofs for mutual recursion.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use trust_wp_core::formula::{BinOp, Pattern, PureExpr, UnOp};
+use trust_wp_core::formula::{BinOp, CaptureAvoidingSubstOptions, Pattern, PureExpr, UnOp};
 
 use super::{
     graph::{receiver_is_self_dispatch, resolve_logic_call_targets, LogicNameLookup},
@@ -25,12 +28,61 @@ pub(super) struct LogicCallEdge {
     pub(super) path_conditions: Vec<PureExpr>,
     pub(super) recovered_from_text_only: bool,
     pub(super) unsupported_reason: Option<String>,
+    /// Names bound by match-arm patterns, quantifiers and closure parameters
+    /// enclosing the call. `Let` binders never appear: their values are
+    /// substituted into the scope, so `actual_args` and `path_conditions` never
+    /// mention a let-bound name. A caller parameter in this list means the
+    /// call's arguments may refer to the binder rather than the parameter.
+    pub(super) enclosing_binders: Vec<String>,
 }
 
+/// Call edges for the structural checks that compare arguments to parameters
+/// by name (identity pass-through, binder shadowing). Match-arm edges carry an
+/// `unsupported_reason`, and their arguments keep the binder names verbatim.
 pub(super) fn collect_parsed_logic_call_edges(
     nodes: &[LogicRecursionNode],
     lookup: &LogicNameLookup,
 ) -> Vec<LogicCallEdge> {
+    collect_call_edges(nodes, lookup, false)
+}
+
+/// Call edges for variant-decrease PROOFS.
+///
+/// Identical to [`collect_parsed_logic_call_edges`] except under a match arm:
+/// every name the arm pattern binds is renamed apart to a fresh
+/// `arm$<n>$<name>` (capture-avoiding), so an edge's arguments and path
+/// conditions can only mention caller parameters and names that are free —
+/// hence universally quantified — in the decrease query. The arm's path
+/// conditions are extended ONLY with what reaching the arm literally means:
+/// a top-level binding or alias equals the scrutinee, a literal pattern equals
+/// the scrutinee, and a constructor pattern applied to a same-named
+/// constructor scrutinee binds its sub-patterns to the matching arguments.
+/// Nothing is assumed about arms that do not match; an arm whose decrease
+/// needs more than these facts stays unproven, and the caller rejects it.
+pub(super) fn collect_variant_proof_call_edges(
+    nodes: &[LogicRecursionNode],
+    lookup: &LogicNameLookup,
+) -> Vec<LogicCallEdge> {
+    collect_call_edges(nodes, lookup, true)
+}
+
+struct EdgeCtx<'a> {
+    lookup: &'a LogicNameLookup,
+    /// Rename match-arm binders apart and record pattern facts (variant view).
+    variant_view: bool,
+    fresh_counter: std::cell::Cell<usize>,
+}
+
+fn collect_call_edges(
+    nodes: &[LogicRecursionNode],
+    lookup: &LogicNameLookup,
+    variant_view: bool,
+) -> Vec<LogicCallEdge> {
+    let ctx = EdgeCtx {
+        lookup,
+        variant_view,
+        fresh_counter: std::cell::Cell::new(0),
+    };
     let mut edges = Vec::new();
     for (caller_idx, node) in nodes.iter().enumerate() {
         collect_logic_call_edges_from_expr(
@@ -39,10 +91,9 @@ pub(super) fn collect_parsed_logic_call_edges(
             &node.body,
             &[],
             None,
-            lookup,
+            &ctx,
             &mut edges,
         );
-
         let mut text_names = HashSet::new();
         collect_logic_references_from_text(&node.body_text, &mut text_names);
         for name in text_names {
@@ -58,6 +109,7 @@ pub(super) fn collect_parsed_logic_call_edges(
                     unsupported_reason: Some(
                         "call edge is only recoverable from text scanning".to_string(),
                     ),
+                    enclosing_binders: Vec::new(),
                 });
             }
         }
@@ -72,14 +124,16 @@ fn collect_logic_call_edges_from_expr(
     expr: &PureExpr,
     path_conditions: &[PureExpr],
     unsupported_reason: Option<&str>,
-    lookup: &LogicNameLookup,
+    ctx: &EdgeCtx<'_>,
     edges: &mut Vec<LogicCallEdge>,
 ) {
     match expr {
         PureExpr::LogicFnCall { name, args } => {
-            for callee_idx in
-                resolve_logic_call_targets(name, &lookup.full_path_to_idx, &lookup.name_to_indices)
-            {
+            for callee_idx in resolve_logic_call_targets(
+                name,
+                &ctx.lookup.full_path_to_idx,
+                &ctx.lookup.name_to_indices,
+            ) {
                 edges.push(LogicCallEdge {
                     caller_idx,
                     callee_idx,
@@ -87,6 +141,7 @@ fn collect_logic_call_edges_from_expr(
                     path_conditions: path_conditions.to_vec(),
                     recovered_from_text_only: false,
                     unsupported_reason: unsupported_reason.map(str::to_string),
+                    enclosing_binders: Vec::new(),
                 });
             }
             for arg in args {
@@ -96,7 +151,7 @@ fn collect_logic_call_edges_from_expr(
                     arg,
                     path_conditions,
                     unsupported_reason,
-                    lookup,
+                    ctx,
                     edges,
                 );
             }
@@ -115,8 +170,8 @@ fn collect_logic_call_edges_from_expr(
                 );
                 let mut callee_indices = resolve_logic_call_targets(
                     method,
-                    &lookup.full_path_to_idx,
-                    &lookup.name_to_indices,
+                    &ctx.lookup.full_path_to_idx,
+                    &ctx.lookup.name_to_indices,
                 );
                 // Fail-closed self-dispatch threading (the `terminates` trio
                 // class, see `graph::add_self_named_method_dispatch_edges`):
@@ -138,6 +193,7 @@ fn collect_logic_call_edges_from_expr(
                         path_conditions: path_conditions.to_vec(),
                         recovered_from_text_only: false,
                         unsupported_reason: Some(reason.to_string()),
+                        enclosing_binders: Vec::new(),
                     });
                 }
             }
@@ -147,7 +203,7 @@ fn collect_logic_call_edges_from_expr(
                 receiver,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
             for arg in args {
@@ -157,7 +213,7 @@ fn collect_logic_call_edges_from_expr(
                     arg,
                     path_conditions,
                     unsupported_reason,
-                    lookup,
+                    ctx,
                     edges,
                 );
             }
@@ -169,7 +225,7 @@ fn collect_logic_call_edges_from_expr(
                 cond,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
 
@@ -181,7 +237,7 @@ fn collect_logic_call_edges_from_expr(
                 then_expr,
                 &then_path,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
 
@@ -193,7 +249,7 @@ fn collect_logic_call_edges_from_expr(
                 else_expr,
                 &else_path,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -204,7 +260,7 @@ fn collect_logic_call_edges_from_expr(
                 lhs,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
             let mut rhs_path = path_conditions.to_vec();
@@ -215,7 +271,7 @@ fn collect_logic_call_edges_from_expr(
                 rhs,
                 &rhs_path,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -226,7 +282,7 @@ fn collect_logic_call_edges_from_expr(
                 lhs,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
             let mut rhs_path = path_conditions.to_vec();
@@ -237,7 +293,7 @@ fn collect_logic_call_edges_from_expr(
                 rhs,
                 &rhs_path,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -248,7 +304,7 @@ fn collect_logic_call_edges_from_expr(
                 scrutinee,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
             for arm in arms {
@@ -258,29 +314,70 @@ fn collect_logic_call_edges_from_expr(
                     &arm.pattern,
                     path_conditions,
                     Some("match-based mutual recursion is not supported"),
-                    lookup,
+                    ctx,
                     edges,
                 );
-                collect_logic_call_edges_from_expr(
-                    caller_idx,
-                    caller_name,
-                    &arm.body,
-                    path_conditions,
-                    Some("match-based mutual recursion is not supported"),
-                    lookup,
-                    edges,
-                );
+                let mut arm_edges = Vec::new();
+                if ctx.variant_view {
+                    let mut renames = HashMap::new();
+                    for name in arm.pattern.bound_names() {
+                        let n = ctx.fresh_counter.get();
+                        ctx.fresh_counter.set(n + 1);
+                        renames.insert(
+                            name.to_string(),
+                            PureExpr::Var(format!("arm${n}${name}"), None),
+                        );
+                    }
+                    let mut arm_path = path_conditions.to_vec();
+                    pattern_match_facts(&arm.pattern, scrutinee, &renames, ctx, &mut arm_path);
+                    let body = arm.body.substitute_capture_avoiding(
+                        &renames,
+                        &CaptureAvoidingSubstOptions::default(),
+                    );
+                    collect_logic_call_edges_from_expr(
+                        caller_idx,
+                        caller_name,
+                        &body,
+                        &arm_path,
+                        unsupported_reason,
+                        ctx,
+                        &mut arm_edges,
+                    );
+                } else {
+                    collect_logic_call_edges_from_expr(
+                        caller_idx,
+                        caller_name,
+                        &arm.body,
+                        path_conditions,
+                        Some("match-based mutual recursion is not supported"),
+                        ctx,
+                        &mut arm_edges,
+                    );
+                }
+                push_under_binders(edges, arm_edges, arm.pattern.bound_names());
             }
         }
-        PureExpr::Forall { body, triggers, .. } | PureExpr::Exists { body, triggers, .. } => {
+        PureExpr::Forall {
+            var,
+            body,
+            triggers,
+            ..
+        }
+        | PureExpr::Exists {
+            var,
+            body,
+            triggers,
+            ..
+        } => {
+            let mut scoped_edges = Vec::new();
             collect_logic_call_edges_from_expr(
                 caller_idx,
                 caller_name,
                 body,
                 path_conditions,
                 Some("quantifier-scoped mutual recursion is not supported"),
-                lookup,
-                edges,
+                ctx,
+                &mut scoped_edges,
             );
             for trigger in triggers {
                 for expr in trigger {
@@ -290,29 +387,41 @@ fn collect_logic_call_edges_from_expr(
                         expr,
                         path_conditions,
                         Some("quantifier-trigger mutual recursion is not supported"),
-                        lookup,
-                        edges,
+                        ctx,
+                        &mut scoped_edges,
                     );
                 }
             }
+            push_under_binders(edges, scoped_edges, [var.as_str()]);
         }
-        PureExpr::Let { value, body, .. } => {
+        PureExpr::Let { var, value, body } => {
             collect_logic_call_edges_from_expr(
                 caller_idx,
                 caller_name,
                 value,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
+            );
+            // Binder-aware: `let x = v; f(x - 1)` calls `f(v - 1)`. Substituting
+            // the value (capture-avoiding) keeps every name in the collected
+            // arguments and path conditions bound where the edge is USED — the
+            // enclosing parameters — so a `let` that shadows a parameter can no
+            // longer masquerade as that parameter in a decrease query.
+            let mut substitution = HashMap::new();
+            substitution.insert(var.clone(), (**value).clone());
+            let body = body.substitute_capture_avoiding(
+                &substitution,
+                &CaptureAvoidingSubstOptions::default(),
             );
             collect_logic_call_edges_from_expr(
                 caller_idx,
                 caller_name,
-                body,
+                &body,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -323,7 +432,7 @@ fn collect_logic_call_edges_from_expr(
                 assumption,
                 path_conditions,
                 Some("LetAssume-scoped mutual recursion is not supported"),
-                lookup,
+                ctx,
                 edges,
             );
             collect_logic_call_edges_from_expr(
@@ -332,7 +441,7 @@ fn collect_logic_call_edges_from_expr(
                 body,
                 path_conditions,
                 Some("LetAssume-scoped mutual recursion is not supported"),
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -343,7 +452,7 @@ fn collect_logic_call_edges_from_expr(
                 obligation,
                 path_conditions,
                 Some("LetObligation-scoped mutual recursion is not supported"),
-                lookup,
+                ctx,
                 edges,
             );
             collect_logic_call_edges_from_expr(
@@ -352,19 +461,27 @@ fn collect_logic_call_edges_from_expr(
                 body,
                 path_conditions,
                 Some("LetObligation-scoped mutual recursion is not supported"),
-                lookup,
+                ctx,
                 edges,
             );
         }
-        PureExpr::Closure { body, .. } => collect_logic_call_edges_from_expr(
-            caller_idx,
-            caller_name,
-            body,
-            path_conditions,
-            Some("closure-scoped mutual recursion is not supported"),
-            lookup,
-            edges,
-        ),
+        PureExpr::Closure { params, body } => {
+            let mut scoped_edges = Vec::new();
+            collect_logic_call_edges_from_expr(
+                caller_idx,
+                caller_name,
+                body,
+                path_conditions,
+                Some("closure-scoped mutual recursion is not supported"),
+                ctx,
+                &mut scoped_edges,
+            );
+            push_under_binders(
+                edges,
+                scoped_edges,
+                params.iter().map(|(name, _)| name.as_str()),
+            );
+        }
         PureExpr::BinOp(lhs, _, rhs) => {
             collect_logic_call_edges_from_expr(
                 caller_idx,
@@ -372,7 +489,7 @@ fn collect_logic_call_edges_from_expr(
                 lhs,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
             collect_logic_call_edges_from_expr(
@@ -381,7 +498,7 @@ fn collect_logic_call_edges_from_expr(
                 rhs,
                 path_conditions,
                 unsupported_reason,
-                lookup,
+                ctx,
                 edges,
             );
         }
@@ -395,12 +512,25 @@ fn collect_logic_call_edges_from_expr(
             inner,
             path_conditions,
             unsupported_reason,
-            lookup,
+            ctx,
             edges,
         ),
         PureExpr::Bool(_) | PureExpr::Int(_) | PureExpr::Float(_) | PureExpr::Var(_, _) => {}
         _ => {}
     }
+}
+
+/// Append `scoped` to `edges`, recording `binders` as enclosing each edge.
+fn push_under_binders<'a>(
+    edges: &mut Vec<LogicCallEdge>,
+    scoped: Vec<LogicCallEdge>,
+    binders: impl IntoIterator<Item = &'a str>,
+) {
+    let binders: Vec<String> = binders.into_iter().map(str::to_string).collect();
+    edges.extend(scoped.into_iter().map(|mut edge| {
+        edge.enclosing_binders.extend(binders.iter().cloned());
+        edge
+    }));
 }
 
 fn collect_logic_call_edges_from_pattern(
@@ -409,7 +539,7 @@ fn collect_logic_call_edges_from_pattern(
     pattern: &Pattern,
     path_conditions: &[PureExpr],
     unsupported_reason: Option<&str>,
-    lookup: &LogicNameLookup,
+    ctx: &EdgeCtx<'_>,
     edges: &mut Vec<LogicCallEdge>,
 ) {
     match pattern {
@@ -420,7 +550,7 @@ fn collect_logic_call_edges_from_pattern(
             expr,
             path_conditions,
             unsupported_reason,
-            lookup,
+            ctx,
             edges,
         ),
         Pattern::Constructor {
@@ -431,7 +561,7 @@ fn collect_logic_call_edges_from_pattern(
             inner,
             path_conditions,
             unsupported_reason,
-            lookup,
+            ctx,
             edges,
         ),
         Pattern::Constructor { inner: None, .. } => {}
@@ -443,12 +573,82 @@ fn collect_logic_call_edges_from_pattern(
                     element,
                     path_conditions,
                     unsupported_reason,
-                    lookup,
+                    ctx,
                     edges,
                 );
             }
         }
         #[allow(unreachable_patterns, clippy::match_wildcard_for_single_variants)]
         _ => {}
+    }
+}
+
+/// Facts that hold whenever `pattern` matched `scrutinee` (variant view only),
+/// stated over the renamed binders. Only literal consequences of the match are
+/// produced; an unrecognized shape produces nothing (weaker hypotheses).
+fn pattern_match_facts(
+    pattern: &Pattern,
+    scrutinee: &PureExpr,
+    renames: &HashMap<String, PureExpr>,
+    ctx: &EdgeCtx<'_>,
+    out: &mut Vec<PureExpr>,
+) {
+    let eq = |lhs: PureExpr, rhs: &PureExpr| {
+        PureExpr::BinOp(Arc::new(lhs), BinOp::Eq, Arc::new(rhs.clone()))
+    };
+    match pattern {
+        Pattern::Wildcard => {}
+        Pattern::Binding(name) => {
+            if let Some(fresh) = renames.get(name) {
+                out.push(eq(fresh.clone(), scrutinee));
+            }
+        }
+        Pattern::Literal(literal) => {
+            if matches!(literal, PureExpr::Int(_) | PureExpr::Bool(_)) {
+                out.push(eq(scrutinee.clone(), literal));
+            }
+        }
+        Pattern::Alias { alias, pattern } => {
+            if let Some(fresh) = renames.get(alias) {
+                out.push(eq(fresh.clone(), scrutinee));
+            }
+            pattern_match_facts(pattern, scrutinee, renames, ctx, out);
+        }
+        Pattern::Constructor { name, inner } => {
+            // Only a scrutinee that IS a same-named constructor application
+            // (and not a logic function of that name) tells us its fields.
+            let PureExpr::LogicFnCall {
+                name: scrutinee_name,
+                args,
+            } = scrutinee
+            else {
+                return;
+            };
+            if scrutinee_name != name
+                || !resolve_logic_call_targets(
+                    scrutinee_name,
+                    &ctx.lookup.full_path_to_idx,
+                    &ctx.lookup.name_to_indices,
+                )
+                .is_empty()
+            {
+                return;
+            }
+            match inner.as_deref() {
+                None => {}
+                Some(inner) if args.len() == 1 => {
+                    pattern_match_facts(inner, &args[0], renames, ctx, out);
+                }
+                Some(Pattern::Tuple(elements)) if elements.len() == args.len() => {
+                    for (element, arg) in elements.iter().zip(args) {
+                        pattern_match_facts(element, arg, renames, ctx, out);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        // Tuple scrutinees and any future pattern shape: no facts (weaker).
+        #[allow(unreachable_patterns)]
+        Pattern::Tuple(_) | _ => {}
     }
 }

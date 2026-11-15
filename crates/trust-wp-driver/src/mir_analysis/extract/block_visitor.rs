@@ -9,8 +9,6 @@
 //! pipelines (primary, spanned, substitution). Each pipeline implements
 //! the trait's callbacks; the walker handles cycle detection, statement
 //! iteration, and terminator routing.
-//!
-//! Phase 2 of #2066 — see `designs/2026-03-07-extract-block-visitor.md`.
 
 use std::collections::HashSet;
 
@@ -61,6 +59,10 @@ pub(super) trait BlockVisitor<'tcx> {
 
     /// Record that the walker revisited an already-seen block.
     fn on_cycle(&mut self, _block: BasicBlock) {}
+
+    /// Called once when the walker enters a not-yet-visited block, before its
+    /// statements. Default: no-op.
+    fn on_block_enter(&mut self, _block: BasicBlock) {}
 
     // ── Statement callbacks ──────────────────────────────────────────
 
@@ -170,6 +172,10 @@ pub(super) trait BlockVisitor<'tcx> {
         bb: BasicBlock,
     ) -> VisitorAction<Self::Result>;
 
+    /// Observe the place a `Drop` terminator drops (before `on_drop`).
+    /// Default: nothing.
+    fn on_drop_place(&mut self, _place: &Place<'tcx>, _body: &Body<'tcx>) {}
+
     /// Handle Drop terminator. Default: continue to target.
     fn on_drop(&mut self, target: BasicBlock) -> VisitorAction<Self::Result> {
         VisitorAction::Continue(target)
@@ -210,6 +216,7 @@ pub(super) fn walk_block<'tcx, V: BlockVisitor<'tcx>>(
         return None;
     }
     visitor.visited_mut().insert(start_bb);
+    visitor.on_block_enter(start_bb);
 
     let bb_data = &body.basic_blocks[start_bb];
 
@@ -226,7 +233,7 @@ pub(super) fn walk_block<'tcx, V: BlockVisitor<'tcx>>(
         }
 
         match &stmt.kind {
-            StatementKind::Assign(box (place, rvalue)) => {
+            StatementKind::Assign((place, rvalue)) => {
                 if place.projection.is_empty() {
                     visitor.on_assign_local(place.local, rvalue, body, location);
                 } else if !place
@@ -270,7 +277,7 @@ pub(super) fn walk_block<'tcx, V: BlockVisitor<'tcx>>(
     };
     let action = match &terminator.kind {
         TerminatorKind::Return => return visitor.on_return(body),
-        TerminatorKind::Goto { target } => visitor.on_goto(*target),
+        TerminatorKind::Goto { target, .. } => visitor.on_goto(*target),
         TerminatorKind::Assert {
             cond,
             expected,
@@ -288,7 +295,10 @@ pub(super) fn walk_block<'tcx, V: BlockVisitor<'tcx>>(
             target,
             ..
         } => visitor.on_call(func, args, *destination, *target, body, start_bb),
-        TerminatorKind::Drop { target, .. } => visitor.on_drop(*target),
+        TerminatorKind::Drop { place, target, .. } => {
+            visitor.on_drop_place(place, body);
+            visitor.on_drop(*target)
+        }
         TerminatorKind::FalseEdge { real_target, .. }
         | TerminatorKind::FalseUnwind { real_target, .. } => visitor.on_false_edge(*real_target),
         // Dead-end terminators: these are CFG leaves with no successors.

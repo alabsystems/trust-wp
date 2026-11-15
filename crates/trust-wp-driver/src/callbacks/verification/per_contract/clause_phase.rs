@@ -66,6 +66,8 @@ pub(super) fn apply_clause_enrichment_phase(
         type_invariant_defs: shared.config.type_invariant_defs,
         synthesized_closure_ensures: &synth_ensures,
         closure_capture_infos: &closure_capture_infos,
+        trait_specs: shared.config.trait_specs,
+        extern_specs: shared.config.extern_specs,
     };
     enrich_effective_clauses(
         shared.tcx,

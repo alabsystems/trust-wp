@@ -68,10 +68,10 @@ fn test_cc_seq_g_all_postconditions_combined_pipeline() {
         &[req],
         &[ens1, ens2, ens3, ens4, ens5, ens6],
     ));
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()

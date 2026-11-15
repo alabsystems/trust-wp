@@ -907,7 +907,16 @@ pub(super) fn emit_prophecy_writebacks(
         // `<parent>_current` is the entry-time current. Fusing them here
         // causes vacuous-UNSAT collapse — sibling of #2663. See bug/682 /
         // #5 / bug/two_phase.
-        if !suppress_current_writeback {
+        //
+        // Also SKIP it for a child classified `Fresh` (non-final): the parent
+        // place is used again after the reborrow, so the child's final is not
+        // the parent's value at any single program point, and `<parent>_current`
+        // is the entry-time symbol. `parent_current == child_final` is then a
+        // false premise (s30 review; `let b1 = &mut *bor; *b1 = 5; *bor = 1;`).
+        let child_is_fresh_for_writeback = finality
+            .and_then(|f| f.get(child_name))
+            .is_some_and(|b| matches!(b, BorrowFinality::Fresh));
+        if !suppress_current_writeback && !child_is_fresh_for_writeback {
             if let (Some(child_final), Some(parent_current)) = (
                 encoder.var_term(&child_names.final_val),
                 encoder.var_term(&parent_names.current),
@@ -957,12 +966,26 @@ pub(super) fn emit_prophecy_writebacks(
         // For field projection reborrows, emits:
         //   child_final == tuple_get_N(parent_final)
         // This is the projected version of the propagation. (#2673, strengthened)
-        let is_final = finality
-            .and_then(|f| f.get(child_name))
-            .is_some_and(|b| matches!(b, BorrowFinality::Final { .. }));
+        let child_finality = finality.and_then(|f| f.get(child_name));
+        let is_final = child_finality.is_some_and(|b| matches!(b, BorrowFinality::Final { .. }));
+        // Creusot's finality rule: a reborrow the `NotFinalPlaces` analysis
+        // classified NON-final (`Fresh`) is `borrow_mut` — fresh id, NO link
+        // between its final value and the parent's. The parent place is used
+        // again after the reborrow (read-through-move, borrow, or STORE), so
+        // `parent_final == child_final` is false in general: in
+        // `let b1 = &mut *bor; *b1 = 5; *bor = 1;` the child's final is 5 and
+        // the parent's is 1. The resolve-set and mutation-continued shortcuts
+        // below derive the link from `parent_current == child_final` +
+        // `parent_final == parent_current`, but `<parent>_current` is a single
+        // entry-time symbol that does not see the later store, so for a Fresh
+        // child they manufacture exactly that false link. Only children with
+        // no finality verdict (not `&mut`-parameter rooted) keep the legacy
+        // shortcuts.
+        let child_is_fresh = child_finality.is_some_and(|b| matches!(b, BorrowFinality::Fresh));
         let parent_is_resolved =
             resolve_set.is_some_and(|rs| rs.iter().any(|name| name == parent_name));
-        let should_propagate_final = is_final || parent_is_resolved || parent_is_mutation_continued;
+        let should_propagate_final =
+            is_final || (!child_is_fresh && (parent_is_resolved || parent_is_mutation_continued));
         if should_propagate_final {
             if let (Some(child_final), Some(parent_final)) = (
                 encoder.var_term(&child_names.final_val),
@@ -1184,7 +1207,7 @@ fn emit_transitive_writeback_chains(
 
         // Walk up the chain from immediate_parent to find grandparent+.
         let mut ancestor = immediate_parent.clone();
-        let mut depth = 0;
+        let mut depth = 0usize;
         while let Some(next_ancestor) = writebacks
             .iter()
             .find(|(child, _)| *child == &ancestor)
@@ -1194,7 +1217,7 @@ fn emit_transitive_writeback_chains(
             if has_field_projection(&ancestor) {
                 break;
             }
-            depth += 1;
+            depth = depth.saturating_add(1);
             // Safety limit to avoid infinite loops in malformed writeback graphs.
             if depth > 10 {
                 break;
@@ -1316,7 +1339,9 @@ fn emit_projected_equality(
         // For intermediate steps, use Int as a default (tuple nesting
         // with concrete sorts would need the intermediate tuple type,
         // but Int is a safe fallback for the generic case).
-        let result_sort = if i == field_steps.len() - 1 {
+        // `i + 1 == len` asks "is this the last step" without the
+        // subtraction that underflows on an empty step list.
+        let result_sort = if i.saturating_add(1) == field_steps.len() {
             child_sort.clone()
         } else {
             ay_dpll::api::Sort::Int

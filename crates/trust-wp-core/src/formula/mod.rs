@@ -22,17 +22,22 @@
 use std::sync::Arc;
 
 mod display;
+pub mod elaborate;
 mod final_pin;
 mod float_bits;
+pub mod ieee;
 pub mod int_bounds;
 pub mod internal;
+pub(crate) mod listed_enum;
 mod named_binding;
 mod postcond;
 mod pure_expr;
 pub mod sort_intern;
 mod substitute;
+pub mod synthesized_names;
 mod traversal;
 mod types;
+mod unplaced;
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +46,8 @@ mod tests;
 pub use final_pin::{FinalPinTarget, PinStep, ProjectedFinalPin};
 pub use named_binding::NamedBindingValue;
 pub use pure_expr::{
-    reuse_arc, reuse_node, ExprSort, FloatBits, MatchArm, Pattern, PureExpr, PureExprChildRole,
+    reuse_arc, reuse_node, ExprSort, FloatBits, FloatWidth, MatchArm, Pattern, PureExpr,
+    PureExprChildRole,
 };
 pub use sort_intern::{intern_sort_name, resolve_sort_name};
 #[doc(hidden)]
@@ -49,11 +55,13 @@ pub use substitute::expr_has_free_occurrence;
 #[doc(hidden)]
 pub use substitute::rename_free_var;
 pub use substitute::CaptureAvoidingSubstOptions;
+pub use synthesized_names::{is_synthesized_name, SYNTHESIZED_NAME_SIGIL};
 pub use traversal::PureExprDepthLimitedTraversalExt;
 pub use types::{
-    named_struct_ctor_name, parse_named_struct_ctor, BinOp, BorrowFinality, BorrowIdOrigin,
-    BorrowIdStep, Location, Permission, UnOp, Value,
+    named_struct_ctor_name, parse_named_struct_ctor, reborrow_root, BinOp, BorrowFinality,
+    BorrowIdOrigin, BorrowIdStep, Location, Permission, UnOp, Value, NAMED_CTOR_REST_MARKER,
 };
+pub use unplaced::{first_unplaced_named_ctor, first_unplaced_named_ctor_in_pattern};
 
 /// Placeholder value name for an indexed write (`v[i] = expr`) whose written
 /// VALUE could not be translated (e.g. the value is itself an un-modeled indexed
@@ -93,12 +101,10 @@ pub enum Formula {
     /// Represents a mutable borrow as a (current, final, id) triple where:
     /// - `current`: The value at borrow creation
     /// - `final_val`: The prophecy of value when borrow ends
-    /// - `id`: The borrow identity used to distinguish same-value reborrows
+    /// - `id`: The borrow identity that distinguishes same-value reborrows
     ///
     /// This enables verification of mutable references without heap modeling,
     /// relying on Rust's ownership guarantees for disjointness.
-    ///
-    /// See: designs/2026-02-01-rusthorn-vs-sl.md
     MutBorrow {
         /// Variable name for the borrow
         var: String,

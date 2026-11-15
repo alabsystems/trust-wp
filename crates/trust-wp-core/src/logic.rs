@@ -161,6 +161,12 @@ pub struct AdtDecl {
     pub adt_name: String,
     pub kind: AdtKind,
     pub constructors: Vec<AdtConstructorDecl>,
+    /// Whether a value of some instantiation met under this name may hold a
+    /// `&mut`, decided from its Rust type. The field sorts cannot answer it:
+    /// a builtin value model declares an `Option<&mut T>` or `Vec<&mut T>`
+    /// field at `Int` or `Seq`, and one declaration answers for every
+    /// instantiation and every same-named ADT (D-126).
+    pub may_hold_a_borrow: bool,
 }
 
 impl AdtDecl {
@@ -176,7 +182,15 @@ impl AdtDecl {
             adt_name,
             kind,
             constructors,
+            may_hold_a_borrow: false,
         }
+    }
+
+    /// Record whether a value of this declaration's type may hold a `&mut`.
+    #[must_use]
+    pub fn with_may_hold_a_borrow(mut self, may_hold_a_borrow: bool) -> Self {
+        self.may_hold_a_borrow = may_hold_a_borrow;
+        self
     }
 }
 
@@ -285,6 +299,13 @@ pub struct LogicFnDef {
     return_sort: Option<ExprSort>,
     /// Preconditions guarding the function body
     requires: Vec<PureExpr>,
+    /// How many leading `requires` clauses are the ones written in
+    /// `#[requires]`. The driver appends clauses of its own after them to
+    /// guard the definition (the opaque `false` guard, machine-integer
+    /// parameter ranges, unit-field and unsigned facts); a caller owes only the
+    /// written ones, as Creusot's vcgen does. Element-wise rewrites of
+    /// `requires` keep the count. `None`: not recorded.
+    written_requires: Option<usize>,
     /// Postconditions to verify about the function body.
     ///
     /// When non-empty, the logic function's body is verified against these
@@ -318,6 +339,10 @@ pub struct LogicFnDef {
     is_law: bool,
     /// Openness mode from the `#[logic(...)]` attribute argument.
     mode: LogicMode,
+    /// The source short name when `name` was replaced by a unique id because
+    /// another local logic function shares the short name
+    /// (see [`identity`]). `None` means `name` is the short name itself.
+    short_name: Option<String>,
 }
 
 impl LogicFnDef {
@@ -331,6 +356,7 @@ impl LogicFnDef {
             return_sort: None,
             params,
             requires: Vec::new(),
+            written_requires: None,
             ensures: Vec::new(),
             body,
             is_recursive: false,
@@ -339,6 +365,7 @@ impl LogicFnDef {
             is_trusted: false,
             is_law: false,
             mode: LogicMode::Default,
+            short_name: None,
         }
     }
 
@@ -358,6 +385,7 @@ impl LogicFnDef {
             return_sort: None,
             params,
             requires,
+            written_requires: None,
             ensures: Vec::new(),
             body,
             is_recursive: false,
@@ -366,6 +394,7 @@ impl LogicFnDef {
             is_trusted: false,
             is_law: false,
             mode: LogicMode::Default,
+            short_name: None,
         }
     }
 
@@ -425,8 +454,36 @@ impl LogicFnDef {
     /// its body contains a call to its own name. Sets `is_recursive` accordingly.
     #[must_use]
     pub fn detect_recursion(mut self) -> Self {
-        self.is_recursive = expr_contains_fn_call(&self.body, &self.name);
+        self.is_recursive = expr_contains_fn_call(&self.body, &self.name)
+            || self
+                .short_name
+                .as_deref()
+                .is_some_and(|short| expr_contains_fn_call(&self.body, short));
         self
+    }
+
+    /// Replace `name` by the unique id `id`, remembering the short name.
+    ///
+    /// Used for every member of a short-name collision so each definition gets
+    /// its own solver symbol (see [`identity`]).
+    pub fn assign_unique_id(&mut self, id: String) {
+        if self.short_name.is_none() {
+            self.short_name = Some(std::mem::replace(&mut self.name, id));
+        } else {
+            self.name = id;
+        }
+    }
+
+    /// The source short name (equal to `name` unless a unique id was assigned).
+    #[must_use]
+    pub fn short_name(&self) -> &str {
+        self.short_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether `name` is a unique id assigned for a short-name collision.
+    #[must_use]
+    pub fn has_unique_id(&self) -> bool {
+        self.short_name.is_some()
     }
 
     /// Re-detect recursion counting ONLY resolved `LogicFnCall` nodes,
@@ -448,7 +505,14 @@ impl LogicFnDef {
     /// encode to builtin/opaque symbols, never to this function's own
     /// symbol, so a defining equation over them is not self-referential.
     pub fn redetect_recursion_logic_calls_only(&mut self) {
-        self.is_recursive = expr_contains_logic_fn_call_only(&self.body, &self.name);
+        // A collision member's own recursive calls may still be spelled with
+        // the short name (resolved only at encoding time): count those too,
+        // conservatively.
+        self.is_recursive = expr_contains_logic_fn_call_only(&self.body, &self.name)
+            || self
+                .short_name
+                .as_deref()
+                .is_some_and(|short| expr_contains_logic_fn_call_only(&self.body, short));
     }
 
     // --- Accessors (#906) ---
@@ -487,6 +551,20 @@ impl LogicFnDef {
     #[must_use]
     pub fn requires(&self) -> &[PureExpr] {
         &self.requires
+    }
+
+    /// Record that the first `count` `requires` clauses are the written ones.
+    #[must_use]
+    pub fn with_written_requires(mut self, count: usize) -> Self {
+        self.written_requires = Some(count);
+        self
+    }
+
+    /// The `requires` clauses written in `#[requires]`, when recorded.
+    #[must_use]
+    pub fn written_requires(&self) -> Option<&[PureExpr]> {
+        self.written_requires
+            .map(|count| &self.requires[..count.min(self.requires.len())])
     }
 
     /// Returns the postcondition expressions.
@@ -565,6 +643,15 @@ impl LogicFnDef {
     /// Replace the mode.
     pub fn set_mode(&mut self, mode: LogicMode) {
         self.mode = mode;
+    }
+
+    /// Mutable access to the parsed `#[variant(...)]` measures.
+    ///
+    /// Needed by the driver's named-field placement pass: a variant is
+    /// specification text like any other clause and may spell a named-field
+    /// constructor.
+    pub fn variants_mut(&mut self) -> &mut Vec<PureExpr> {
+        &mut self.variants
     }
 
     /// Mutable access to the preconditions.
@@ -873,6 +960,55 @@ pub fn type_invariant_method_name(type_name: &str) -> String {
     format!("{TYPE_INVARIANT_METHOD_PREFIX}{suffix}")
 }
 
+/// Suffix that marks the invariant of a TYPE PARAMETER rather than of a type.
+///
+/// No output of [`type_invariant_method_name`] can start with it: that
+/// encoding writes `_` as `__`, and none of its escape tokens begins `_T`.
+const TYPE_PARAM_INVARIANT_TAG: &str = "_TP";
+
+/// The invariant predicate of the type parameter at `index` of the generics
+/// it is written under — Creusot's opaque `inv_T`.
+///
+/// It has no defining body: it stands for whatever type the parameter is
+/// instantiated at, so the only fact about it a body may hold is one a caller
+/// paid for, and the only obligation it discharges is the same predicate at
+/// the same parameter. The index is what a call site instantiates; the name
+/// only makes the symbol readable.
+#[must_use]
+pub fn type_param_invariant_method_name(index: u32, name: &str) -> String {
+    let readable: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("{TYPE_INVARIANT_METHOD_PREFIX}{TYPE_PARAM_INVARIANT_TAG}{index}_{readable}")
+}
+
+/// The generics index a [`type_param_invariant_method_name`] was minted for,
+/// or `None` for every other method name.
+#[must_use]
+pub fn type_param_invariant_index(method: &str) -> Option<u32> {
+    let rest = method
+        .strip_prefix(TYPE_INVARIANT_METHOD_PREFIX)?
+        .strip_prefix(TYPE_PARAM_INVARIANT_TAG)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || rest.as_bytes().get(digits) != Some(&b'_') {
+        return None;
+    }
+    rest[..digits].parse().ok()
+}
+
+/// Whether `expr` states a type parameter's invariant anywhere inside it —
+/// bare, on a tuple field, or in the arm of an enum decomposition.
+///
+/// One definition for the driver, which charges such a clause where a call
+/// fixes the parameter, and for the verdict gate, which withholds a
+/// refutation of one: `inv_T` has no body, so a model that falsifies it
+/// describes no instantiation any caller could have made.
+#[must_use]
+pub fn mentions_type_param_invariant(expr: &PureExpr) -> bool {
+    expr.any_recursive(|node| {
+        matches!(node, PureExpr::MethodCall { method, args, .. }
+            if args.is_empty() && type_param_invariant_index(method).is_some())
+    })
+}
+
 /// Returns true when `method` denotes an invariant predicate call.
 #[must_use]
 pub fn is_invariant_method_name(method: &str) -> bool {
@@ -924,6 +1060,9 @@ pub fn logic_fn_smt_name(name: &str) -> String {
     }
     format!("logic_{suffix}")
 }
+
+pub mod final_reads;
+pub mod identity;
 
 #[cfg(test)]
 mod tests;

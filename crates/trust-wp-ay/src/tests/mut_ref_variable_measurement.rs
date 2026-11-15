@@ -2,16 +2,15 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! MutRefVarNames variable count measurement tests (#2150 Phase 3).
+//! MutRefVarNames variable count measurement tests (#2150).
 //!
-//! These tests verify that the Phase 3 reduction (6 to 2 MutRefVarNames fields)
-//! produces correct results with the reduced variable set, and document the
-//! measured variable counts before and after.
-//!
-//! Measurement summary (via TRUST_WP_DEBUG=1):
-//! - After Phase 3: 7 SMT variables per `&mut i32` parameter
-//! - Before Phase 3: ~11 variables per parameter
-//! - Reduction: 4 cross-composition variables removed per parameter (36%)
+//! `MutRefVarNames` pre-declares `current`, `final_val` and the borrow
+//! identity `id`; only the four cross-composition names (current_final,
+//! current_current, final_current, final_final) are resolved on demand, when
+//! a postcondition mentions them. These tests check that `&mut` shapes still
+//! verify with that pre-declared set. The per-parameter SMT variable count
+//! (7 for `&mut i32`, visible via TRUST_WP_DEBUG=1) is documented here, not
+//! asserted.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -19,21 +18,18 @@ use ntest::timeout;
 
 use super::{super::*, helpers::*};
 
-/// Measure the SMT variable count per `&mut i32` parameter after Phase 3
-/// reduction (6 to 2 MutRefVarNames fields).
+/// Document the SMT variable count per `&mut i32` parameter when
+/// `MutRefVarNames` pre-declares current, final_val and id but no
+/// cross-composition name; the test itself asserts only the verdict.
 ///
-/// Before #2150 Phase 3: MutRefVarNames had 6 fields (current, final_val,
-/// current_final, current_current, final_current, final_final), producing
-/// ~11 SMT variables per `&mut i32` parameter.
-///
-/// After Phase 3: MutRefVarNames has 2 fields (current, final_val).
-/// The encoding loop in `verify_mut_borrow_function_with_modes_inner` creates
-/// exactly 7 variables per `&mut i32` parameter:
+/// Measured via TRUST_WP_DEBUG=1, the encoding loop in
+/// `verify_mut_borrow_function_with_modes_inner` creates 7 variables per
+/// `&mut i32` parameter:
 ///   v_current, v_final, old_v_current,
 ///   v_current_view, old_v_current_view, v_view, old_v_view
-///
-/// This is a 36% reduction (11 to 7) per parameter, verified empirically via
-/// TRUST_WP_DEBUG=1 output.
+/// Each eagerly pre-declared cross-composition name would add one more
+/// unconstrained variable per parameter to every function, whether or not
+/// any postcondition mentions it.
 ///
 /// Re: #2150
 #[test]
@@ -41,7 +37,7 @@ use super::{super::*, helpers::*};
 fn test_mut_ref_var_count_after_phase3_reduction() {
     use crate::encoder::MutRefVarNames;
 
-    // MutRefVarNames struct has exactly 2 fields
+    // The two value-carrying names; the third field, id, is the borrow identity.
     let names = MutRefVarNames::new("v");
     let field_names = [&names.current, &names.final_val];
     assert_eq!(
@@ -64,15 +60,13 @@ fn test_mut_ref_var_count_after_phase3_reduction() {
     let result =
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[req], &[ens], &final_values))
             .unwrap();
-    // KNOWN-CLASS PIN (2026-08-23 mut_ref drift adjudication): since ay's
-    // mandatory strict UNSAT certification (0.7 line), this trivial LIA/EUF VC
-    // computes UNSAT but its certificate fails strict validation ("step t0
-    // uses unverified trust rule"), demoting Verified to
-    // `Unknown(ProofTrusted)` — the sound direction. The Phase-3 encoding
-    // property this test guards is intact; the gap is upstream certificate
-    // coverage (ay docs/ay-asks premiseless-Trust census). Retire the
-    // tolerance when the class closes upstream. Every other outcome still
-    // fails the test.
+    // KNOWN-CLASS PIN (upstream proof-trusted certification gap): under ay's
+    // mandatory strict UNSAT certification this trivial LIA/EUF VC computes
+    // UNSAT but its certificate fails strict validation ("step t0 uses
+    // unverified trust rule"), demoting Verified to `Unknown(ProofTrusted)` —
+    // the sound direction. The encoding property this test guards is intact;
+    // the gap is upstream certificate coverage. Retire the tolerance when the
+    // class closes upstream. Every other outcome still fails the test.
     assert!(
         matches!(
             result,
@@ -89,9 +83,9 @@ fn test_mut_ref_var_count_after_phase3_reduction() {
 /// created by MutRefVarNames but can still be resolved on demand by
 /// resolve_nameable_expr.
 ///
-/// This documents the Phase 3 design: cross-composition variables are
-/// demand-driven (created only if postconditions reference them) rather than
-/// eagerly pre-declared for every `&mut` parameter.
+/// Cross-composition variables are demand-driven (created only if
+/// postconditions reference them) rather than eagerly pre-declared for every
+/// `&mut` parameter.
 ///
 /// Re: #2150
 #[test]
@@ -123,8 +117,8 @@ fn test_cross_composition_vars_not_pre_declared() {
     // never reference them, saving 4 SMT variables per parameter.
 }
 
-/// Verify that a Vec-backed `&mut` parameter (with Seq view) also works
-/// correctly after Phase 3 reduction.
+/// Verify that a Vec-backed `&mut` parameter (with Seq view) also verifies
+/// with `MutRefVarNames` pre-declaring only current, final_val and id.
 ///
 /// Re: #2150
 #[test]
@@ -154,7 +148,7 @@ fn test_vec_mut_ref_verifies_after_phase3_reduction() {
                 || reason.as_str().contains("model validation")
                 || reason.as_str().contains("vacuous proof")
                 || reason.as_str().contains("timeout")
-                // KNOWN-CLASS PIN (2026-08-23 mut_ref drift adjudication):
+                // KNOWN-CLASS PIN (upstream Seq proof production gap):
                 // the native-Seq UNSAT lacks a proof-producing re-solve
                 // ("non-string sequence UNSAT not corroborated by a
                 // proof-producing re-solve") and demotes to

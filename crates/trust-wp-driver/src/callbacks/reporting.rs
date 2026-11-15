@@ -4,10 +4,8 @@
 
 //! Verification result reporting and summary formatting.
 //!
-//! Extracted from `verification.rs` as Phase 2 of the callbacks/verification
-//! decomposition (#1526). Contains all user-facing output logic: summary
-//! formatting, function result reporting, proof_assert result reporting,
-//! and diagnostic hints.
+//! All user-facing output logic: summary formatting, function result
+//! reporting, proof_assert result reporting, and diagnostic hints.
 
 use std::{collections::HashSet, fmt::Write as _, fs, path::PathBuf, time::Duration};
 
@@ -15,16 +13,20 @@ use sha2::{Digest, Sha256};
 use tracing::debug;
 use trust_wp_ay::{
     proof_assert_native_replay_metadata, proof_assert_obligation_slice_claims,
-    proof_assert_obligation_slice_derivations, EncodingError, ProofAssertSliceCertificate,
-    ProofAssertSliceDerivation, SolveEvidenceSnapshot, SolveStatisticsSnapshot,
-    SolveVerificationLevelSnapshot, UnknownReason, VerificationOutcome, VerificationProvenance,
-    VerificationResult,
+    proof_assert_obligation_slice_derivations, refutation_evidence_gap_reason, EncodingError,
+    ProofAssertSliceCertificate, ProofAssertSliceDerivation, SolveEvidenceSnapshot,
+    SolveStatisticsSnapshot, SolveVerificationLevelSnapshot, UnknownReason, VerificationOutcome,
+    VerificationProvenance, VerificationResult,
 };
-use trust_wp_core::{logic::LogicFnDef, result_protocol::encode_wire_value};
+use trust_wp_core::{formula::PureExpr, logic::LogicFnDef, result_protocol::encode_wire_value};
 
 use super::{
-    super::contracts::FunctionContract, encoding_error_breakdown::EncodingErrorBreakdown,
-    helpers::report_counterexample, parsing::ParsedContract,
+    super::{contracts::FunctionContract, mir_analysis::MutBorrowBody},
+    encoding_error_breakdown::EncodingErrorBreakdown,
+    function_credit::{grant_function_credit, CreditKind, FunctionCredit},
+    helpers::report_counterexample,
+    parsing::{LoopFields, LoopObligationGroup, MutBorrowFields, ParsedContract},
+    verification::neutralized_axiom_reached,
 };
 
 const NATIVE_REPLAY_DIR_ENV: &str = "TRUST_WP_NATIVE_REPLAY_DIR";
@@ -33,13 +35,17 @@ const PROOF_ASSERT_REPLAY_TIMEOUT_MAX_MS: u128 = 6_000;
 
 /// Accumulated counters for function contract verification results.
 ///
-/// Consolidates the individual `&mut usize` counter parameters that were
-/// previously threaded through `verify_contracts`, `verify_contract_loop_path`,
+/// One struct in place of separate `&mut usize` counter parameters threaded
+/// through `verify_contracts`, `verify_contract_loop_path`,
 /// `verify_logic_fn_postconditions`, `check_trait_refinement`, and the
-/// reporting functions. Introduced as Phase 3 of the callbacks/verification
-/// decomposition (#1526).
+/// reporting functions.
 #[derive(Debug, Default)]
 pub(super) struct VerificationCounters {
+    /// Logic functions whose own body assertions were all proved. The logic lane
+    /// prints each as a `proof_assert in X verified` line, so the proof_assert total
+    /// on the wire and in the summary must include it, or the per-function gate
+    /// reads a credit line the driver's own count denies.
+    pub logic_assertions_verified: usize,
     pub verified: usize,
     pub failed: usize,
     pub errors: usize,
@@ -83,6 +89,18 @@ pub(super) struct VerificationCounters {
     /// Verified-shaped function results that could not be counted as clean
     /// because accepted solver proof evidence was missing or rejected.
     pub evidence_gaps: usize,
+    /// `Failed`-shaped results withheld because no VALIDATED counterexample
+    /// model backed them (see `withhold_unvalidated_refutation`). A subset of
+    /// `errors`: the withheld verdict is reported and counted as `unknown`.
+    /// Tracked separately so "trust-wp refuted this" and "trust-wp could not
+    /// decide this" stay countable apart.
+    pub refutations_withheld: usize,
+    /// Lane credits held until their function's own assertions are
+    /// adjudicated. Every `verified`/`verified*` credit goes through
+    /// `function_credit::grant_function_credit`, never straight to these
+    /// counters, so a function is never counted verified beside an unproved
+    /// assertion of its own.
+    pub(in crate::callbacks) credit_ledger: super::function_credit::CreditLedger,
 }
 
 /// Accumulated counters for proof_assert verification results.
@@ -103,6 +121,21 @@ pub(super) struct ProofAssertCounters {
     pub inconclusive: usize,
     /// Verified-shaped proof_assert results without accepted solver proof evidence.
     pub evidence_gaps: usize,
+    /// proof_assert `Failed` results withheld for lack of a VALIDATED
+    /// counterexample model. See the field of the same name on
+    /// `VerificationCounters`.
+    pub refutations_withheld: usize,
+    /// Functions whose body assertions the in-function pass already
+    /// adjudicated.
+    ///
+    /// A clause-free function that nonetheless reaches the main contract loop
+    /// is visited by BOTH assertion passes, and each `proof_assert!` then gets
+    /// two identical verdicts for one source obligation. That is a
+    /// double-count, not two proofs: the goal inventory sees one assertion and
+    /// the driver claims two, so the item reads as a mismatch even though
+    /// every assertion was discharged. The standalone pass reads this set and
+    /// declines a function the in-function pass has already answered.
+    pub assertions_adjudicated: std::collections::HashSet<rustc_hir::def_id::DefId>,
 }
 
 /// Structured verification outcome returned by `verify_contracts`.
@@ -223,7 +256,7 @@ impl VerificationSummary {
             verified_with_axiom_deps: counters.verified_with_axiom_deps,
             verified_native_only: counters.verified_native_only,
             unverified_axioms: 0,
-            proof_assert_verified: pa_counters.verified,
+            proof_assert_verified: pa_counters.verified + counters.logic_assertions_verified,
             proof_assert_failed: pa_counters.failed,
             proof_assert_errors: pa_counters.errors,
             proof_assert_inconclusive: pa_counters.inconclusive,
@@ -396,11 +429,17 @@ pub(super) fn format_verification_summary(
 ///
 /// Produces output like: `trust-wp: proof_assert: 3 verified, 0 failed, 2 errors`
 /// with an optional encoding-errors suffix when the breakdown is non-empty.
-/// Centralizes the proof-assert summary that previously leaked into
-/// `verification.rs` as an inline `eprintln!`.
-pub(super) fn format_proof_assert_summary(pa_counters: &ProofAssertCounters) -> String {
+/// The single spelling of that line; `verification.rs` emits this rather than
+/// an inline `eprintln!` of its own.
+pub(super) fn format_proof_assert_summary(
+    pa_counters: &ProofAssertCounters,
+    logic_assertions_verified: usize,
+) -> String {
     let mut parts = vec![
-        format!("{} verified", pa_counters.verified),
+        format!(
+            "{} verified",
+            pa_counters.verified + logic_assertions_verified
+        ),
         format!("{} failed", pa_counters.failed),
         format!("{} errors", pa_counters.errors),
     ];
@@ -472,6 +511,68 @@ pub(in crate::callbacks) fn user_authored_requires_false(contract: &FunctionCont
     })
 }
 
+/// How many of the user's own `ensures` clauses reach the solver's clause
+/// vector, and therefore how many low indices `clause_idx` can still mean a
+/// user clause.
+///
+/// `discharge_ensures_already_required` retains away every `Bool(true)` clause
+/// before the vector is handed to the solver, so a literal `#[ensures(true)]`
+/// occupies no index and the first synthesized obligation slides down into its
+/// place. Counting the raw `parsed.ensures` would then label that obligation
+/// `violated ensures #0` on a function whose only written postcondition is
+/// `true` — which cannot be violated (D-26).
+pub(super) fn surviving_user_clause_count(parsed: &ParsedContract) -> usize {
+    parsed
+        .ensures
+        .iter()
+        .filter(|clause| !matches!(clause, trust_wp_core::formula::PureExpr::Bool(true)))
+        .count()
+}
+
+/// Label a violated function-level clause without claiming it is a user
+/// `#[ensures]` when it is not.
+///
+/// `clause_idx` indexes the FINAL `effective_ensures` vector handed to the
+/// solver. That vector starts as the user's parsed `ensures` and is then
+/// EXTENDED with obligations synthesized from the body — call-site
+/// preconditions (including the fail-closed `requires(false)` an opaque call
+/// is owed), machine-integer arithmetic goals, panic-site goals and
+/// type-invariant goals. Printing every one of them as `violated ensures #N`
+/// would tell users their postcondition failed on a function that has no
+/// postcondition: `10 / y` would report `violated ensures #0: (y != 0)` for a
+/// function with zero `#[ensures]` clauses (D-26).
+///
+/// The boundary is one-directional and that is deliberate. Clauses are only
+/// ever APPENDED after the user prefix, and the user prefix only ever SHRINKS
+/// (`discharge_ensures_already_required` retains away `Bool(true)`), so
+/// `clause_idx >= user_clause_count` PROVES the clause is synthesized. The
+/// converse does not hold — a synthesized clause can slide below the boundary
+/// when a user clause was dropped — so the `ensures #N` label is kept for the
+/// low indices rather than replaced by a stronger claim this site cannot make.
+pub(super) fn report_violated_clause(
+    info: &trust_wp_ay::PostconditionInfo,
+    user_clause_count: usize,
+) {
+    if info.clause_idx >= user_clause_count {
+        eprintln!(
+            "  violated obligation #{}: {}",
+            info.clause_idx, info.contract_text,
+        );
+        if user_clause_count == 0 {
+            eprintln!(
+                "  note: this function carries no #[ensures] obligation of its own; the \
+                 clause above was raised by its body (a call precondition, an arithmetic \
+                 goal or a panic site)"
+            );
+        }
+        return;
+    }
+    eprintln!(
+        "  violated ensures #{}: {}",
+        info.clause_idx, info.contract_text,
+    );
+}
+
 /// Per-function context for result reporting (#2657).
 ///
 /// Bundles the function identity and diagnostic fields that are constant
@@ -483,12 +584,223 @@ pub(super) struct FunctionReportContext<'a> {
     pub(super) contract: &'a FunctionContract,
     pub(super) parsed: &'a ParsedContract,
     pub(super) source_map: &'a rustc_span::source_map::SourceMap,
+    /// What this function-level check, continuing from a loop, may not claim
+    /// (see `LoopCaveats`).
+    pub(super) loop_caveats: &'a LoopCaveats,
+}
+
+/// What a function-level check that continues from a loop may not claim.
+#[derive(Default)]
+pub(in crate::callbacks) struct LoopCaveats {
+    /// `Some(reason)` when the loop phases were INCOMPLETE (no phase
+    /// produced a counterexample, but the invariant was not proven) and
+    /// the function-level path runs without the loop's invariant. A
+    /// counterexample found there was never checked against the unproven
+    /// invariant, so it must be reported as unknown, not FAILED.
+    pub(in crate::callbacks) incomplete_loop: Option<String>,
+    /// `Some(reason)` when `result` is unbound because no single post-loop
+    /// return value describes every path from the loop's exit (D-165). A
+    /// proof without the body's value holds whatever it is, so it stands; a
+    /// counterexample may contradict it and is reported as unknown.
+    pub(in crate::callbacks) result_unbound: Option<String>,
+    /// `Some(reason)` when the function-level VC reads a value no premise
+    /// states: the loop condition the exit assumptions negate reads an
+    /// unstated call result (`LoopBodyExpr::condition_unstated`). The proven
+    /// invariant is a sound premise, so a proof stands, but a counterexample
+    /// picks that value freely and is reported as unknown.
+    pub(in crate::callbacks) unstated_exit_premise: Option<String>,
+}
+
+impl LoopCaveats {
+    /// Why a function-level counterexample is not checked against what the
+    /// loop phases establish: the unproven invariant, else the unbound
+    /// `result`.
+    pub(in crate::callbacks) fn incomplete_or_unbound(&self) -> Option<&str> {
+        self.incomplete_loop
+            .as_deref()
+            .or(self.result_unbound.as_deref())
+    }
+}
+
+/// Verdict label for a function-level counterexample.
+///
+/// A counterexample found while the loop invariant was unproven (all loop
+/// phases incomplete, none failed), or while `result` was read without the
+/// post-loop return value, was never checked against what the loop
+/// establishes: it may describe a state the loop cannot reach. It is therefore
+/// unknown, not a refutation. Only a counterexample from a run that carried the
+/// loop's proven facts (or had no loop) is reported as FAILED.
+pub(super) fn function_counterexample_is_unvalidated(incomplete_loop: Option<&str>) -> bool {
+    incomplete_loop.is_some()
+}
+
+/// Whether a function-level proof leaves a loop invariant unproved.
+///
+/// A loop invariant is an obligation of the function, not only a premise
+/// for its postcondition: a postcondition the function-level check proves
+/// WITHOUT the invariant says nothing about whether the invariant holds, so
+/// crediting it would accept a function whose invariant is false
+/// (s53_mutcall_prior_loop_init_invariant, whose `ensures(true)` needs no
+/// invariant at all).
+pub(super) fn function_proof_leaves_loop_invariant_unproven(incomplete_loop: Option<&str>) -> bool {
+    incomplete_loop.is_some()
+}
+
+/// Every `PureExpr` the parsed contract carries.
+///
+/// The destructuring is exhaustive on purpose. A clause this walk does not see
+/// is a logic-function mention that would go unnoticed, and an unnoticed
+/// mention reports a clean `verified` for a contract that names an entry
+/// nobody proved. A field added to `ParsedContract` must therefore break this
+/// build rather than silently open an unscanned channel.
+fn collect_parsed_contract_exprs<'a>(parsed: &'a ParsedContract, out: &mut Vec<&'a PureExpr>) {
+    let ParsedContract {
+        requires,
+        ensures,
+        result_expr,
+        result_expr_spanned,
+        arg_names: _,
+        call_assumptions,
+        pre_loop_call_assumptions,
+        call_obligations,
+        pre_loop_call_obligations,
+        post_loop_call_obligations,
+        returning_path_facts,
+        extraction_fail_closed_reason: _,
+        panic_unreachability_obligations: _,
+        user_written_false_obligations: _,
+        // MIR edges; no expression.
+        proved_dead_edges: _,
+        loop_fields,
+        mut_borrow,
+        // Enum field indices of a recursive `&mut self` reborrow; no expression.
+        reborrow_prophecy: _,
+    } = parsed;
+
+    out.extend(requires.iter());
+    out.extend(ensures.iter());
+    out.extend(result_expr.iter());
+    out.extend(result_expr_spanned.iter().map(|spanned| &spanned.expr));
+    out.extend(call_assumptions.iter());
+    out.extend(pre_loop_call_assumptions.iter());
+    out.extend(call_obligations.iter());
+    out.extend(pre_loop_call_obligations.iter());
+    out.extend(post_loop_call_obligations.iter());
+    out.extend(returning_path_facts.iter());
+
+    let LoopFields {
+        invariants,
+        per_loop_invariants,
+        per_loop_variants,
+        // Spans and basic blocks; no expression.
+        all_loop_spans: _,
+        variants,
+        loop_analysis: _,
+        loop_obligation_groups,
+    } = loop_fields;
+    out.extend(invariants.iter());
+    out.extend(variants.iter());
+    out.extend(
+        per_loop_invariants
+            .iter()
+            .chain(per_loop_variants.iter())
+            .flat_map(|(_, _, exprs)| exprs.iter()),
+    );
+    for LoopObligationGroup {
+        assumptions,
+        obligations,
+        condition,
+        loop_index: _,
+        condition_unstated: _,
+        pre_loop_stored_names: _,
+        unstated_entry_values: _,
+        injected_fail_closed: _,
+    } in loop_obligation_groups
+    {
+        out.extend(assumptions.iter());
+        out.extend(obligations.iter());
+        out.extend(condition.iter());
+    }
+
+    let MutBorrowFields {
+        mut_borrow_body,
+        mut_ref_param_names: _,
+        state_params: _,
+        projected_final_pins,
+        stale_call_final_params: _,
+    } = mut_borrow;
+    out.extend(projected_final_pins.iter().map(|pin| &pin.value));
+    if let Some(MutBorrowBody {
+        final_values,
+        indexed_writes,
+        // MIR locations, borrow ids and parameter-name sets; no expression.
+        resolve_results: _,
+        finality: _,
+        borrow_id_origins: _,
+        delayed_writeback_assumptions,
+        mutation_continued_params: _,
+        nested_slot_resolutions,
+        nested_transfer_params: _,
+        lent_path_resolutions,
+    }) = mut_borrow_body
+    {
+        out.extend(final_values.values());
+        out.extend(
+            indexed_writes
+                .iter()
+                .flat_map(|write| [&write.index, &write.value]),
+        );
+        out.extend(delayed_writeback_assumptions.iter());
+        out.extend(nested_slot_resolutions.iter());
+        out.extend(lent_path_resolutions.iter());
+    }
+}
+
+/// The unproven entries THIS contract's verdict rests on.
+///
+/// Scanning the whole crate's logic-function slice made one recorded entry
+/// mark every verified contract in the crate, including contracts that never
+/// mention it — a caveat attached to a proof that does not carry it says
+/// nothing true about that proof. A contract keeps its clean `verified` only
+/// when the entry is outside everything its clauses can reach.
+///
+/// Reachability is decided by `neutralized_axiom_reached` — the same predicate
+/// the verdict path uses to WITHHOLD a refutation that rests on a withdrawn
+/// axiom. The code that grants the clean verdict and the code that owes the
+/// caveat have to answer the same question the same way, or one of them is
+/// guessing: that predicate already knows every spelling a call site can carry
+/// (unique id, full path, crate-relative path, bare method name) and already
+/// walks the live definitions in between. Asking it once per recorded entry
+/// treats the OTHER entries as live, which can only widen what this contract
+/// is held to reach.
+fn contract_unverified_axiom_deps<'a>(
+    parsed: &ParsedContract,
+    logic_fns: &[LogicFnDef],
+    unverified_axioms: &'a HashSet<String>,
+) -> Vec<&'a str> {
+    if unverified_axioms.is_empty() {
+        return Vec::new();
+    }
+    let mut exprs: Vec<&PureExpr> = Vec::new();
+    collect_parsed_contract_exprs(parsed, &mut exprs);
+    let mut deps: Vec<&str> = unverified_axioms
+        .iter()
+        .filter(|path| {
+            let entry: HashSet<String> = std::iter::once((*path).clone()).collect();
+            neutralized_axiom_reached(logic_fns, &entry, exprs.iter().copied()).is_some()
+        })
+        .map(String::as_str)
+        .collect();
+    deps.sort_unstable();
+    deps
 }
 
 /// Dispatch a function verification result to counters and report to stderr.
 ///
-/// Returns `true` if the function was verified successfully (used by callers
-/// to decide whether to proceed with trait refinement checks).
+/// Returns `true` when the result is a credit. The credit itself goes through
+/// `function_credit::grant_function_credit`, so while the contract loop is
+/// verifying the function it still waits on the function's own assertions
+/// and may never be printed or counted.
 pub(super) fn report_function_verification_result(
     result: Result<VerificationOutcome, EncodingError>,
     fn_ctx: &FunctionReportContext<'_>,
@@ -503,9 +815,30 @@ pub(super) fn report_function_verification_result(
     let source_map = fn_ctx.source_map;
     match result {
         Ok(outcome) => {
+            let outcome =
+                withhold_unvalidated_refutation(outcome, &mut counters.refutations_withheld);
             emit_verification_diagnostic_if_requested(def_path, "function_contract", &outcome);
             let evidence_gap_reason = verified_evidence_gap_reason(&outcome);
             match outcome.result {
+                VerificationResult::Verified(_)
+                    if function_proof_leaves_loop_invariant_unproven(
+                        fn_ctx.loop_caveats.incomplete_loop.as_deref(),
+                    ) =>
+                {
+                    counters.errors += 1;
+                    let reason = fn_ctx
+                        .loop_caveats
+                        .incomplete_loop
+                        .as_deref()
+                        .unwrap_or("loop invariant incomplete");
+                    eprintln!("trust-wp: {def_path} unknown (incomplete loop: {reason})");
+                    eprintln!("  at {loc}");
+                    eprintln!(
+                        "  note: the function-level check holds without the loop invariant, \
+                         which is itself an obligation and was not proved"
+                    );
+                    false
+                }
                 VerificationResult::Verified(ref certificate) => {
                     if let Some(reason) = evidence_gap_reason {
                         counters.evidence_gaps += 1;
@@ -514,35 +847,77 @@ pub(super) fn report_function_verification_result(
                         eprintln!("  at {loc}");
                         return false;
                     }
-                    // Report if this verified function depends on unverified axioms (#1490).
-                    let deps: Vec<&str> = logic_fns_opt
-                        .unwrap_or(&[])
-                        .iter()
-                        .filter(|lf| unverified_axioms.contains(lf.full_path()))
-                        .map(|lf| lf.full_path())
-                        .collect();
-                    if deps.is_empty() {
-                        counters.verified += 1;
+                    // Report the unverified axioms THIS contract can reach
+                    // (#1490): the crate's other recorded entries are not this
+                    // function's caveat, and the crate summary counts the
+                    // functions marked here.
+                    let deps = contract_unverified_axiom_deps(
+                        parsed,
+                        logic_fns_opt.unwrap_or(&[]),
+                        unverified_axioms,
+                    );
+                    let credit = if deps.is_empty() {
                         // A proof ay validated fully but cannot render into the
                         // pinned Alethe calculus is still a proof — it is just
                         // one only ay can re-check. Counted alongside
                         // `verified`, never instead of it.
-                        if verified_on_native_only_authority(certificate.as_ref()) {
-                            counters.verified_native_only += 1;
-                        }
-                        eprintln!("trust-wp: {def_path} verified \u{2713}");
+                        FunctionCredit::new(
+                            CreditKind::Verified {
+                                native_only: verified_on_native_only_authority(
+                                    certificate.as_ref(),
+                                ),
+                            },
+                            format!("trust-wp: {def_path} verified \u{2713}"),
+                        )
                     } else {
                         // Do not count as unconditionally verified (#1878).
-                        counters.verified_with_axiom_deps += 1;
-                        eprintln!(
-                            "trust-wp: {def_path} verified* (depends on {} unverified axiom(s))",
-                            deps.len()
-                        );
-                        for dep in &deps {
-                            eprintln!("  unverified axiom: {dep}");
-                        }
-                    }
+                        deps.iter().fold(
+                            FunctionCredit::new(
+                                CreditKind::VerifiedWithAxiomDeps,
+                                format!(
+                                    "trust-wp: {def_path} verified* (depends on {} unverified axiom(s))",
+                                    deps.len()
+                                ),
+                            ),
+                            |credit, dep| credit.with_line(format!("  unverified axiom: {dep}")),
+                        )
+                    };
+                    grant_function_credit(counters, credit);
                     true
+                }
+                VerificationResult::Failed(_)
+                    if fn_ctx.loop_caveats.unstated_exit_premise.is_some() =>
+                {
+                    counters.errors += 1;
+                    let reason = fn_ctx
+                        .loop_caveats
+                        .unstated_exit_premise
+                        .as_deref()
+                        .unwrap_or_default();
+                    eprintln!(
+                        "trust-wp: {def_path} unknown ({}: {reason})",
+                        trust_wp_ay::REFUTATION_AUTHORITY_MESSAGE
+                    );
+                    eprintln!("  at {loc}");
+                    false
+                }
+                VerificationResult::Failed(_)
+                    if function_counterexample_is_unvalidated(
+                        fn_ctx.loop_caveats.incomplete_or_unbound(),
+                    ) =>
+                {
+                    counters.errors += 1;
+                    let reason = fn_ctx
+                        .loop_caveats
+                        .incomplete_or_unbound()
+                        .unwrap_or("loop invariant incomplete");
+                    eprintln!("trust-wp: {def_path} unknown (incomplete loop: {reason})");
+                    eprintln!("  at {loc}");
+                    eprintln!(
+                        "  note: the function-level check ran without what the loop \
+                         phases establish; its counterexample was not validated against it"
+                    );
+                    false
                 }
                 VerificationResult::Failed(counterexample) => {
                     counters.failed += 1;
@@ -575,10 +950,7 @@ pub(super) fn report_function_verification_result(
                     // clauses only when no clause was tagged (e.g.,
                     // non-postcondition failures like loop invariants).
                     if let Some(info) = counterexample.violated_postcondition.as_ref() {
-                        eprintln!(
-                            "  violated ensures #{}: {}",
-                            info.clause_idx, info.contract_text,
-                        );
+                        report_violated_clause(info, surviving_user_clause_count(parsed));
                     } else if !contract.ensures.is_empty() {
                         eprintln!("  postcondition(s):");
                         for ens in &contract.ensures {
@@ -620,11 +992,16 @@ pub(super) fn report_function_verification_result(
                         // (a postcondition) is NOT credited here — it still falls
                         // through to the vacuous/soundness-gap path below.
                         if user_authored_requires_false(contract) {
-                            counters.verified += 1;
-                            eprintln!(
-                                "trust-wp: {def_path} verified \u{2713} (vacuous: explicit #[requires(false)])"
+                            grant_function_credit(
+                                counters,
+                                FunctionCredit::new(
+                                    CreditKind::Verified { native_only: false },
+                                    format!(
+                                        "trust-wp: {def_path} verified \u{2713} (vacuous: explicit #[requires(false)])"
+                                    ),
+                                )
+                                .with_line(format!("  at {loc}")),
                             );
-                            eprintln!("  at {loc}");
                             return true;
                         }
                         counters.vacuous += 1;
@@ -678,8 +1055,7 @@ pub(in crate::callbacks) fn emit_verification_diagnostic_if_requested(
     // outcome is built via `VerificationOutcome::without_provenance(Unknown(Timeout))`
     // and carries no provenance. Without the synthesized fallback below we would
     // suppress the per-phase diagnostic and reduce the failure mode to "unknown
-    // (loop invariant: timeout)" with no breadcrumbs (Fix B in
-    // designs/2026-05-19-100doors-vec-sort-leakage.md).
+    // (loop invariant: timeout)" with no breadcrumbs.
     eprintln!(
         "{}",
         verification_diagnostic_wire_line(
@@ -721,6 +1097,59 @@ fn is_unknown_timeout_without_provenance(outcome: &VerificationOutcome) -> bool 
             outcome.result,
             VerificationResult::Unknown(UnknownReason::Timeout)
         )
+}
+
+/// Withhold a `Failed` verdict that carries no VALIDATED counterexample.
+///
+/// **The rule (D-28).** `FAILED \u{2717} (counterexample)` asserts
+/// that a state exists which violates the obligation. trust-wp may publish that
+/// only when ay actually computed a satisfying assignment for the negated
+/// obligation AND validated it (see
+/// [`trust_wp_ay::refutation_evidence_gap_reason`] for the exact bar). A
+/// verdict that does not clear it -- no provenance, synthesized structural
+/// provenance, a shortcut SAT that skipped model validation, an `unsat` or
+/// `unknown` snapshot under a `Failed` -- describes an obligation that was NOT
+/// refuted, and becomes `unknown` with the withholding reason attached.
+///
+/// Apply this BEFORE anything reads the verdict, so the wire line, the stderr
+/// verdict and the counters cannot disagree. It is idempotent, so applying it
+/// again at an inner layer is free.
+///
+/// Strictly narrowing: it only ever turns a refutation into an inconclusive.
+/// `unknown` counts as an error, never as `verified`, so no obligation becomes
+/// gate-clean by passing through here, and the crate keeps a non-zero exit.
+pub(in crate::callbacks) fn withhold_unvalidated_refutation(
+    outcome: VerificationOutcome,
+    withheld: &mut usize,
+) -> VerificationOutcome {
+    if let Some(reason) = refutation_evidence_gap_reason(&outcome) {
+        *withheld += 1;
+        debug!(reason = %reason, "refutation withheld: no validated counterexample model");
+        return outcome.apply_mandatory_refutation_authority();
+    }
+    // The ay boundary (`apply_mandatory_proof_authority`) usually gets there
+    // first, so by the time an outcome reaches the driver the verdict is
+    // ALREADY `Unknown` and the gap reason above is `None`. Count it anyway:
+    // this counter is what tells "trust-wp could not decide" apart from
+    // "trust-wp hit a solver error", and #3771 reads it to decide whether the
+    // rest of the crate is still worth attempting. Counting only the downgrades
+    // the DRIVER performs would make it report zero on every real run.
+    if is_withheld_refutation(&outcome.result) {
+        *withheld += 1;
+    }
+    outcome
+}
+
+/// True for a verdict the refutation-authority gate already withheld.
+///
+/// The gate replaces the verdict with `Unknown(SolverMessage("<prefix>: .."))`,
+/// so this is how a later stage recognises "a refutation was withheld here" —
+/// at the ay boundary or in the driver, whichever ran first.
+pub(in crate::callbacks) fn is_withheld_refutation(result: &VerificationResult) -> bool {
+    // One definition, in the crate that owns the gate: the driver must not
+    // carry a second spelling of "this refutation was withheld" that can drift
+    // from the message `apply_mandatory_refutation_authority` actually writes.
+    trust_wp_ay::is_withheld_refutation(result)
 }
 
 pub(in crate::callbacks) fn verified_evidence_gap_reason(
@@ -775,13 +1204,13 @@ pub(in crate::callbacks) fn verified_evidence_gap_reason(
 /// pair fails, or `None` when the pair carries a complete, strictly checked
 /// UNSAT proof.
 ///
-/// The predicate is unchanged from the boolean form it replaces; only the
-/// diagnostic is richer. Naming the field matters because the two halves of
-/// this pair are captured separately (`solve_evidence` and `solver_statistics`
-/// on the same [`VerificationProvenance`]) and a mismatched pair is the exact
-/// rot this reports: an authoritative evidence snapshot paired with placeholder
-/// statistics reads as "unsat + ProofChecked + no proof steps", which must be
-/// refused but is impossible to triage from a bare "checks failed" string.
+/// Naming the field, rather than answering a bare boolean, matters because the
+/// two halves of this pair are captured separately (`solve_evidence` and
+/// `solver_statistics` on the same [`VerificationProvenance`]) and a mismatched
+/// pair is the exact rot this reports: an authoritative evidence snapshot
+/// paired with placeholder statistics reads as "unsat + ProofChecked + no proof
+/// steps", which must be refused but is impossible to triage from a bare
+/// "checks failed" string.
 fn unsat_proof_authority_gap(
     evidence: &SolveEvidenceSnapshot,
     statistics: &SolveStatisticsSnapshot,
@@ -874,8 +1303,7 @@ fn verification_diagnostic_wire_line(
     // When the worker was killed by an outer hard-timeout we have no
     // SolveEvidenceSnapshot, but the outcome itself records the timeout. Surface
     // it as `ay_result=timeout` so loop-phase diagnostics stay self-describing
-    // even when provenance is missing (Fix B in
-    // designs/2026-05-19-100doors-vec-sort-leakage.md).
+    // even when provenance is missing.
     let synthetic_timeout = is_unknown_timeout_without_provenance(outcome);
     let ay_result_owned = if synthetic_timeout {
         Some("timeout".to_string())
@@ -910,12 +1338,31 @@ fn verification_diagnostic_wire_line(
     );
     let solve_time_ms = provenance.map_or(0, |p| p.solve_time.as_millis());
     let assertions = provenance.map_or(0, |p| p.assertion_count);
+    // Say, in one field, whether this line's verdict is a refutation anybody
+    // may rely on. `validated` requires an accepted, model-validated SAT
+    // snapshot (`trust_wp_ay::refutation_evidence_gap_reason`); `withheld`
+    // marks a refutation this run REFUSED to publish for want of one; `none` is
+    // every non-refutation verdict. A consumer must never reconstruct this from
+    // `status=failed` alone -- that is the exact mistake this field exists to
+    // remove.
+    let refutation = match &outcome.result {
+        VerificationResult::Failed(_) => {
+            if refutation_evidence_gap_reason(outcome).is_some() {
+                "withheld"
+            } else {
+                "validated"
+            }
+        }
+        result if is_withheld_refutation(result) => "withheld",
+        _ => "none",
+    };
     format!(
         "{} def_path={} kind={} status={} reason={} solve_time_ms={} assertions={} timeout_ms={} \
          ay_result={} accepted_for_consumer={} model_validated={} unsat_proof_available={} \
          verification_level={} replay_present={} replay_bytes={} replay_sha256={} \
          native_replay_present={} native_replay_bytes={} native_replay_sha256={} \
-         native_replay_schema={} native_replay_path={} native_replay_write_error={} {}",
+         native_replay_schema={} native_replay_path={} native_replay_write_error={} \
+         refutation={} {}",
         trust_wp_core::result_protocol::DIAGNOSTIC_WIRE_PREFIX,
         encode_wire_value(def_path),
         encode_wire_value(obligation_kind),
@@ -942,8 +1389,9 @@ fn verification_diagnostic_wire_line(
         }),
         encode_wire_value(&native_replay_path),
         encode_wire_value(&native_replay_write_error),
+        refutation,
         // Appended last so every existing key keeps its position and meaning:
-        // this change adds an instrument, it does not redefine one.
+        // an added instrument, not a redefined one.
         strict_proof_replay_wire_fields(
             provenance.and_then(|provenance| provenance.strict_proof_replay.as_ref()),
             provenance.map_or(0, |provenance| provenance.strict_proof_replay_unbound),
@@ -962,9 +1410,9 @@ fn verification_diagnostic_wire_line(
 /// `set_produce_proofs(false)` and never calls `set_verification_level`, so it
 /// answers `Trusted` / `false` for EVERY query — including ones ay proved with a
 /// complete derivation. A control replaying a genuine `Unsat` through it is
-/// byte-identical to a real refusal. Three separate corpus censuses read those
-/// keys as measurements and reported counts of "obligations with no proof
-/// object" that were really counts of the encoder's configuration.
+/// byte-identical to a real refusal. A census that reads those keys as
+/// measurements counts "obligations with no proof object" that are really the
+/// encoder's configuration.
 ///
 /// The `strict_replay_*` keys below come from a solver that actually had proof
 /// production on, so `strict_replay_proof_checked_steps=51`
@@ -978,15 +1426,14 @@ fn verification_diagnostic_wire_line(
 ///
 /// # Equal step counters do NOT mean "ay built a derivation and refused it"
 ///
-/// `checked == total > 0` with `skipped_hole_steps=0` was read as establishing a
-/// complete derivation, and it does not: `strict_replay_proof_complete=` is an
+/// `checked == total > 0` with `skipped_hole_steps=0` does not establish a
+/// complete derivation: `strict_replay_proof_complete=` is an
 /// INDEPENDENT flag, and the proof-authority boundary requires it separately
 /// from the step counters. A replay can report `checked=17 total=17` holes 0
 /// with `proof_complete=false`, because those counters describe the steps that
 /// exist, not whether they reach the empty clause.
 ///
-/// This matters because the two cases need opposite responses and were being
-/// counted as one population. Split them on
+/// This matters because the two cases need opposite responses. Split them on
 /// `strict_replay_unknown_reason=`:
 ///
 /// * `self_check_rejected` / `proof_trusted` — a verdict WAS computed and a
@@ -1021,10 +1468,9 @@ fn verification_diagnostic_wire_line(
 /// * `strict_replay=none strict_replay_unbound=1` — one ran on a SIBLING slice
 ///   of the same function and is deliberately not reported here.
 ///
-/// Before the binding existed, the second row printed as the first row's
-/// opposite: the sibling's measurement, `authority_accepted=true` and all, on a
-/// blocked obligation's line. That produced a "certified but blocked" class that
-/// did not exist, in a report that had already been filed.
+/// Without the binding the second row would print as the first row's opposite:
+/// the sibling's measurement, `authority_accepted=true` and all, on a blocked
+/// obligation's line — a "certified but blocked" class that does not exist.
 fn strict_proof_replay_wire_fields(
     observation: Option<&trust_wp_ay::StrictProofReplayObservation>,
     unbound: u32,
@@ -1233,30 +1679,56 @@ fn canonical_proof_assert_evidence(mut evidence: SolveEvidenceSnapshot) -> Solve
     evidence
 }
 
+/// ay's `smt.*_total` counters that accumulate across every executor
+/// invocation in the process (`combined_solvers::theory_stats`, published by
+/// `collect_theory_stats_incremental`): observations of the process, not of
+/// one solve.
+const AY_PROCESS_WIDE_TOTALS: [&str; 3] = [
+    "smt.no_rounds_total",
+    "smt.combiner_checks_total",
+    "smt.checks.arrays_total",
+];
+
 fn canonical_proof_assert_statistics(
     mut statistics: SolveStatisticsSnapshot,
 ) -> SolveStatisticsSnapshot {
     statistics.extra_ints.retain(|(key, _)| {
         let key = key.to_ascii_lowercase();
         // Volatile observations of the RUN, not of the proof: wall time,
-        // memory, and (ay >= 0.10, ay 550e5792b7) the `cert.*`
-        // certification-accounting family. ay publishes those counters from a
+        // memory, and (ay >= 0.10) the `cert.*` certification-accounting
+        // family. ay publishes those counters from a
         // PROCESS-GLOBAL accumulator into every solve's statistics
         // (`executor/proof/check.rs` `publish_certification_accounting`;
         // `executor/cert_accounting.rs` documents them as write-only —
         // "Nothing in ay-dpll reads a counter to decide anything"). A
         // process-cumulative counter can never agree between the certificate's
-        // solve and the report-time strict replay, so keeping them made this
-        // canonical comparison unsatisfiable and demoted every proof_assert
+        // solve and the report-time strict replay, so keeping them would make
+        // this canonical comparison unsatisfiable and demote every proof_assert
         // to an evidence gap. Proof-semantic statistics (proof_checker_*,
         // proof_trust, core counters) remain compared exactly.
+        //
+        // ay 72348e74f added process-wide counters that accumulate across
+        // every solver instance in the process: three `smt.*_total` totals
+        // and the arrays theory's `arrays_prop_eq_*` family. They disagreed
+        // between the certificate's solve and the replay
+        // (`smt.combiner_checks_total`: 5 vs 1) and demoted true assertions
+        // to an evidence gap. Only those are dropped, by name: a `_total`
+        // suffix alone says nothing (ay's `sat.preprocess_tx_*_total` count
+        // one solve's preprocessing, and stay compared). A counter in a time
+        // unit (`lra_..._compile_us_total`, `_us_max`) is a wall-clock
+        // observation whatever its suffix.
         !key.contains("time")
+            && !key
+                .split(['.', '_'])
+                .any(|segment| matches!(segment, "us" | "ms" | "ns"))
             && !key.contains("elapsed")
             && !key.contains("duration")
             && !key.contains("memory")
             && !key.contains("rss")
             && !key.contains("nanos")
             && !key.starts_with("cert.")
+            && !AY_PROCESS_WIDE_TOTALS.contains(&key.as_str())
+            && !key.starts_with("arrays_prop_eq_")
     });
     statistics.extra_ints.sort_unstable();
     statistics
@@ -1390,15 +1862,77 @@ fn proof_assert_slice_certificate_gap_reason(
              {expected_ordinal}"
         ));
     }
-    if canonical_proof_assert_statistics(certificate.solver_statistics.clone())
-        != canonical_proof_assert_statistics(replay_statistics)
-    {
+    let certified = canonical_proof_assert_statistics(certificate.solver_statistics.clone());
+    let replayed = canonical_proof_assert_statistics(replay_statistics);
+    if certified != replayed {
         return Some(format!(
             "certificate solver statistics disagreed with strict replay at ordinal \
-             {expected_ordinal}"
+             {expected_ordinal}: {}",
+            statistics_disagreement(&certified, &replayed)
         ));
     }
     None
+}
+
+/// The statistics `certified` and `replayed` disagree on, each as
+/// `name: certified vs replayed`, for the evidence-gap reason.
+fn statistics_disagreement(
+    certified: &SolveStatisticsSnapshot,
+    replayed: &SolveStatisticsSnapshot,
+) -> String {
+    let mut differing = Vec::new();
+    macro_rules! compare {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if certified.$field != replayed.$field {
+                    differing.push(format!(
+                        "{}: {:?} vs {:?}",
+                        stringify!($field),
+                        certified.$field,
+                        replayed.$field
+                    ));
+                }
+            )*
+        };
+    }
+    compare!(
+        decisions,
+        conflicts,
+        propagations,
+        restarts,
+        theory_conflicts,
+        theory_propagations,
+        theory_unknown_count,
+        partial_clause_count,
+        model_validation_skips,
+        model_validation_failures,
+        proof_clause_count,
+        proof_complete,
+        ematching_rounds_completed,
+        ematching_instances_created,
+        term_bytes,
+        term_count,
+        refinement_count,
+        rlimit_count,
+        num_vars,
+        num_clauses,
+        num_assertions,
+    );
+    let certified_extra: std::collections::BTreeMap<_, _> =
+        certified.extra_ints.iter().cloned().collect();
+    let replayed_extra: std::collections::BTreeMap<_, _> =
+        replayed.extra_ints.iter().cloned().collect();
+    let keys: std::collections::BTreeSet<_> = certified_extra
+        .keys()
+        .chain(replayed_extra.keys())
+        .collect();
+    for key in keys {
+        let (a, b) = (certified_extra.get(key), replayed_extra.get(key));
+        if a != b {
+            differing.push(format!("{key}: {a:?} vs {b:?}"));
+        }
+    }
+    differing.join(", ")
 }
 
 fn proof_assert_authority_gap_reason(
@@ -1480,6 +2014,8 @@ pub(super) fn report_proof_assert_outcome_result(
 ) {
     match result {
         Ok(outcome) => {
+            let outcome =
+                withhold_unvalidated_refutation(outcome, &mut pa_counters.refutations_withheld);
             // A Verified-shaped outcome is not diagnostic authority. Replay and
             // validate every exact slice certificate before emitting any
             // success-adjacent diagnostic or incrementing the verified count.
@@ -1496,7 +2032,8 @@ pub(super) fn report_proof_assert_outcome_result(
                 return;
             }
             emit_verification_diagnostic_if_requested(&prepared.fn_path, "proof_assert", &outcome);
-            report_proof_assert_verification_result(outcome.result, prepared, pa_counters);
+            let result = demote_loop_head_counterexample(outcome.result, prepared);
+            report_proof_assert_verification_result(result, prepared, pa_counters);
         }
         Err(ref e) => {
             pa_counters.errors += 1;
@@ -1505,6 +2042,40 @@ pub(super) fn report_proof_assert_outcome_result(
             eprintln!("  at {}", prepared.loc);
         }
     }
+}
+
+/// A counterexample to an assertion that reads a loop-head value (D-187) is a
+/// model of the loop with no invariant beyond its condition, Creusot's
+/// implicit `invariant true`: the loop-head symbol ranges over every value of
+/// the local's type, including values no iteration can reach (`y` is `x` or
+/// `x + 1` at the head of every iteration of `while .. { y = x + 1; }`, but
+/// the symbol may be 7). Such a model refutes nothing about the program, so
+/// it is reported `unknown`, never `FAILED`. Only a refutation is demoted.
+fn demote_loop_head_counterexample(
+    result: VerificationResult,
+    prepared: &super::proof_assert_verify::PreparedAssertion,
+) -> VerificationResult {
+    if !matches!(result, VerificationResult::Failed(_)) {
+        return result;
+    }
+    let reads_loop_head = prepared
+        .preconditions
+        .iter()
+        .chain(&prepared.ensures)
+        .chain(&prepared.return_expr)
+        .any(|expr| {
+            expr.free_vars()
+                .iter()
+                .any(|name| name.starts_with(crate::mir_analysis::extract::LOOP_HEAD_SYMBOL_PREFIX))
+        });
+    if !reads_loop_head {
+        return result;
+    }
+    VerificationResult::Unknown(UnknownReason::Demoted(
+        "loop-head value: the counterexample ranges over a value a loop carries into an \
+         arbitrary iteration, which only the loop's invariants constrain (D-187)"
+            .to_string(),
+    ))
 }
 
 fn report_proof_assert_verification_result(
@@ -1726,8 +2297,86 @@ mod diagnostic_tests {
         assert_eq!(proof_assert_authority_gap_reason(&outcome, &prepared), None);
     }
 
+    /// ay's process-wide totals (ay 72348e74f) are observations of the
+    /// process, not of the proof: two solves of one artifact read them at
+    /// different values, so the canonical form drops them, and keeps the
+    /// per-solve counter beside them.
+    #[test]
+    fn canonical_statistics_drop_process_wide_totals() {
+        let mut statistics = SolveStatisticsSnapshot::default();
+        statistics.extra_ints = vec![
+            ("smt.no_rounds_total".to_string(), 5),
+            ("smt.combiner_checks_total".to_string(), 5),
+            ("smt.checks.arrays_total".to_string(), 3),
+            ("arrays_prop_eq_calls".to_string(), 7),
+            ("smt.no_rounds".to_string(), 1),
+        ];
+        let mut later = statistics.clone();
+        for (key, value) in &mut later.extra_ints {
+            if key != "smt.no_rounds" {
+                *value += 1;
+            }
+        }
+        let canonical = canonical_proof_assert_statistics(statistics);
+        assert_eq!(
+            canonical.extra_ints,
+            vec![("smt.no_rounds".to_string(), 1)],
+            "only the per-solve counter is compared"
+        );
+        assert_eq!(canonical, canonical_proof_assert_statistics(later));
+    }
+
+    /// A `_total` suffix is no mark of a process-wide counter: ay's
+    /// `sat.preprocess_tx_*_total` count one solve's preprocessing, so a
+    /// certificate and a replay that disagree on one disagree on the proof,
+    /// and the firewall compares them. Dropping every `_total` key once let
+    /// such a disagreement through. A counter in a time unit is a wall-clock
+    /// observation, `_total` or not.
+    #[test]
+    fn canonical_statistics_keep_per_solve_totals() {
+        let mut statistics = SolveStatisticsSnapshot::default();
+        statistics.extra_ints = vec![
+            (
+                "sat.preprocess_tx_eliminated_variables_total".to_string(),
+                4,
+            ),
+            (
+                "sat.preprocess_tx_equivalent_variables_total".to_string(),
+                2,
+            ),
+            (
+                "sat.preprocess_tx_planned_substitutions_total".to_string(),
+                1,
+            ),
+            ("sat.two_stage_score_total".to_string(), 9),
+            ("smt.combiner_checks_total".to_string(), 5),
+            (
+                "lra_llvm2_trust_ir_substitute_queue_compile_us_total".to_string(),
+                120,
+            ),
+            (
+                "lra_llvm2_trust_ir_substitute_queue_compile_us_max".to_string(),
+                80,
+            ),
+        ];
+        let canonical = canonical_proof_assert_statistics(statistics.clone());
+        assert_eq!(
+            canonical.extra_ints.len(),
+            4,
+            "only the process-wide total and the wall-clock counters are dropped: {:?}",
+            canonical.extra_ints
+        );
+        let mut disagreeing = statistics;
+        disagreeing.extra_ints[0].1 += 1;
+        assert_ne!(
+            canonical,
+            canonical_proof_assert_statistics(disagreeing),
+            "a per-solve total that disagrees is a disagreement"
+        );
+    }
+
     /// Name-level pin of the linked-ay assumption behind the `cert.*`
-    /// canonicalization exception (ay 550e5792b7, ay >= 0.10): a strict replay
+    /// canonicalization exception (ay >= 0.10): a strict replay
     /// publishes process-cumulative `cert.*` accounting integers into its
     /// statistics. If this fails, the linked ay stopped publishing them and
     /// the `cert.` arm of `canonical_proof_assert_statistics` is dead — retire
@@ -1908,6 +2557,153 @@ mod diagnostic_tests {
         assert!(!line.contains('\n'));
     }
 
+    /// A SAT snapshot ay validated and accepted: an honest refutation.
+    fn validated_sat_provenance() -> VerificationProvenance {
+        let mut evidence = SolveEvidenceSnapshot::default();
+        evidence.result = "sat".to_string();
+        evidence.model_validated = true;
+        evidence.accepted_for_consumer = true;
+        evidence.verification.sat_model_validated = true;
+        evidence.verification_level = SolveVerificationLevelSnapshot::FullyVerified;
+        VerificationProvenance::with_solve_time(Duration::from_millis(5))
+            .with_assertion_count(2)
+            .with_solve_evidence(Some(evidence))
+    }
+
+    /// The wire line must SAY which kind of refutation it carries. A consumer
+    /// that reconstructs it from `status=failed` reads every withheld
+    /// refutation as a counterexample that never had a model.
+    #[test]
+    fn diagnostic_wire_line_marks_a_validated_refutation() {
+        let provenance = validated_sat_provenance();
+        let outcome = VerificationOutcome::new(
+            VerificationResult::Failed(trust_wp_ay::Counterexample::empty()),
+            Some(provenance.clone()),
+        );
+
+        let line = verification_diagnostic_wire_line(
+            "demo::f",
+            "function_contract",
+            &outcome,
+            Some(&provenance),
+        );
+
+        assert!(line.contains("status=failed"), "{line}");
+        assert!(line.contains("refutation=validated"), "{line}");
+    }
+
+    /// And the withheld direction: after the gate the verdict is `unknown` and
+    /// the line says the refutation was withheld, not that it never existed.
+    #[test]
+    fn diagnostic_wire_line_marks_a_withheld_refutation() {
+        let outcome = VerificationOutcome::without_provenance(VerificationResult::Failed(
+            trust_wp_ay::Counterexample::empty(),
+        ))
+        .apply_mandatory_refutation_authority();
+
+        let line =
+            verification_diagnostic_wire_line("demo::f", "function_contract", &outcome, None);
+
+        assert!(line.contains("status=unknown"), "{line}");
+        assert!(line.contains("refutation=withheld"), "{line}");
+        assert!(
+            !line.contains("reason=counterexample"),
+            "a withheld refutation must never claim a counterexample: {line}"
+        );
+    }
+
+    /// An unvalidated refutation that somehow reaches the emitter unGATED is
+    /// still labelled honestly.
+    #[test]
+    fn diagnostic_wire_line_marks_an_ungated_failed_as_withheld() {
+        let outcome = VerificationOutcome::without_provenance(VerificationResult::Failed(
+            trust_wp_ay::Counterexample::empty(),
+        ));
+
+        let line =
+            verification_diagnostic_wire_line("demo::f", "function_contract", &outcome, None);
+
+        assert!(line.contains("refutation=withheld"), "{line}");
+    }
+
+    #[test]
+    fn diagnostic_wire_line_marks_non_refutations_none() {
+        let outcome = VerificationOutcome::without_provenance(VerificationResult::Unknown(
+            UnknownReason::Timeout,
+        ));
+
+        let line =
+            verification_diagnostic_wire_line("demo::f", "function_contract", &outcome, None);
+
+        assert!(line.contains("refutation=none"), "{line}");
+    }
+
+    /// The counter's contract: a withheld refutation is counted once, and an
+    /// honest one is not counted at all.
+    #[test]
+    fn withhold_unvalidated_refutation_counts_only_the_withheld() {
+        let mut withheld = 0;
+        let gated = withhold_unvalidated_refutation(
+            VerificationOutcome::without_provenance(VerificationResult::Failed(
+                trust_wp_ay::Counterexample::empty(),
+            )),
+            &mut withheld,
+        );
+        assert_eq!(withheld, 1);
+        assert!(matches!(gated.result, VerificationResult::Unknown(_)));
+
+        let mut honest = 0;
+        let kept = withhold_unvalidated_refutation(
+            VerificationOutcome::new(
+                VerificationResult::Failed(trust_wp_ay::Counterexample::empty()),
+                Some(validated_sat_provenance()),
+            ),
+            &mut honest,
+        );
+        assert_eq!(honest, 0);
+        assert!(matches!(kept.result, VerificationResult::Failed(_)));
+    }
+
+    /// The ay boundary usually withholds FIRST, so what reaches the driver is
+    /// already `Unknown`. It must still be counted — otherwise the counter reads
+    /// zero on every real run, and #3771 (which reads it) keeps amputating the
+    /// siblings of an inconclusive (`bug/final_borrows`: the gate fires, the
+    /// verdict is honest, and the crate is still abandoned).
+    #[test]
+    fn a_refutation_withheld_at_the_ay_boundary_is_still_counted() {
+        let already_withheld = VerificationOutcome::without_provenance(VerificationResult::Failed(
+            trust_wp_ay::Counterexample::empty(),
+        ))
+        .apply_mandatory_refutation_authority();
+        assert!(is_withheld_refutation(&already_withheld.result));
+
+        let mut withheld = 0;
+        let passed_through = withhold_unvalidated_refutation(already_withheld, &mut withheld);
+        assert_eq!(withheld, 1);
+        assert!(matches!(
+            passed_through.result,
+            VerificationResult::Unknown(_)
+        ));
+    }
+
+    /// An ordinary `Unknown` is NOT a withheld refutation and must not be
+    /// counted as one — #3771 would then ignore a genuine solver timeout.
+    #[test]
+    fn an_ordinary_unknown_is_not_a_withheld_refutation() {
+        let mut withheld = 0;
+        let _ = withhold_unvalidated_refutation(
+            VerificationOutcome::without_provenance(VerificationResult::Unknown(
+                UnknownReason::Timeout,
+            )),
+            &mut withheld,
+        );
+        assert_eq!(withheld, 0);
+
+        assert!(!is_withheld_refutation(&VerificationResult::Unknown(
+            UnknownReason::SolverMessage("vacuous proof: base is UNSAT".to_string())
+        )));
+    }
+
     #[test]
     fn verified_outcome_with_missing_provenance_is_evidence_gap() {
         let outcome = VerificationOutcome::without_provenance(VerificationResult::Verified(None));
@@ -1946,9 +2742,9 @@ mod diagnostic_tests {
         // Pin the SHAPE of the accepted evidence, not just the verdict. The
         // mandatory boundary reads a pair captured on two different code paths
         // (`solve_evidence` and `solver_statistics` on one
-        // `VerificationProvenance`); when the two stopped describing the same
-        // solve, every contractless obligation silently became an evidence gap
-        // and nothing named which field went missing. Assert each field by
+        // `VerificationProvenance`); if the two stop describing the same
+        // solve, every contractless obligation silently becomes an evidence gap
+        // and nothing names which field went missing. Assert each field by
         // name so a rename or a dropped statistic in the solver — or another
         // provenance merge that re-pairs the halves — fails loudly here.
         let provenance = outcome.provenance.as_ref().expect("provenance");
@@ -1988,9 +2784,9 @@ mod diagnostic_tests {
     /// Fail-closed direction of the same pin: authoritative evidence paired
     /// with statistics that do not describe its proof must still be refused,
     /// and the refusal must name the field. This is exactly the mismatched pair
-    /// that `install_preferred_verified_solve_diagnostics` now prevents; if a
-    /// future provenance merge reintroduces it, the end-to-end acceptance pin
-    /// above fails and this one explains why.
+    /// that `install_preferred_verified_solve_diagnostics` prevents; if a
+    /// provenance merge reintroduces it, the end-to-end acceptance pin above
+    /// fails and this one explains why.
     #[test]
     fn authoritative_evidence_with_placeholder_statistics_is_refused_by_name() {
         let mut outcome =
@@ -2069,7 +2865,6 @@ mod diagnostic_tests {
         );
     }
 
-    /// Fix B (designs/2026-05-19-100doors-vec-sort-leakage.md):
     /// `Unknown(Timeout)` outcomes that lack provenance must still gate true so
     /// the loop-phase diagnostic line is emitted when the outer hard-timeout
     /// kills the ay worker before it returns evidence.
@@ -2084,7 +2879,7 @@ mod diagnostic_tests {
         assert!(is_unknown_timeout_without_provenance(&outcome));
     }
 
-    /// Fix B: the synthesized wire line carries `ay_result=timeout`, marks the
+    /// The synthesized wire line carries `ay_result=timeout`, marks the
     /// outcome as not accepted by the consumer, and includes the loop-phase
     /// `kind=` token so downstream consumers can attribute the timeout to the
     /// correct phase even with no solver provenance.
@@ -2166,5 +2961,189 @@ mod diagnostic_tests {
         assert_eq!(record.status, "verified");
         assert_eq!(record.reason, "none");
         assert_eq!(record.field_tristate_bool("model_validated"), Some(None));
+    }
+}
+
+#[cfg(test)]
+mod incomplete_loop_verdict_tests {
+    use super::function_counterexample_is_unvalidated;
+
+    #[test]
+    fn counterexample_after_incomplete_loop_is_not_a_failure() {
+        assert!(function_counterexample_is_unvalidated(Some(
+            "loop invariant timeout"
+        )));
+    }
+
+    #[test]
+    fn counterexample_without_incomplete_loop_stays_a_failure() {
+        assert!(!function_counterexample_is_unvalidated(None));
+    }
+
+    #[test]
+    fn proof_after_incomplete_loop_is_not_a_credit() {
+        assert!(super::function_proof_leaves_loop_invariant_unproven(Some(
+            "loop invariant refutation withheld"
+        )));
+        assert!(!super::function_proof_leaves_loop_invariant_unproven(None));
+    }
+}
+
+#[cfg(test)]
+mod axiom_dependency_tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
+
+    use trust_wp_core::{
+        formula::{BinOp, PureExpr},
+        logic::LogicFnDef,
+    };
+
+    use super::contract_unverified_axiom_deps;
+    use crate::callbacks::parsing::{LoopFields, MutBorrowFields, ParsedContract};
+
+    fn logic_fn(full_path: &str, body: PureExpr) -> LogicFnDef {
+        let name = full_path.rsplit("::").next().unwrap_or(full_path);
+        LogicFnDef::new(
+            name.to_owned(),
+            full_path.to_owned(),
+            vec!["x".to_owned()],
+            body,
+        )
+    }
+
+    fn call(name: &str) -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: name.to_owned(),
+            args: vec![PureExpr::Var("x".to_owned(), None)],
+        }
+    }
+
+    /// A contract whose only clause is `ensures`.
+    fn contract_ensuring(clause: PureExpr) -> ParsedContract {
+        ParsedContract {
+            requires: vec![],
+            ensures: vec![clause],
+            result_expr: None,
+            result_expr_spanned: None,
+            arg_names: vec!["x".to_owned()],
+            call_assumptions: vec![],
+            pre_loop_call_assumptions: vec![],
+            call_obligations: vec![],
+            pre_loop_call_obligations: vec![],
+            post_loop_call_obligations: vec![],
+            returning_path_facts: vec![],
+            extraction_fail_closed_reason: None,
+            panic_unreachability_obligations: 0,
+            user_written_false_obligations: 0,
+            proved_dead_edges: Default::default(),
+            loop_fields: LoopFields {
+                invariants: vec![],
+                per_loop_invariants: vec![],
+                per_loop_variants: vec![],
+                all_loop_spans: vec![],
+                variants: vec![],
+                loop_analysis: None,
+                loop_obligation_groups: vec![],
+            },
+            mut_borrow: MutBorrowFields {
+                mut_borrow_body: None,
+                mut_ref_param_names: HashSet::new(),
+                state_params: HashSet::new(),
+                projected_final_pins: vec![],
+                stale_call_final_params: HashSet::new(),
+            },
+            reborrow_prophecy: None,
+        }
+    }
+
+    /// `refused` is recorded; `proved` and `hop` are not. `hop`'s body reaches
+    /// `refused`, so a contract naming `hop` reaches it too.
+    fn crate_logic_fns() -> Vec<LogicFnDef> {
+        vec![
+            logic_fn("c::other", PureExpr::Var("x".to_owned(), None)),
+            logic_fn("c::refused", call("c::other")),
+            logic_fn("c::proved", PureExpr::Var("x".to_owned(), None)),
+            logic_fn("c::hop", call("c::refused")),
+        ]
+    }
+
+    fn recorded() -> HashSet<String> {
+        std::iter::once("c::refused".to_owned()).collect()
+    }
+
+    #[test]
+    fn a_contract_that_names_nothing_keeps_its_clean_verdict() {
+        let parsed = contract_ensuring(PureExpr::Bool(true));
+        assert!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()).is_empty(),
+            "a recorded entry elsewhere in the crate is not this contract's caveat"
+        );
+    }
+
+    #[test]
+    fn a_contract_over_another_law_keeps_its_clean_verdict() {
+        let parsed = contract_ensuring(call("c::proved"));
+        assert!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()).is_empty(),
+            "depending on a proved law is not depending on the refused one"
+        );
+    }
+
+    #[test]
+    fn a_contract_naming_the_recorded_entry_keeps_the_caveat() {
+        let parsed = contract_ensuring(call("c::refused"));
+        assert_eq!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()),
+            vec!["c::refused"],
+        );
+    }
+
+    #[test]
+    fn a_contract_reaching_the_recorded_entry_through_a_body_keeps_the_caveat() {
+        let parsed = contract_ensuring(call("c::hop"));
+        assert_eq!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()),
+            vec!["c::refused"],
+            "a withdrawn fact two hops away is just as absent"
+        );
+    }
+
+    #[test]
+    fn every_clause_channel_is_scanned_not_just_ensures() {
+        let mut parsed = contract_ensuring(PureExpr::Bool(true));
+        parsed.loop_fields.invariants.push(PureExpr::BinOp(
+            Arc::new(call("c::refused")),
+            BinOp::Eq,
+            Arc::new(PureExpr::Var("x".to_owned(), None)),
+        ));
+        assert_eq!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()),
+            vec!["c::refused"],
+            "a loop invariant is a clause of this contract like any other"
+        );
+
+        let mut parsed = contract_ensuring(PureExpr::Bool(true));
+        let mut final_values = HashMap::new();
+        final_values.insert("v".to_owned(), call("c::refused"));
+        parsed.mut_borrow.mut_borrow_body = Some(crate::mir_analysis::MutBorrowBody {
+            final_values,
+            indexed_writes: vec![],
+            resolve_results: None,
+            finality: HashMap::new(),
+            borrow_id_origins: HashMap::new(),
+            delayed_writeback_assumptions: vec![],
+            mutation_continued_params: HashSet::new(),
+            nested_slot_resolutions: vec![],
+            nested_transfer_params: HashSet::new(),
+            lent_path_resolutions: vec![],
+        });
+        assert_eq!(
+            contract_unverified_axiom_deps(&parsed, &crate_logic_fns(), &recorded()),
+            vec!["c::refused"],
+            "a mut-borrow final value carries the same substituted calls"
+        );
     }
 }

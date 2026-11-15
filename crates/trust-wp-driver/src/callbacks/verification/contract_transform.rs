@@ -6,7 +6,6 @@
 //!
 //! Applies A-F transform chain: mut-ref rewrite, closure capture field
 //! transforms, call-assumption merging, and call-obligation merging.
-//! Extracted from `verification.rs` (#1669).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -62,6 +61,19 @@ pub(in crate::callbacks) struct TransformedContract {
     /// Count of original user requires before call-assumption merging.
     /// Retained for diagnostics/tests.
     pub(in crate::callbacks) base_requires_count: usize,
+    /// How many entries of `effective_requires`, starting at
+    /// `base_requires_count`, were derived from the BODY's call assumptions
+    /// (the assumptions themselves plus their normalized-old, tester/selector
+    /// and result-bridged forms).
+    ///
+    /// Everything outside `base_requires_count .. base_requires_count +
+    /// call_assumption_derived_count` is derived from the user's `#[requires]`
+    /// clauses — the base clauses themselves, and the mut-ref groundings and
+    /// `inv` side conditions appended after the call-assumption region. The
+    /// stale-entry-fact drop (`stale_entry_facts`, D-38) needs that split to
+    /// remove the ENTRY facts a loop has invalidated without touching the
+    /// body's call-assumption facts, which have their own invalidation lane.
+    pub(in crate::callbacks) call_assumption_derived_count: usize,
     /// Count of original user ensures before call-obligation merging.
     /// Retained for diagnostics/tests.
     pub(in crate::callbacks) base_ensures_count: usize,
@@ -99,41 +111,16 @@ impl TransformedContract {
     }
 }
 
-/// Desugar closure-style ensures into applied form (#2676).
-///
-/// Creusot allows `#[ensures(|x| x > 0)]` or `#[ensures(|(a, b)| a == b)]` as
-/// shorthand for postconditions that bind the return value. When the ensures
-/// clause is a `PureExpr::Closure`, the closure parameters are bound to the
-/// result (or tuple projections of the result for multi-param closures).
-///
-/// - Single param: `|x| body` → `body[x := result]`
-/// - Multi-param (tuple destructure): `|(a, b)| body` →
-///   `body[a := __trust_wp_tuple_get_0(result), b := __trust_wp_tuple_get_1(result)]`
+/// Desugar closure-style ensures into applied form (#2676): `|x| body` is
+/// `body[x := result]`, read by the same function a call of this function
+/// reads the clause with (`formula::elaborate::applied_to_the_result`).
+/// `parse_boolean_clause` refuses a closure postcondition of another arity.
 fn desugar_closure_ensures(ensures: &[PureExpr]) -> Vec<PureExpr> {
-    use trust_wp_core::formula::internal::tuple_lowering::tuple_field_logic_fn_name;
-
     ensures
         .iter()
-        .map(|e| match e {
-            PureExpr::Closure { params, body } if !params.is_empty() => {
-                let mut substitutions = HashMap::new();
-                let result_var = PureExpr::Var("result".to_string(), None);
-                if params.len() == 1 {
-                    // Single parameter: bind directly to result
-                    substitutions.insert(params[0].0.clone(), result_var);
-                } else {
-                    // Multiple parameters: bind to tuple projections of result
-                    for (i, (name, _sort)) in params.iter().enumerate() {
-                        let projection = PureExpr::LogicFnCall {
-                            name: tuple_field_logic_fn_name(i),
-                            args: vec![result_var.clone()],
-                        };
-                        substitutions.insert(name.clone(), projection);
-                    }
-                }
-                body.substitute(&substitutions)
-            }
-            _ => e.clone(),
+        .map(|e| {
+            trust_wp_core::formula::elaborate::applied_to_the_result(e)
+                .unwrap_or_else(|_| e.clone())
         })
         .collect()
 }
@@ -206,14 +193,27 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
     }
 
     // (C) Transform ensures: *x -> ^x (Final) for mut ref params
-    let mut transformed_ensures: Vec<_> = if mut_ref_params.is_empty() {
-        desugared_ensures.clone()
-    } else {
-        desugared_ensures
-            .iter()
-            .map(|e| e.transform_postcondition_for_mut_refs(&mut_ref_params))
-            .collect()
-    };
+    //
+    //     Creusot semantics (soundness): in an `ensures`, `*p` is the value of
+    //     the referent at ENTRY and only `^p` is the final value; a clause in
+    //     the pre-Creusot dialect (it names a `&mut` param inside `old(..)`)
+    //     reads its bare `*p` as the post-state. Every call of this function
+    //     reads the clause through the same function
+    //     (`formula::elaborate::postcondition_at_a_call`) over the same
+    //     parameters (`state_params`, the signature's, not `mut_ref_params`,
+    //     which body extraction widens), so the state the body is proved at
+    //     is the state every caller is credited with. A pre-Creusot bare `*p`
+    //     of a parameter the result may borrow was refused where the clause
+    //     was placed (`place_parameter_reads`), in this lane and at each call.
+    let mut transformed_ensures: Vec<_> = desugared_ensures
+        .iter()
+        .map(|e| {
+            trust_wp_core::formula::elaborate::postcondition_states(
+                e,
+                &parsed.mut_borrow.state_params,
+            )
+        })
+        .collect();
 
     // (D) Transform ensures/requires for closure captures
     let mut transformed_requires = if closure_capture_fields.is_empty() {
@@ -241,12 +241,13 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
             .map(|expr| normalize_immutable_ref_param_vars(expr, &immutable_ref_params))
             .collect();
 
-        // (D2) `old(p)` IS `p` for a parameter that is not a `&mut`.
+        // (D2) `old(e)` over a parameter that is not a `&mut` reads it as the
+        // parameter (`formula::elaborate::entry_reads_of_unchanging_params`).
         //
         // Such a parameter cannot change under the caller's feet: the callee
         // may rebind its own copy (`mut p: i32`), but nothing the caller can
         // observe moves, so the entry value and the specification's `p` are the
-        // same thing. The encoder does not know that — left as `Old(Var(p))` it
+        // same thing. The encoder does not know that — left inside an `old` it
         // mints a SEPARATE, entirely unconstrained symbol `old_p`, and then
         // any contract relating the two is unprovable. Not merely declined:
         //
@@ -255,19 +256,22 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
         //     trust-wp: f FAILED ✗   counterexample: old_x = 1, x = 0
         //
         // A true contract reported as false, with a "counterexample" whose two
-        // values have no relationship at all. Collapsing here is the non-mut-ref
-        // counterpart of `verify::mut_borrow::collapse_old_over_mut_ref_currents`,
-        // whose `old_body_is_mut_ref_entry_expr` already classifies a
-        // non-mut-ref `Var` as an entry-state expression — this makes the
-        // encoding agree with that classification.
-        transformed_requires = transformed_requires
-            .iter()
-            .map(|expr| collapse_old_over_entry_state_params(expr, &immutable_ref_params))
-            .collect();
-        transformed_ensures = transformed_ensures
-            .iter()
-            .map(|expr| collapse_old_over_entry_state_params(expr, &immutable_ref_params))
-            .collect();
+        // values have no relationship at all. `old(v@) + 1`, `old(v@ + 1)` and
+        // `old(v@ + i)` were refuted alike while only the exact `old(v)` shape
+        // was read as `v`. This is the non-mut-ref counterpart of
+        // `verify::mut_borrow::collapse_old_over_mut_ref_currents`, whose
+        // `old_body_is_mut_ref_entry_expr` already classifies a non-mut-ref
+        // `Var` as an entry-state expression.
+        let unchanging = |name: &str| immutable_ref_params.contains(name);
+        for clause in transformed_requires
+            .iter_mut()
+            .chain(transformed_ensures.iter_mut())
+        {
+            *clause = trust_wp_core::formula::elaborate::entry_reads_of_unchanging_params(
+                clause,
+                &unchanging,
+            );
+        }
     }
 
     // (E) Merge call-site assumptions into requires
@@ -279,6 +283,7 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
     let base_requires = transformed_requires;
     let mut effective_requires = base_requires.clone();
     let base_requires_count = base_requires.len();
+    let requires_len_before_call_assumptions = effective_requires.len();
     if !parsed.call_assumptions.is_empty() {
         let call_assumptions: Vec<PureExpr> = parsed.call_assumptions.clone();
         effective_requires.extend(call_assumptions.iter().cloned());
@@ -327,6 +332,8 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
             }
         }
     }
+    let call_assumption_derived_count =
+        effective_requires.len() - requires_len_before_call_assumptions;
     // Mutable-reference reborrows carry invariant side conditions in Creusot.
     // Keep the pointee invariant for structural type-invariant rewriting, and
     // also add the whole-borrow invariant so clauses like generic_deref.rs'
@@ -361,6 +368,32 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
     //
     // Keep `parsed.call_obligations` intact because downstream diagnostics
     // still report the extracted obligations after transformation.
+    // (F0) #1075/#1401 returning-path facts premise ONLY the postconditions:
+    // `facts ==> ensures`. They are never merged into `effective_requires`,
+    // where they would also premise the call obligations merged below (the
+    // diverging arm's own call preconditions, and obligations emitted before
+    // the diverging switch). Dropped — a completeness cost only — when a
+    // `&mut` parameter or a closure capture field is involved, because the
+    // facts are stated over the program-point state while those ensures are
+    // rewritten to prophecy / capture form.
+    if !parsed.returning_path_facts.is_empty()
+        && mut_ref_params.is_empty()
+        && closure_capture_fields.is_empty()
+    {
+        let facts = parsed
+            .returning_path_facts
+            .iter()
+            .map(|fact| normalize_immutable_ref_param_vars(fact, &immutable_ref_params))
+            .reduce(|lhs, rhs| PureExpr::BinOp(Arc::new(lhs), BinOp::And, Arc::new(rhs)));
+        if let Some(facts) = facts {
+            transformed_ensures = transformed_ensures
+                .into_iter()
+                .map(|ensures| {
+                    PureExpr::BinOp(Arc::new(facts.clone()), BinOp::Implies, Arc::new(ensures))
+                })
+                .collect();
+        }
+    }
     let mut effective_ensures = transformed_ensures;
     let base_ensures = effective_ensures.clone();
     let base_ensures_count = base_ensures.len();
@@ -378,6 +411,7 @@ pub(in crate::callbacks) fn transform_contract(parsed: &ParsedContract) -> Trans
         pre_loop_call_obligation_ensures,
         post_loop_call_obligation_ensures,
         base_requires_count,
+        call_assumption_derived_count,
         base_ensures_count,
         mut_ref_params,
         closure_capture_fields,
@@ -411,25 +445,6 @@ pub(in crate::callbacks) fn immutable_ref_param_names(
         .filter(|name| !mut_ref_params.contains(*name))
         .cloned()
         .collect()
-}
-
-/// Rewrite `old(p)` to `p` for every parameter that is not a `&mut`.
-///
-/// Only the exact `Old(Var(p))` shape moves. `old(*v)` on a mutable borrow is
-/// the entry value of a cell that genuinely does change and is handled by the
-/// mut-borrow lane; `old()` over any compound expression keeps its own
-/// meaning.
-pub(in crate::callbacks) fn collapse_old_over_entry_state_params(
-    expr: &PureExpr,
-    entry_state_params: &HashSet<String>,
-) -> PureExpr {
-    expr.rewrite_bottom_up(|node| match &node {
-        PureExpr::Old(inner) => match inner.as_ref() {
-            PureExpr::Var(name, _) if entry_state_params.contains(name) => inner.as_ref().clone(),
-            _ => node,
-        },
-        _ => node,
-    })
 }
 
 pub(in crate::callbacks) fn normalize_immutable_ref_param_vars(

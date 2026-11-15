@@ -51,6 +51,10 @@ pub(crate) struct GhostSourceAssignment {
     pub(crate) lhs_tuple_fields: Vec<usize>,
     /// HIR id of the target local binding.
     pub(crate) lhs_hir_id: HirId,
+    /// The containing body binds `lhs_name` more than once and the binding
+    /// this write targets could not be found among them: the write may have
+    /// changed any binding of that source name (D-237).
+    pub(crate) lhs_binding_unresolved: bool,
     /// Structurally translated RHS expression when it is verifier-pure.
     pub(crate) rhs_expr: Option<PureExpr>,
     /// Best-effort RHS source text, for downstream matching/prototyping only.
@@ -137,6 +141,30 @@ impl<'tcx> SourceAssignmentCollector<'_, 'tcx> {
             return;
         }
 
+        // The HIR names the target by source name; a body that binds that
+        // name more than once names each binding apart (D-237), so the write
+        // targets the binding the HIR resolved it to, or, when the body has no
+        // binding of that name, every binding of the name.
+        let identity = crate::mir_analysis::binding_identity::hir_binding_debug_name(
+            self.tcx, &lhs_name, lhs_hir_id,
+        );
+        let lhs_binding_unresolved = identity != lhs_name
+            && !crate::callbacks::try_get_body_with_context(
+                self.tcx,
+                self.ghost_block.containing_fn,
+            )
+            .is_some_and(|body| {
+                body.body
+                    .var_debug_info
+                    .iter()
+                    .any(|debug| debug.name.as_str() == identity)
+            });
+        let lhs_name = if lhs_binding_unresolved {
+            lhs_name
+        } else {
+            identity
+        };
+
         let rhs_source = self.tcx.sess.source_map().span_to_snippet(rhs.span).ok();
         let rhs_expr = hir_expr_to_pure(rhs);
         let is_deref = matches!(lhs.kind, ExprKind::Unary(UnOp::Deref, _));
@@ -150,6 +178,7 @@ impl<'tcx> SourceAssignmentCollector<'_, 'tcx> {
             lhs_name,
             lhs_tuple_fields,
             lhs_hir_id,
+            lhs_binding_unresolved,
             rhs_expr,
             rhs_source,
             is_deref,
@@ -202,8 +231,9 @@ fn hir_expr_to_pure(expr: &Expr<'_>) -> Option<PureExpr> {
                 rustc_hir::BinOpKind::Add => BinOp::Add,
                 rustc_hir::BinOpKind::Sub => BinOp::Sub,
                 rustc_hir::BinOpKind::Mul => BinOp::Mul,
-                rustc_hir::BinOpKind::Div => BinOp::Div,
-                rustc_hir::BinOpKind::Rem => BinOp::Mod,
+                // Rust / Creusot `Int` `/` and `%` truncate toward zero.
+                rustc_hir::BinOpKind::Div => BinOp::DivTrunc,
+                rustc_hir::BinOpKind::Rem => BinOp::RemTrunc,
                 rustc_hir::BinOpKind::Eq => BinOp::Eq,
                 rustc_hir::BinOpKind::Lt => BinOp::Lt,
                 rustc_hir::BinOpKind::Le => BinOp::Le,
@@ -257,7 +287,6 @@ fn is_tuple_ctor_callee(callee: &Expr<'_>) -> bool {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -278,64 +307,19 @@ mod tests {
     }
 
     impl Callbacks for AssignmentProbe {
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            let ghost_blocks = find_ghost_blocks(tcx);
-            self.assignments = collect_ghost_source_assignments(tcx, &ghost_blocks);
-            self.ran = true;
-            Compilation::Stop
-        }
-    }
-
-    fn dependency_dir() -> PathBuf {
-        std::env::current_exe()
-            .expect("current test executable path")
-            .parent()
-            .expect("test executable should live under deps/")
-            .to_path_buf()
-    }
-
-    fn dependency_artifact(crate_name: &str, extensions: &[&str]) -> PathBuf {
-        let prefix = format!("lib{crate_name}-");
-        let mut candidates: Vec<PathBuf> = fs::read_dir(dependency_dir())
-            .expect("read dependency dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    return false;
-                };
-                file_name.starts_with(&prefix)
-                    && path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| extensions.contains(&ext))
-                    // A zero-length artifact is a cargo placeholder, and
-                    // passing it to `--extern` fails as "can't find crate".
-                    && fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                let ghost_blocks = find_ghost_blocks(tcx);
+                self.assignments = collect_ghost_source_assignments(tcx, &ghost_blocks);
+                self.ran = true;
+                Compilation::Stop
             })
-            .collect();
-        // Prefer an rlib over an rmeta, then the most recently modified. A
-        // `target/debug/deps` that has been rebuilt a few times holds many
-        // `libtrust_wp-<hash>` artifacts, and only the newest matches the
-        // current compilation. Picking any other one fails with "can't find
-        // crate for `trust_wp`", which reads as a defect in the code under
-        // test rather than in the harness. Same rule as
-        // `callbacks/verification/tests/rustc_callback_harness.rs`.
-        candidates.sort_by_key(|path| {
-            let ext_priority: u8 = match path.extension().and_then(|ext| ext.to_str()) {
-                Some("rlib") => 0,
-                Some("rmeta") => 1,
-                _ => 2,
-            };
-            let mtime = fs::metadata(path)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (ext_priority, std::cmp::Reverse(mtime))
-        });
-        candidates
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("missing dependency artifact for {crate_name}"))
+        }
     }
 
     fn collect_from_source(source: &str) -> AssignmentProbe {
@@ -350,14 +334,14 @@ mod tests {
         let source_path = temp_dir.join("test.rs");
         fs::write(&source_path, source).expect("write test source");
 
-        let deps_dir = dependency_dir();
+        let units = trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe();
         // rustc emits artifacts using crate-name form (underscores), and
         // `--cfg` / `--extern` both consume crate-name form. The hyphenated
         // package name `trust-wp` maps to crate name `trust_wp`.
-        let trust_wp_artifact = dependency_artifact("trust_wp", &["rmeta", "rlib"]);
-        let trust_wp_std_artifact = dependency_artifact("trust_wp_std", &["rmeta", "rlib"]);
+        let trust_wp_artifact = units.artifact("trust_wp", &["rmeta", "rlib"]);
+        let trust_wp_std_artifact = units.artifact("trust_wp_std", &["rmeta", "rlib"]);
 
-        let args = vec![
+        let mut args = vec![
             "rustc".to_string(),
             source_path.to_string_lossy().into_owned(),
             "--crate-name".to_string(),
@@ -367,8 +351,6 @@ mod tests {
             "--edition=2021".to_string(),
             "--cfg".to_string(),
             "trust_wp".to_string(),
-            "-L".to_string(),
-            format!("dependency={}", deps_dir.display()),
             "--extern".to_string(),
             format!("trust_wp={}", trust_wp_artifact.display()),
             "--extern".to_string(),
@@ -376,6 +358,7 @@ mod tests {
             "--out-dir".to_string(),
             temp_dir.to_string_lossy().into_owned(),
         ];
+        args.extend(units.search_args());
 
         let mut callbacks = AssignmentProbe::default();
         run_compiler(&args, &mut callbacks);

@@ -85,7 +85,7 @@ fn rewrite_unit_block_stmt(stmt: &mut Stmt) {
 /// pattern with statement-level logic (Stmt::Local, Stmt::Expr). Not converted
 /// to `rewrite_expr_bottom_up` because the ownership-based helper cannot thread
 /// mutable references and the Call-specific path-arg capture logic is unique to
-/// this walker. Deferred per designs/2026-03-19-2530. (#2530)
+/// this walker. (#2530)
 fn rewrite_unit_block_expr(expr: &mut Expr) {
     match expr {
         Expr::Call(call) => {
@@ -229,31 +229,36 @@ fn annotate_untyped_param_with_int(pat: syn::Pat) -> syn::Pat {
 /// Only applied inside `snapshot!` expansion — does not affect general
 /// `such_that` calls in the language.
 pub(crate) fn rewrite_such_that_closure_to_mapping(expr: Expr) -> Expr {
-    rewrite_expr_bottom_up(expr, &mut |e| {
-        if let Expr::Call(mut call) = e {
+    rewrite_expr_bottom_up(expr, &mut |e| match e {
+        Expr::Call(mut call) => {
             let is_such_that = matches!(
                 call.func.as_ref(),
                 Expr::Path(path) if path.path.segments.last()
                     .is_some_and(|seg| seg.ident == "such_that")
             );
             if is_such_that {
-                call.args = call
-                    .args
-                    .into_iter()
-                    .map(|arg| {
-                        if matches!(&arg, Expr::Closure(_)) {
-                            syn::parse_quote! {
-                                ::trust_wp_std::logic::Mapping::<_, _>::from_closure(#arg)
-                            }
-                        } else {
-                            arg
-                        }
-                    })
-                    .collect();
+                call.args = call.args.into_iter().map(wrap_closure_as_mapping).collect();
             }
             Expr::Call(call)
-        } else {
-            e
         }
+        // `FMap::merge` takes the resolver as a `Mapping`, because that is what
+        // a pearlite closure denotes and the only thing spec text can hand it.
+        // A `snapshot!` body is ordinary Rust, so the closure written there
+        // needs the same denotation spelled out.
+        Expr::MethodCall(mut call) if call.method == "merge" => {
+            call.args = call.args.into_iter().map(wrap_closure_as_mapping).collect();
+            Expr::MethodCall(call)
+        }
+        other => other,
     })
+}
+
+fn wrap_closure_as_mapping(arg: Expr) -> Expr {
+    if matches!(&arg, Expr::Closure(_)) {
+        syn::parse_quote! {
+            ::trust_wp_std::logic::Mapping::<_, _>::from_closure(#arg)
+        }
+    } else {
+        arg
+    }
 }

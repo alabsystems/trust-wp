@@ -10,6 +10,10 @@
 //! - Phase 1: Fn closure-spec methods (precondition, postcondition) as uninterpreted predicates
 //! - Phase 1.5: Non-trusted Fn closures via call-site assumption injection
 //! - Phase 2: FnMut closures with postcondition_mut (four-place predicate with ^self)
+//!
+//! Contracts state their arithmetic over `@` views: on a machine integer a
+//! clause's `+` is the oracle's wrapping add (D-232), and a closure contract
+//! of more than one attribute gets no type check to read it at its type.
 
 use trust_wp::{ensures, requires, trusted};
 
@@ -171,10 +175,12 @@ fn call_fn_mut_twice_trusted<F: FnMut(i32) -> i32>(f: &mut F, x: i32) -> i32 {
 // =============================================================================
 
 /// Positive Phase 3 case: inline closure contract matches closure body.
+///
+/// `x < i32::MAX` is the tightest bound that keeps `x + 1` from overflowing.
 fn phase3_annotated_closure_positive() {
     let _closure = {
-        #[requires(x > 0)]
-        #[ensures(result == x + 1)]
+        #[requires(x > 0 && x < i32::MAX)]
+        #[ensures(result@ == x@ + 1)]
         |x: i32| -> i32 { x + 1 }
     };
 }
@@ -182,17 +188,20 @@ fn phase3_annotated_closure_positive() {
 /// Negative Phase 3 case: inline closure contract is too strong.
 fn phase3_annotated_closure_negative() {
     let _closure = {
-        #[requires(x > 0)]
-        #[ensures(result == x + 2)]
+        #[requires(x > 0 && x < i32::MAX)]
+        #[ensures(result@ == x@ + 2)]
         |x: i32| -> i32 { x + 1 }
     };
 }
 
 /// Positive capture substitution case: contract references captured `y`.
+///
+/// Spec arithmetic is unbounded, so `x + y <= i32::MAX` is exactly the
+/// no-overflow condition for `x + y`; with `x > 0` the sum cannot underflow.
 fn phase3_capture_substitution_positive(y: i32) {
     let _closure = {
-        #[requires(x > 0)]
-        #[ensures(result == x + y)]
+        #[requires(x > 0 && x@ + y@ <= i32::MAX@)]
+        #[ensures(result@ == x@ + y@)]
         |x: i32| -> i32 { x + y }
     };
 }
@@ -200,8 +209,8 @@ fn phase3_capture_substitution_positive(y: i32) {
 /// Negative capture substitution case: captured-variable contract is too strong.
 fn phase3_capture_substitution_negative(y: i32) {
     let _closure = {
-        #[requires(x > 0)]
-        #[ensures(result == x + y + 1)]
+        #[requires(x > 0 && x@ + y@ <= i32::MAX@)]
+        #[ensures(result@ == x@ + y@ + 1)]
         |x: i32| -> i32 { x + y }
     };
 }
@@ -224,9 +233,13 @@ fn phase3_basic_capture_return(y: i32) {
 /// Multi-argument closure (adapted from Creusot 01_basic.rs `multi_arg`).
 ///
 /// Tests closure body extraction with two parameters: `|a, b| a + b`.
+///
+/// Spec arithmetic is unbounded, so the precondition is exactly the set of
+/// `(a, b)` for which `a + b` stays in `i32`.
 fn phase3_basic_multi_arg_positive() {
     let _closure = {
-        #[ensures(result == a + b)]
+        #[requires(a@ + b@ >= i32::MIN@ && a@ + b@ <= i32::MAX@)]
+        #[ensures(result@ == a@ + b@)]
         |a: i32, b: i32| -> i32 { a + b }
     };
 }
@@ -252,7 +265,7 @@ fn phase3_basic_multi_arg_fails() {
 fn phase3_fnmut_capture_increment_positive(mut x: i32) {
     let mut _closure = {
         #[requires(x < 1000)]
-        #[ensures(x == old(x) + 1)]
+        #[ensures(x@ == old(x@) + 1)]
         #[ensures(result == 5)]
         || -> i32 {
             x += 1;
@@ -265,7 +278,7 @@ fn phase3_fnmut_capture_increment_positive(mut x: i32) {
 fn phase3_fnmut_capture_increment_negative(mut x: i32) {
     let mut _closure = {
         #[requires(x < 1000)]
-        #[ensures(x == old(x) + 2)]
+        #[ensures(x@ == old(x@) + 2)]
         #[ensures(result == 5)]
         || -> i32 {
             x += 1;
@@ -285,7 +298,7 @@ fn phase3_fnmut_capture_increment_negative(mut x: i32) {
 ///
 /// This tests that `resolve(v)` in a postcondition correctly encodes as
 /// `v_current == v_final` in SMT.
-#[requires(*v > 0)]
+#[requires(*v > 0 && *v < i32::MAX)]
 #[ensures(^v == *v + 1)]
 fn phase4_resolve_simple_positive(v: &mut i32) {
     *v += 1;
@@ -342,7 +355,7 @@ fn call_fn_once_negative<F: FnOnce(i32) -> i32>(f: F, x: i32) -> i32 {
 /// Marked #[trusted] because the body uses FnMut::call_mut internally
 /// but the contract speaks in FnOnce terms.
 #[trusted]
-#[requires((*f).precondition(x))]
+#[requires(f.precondition(x))]
 #[ensures(f.postcondition_once(x, result))]
 fn call_fn_mut_as_fn_once_trusted<F: FnMut(i32) -> i32>(mut f: F, x: i32) -> i32 {
     f(x)
@@ -358,7 +371,7 @@ fn call_fn_mut_as_fn_once_trusted<F: FnMut(i32) -> i32>(mut f: F, x: i32) -> i32
 ///     ==> postcondition_once(self, args, result)
 ///
 /// This exercises the full FnMut->FnOnce weakening through the verification pipeline.
-#[requires((*f).precondition(x))]
+#[requires(f.precondition(x))]
 #[ensures(f.postcondition_once(x, result))]
 fn call_fn_mut_as_fn_once_verified<F: FnMut(i32) -> i32>(mut f: F, x: i32) -> i32 {
     f(x)
@@ -368,7 +381,7 @@ fn call_fn_mut_as_fn_once_verified<F: FnMut(i32) -> i32>(mut f: F, x: i32) -> i3
 ///
 /// Claims `result > x` but postcondition_once only provides the abstract
 /// closure contract — no concrete bound on result relative to x.
-#[requires((*f).precondition(x))]
+#[requires(f.precondition(x))]
 #[ensures(result > x)]
 fn call_fn_mut_as_fn_once_negative<F: FnMut(i32) -> i32>(mut f: F, x: i32) -> i32 {
     f(x)
@@ -454,7 +467,7 @@ fn call_fn_negative<F: Fn(i32) -> i32>(f: F, x: i32) -> i32 {
 ///
 /// This variant uses `mut f: F` (by-value with mut binding) — the same
 /// pattern as Creusot's `weaken_2_std`.
-#[requires((*f).precondition(a))]
+#[requires(f.precondition(a))]
 #[ensures(f.postcondition_once(a, result))]
 fn weaken_fn_mut_to_fn_once<F: FnMut(i32) -> i32>(mut f: F, a: i32) -> i32 {
     f(a)
@@ -594,9 +607,13 @@ fn phase6_move_closure_negative(y: i32) {
 }
 
 /// Move closure capturing two variables and using both in computation.
+///
+/// Spec arithmetic is unbounded, so the precondition is exactly the set of
+/// captured `(a, b)` for which `a + b` stays in `i32`.
 fn phase6_move_closure_two_captures(a: i32, b: i32) {
     let _closure = {
-        #[ensures(result == a + b)]
+        #[requires(a@ + b@ >= i32::MIN@ && a@ + b@ <= i32::MAX@)]
+        #[ensures(result@ == a@ + b@)]
         move || -> i32 { a + b }
     };
 }

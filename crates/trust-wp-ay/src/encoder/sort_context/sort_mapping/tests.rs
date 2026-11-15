@@ -243,7 +243,8 @@ fn test_expr_sort_to_ay_sort_respects_qualified_model_classification() {
 }
 
 /// Verify TypeParam encodes to Int (universal sort) for monomorphic
-/// verification. (#2551: previously Uninterpreted, causing sort mismatches.)
+/// verification; an Uninterpreted sort would mismatch against the Int-sorted
+/// values it is compared with. (#2551)
 #[test]
 #[timeout(30000)]
 fn test_type_param_resolves_to_int() {
@@ -302,11 +303,24 @@ fn test_ay_sort_to_expr_sort_int_is_none() {
     assert_eq!(ay_sort_to_expr_sort(&Sort::Int), None);
 }
 
-/// Sort::Real → ExprSort::Float
+/// A float format's sort maps back to its float sort; `Real` is no float.
 #[test]
 #[timeout(30000)]
-fn test_ay_sort_to_expr_sort_real() {
-    assert_eq!(ay_sort_to_expr_sort(&Sort::Real), Some(ExprSort::Float));
+fn test_ay_sort_to_expr_sort_float_formats() {
+    use trust_wp_core::formula::FloatWidth;
+    assert_eq!(
+        ay_sort_to_expr_sort(&Sort::FloatingPoint(11, 53)),
+        Some(ExprSort::Float(FloatWidth::F64))
+    );
+    assert_eq!(
+        ay_sort_to_expr_sort(&Sort::FloatingPoint(8, 24)),
+        Some(ExprSort::Float(FloatWidth::F32))
+    );
+    assert_eq!(ay_sort_to_expr_sort(&Sort::FloatingPoint(5, 11)), None);
+    assert_ne!(
+        ay_sort_to_expr_sort(&Sort::Real),
+        Some(ExprSort::Float(FloatWidth::F64))
+    );
 }
 
 /// Sort::Seq(Int) → ExprSort::Seq (native sort path)
@@ -319,8 +333,9 @@ fn test_ay_sort_to_expr_sort_native_seq() {
     );
 }
 
-/// After #2080 migration, Uninterpreted("Seq") is no longer special-cased.
-/// It falls through to Datatype("Seq") since all Seq sorts are now native Sort::Seq(Int).
+/// Uninterpreted("Seq") is not special-cased: every Seq sort is native
+/// Sort::Seq(Int), so the uninterpreted spelling falls through to
+/// Datatype("Seq"). (#2080)
 #[test]
 #[timeout(30000)]
 fn test_ay_sort_to_expr_sort_seq_uninterpreted_is_datatype_post_migration() {
@@ -429,11 +444,16 @@ fn test_ay_sort_roundtrip_stable_sorts() {
         ay_sort_to_expr_sort(&expr_sort_to_ay_sort(&ExprSort::Tuple(3))),
         Some(ExprSort::Tuple(3)),
     );
-    // Float: ExprSort::Float → Sort::Real → ExprSort::Float
-    assert_eq!(
-        ay_sort_to_expr_sort(&expr_sort_to_ay_sort(&ExprSort::Float)),
-        Some(ExprSort::Float),
-    );
+    // Float: each format round-trips through its floating-point sort.
+    for width in [
+        trust_wp_core::formula::FloatWidth::F32,
+        trust_wp_core::formula::FloatWidth::F64,
+    ] {
+        assert_eq!(
+            ay_sort_to_expr_sort(&expr_sort_to_ay_sort(&ExprSort::Float(width))),
+            Some(ExprSort::Float(width)),
+        );
+    }
     // Int: ExprSort::Int → Sort::Int → None (Int is default, None is backward compat)
     assert_eq!(
         ay_sort_to_expr_sort(&expr_sort_to_ay_sort(&ExprSort::Int)),
@@ -479,7 +499,10 @@ fn test_encode_mutref_inner_sort_primitives() {
     assert_eq!(encode_mutref_inner_sort(&ExprSort::Seq), "seq");
     assert_eq!(encode_mutref_inner_sort(&ExprSort::Unit), "unit");
     assert_eq!(encode_mutref_inner_sort(&ExprSort::FMap), "fmap");
-    assert_eq!(encode_mutref_inner_sort(&ExprSort::Float), "float");
+    assert_eq!(
+        encode_mutref_inner_sort(&ExprSort::Float(trust_wp_core::formula::FloatWidth::F64)),
+        "float_f64"
+    );
 }
 
 #[test]
@@ -529,7 +552,11 @@ fn test_decode_mutref_inner_sort_primitives() {
     assert_eq!(decode_mutref_inner_sort("seq"), Some(ExprSort::Seq));
     assert_eq!(decode_mutref_inner_sort("unit"), Some(ExprSort::Unit));
     assert_eq!(decode_mutref_inner_sort("fmap"), Some(ExprSort::FMap));
-    assert_eq!(decode_mutref_inner_sort("float"), Some(ExprSort::Float));
+    assert_eq!(
+        decode_mutref_inner_sort("float_f32"),
+        Some(ExprSort::Float(trust_wp_core::formula::FloatWidth::F32))
+    );
+    assert_eq!(decode_mutref_inner_sort("float"), None);
 }
 
 #[test]
@@ -574,7 +601,8 @@ fn test_mutref_inner_sort_roundtrip_all_variants() {
         ExprSort::Seq,
         ExprSort::Unit,
         ExprSort::FMap,
-        ExprSort::Float,
+        ExprSort::Float(trust_wp_core::formula::FloatWidth::F32),
+        ExprSort::Float(trust_wp_core::formula::FloatWidth::F64),
         ExprSort::Tuple(2),
         ExprSort::Datatype(intern_sort_name("Option")),
         ExprSort::TypeParam(intern_sort_name("K")),
@@ -745,8 +773,8 @@ fn m2_carrier_tuple_sort_name_round_trips() {
 #[test]
 #[timeout(30000)]
 fn m2_carrier_tuple_requires_at_least_one_mut_ref() {
-    // No `&mut` element: no carrier sort, so the tuple keeps its
-    // byte-identical legacy `Tuple{arity}` spelling (zero corpus churn).
+    // No `&mut` element: no carrier sort, so the tuple keeps its plain
+    // `Tuple{arity}` spelling and value-only tuples are untouched.
     assert_eq!(mutref_carrier_tuple_sort_name(&[None, None]), None);
     assert_eq!(mutref_carrier_tuple_sort_name(&[]), None);
     // A non-`MutRef` token is not a spelling this module mints — a
@@ -814,7 +842,7 @@ fn m2_option_of_carrier_tuple_maps_to_the_specialized_family() {
     assert_eq!(sort, Sort::Uninterpreted(family.name));
 }
 
-// --- restore-route audit (2026-08-26): the carrier recognizer -------------
+// --- the carrier recognizer (`ay_sort_contains_mut_ref_carrier`) ----------
 
 #[test]
 #[timeout(30000)]

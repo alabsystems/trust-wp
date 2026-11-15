@@ -244,8 +244,24 @@ where
     K: Eq + Hash,
     V: PartialEq,
 {
+    /// Creusot `hash_map.rs` `from_iter_post`, last-occurrence semantics:
+    /// `forall<k, v> (res@.get(k) == Some(v)) == (exists<i> prod[i] == (k, v)
+    ///     && forall<j> i < j < prod.len() ==> prod[j].0 != k)`.
+    /// A key that occurs several times maps to the value of its LAST
+    /// occurrence, so `[(1, 10), (1, 20)]` collects to `{1 => 20}` (len 1).
     fn from_iter_post(&self, prod: Seq<(K, V)>) -> bool {
-        self.len() == prod.len() && prod.matches_map(self)
+        let pairs: Vec<&(K, V)> = prod.iter().collect();
+        let last_index_of = |key: &K| pairs.iter().rposition(|(k, _)| k == key);
+        // (<=) every last occurrence `(k, v)` is an entry of the map.
+        let last_occurrences_present = pairs
+            .iter()
+            .enumerate()
+            .all(|(i, (k, v))| last_index_of(k) != Some(i) || self.get(k) == Some(v));
+        // (=>) every map entry is the last occurrence of its key in `prod`.
+        let entries_are_last_occurrences = self
+            .iter()
+            .all(|(k, v)| last_index_of(k).is_some_and(|i| pairs[i].1 == *v));
+        last_occurrences_present && entries_are_last_occurrences
     }
 }
 
@@ -639,6 +655,25 @@ mod tests {
         assert!(map.from_iter_post(prod));
     }
 
+    /// T1: duplicate keys follow Creusot's last-occurrence semantics
+    /// (`hash_map.rs` `from_iter_post`): `[(1, 10), (1, 20)]` is `{1 => 20}`.
+    #[test]
+    fn test_hashmap_from_iter_post_duplicate_keys_last_occurrence() {
+        let prod = || Seq::from(vec![(1i32, 10i32), (1i32, 20i32)]);
+        let collected: HashMap<i32, i32> = prod().iter().copied().collect();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected.get(&1), Some(&20));
+        assert!(collected.from_iter_post(prod()));
+
+        let first_wins = HashMap::from([(1i32, 10i32)]);
+        assert!(!first_wins.from_iter_post(prod()));
+        let extra_key = HashMap::from([(1i32, 20i32), (2i32, 0i32)]);
+        assert!(!extra_key.from_iter_post(prod()));
+        let empty: HashMap<i32, i32> = HashMap::new();
+        assert!(!empty.from_iter_post(prod()));
+        assert!(empty.from_iter_post(Seq::from(vec![])));
+    }
+
     #[test]
     fn test_hashmap_from_iter_post_mismatch() {
         let mut map = HashMap::new();
@@ -669,19 +704,32 @@ mod tests {
         assert!(it.produces(visited, o));
     }
 
+    /// T2: the generic collect entry states nothing about the result; the
+    /// view roundtrip lives only in the gated `ITERATOR_COLLECT_ROUNDTRIP`.
     #[test]
     fn test_collect_spec_parses() {
         let spec = crate::std::test_shim::parse_spec_string(specs::ITERATOR_COLLECT);
         assert!(spec.requires.is_empty());
-        assert_eq!(spec.ensures.len(), 2);
         assert!(
-            spec.ensures.iter().any(|e| e.contains("from_iter_post")),
-            "ITERATOR_COLLECT should keep from_iter_post bridge"
+            spec.ensures.is_empty(),
+            "ITERATOR_COLLECT must carry no ungated result clause; got {:?}",
+            spec.ensures
         );
         assert!(
-            spec.ensures.iter().any(|e| e.contains("result@ == self@")),
-            "ITERATOR_COLLECT should include extensional view round-trip"
+            !specs::ITERATOR_COLLECT.contains("result@ == self@"),
+            "ITERATOR_COLLECT must not contain the view roundtrip"
         );
+        assert!(
+            !specs::ITERATOR_COLLECT.contains("from_iter_post(self@)"),
+            "ITERATOR_COLLECT must not treat self@ as the produced sequence"
+        );
+    }
+
+    #[test]
+    fn test_collect_roundtrip_spec_parses() {
+        let spec = crate::std::test_shim::parse_spec_string(specs::ITERATOR_COLLECT_ROUNDTRIP);
+        assert!(spec.requires.is_empty());
+        assert_eq!(spec.ensures, vec!["result@ == self@".to_string()]);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use trust_wp::{ensures, requires};
 ///
 /// The `#[requires]` and `#[ensures]` attributes specify the function's
 /// contract using Creusot-compatible syntax.
-#[requires(x > i32::MIN)]
+#[requires(x < i32::MAX)]
 #[ensures(result == x + 1)]
 fn increment(x: i32) -> i32 {
     x + 1

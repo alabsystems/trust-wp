@@ -26,7 +26,7 @@ use std::{borrow::Borrow, collections::HashMap, hash::Hash, marker::PhantomData,
 
 use super::{
     ra::{UnitRA, RA},
-    Int, Seq,
+    Int, Mapping, Seq,
 };
 
 /// A finite map type for specifications.
@@ -231,22 +231,20 @@ where
         self
     }
 
-    /// Merge two maps, combining conflicting values with `f`.
-    pub fn merge<F>(self, other: Self, f: F) -> Self
-    where
-        K: Clone,
-        V: Clone,
-        F: Fn((V, V)) -> V,
-    {
-        let mut result = other;
-        for (k, v_left) in self.map {
-            if let Some(v_right) = result.map.get(&k).cloned() {
-                result.map.insert(k, f((v_left, v_right)));
-            } else {
-                result.map.insert(k, v_left);
-            }
-        }
-        result
+    /// Merge two maps, combining conflicting values with the logical function
+    /// `f`.
+    ///
+    /// `f` is a `Mapping`, not an `Fn`, because that is the only thing a
+    /// specification can hand it: the macro surface compiles every pearlite
+    /// closure into a `Mapping`, so an `Fn` bound here is a parameter no
+    /// contract can ever fill. A `Mapping` is applied by INDEXING and carries
+    /// no code, which is why this has no runtime model — the overlap value is
+    /// stated by the contract, and a model that invented one (taking the left
+    /// value, say) would be a different function from the one proofs reason
+    /// about.
+    pub fn merge(self, other: Self, f: Mapping<(V, V), V>) -> Self {
+        let _ = (self, other, f);
+        panic!("ghost code only")
     }
 
     /// Extensional equality (same key/value mapping).
@@ -1120,18 +1118,6 @@ mod tests {
         let map1 = FMap::singleton(1, 10);
         let map2 = FMap::singleton(1, 20);
         let _ = map1.union(map2);
-    }
-
-    #[test]
-    fn test_fmap_merge_preserves_non_overlapping_values() {
-        let map1 = FMap::empty().insert(1, 10).insert(2, 20);
-        let map2 = FMap::empty().insert(2, 200).insert(3, 30);
-        let merged = map1.merge(map2, |(left, right)| left + right);
-
-        assert_eq!(merged.len(), Int(3));
-        assert_eq!(merged.lookup(1), 10);
-        assert_eq!(merged.lookup(2), 220);
-        assert_eq!(merged.lookup(3), 30);
     }
 
     #[test]

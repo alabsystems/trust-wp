@@ -50,6 +50,10 @@ impl Callbacks for ClosureArgCallbacks {
                 trait_specs: &trait_specs,
                 extern_specs: &extern_specs,
                 closure_capture_names: None,
+                final_reborrow_sites: std::collections::HashSet::new(),
+                written_deref_reads: HashMap::new(),
+                loop_head_rebinds: HashMap::new(),
+                renamable_params: std::collections::HashSet::new(),
             };
 
             // Walk basic blocks to find a Call terminator with arguments
@@ -73,8 +77,11 @@ impl Callbacks for ClosureArgCallbacks {
 
                 let mut translated = translate_call_args_for_substitutions(args, &local_exprs);
 
-                // Only process blocks that have fallback args (potential closures)
-                if !translated.iter().any(|ta| ta.is_fallback) {
+                // Only process calls that pass a closure-typed argument.
+                if !args
+                    .iter()
+                    .any(|arg| arg.node.ty(&body.local_decls, tcx).is_closure())
+                {
                     continue;
                 }
 
@@ -125,66 +132,119 @@ fn resolve_closure_args_in_source(source: &str, fn_name: &str) -> Vec<Translated
 
     assert!(
         callbacks.ran,
-        "failed to find a Call with fallback closure args in `{fn_name}`"
+        "failed to find a Call with a closure arg in `{fn_name}`"
     );
     callbacks
         .resolved_args
         .expect("resolved_args should be set when ran=true")
 }
 
+/// The closure-typed argument's translation after resolution.
+fn closure_arg_in_source(source: &str, fn_name: &str) -> TranslatedArg {
+    let resolved = resolve_closure_args_in_source(source, fn_name);
+    // The closure is the last argument of every combinator probed here.
+    resolved.last().cloned().expect("call has arguments")
+}
+
 #[test]
-fn resolve_closure_arg_replaces_fallback_for_simple_closure() {
-    // `ok_or_else(|| 42)` passes a closure as the error-factory argument.
-    // The closure `|| 42` has no captures and returns a constant — the
-    // resolution should replace the fallback TranslatedArg with the
-    // closure's return expression.
+fn resolve_closure_arg_replaces_literal_thunk_exactly() {
+    // `ok_or_else(|| 42)`: capture-free, parameter-free, body `_0 = const 42`.
     let source = r#"
 pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
 x.ok_or_else(|| 42)
 }
 "#;
-
-    let resolved = resolve_closure_args_in_source(source, "test_fn");
-
-    // At least one arg should have been resolved from fallback
-    let any_resolved = resolved.iter().any(|ta| !ta.is_fallback);
+    let arg = closure_arg_in_source(source, "test_fn");
     assert!(
-        any_resolved,
-        "expected at least one fallback arg to be resolved by closure extraction, \
-         got: {:?}",
-        resolved
-            .iter()
-            .map(|ta| (ta.is_fallback, &ta.expr))
-            .collect::<Vec<_>>()
+        arg.exact_callable_value,
+        "literal thunk must be exact: {arg:?}"
+    );
+    assert_eq!(arg.expr, PureExpr::Int(42));
+}
+
+#[test]
+fn resolve_closure_arg_keeps_receiver_untouched() {
+    let source = r#"
+pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
+x.ok_or_else(|| 42)
+}
+"#;
+    let resolved = resolve_closure_args_in_source(source, "test_fn");
+    let receiver = resolved.first().expect("receiver arg");
+    assert!(!receiver.exact_callable_value, "{receiver:?}");
+    assert_ne!(receiver.expr, PureExpr::Int(42));
+}
+
+fn assert_opaque(source: &str, what: &str) {
+    let arg = closure_arg_in_source(source, "test_fn");
+    assert!(
+        arg.opaque_callable(),
+        "{what}: closure argument must stay an opaque callable, got {arg:?}"
     );
 }
 
 #[test]
-fn resolve_closure_arg_preserves_non_fallback_args() {
-    // In a call like `ok_or_else(|| 42)`, the receiver (`self`/`x`) should
-    // already be translated (non-fallback). Only the closure arg should
-    // be touched.
-    let source = r#"
-pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
-x.ok_or_else(|| 42)
+fn resolve_closure_arg_capturing_closure_is_opaque() {
+    assert_opaque(
+        r#"
+pub fn test_fn(x: Option<i32>, b: i32) -> Result<i32, i32> {
+x.ok_or_else(move || b + 1)
 }
-"#;
+"#,
+        "capturing closure",
+    );
+}
 
-    let resolved = resolve_closure_args_in_source(source, "test_fn");
+#[test]
+fn resolve_closure_arg_loop_body_is_opaque() {
+    assert_opaque(
+        r#"
+#[inline(never)]
+fn step(x: i32) -> i32 { x + 1 }
+pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
+x.ok_or_else(|| { let mut i = 0i32; let mut n = 0i32; while i < 3 { n = step(n); i += 1; } n })
+}
+"#,
+        "loop body",
+    );
+}
 
-    // The self/receiver argument (typically arg0) should remain non-fallback
-    // if it was successfully translated from the local_exprs map
-    for (idx, ta) in resolved.iter().enumerate() {
-        if !ta.is_fallback {
-            // Non-fallback args should not have been overwritten with
-            // a different expression by resolve_closure_arg_return_values
-            // (the function skips non-fallback entries)
-            assert!(
-                !matches!(&ta.expr, PureExpr::Int(42)),
-                "arg{idx} was non-fallback but got overwritten with closure return value"
-            );
-        }
-    }
+#[test]
+fn resolve_closure_arg_panicking_body_is_opaque() {
+    assert_opaque(
+        r#"
+pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
+x.ok_or_else(|| { if 1 == 1 { panic!() } 1 })
+}
+"#,
+        "panicking body",
+    );
+}
+
+#[test]
+fn resolve_closure_arg_call_body_is_opaque() {
+    assert_opaque(
+        r#"
+#[inline(never)]
+fn seven() -> i32 { std::hint::black_box(7) }
+pub fn test_fn(x: Option<i32>) -> Result<i32, i32> {
+x.ok_or_else(|| seven())
+}
+"#,
+        "call body",
+    );
+}
+
+#[test]
+fn resolve_closure_arg_parameterised_closure_is_opaque() {
+    assert_opaque(
+        r#"
+pub fn test_fn(x: Option<i32>) -> i32 {
+x.map_or_else(|| 0, |v| v)
+}
+"#,
+        "closure with a parameter",
+    );
 }
 
 /// Test callback that compiles code, finds a target function, and captures
@@ -224,6 +284,8 @@ fn discover_trait_specs(tcx: TyCtxt<'_>) -> HashMap<DefId, StdSpec> {
             trait_specs.insert(
                 assoc_item.def_id,
                 StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires,
                     ensures,
                     param_names: None,
@@ -502,6 +564,8 @@ impl Callbacks for RecursiveSelfSpecReturnExprCallbacks {
                     user_specs.insert(
                         def_id,
                         StdSpec {
+                            capture_inv_requires: Vec::new(),
+                            inv_requires: Vec::new(),
                             requires,
                             ensures,
                             param_names: Some(arg_names.clone()),
@@ -859,8 +923,14 @@ pub fn deref_mut_wrap<T: DerefMut>(x: &mut T) -> &mut T::Target {
 "#;
 
     let assumptions = extract_call_assumptions_in_source_with_std_specs(source, "deref_mut_wrap");
+    // A call postcondition is scoped under the call's own preconditions
+    // (`T::deref_mut.precondition(x) ==> T::deref_mut.postcondition(x, r)`).
     let deref_mut_assumptions: Vec<&PureExpr> = assumptions
         .iter()
+        .map(|assumption| match assumption {
+            PureExpr::BinOp(_, BinOp::Implies, post) => post.as_ref(),
+            other => other,
+        })
         .filter(|assumption| {
             matches!(
                 assumption,
@@ -898,8 +968,14 @@ pub fn deref_mut_wrap<T: DerefMut>(x: &mut T) -> &mut T::Target {
 "#;
 
     let assumptions = extract_call_assumptions_in_source_with_std_specs(source, "deref_mut_wrap");
+    // A call postcondition is scoped under the call's own preconditions
+    // (`T::deref_mut.precondition(x) ==> T::deref_mut.postcondition(x, r)`).
     let deref_mut_assumptions: Vec<&PureExpr> = assumptions
         .iter()
+        .map(|assumption| match assumption {
+            PureExpr::BinOp(_, BinOp::Implies, post) => post.as_ref(),
+            other => other,
+        })
         .filter(|assumption| {
             matches!(
                 assumption,
@@ -967,7 +1043,7 @@ pub fn clone_wrap<T: Clone>(t: &T) -> T {
                         [PureExpr::Var(name, Some(ExprSort::Ref(inner))), PureExpr::Var(result_name, _)]
                             if name == "t"
                                 && matches!(inner.as_ref(), ExprSort::TypeParam(_))
-                                && result_name.starts_with("call_")
+                                && result_name.starts_with("$call_")
                     )
             )
         }),
@@ -976,8 +1052,12 @@ pub fn clone_wrap<T: Clone>(t: &T) -> T {
     );
 }
 
+/// Spec provenance (s38): a LOCAL `ghost::Ghost` in a crate that happens to be
+/// named `trust_wp_std` is not the spec library's `Ghost`; its `deref_mut` must
+/// not receive the builtin whole-borrow passthrough (`result == x`), because
+/// the local body may do anything.
 #[test]
-fn ghost_deref_mut_return_expr_uses_whole_borrow_receiver() {
+fn ghost_deref_mut_local_lookalike_does_not_get_whole_borrow_passthrough() {
     let source = r#"
 use std::ops::DerefMut;
 
@@ -1010,12 +1090,11 @@ pub fn ghost_deref_mut_wrap(x: &mut ghost::Ghost<i32>) -> &mut i32 {
         source,
         "ghost_deref_mut_wrap",
         "trust_wp_std",
-    )
-    .expect("ghost::Ghost::deref_mut return expr should extract with built-in std specs");
+    );
 
     assert!(
-        matches!(&expr, PureExpr::Var(name, _) if name == "x"),
-        "Ghost::deref_mut should resolve to the whole-borrow receiver `x`, got {expr:?}"
+        !matches!(&expr, Some(PureExpr::Var(name, _)) if name == "x"),
+        "a local Ghost lookalike must not resolve to the whole-borrow receiver `x`, got {expr:?}"
     );
 }
 
@@ -1171,7 +1250,7 @@ match x {
 
 fn expr_contains_call_result_var(expr: &PureExpr) -> bool {
     match expr {
-        PureExpr::Var(name, _) => name.starts_with("call_") || name.starts_with("_call_"),
+        PureExpr::Var(name, _) => name.starts_with("$call_") || name.starts_with("$_call_"),
         PureExpr::Bool(_) | PureExpr::Int(_) => false,
         PureExpr::Deref(inner)
         | PureExpr::View(inner)

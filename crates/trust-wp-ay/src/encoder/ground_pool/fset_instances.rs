@@ -18,7 +18,7 @@ impl super::super::AYEncoder {
     /// Ground instances for FSet axioms.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn assert_fset_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         let budget = remaining_budget.min(TRUST_WP_FSET_FAMILY_BUDGET);
 
         if budget == 0 {
@@ -81,7 +81,7 @@ impl super::super::AYEncoder {
                 budget_guard!();
                 let contains_ins_x = self.solver.apply(contains_decl, &[insert_app, x]);
                 self.assert_solver_term("ground/fset_insert_contains", contains_ins_x);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -108,7 +108,7 @@ impl super::super::AYEncoder {
                 let contains_rem_x = self.solver.apply(contains_decl, &[remove_app, x]);
                 let not_contains = self.solver.not(contains_rem_x);
                 self.assert_solver_term("ground/fset_remove_not_contains", not_contains);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -156,7 +156,7 @@ impl super::super::AYEncoder {
                         self.solver.implies(same_receiver, eq)
                     };
                     self.assert_solver_term("ground/fset_intersection_contains", assertion);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -204,7 +204,7 @@ impl super::super::AYEncoder {
                         self.solver.implies(same_receiver, eq)
                     };
                     self.assert_solver_term("ground/fset_difference_contains", assertion);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -223,7 +223,7 @@ impl super::super::AYEncoder {
                     let len_app = self.solver.apply(len_decl, &[args[0]]);
                     let ge_zero = self.solver.ge(len_app, zero);
                     self.assert_solver_term("ground/fset_len_nonneg", ge_zero);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
 
@@ -238,7 +238,7 @@ impl super::super::AYEncoder {
                         let len_eq_zero = self.eq_term(len_app, zero);
                         let iff = self.eq_term(is_empty_app, len_eq_zero);
                         self.assert_solver_term("ground/fset_len_empty_link", iff);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
             }
@@ -265,7 +265,7 @@ impl super::super::AYEncoder {
                     let contains_s_peek = self.solver.apply(contains_decl, &[s, peek_s]);
                     let impl_term = self.solver.implies(not_empty, contains_s_peek);
                     self.assert_solver_term("ground/fset_peek_contains", impl_term);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -292,7 +292,7 @@ impl super::super::AYEncoder {
                 let ite_len = self.solver.ite(contains_s_x, len_s, len_plus_1);
                 let eq = self.eq_term(len_ins, ite_len);
                 self.assert_solver_term("ground/fset_insert_len", eq);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -317,7 +317,7 @@ impl super::super::AYEncoder {
                 let ite_len = self.solver.ite(contains_s_x, len_minus_1, len_s);
                 let eq = self.eq_term(len_rem, ite_len);
                 self.assert_solver_term("ground/fset_remove_len", eq);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -333,7 +333,7 @@ impl super::super::AYEncoder {
                 let is_empty_ins = self.solver.apply(is_empty_decl, &[insert_app]);
                 let not_empty = self.solver.not(is_empty_ins);
                 self.assert_solver_term("ground/fset_insert_non_empty", not_empty);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -353,7 +353,7 @@ impl super::super::AYEncoder {
                 let not_empty = self.solver.not(is_empty_s);
                 let impl_term = self.solver.implies(contains_app, not_empty);
                 self.assert_solver_term("ground/fset_contains_non_empty", impl_term);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -422,8 +422,124 @@ impl super::super::AYEncoder {
                         let x_ne_y = self.solver.not(x_eq_y);
                         let framed = self.solver.implies(x_ne_y, frame_eq);
                         self.assert_solver_term("ground/fset_remove_contains_frame", framed);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
+                }
+            }
+        }
+
+        // Ground instances of the Why3 membership characterisations for
+        // `fset_interval` (FsetInt.interval_def), `fset_filter`
+        // (Fset.filter_def) and `fset_map` (Fset.map_def). Each is the
+        // quantified axiom from `assert_fset_axioms` instantiated at an
+        // observed `contains(r, x)` with `r == <op>(..)`.
+        if let Some(contains_decl) = contains_decl.as_ref() {
+            let mapping = crate::encoder::sort_context::sort_inference::mapping_sort();
+            let entries = |this: &Self, name: &str| -> Vec<(Term, Vec<Term>)> {
+                this.ground_pool
+                    .entries_for(name)
+                    .map(|es| {
+                        es.iter()
+                            .map(|e| (e.application, e.arg_terms.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let interval_entries = entries(self, "fset_interval");
+            let filter_entries = entries(self, "fset_filter");
+            let map_entries = entries(self, "fset_map");
+            let get_decl = if filter_entries.is_empty() && map_entries.is_empty() {
+                None
+            } else {
+                Some(self.get_or_declare_spec_fn(
+                    "mapping_get",
+                    &[mapping.clone(), ay_dpll::api::Sort::Int],
+                    ay_dpll::api::Sort::Int,
+                ))
+            };
+            for (contains_app, contains_args) in &contains_entries {
+                if contains_args.len() != 2 {
+                    continue;
+                }
+                let receiver = contains_args[0];
+                let x = contains_args[1];
+                if self.solver.get_sort(x) != ay_dpll::api::Sort::Int {
+                    continue;
+                }
+                let ops = interval_entries
+                    .iter()
+                    .map(|e| ("interval", e))
+                    .chain(filter_entries.iter().map(|e| ("filter", e)))
+                    .chain(map_entries.iter().map(|e| ("map", e)))
+                    .collect::<Vec<_>>();
+                for (kind, (op_app, op_args)) in ops {
+                    if op_args.len() != 2
+                        || self.solver.get_sort(receiver) != self.solver.get_sort(*op_app)
+                    {
+                        continue;
+                    }
+                    let (a, b) = (op_args[0], op_args[1]);
+                    let expected = match (kind, get_decl.as_ref()) {
+                        ("interval", _) => {
+                            let lower = self.solver.le(a, x);
+                            let upper = self.solver.lt(x, b);
+                            self.solver.and(lower, upper)
+                        }
+                        ("filter", Some(get_decl)) => {
+                            if self.solver.get_sort(b) != mapping {
+                                continue;
+                            }
+                            let mem_s = self.solver.apply(contains_decl, &[a, x]);
+                            let px = self.solver.apply(get_decl, &[b, x]);
+                            let zero = self.solver.int_const(0);
+                            let px_holds = self.solver.neq(px, zero);
+                            self.solver.and(mem_s, px_holds)
+                        }
+                        ("map", Some(get_decl)) => {
+                            if self.solver.get_sort(b) != mapping {
+                                continue;
+                            }
+                            // Skolemized map_def (see `assert_fset_axioms`):
+                            //   (->) contains(r, x) -> contains(a, w) /\ x = get(b, w)
+                            //        with w = fset_map_witness(a, b, x)
+                            let witness_decl = self.get_or_declare_spec_fn(
+                                "fset_map_witness",
+                                &[
+                                    ay_dpll::api::Sort::Int,
+                                    mapping.clone(),
+                                    ay_dpll::api::Sort::Int,
+                                ],
+                                ay_dpll::api::Sort::Int,
+                            );
+                            let w = self.solver.apply(&witness_decl, &[a, b, x]);
+                            let mem_w = self.solver.apply(contains_decl, &[a, w]);
+                            let fw = self.solver.apply(get_decl, &[b, w]);
+                            let x_eq_fw = self.eq_term(x, fw);
+                            let rhs = self.solver.and(mem_w, x_eq_fw);
+                            let forward = self.solver.implies(*contains_app, rhs);
+                            budget_guard!();
+                            let assertion = if receiver == *op_app {
+                                forward
+                            } else {
+                                let same_receiver = self.eq_term(receiver, *op_app);
+                                self.solver.implies(same_receiver, forward)
+                            };
+                            self.assert_solver_term("ground/fset_map_contains_witness", assertion);
+                            count += 1;
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    budget_guard!();
+                    let eq = self.eq_term(*contains_app, expected);
+                    let assertion = if receiver == *op_app {
+                        eq
+                    } else {
+                        let same_receiver = self.eq_term(receiver, *op_app);
+                        self.solver.implies(same_receiver, eq)
+                    };
+                    self.assert_solver_term("ground/fset_builtin_contains", assertion);
+                    count += 1;
                 }
             }
         }

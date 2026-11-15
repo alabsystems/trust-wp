@@ -127,7 +127,7 @@ fn init_fails_without_pre_loop_assignment() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result.initialization, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result.initialization),
         "Init should fail without pre-loop assignment for i. Got: {:?}",
         result.initialization
     );
@@ -751,7 +751,7 @@ fn init_one_of_multiple_invariants_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result.initialization, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result.initialization),
         "Init should fail when sum > 0 but sum starts at 0. Got: {:?}",
         result.initialization
     );

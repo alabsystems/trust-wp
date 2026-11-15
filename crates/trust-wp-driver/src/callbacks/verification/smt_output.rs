@@ -7,7 +7,7 @@
 //! Generates SMT-LIB2 queries from function contracts for debugging and
 //! inspection. Supports two emission sinks (#1691):
 //!
-//! - `--emit-smt`: raw query body to stdout (existing behavior)
+//! - `--emit-smt`: raw query body to stdout
 //! - `--emit-smt-dir <path>`: per-function `.smt2` files with source-mapping
 //!   comments under a crate/module/function directory tree
 
@@ -20,7 +20,6 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 use tracing::warn;
 use trust_wp_core::{
-    formula::PureExpr,
     logic::{LogicFnDef, TypeInvariantDef},
     smt::SmtGenerator,
 };
@@ -76,43 +75,20 @@ pub(in crate::callbacks) fn build_smt_artifacts(
     extern_specs: &HashMap<String, StdSpec>,
     logic_fns: &[LogicFnDef],
 ) -> Vec<GeneratedSmtArtifact> {
-    let user_specs = build_user_spec_table(contracts);
+    let mut user_specs = build_user_spec_table(tcx, contracts, type_invariant_defs);
+    crate::logic::identity::resolve_spec_table_texts(tcx, &mut user_specs);
 
     // Build logic method name set for structural rewriting (mirrors
     // prepare_verification in verification.rs).
     let logic_method_names: HashSet<String> = logic_fns
         .iter()
         .filter(|lf| lf.params().first().is_some_and(|p| p == "self"))
-        .map(|lf| lf.name().to_string())
+        .map(|lf| lf.short_name().to_string())
         .collect();
     let user_shadowed_builtins = build_user_shadowed_builtins(tcx);
 
     // Build const item substitutions (mirrors prepare_verification). (#2123)
-    let const_item_substitutions: HashMap<String, PureExpr> = {
-        use rustc_hir::def::DefKind;
-        let mut map = HashMap::new();
-        for local_def_id in tcx.hir_body_owners() {
-            let def_id = local_def_id.to_def_id();
-            if !matches!(
-                tcx.def_kind(def_id),
-                DefKind::Const { .. } | DefKind::AssocConst { .. }
-            ) {
-                continue;
-            }
-            if let Some(expr) =
-                crate::mir_analysis::translate::resolve_const_item_value(tcx, def_id)
-            {
-                let full_path = tcx.def_path_str(def_id);
-                if let Some(short_name) = full_path.rsplit("::").next() {
-                    map.insert(short_name.to_string(), expr);
-                }
-            }
-        }
-        let generic_assoc_consts =
-            crate::mir_analysis::extract::collect_generic_assoc_const_definitions(tcx);
-        map.extend(generic_assoc_consts);
-        map
-    };
+    let const_item_substitutions = super::super::const_items::const_item_substitutions(tcx);
 
     // Collect trusted proof_assert assumptions. (#2123)
     // SMT emission does not run logic-function verification, so the raw
@@ -134,6 +110,7 @@ pub(in crate::callbacks) fn build_smt_artifacts(
             &user_specs,
             trait_specs,
             extern_specs,
+            type_invariant_defs,
             false,
             !type_invariant_defs.is_empty(),
         );
@@ -145,14 +122,25 @@ pub(in crate::callbacks) fn build_smt_artifacts(
 
         // Structural rewrites: type invariant methods, logic method calls,
         // newtype simplification, named struct field rewriting.
-        rewrite_parsed_contract_structure(
+        //
+        // This is the `--emit-smt` DEBUG path, which publishes no verdict. A
+        // contract whose named-field pattern cannot be placed at its declared
+        // positions (D-31) is refused on the verification path; here it is
+        // skipped, so the dump never shows a pattern read in source order.
+        if let Err(why) = rewrite_parsed_contract_structure(
             tcx,
             contract.def_id,
             &mut parsed,
             type_invariant_defs,
             &logic_method_names,
             &user_shadowed_builtins,
-        );
+        ) {
+            eprintln!(
+                "trust-wp: {} error: {why}; omitted from the SMT dump",
+                tcx.def_path_str(contract.def_id)
+            );
+            continue;
+        }
 
         // Rewrite iterator spec methods for supported types (#2172)
         rewrite_iterator_spec_methods(&mut parsed);
@@ -186,6 +174,8 @@ pub(in crate::callbacks) fn build_smt_artifacts(
             type_invariant_defs,
             synthesized_closure_ensures: &synth_ensures,
             closure_capture_infos: &closure_capture_infos,
+            trait_specs,
+            extern_specs,
         };
         enrich_effective_clauses(
             tcx,
@@ -235,7 +225,7 @@ pub(in crate::callbacks) fn build_smt_artifacts(
     artifacts
 }
 
-/// Emit SMT artifacts to stdout (preserves existing `--emit-smt` behavior).
+/// Emit SMT artifacts to stdout (the `--emit-smt` sink).
 pub(in crate::callbacks) fn emit_smt_artifacts_to_stdout(artifacts: &[GeneratedSmtArtifact]) {
     for artifact in artifacts {
         tracing::debug!(def_path = %artifact.def_path, "emitting SMT to stdout");

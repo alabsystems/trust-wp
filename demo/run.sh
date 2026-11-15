@@ -87,7 +87,7 @@ error: no `trust-wp` binary found.
 
 Build one first (from the repo root):
 
-    cargo build -p trust-wp-cli -p trust-wp-driver -p targo-trust-wp -p trust-wp -p creusot-contracts
+    targo --unverified build -p trust-wp-cli -p trust-wp-driver -p targo-trust-wp -p trust-wp -p creusot-contracts
 
 or point at an existing one:
 
@@ -253,7 +253,7 @@ else
     note "
 --- Part 9: a whole crate ---------------------------------------------------
 Run trust-wp with no file inside a Cargo project and it verifies the package,
-driving cargo with the trust-wp driver as the RUSTC wrapper. This compiles the
+driving targo with the trust-wp driver as the RUSTC wrapper. This compiles the
 contract crates first, so it is the slow step."
     # No subshell: `check` keeps its tallies in this shell's variables.
     HERE="$PWD"

@@ -92,7 +92,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clean-kernel"
-version = "0.4.0"
+version = "0.9.0"
+source = "git+https://github.com/alabsystems/clean.git?rev=e7ae5d418cbac2e1a029369a5b5eda690d471c5c#e7ae5d418cbac2e1a029369a5b5eda690d471c5c"
 dependencies = [
  "ahash",
  "bincode",
@@ -462,9 +463,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "stacker"

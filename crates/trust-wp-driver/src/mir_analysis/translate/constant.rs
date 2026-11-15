@@ -46,7 +46,11 @@ fn translate_promoted_ref_value<'tcx>(
     let ConstValue::Scalar(scalar) = value else {
         return None;
     };
-    let ptr = scalar.to_pointer(&tcx).discard_err()?;
+    // `to_pointer` panics on a size mismatch: one is no pointer.
+    if scalar.size() != tcx.data_layout.pointer_size() {
+        return None;
+    }
+    let ptr = scalar.to_pointer(&tcx);
     let (Some(prov), offset) = ptr.into_raw_parts() else {
         return None;
     };
@@ -110,7 +114,7 @@ fn read_scalar_from_alloc<'tcx>(
                 return None;
             }
             let field_ty = variant.fields[rustc_abi::FieldIdx::ZERO]
-                .ty(tcx, substs)
+                .ty(tcx, *substs)
                 .skip_norm_wip();
             read_scalar_from_alloc(tcx, alloc, offset, field_ty)
         }
@@ -157,10 +161,7 @@ pub(crate) fn translate_constant_with_tcx<'tcx>(
             let def_kind = tcx.def_kind(uneval.def);
             let is_const_item = matches!(
                 def_kind,
-                DefKind::Const { .. }
-                    | DefKind::AssocConst { .. }
-                    | DefKind::AnonConst
-                    | DefKind::InlineConst
+                DefKind::Const { .. } | DefKind::AssocConst { .. } | DefKind::AnonConst
             );
             if !is_const_item {
                 return None;
@@ -259,11 +260,8 @@ pub(crate) fn resolve_const_item_value<'tcx>(
     let ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
     let typing_env = TypingEnv::fully_monomorphized();
     let args = rustc_middle::ty::GenericArgs::empty();
-    let alias_const = rustc_middle::ty::AliasConst::new(
-        tcx,
-        rustc_middle::ty::AliasConstKind::new_from_def_id(tcx, def_id),
-        args,
-    );
+    // `shrink` gives the const its alias kind from its def kind.
+    let alias_const = rustc_middle::mir::UnevaluatedConst::new(def_id, args).shrink(tcx);
     // Try type-level evaluation first (produces ValTree for compound types).
     if let Ok(Ok(val)) =
         tcx.const_eval_resolve_for_typeck(typing_env, alias_const, rustc_span::DUMMY_SP)
@@ -632,7 +630,7 @@ fn translate_valtree_to_expr_with_tcx<'tcx>(
             }
             let mut args = Vec::with_capacity(field_branches.len());
             for (field_vt, field_def) in field_branches.iter().zip(variant.fields.iter()) {
-                let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
+                let field_ty = field_def.ty(tcx, *substs).skip_norm_wip();
                 args.push(translate_valtree_to_expr_with_tcx(
                     tcx,
                     branch_const_to_valtree(*field_vt)?,

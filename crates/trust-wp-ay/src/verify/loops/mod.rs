@@ -54,6 +54,37 @@ use super::{
 };
 use crate::{error::EncodingError, logic::filter_logic_fn_indices_for_goal};
 
+/// Why a loop slice's refutation is withheld when its goal is one trust-wp
+/// synthesized.
+pub(crate) const SYNTHESIZED_GOAL_REASON: &str =
+    "the violated loop invariant is one trust-wp synthesized, not one the program states";
+
+/// Withhold every slice refutation whose goal no source clause states.
+///
+/// A slice's `index` is the position of its invariant in the list it was split
+/// from. The stated invariants lead `ctx.invariants`, and every invariant list
+/// a phase splits keeps them in front, in order. An index at or past
+/// `stated` names a conjecture of trust-wp's own (a frame, a bound, a constant
+/// store), and a model that violates it only shows the conjecture is not
+/// inductive on trust-wp's encoding: it is not a counterexample to anything
+/// the program says (s59_ens_stale_param_pointee_reborrow_write).
+pub(in crate::verify::loops) fn withhold_synthesized_goal_refutations(
+    slice_results: &mut [super::obligation_slices::SliceOutcome],
+    stated: Option<usize>,
+) {
+    let stated = stated.unwrap_or(usize::MAX);
+    for slice in slice_results.iter_mut() {
+        if slice.index >= stated && matches!(slice.outcome.result, VerificationResult::Failed(_)) {
+            slice.outcome = VerificationOutcome::without_provenance(VerificationResult::Unknown(
+                super::UnknownReason::SolverMessage(format!(
+                    "{}: {SYNTHESIZED_GOAL_REASON}",
+                    super::REFUTATION_AUTHORITY_MESSAGE
+                )),
+            ));
+        }
+    }
+}
+
 /// The proof authority a non-executing loop's vacuously-discharged phases carry.
 ///
 /// `may_execute == false` is decided by exactly ONE obligation: the entry check
@@ -204,8 +235,10 @@ fn legacy_verified_phase_evidence_gap_reason(
 pub fn verify_loop_invariant_outcome(
     ctx: &LoopVerificationContext<'_>,
 ) -> Result<LoopVerificationOutcome, EncodingError> {
-    process_isolation::run_loop_outcome_in_child(ctx.config.timeout, || {
-        verify_loop_invariant_inner_outcome(ctx)
+    // THE PLACEMENT GATE (D-31) — see `crate::verify::placement_gate`.
+    let ctx = crate::verify::placement_gate::CheckPlacement::into_placed(ctx)?;
+    process_isolation::run_loop_outcome_in_child(ctx.get().config.timeout, || {
+        verify_loop_invariant_inner_outcome(&ctx)
     })
     .map(LoopVerificationOutcome::apply_mandatory_proof_authority)
 }
@@ -223,18 +256,21 @@ pub(crate) fn verify_loop_invariant_positional(
 }
 
 #[allow(clippy::too_many_lines)] // Central loop VC dispatcher keeps all obligations aligned.
+#[cfg(test)]
 fn verify_loop_invariant_inner(
     ctx: &LoopVerificationContext<'_>,
 ) -> Result<LoopVerificationResult, EncodingError> {
+    let ctx = crate::verify::placement_gate::CheckPlacement::into_placed(ctx)?;
     Ok(legacy_loop_result_from_outcome(
-        verify_loop_invariant_inner_outcome(ctx)?,
+        verify_loop_invariant_inner_outcome(&ctx)?,
     ))
 }
 
 #[allow(clippy::too_many_lines)] // Central loop VC dispatcher keeps all obligations aligned.
 fn verify_loop_invariant_inner_outcome(
-    ctx: &LoopVerificationContext<'_>,
+    ctx: &crate::verify::placement_gate::Placed<&LoopVerificationContext<'_>>,
 ) -> Result<LoopVerificationOutcome, EncodingError> {
+    let ctx = ctx.get();
     let debug_timing = std::env::var("TRUST_WP_LOOP_DEBUG_TIMING").is_ok();
     let phase_start = Instant::now();
     let mut last_phase = phase_start;
@@ -285,9 +321,11 @@ fn verify_loop_invariant_inner_outcome(
             timeout,
             transition_facts: ctx.config.transition_facts.clone(),
             bridge_facts: ctx.config.bridge_facts.clone(),
+            condition_facts: ctx.config.condition_facts.clone(),
             adt_decls: ctx.config.adt_decls,
             adt_field_ranges: ctx.config.adt_field_ranges,
             loop_element_borrow_vars: ctx.config.loop_element_borrow_vars.clone(),
+            stated_invariants: ctx.config.stated_invariants,
         }
     };
     // Apply variable-alias substitutions from pre-loop assignments. (#1295)
@@ -305,9 +343,8 @@ fn verify_loop_invariant_inner_outcome(
     // If a variable has a body effect but is NOT in modified_vars, the
     // postcondition VC would unsoundly constrain it via frame assignments
     // (asserting var == pre_loop_value) while the body modifies it.
-    // This was previously `debug_assert!` (#1884) — promoted to hard error
-    // because unsound frame constraints in release builds are unacceptable
-    // for a verification tool. (#2626)
+    // A hard error rather than a `debug_assert!`: unsound frame constraints
+    // in release builds are unacceptable for a verification tool.
     for key in body_effects.keys() {
         if !modified_set.contains(key.as_str()) {
             return Err(EncodingError::Unsupported {
@@ -388,10 +425,10 @@ fn verify_loop_invariant_inner_outcome(
     //   - Postcondition: the auto-invariant provides the frame information
     //     that postconditions need to reason about unchanged locals.
     //
-    // Previously the postcondition had its own frame_assignments for this
-    // purpose, but those were not available during initialization or as
-    // assumptions for other invariants. Promoting them to full loop invariants
-    // makes them uniformly available across all verification phases.
+    // Frame equalities that live only in the postcondition VC are unavailable
+    // during initialization and as assumptions for other invariants; as full
+    // loop invariants they are uniformly available across all verification
+    // phases.
     let auto_frame_invariants: Vec<PureExpr> = ctx
         .pre_loop_assignments
         .iter()
@@ -414,8 +451,7 @@ fn verify_loop_invariant_inner_outcome(
             // making the preservation check trivially fail.
             if let Some(sort) = &binding.sort {
                 let value_is_int_literal = matches!(binding.value, PureExpr::Int(_));
-                let sort_expects_non_int =
-                    !matches!(sort, ExprSort::Int | ExprSort::Bool | ExprSort::Float);
+                let sort_expects_non_int = !matches!(sort, ExprSort::Int | ExprSort::Bool);
                 if value_is_int_literal && sort_expects_non_int {
                     return false;
                 }
@@ -2500,6 +2536,13 @@ fn infer_constant_deref_invariants(
         // Skip if the effect expression references any modified variable.
         // Such effects change each iteration and are not invariant.
         if expr_helpers::expr_references_any_var(effect_expr, modified_set) {
+            continue;
+        }
+        // A reference the body re-binds (`let r = &mut *a; *r = 7`) stores
+        // into the NEW referent, and the preservation encoding primes the
+        // name by its direct effect alone, so `*r' == 7` is a goal it cannot
+        // state (s59_ens_stale_param_pointee_reborrow_write).
+        if effects.direct.contains_key(var_name) {
             continue;
         }
 

@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 # Nested standalone workspaces (own [workspace] roots): the INTERFACE-v1 reference crate
-# and the spike suite build on stable with their own lockfiles; excluded here so
+# and the spike suite build with their own lockfiles; excluded here so
 # path-deps into them (e.g. trust-wp-driver → trust-spec-iface behind the clean-kernel
 # feature) do not conflict with this workspace root.
 exclude = ["iface/trust-spec-iface", "spikes"]
@@ -24,9 +24,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-# rust-version omitted: requires nightly for rustc_private
+# rust-version omitted: requires the Trust toolchain (rust-toolchain.toml)
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/trust-wp"
@@ -49,18 +49,21 @@ trust-wp-test-utils = { path = "crates/trust-wp-test-utils" }
 trust-wp-ay = { path = "crates/trust-wp-ay" }
 trust-wp-cli = { path = "crates/trust-wp-cli" }
 
-# ay SMT solver: consumed from the released public repo, pinned at the
-# newest ledger-mapped release at export time. The development layout
-# builds against a sibling the pinned ay release checkout instead; publish/transforms.sh
-# rewrites these pins and records the provenance in the stage attestation.
-ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "20646ca1e234199e79427ff58accd05cd8755bf4" }
-ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "20646ca1e234199e79427ff58accd05cd8755bf4" }
+# ay SMT solver: consumed from the released public repo, pinned at ay's
+# newest publication, which the publication engine proved descends from
+# the ay revision this commit was staged against (a sibling ay
+# checkout's HEAD); publish/transforms.sh rewrites these pins, and the
+# stage log records the projection.
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
 
 # trust-ir: universal proof-carrying IR. Provides typed
 # NativeVerificationRequest::TrustWp bundles consumed by the optional
 # trust-ir-native feature in trust-wp-lib. Keep the standalone source exact:
 # a moving branch makes a previously valid --locked build fail when main moves.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "036e1ea8a3994b0eeb826c88e6116cf076560aea" }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
+trust-ir-contract = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", default-features = false }
 
 
 # Proc macro support
@@ -147,47 +150,12 @@ comparison_chain = "allow"
 many_single_char_names = "allow"
 
 [workspace.metadata.atpkg]
-# SHIPPING — but NOT from this bin lane. `expose = []` below is correct and must
-# stay empty; trust-wp reaches users inside the `trust` SYSROOT BUNDLE.
-#
-# The commands: `trust-wp` (the command-line front door, built from the
-# core-only package trust-wp-cli since 2026-08-21 — it needs neither
-# rustc_private nor the solver, so it builds wherever the WP core does and its
-# in-process verbs run in the public snapshot), `targo-trust-wp` (the clippy-shaped front end, invoked
-# `targo trust-wp`; back-compat bin alias `cargo-trust-wp`) and `trust-wp-driver`
-# (the driver doing the real weakest-precondition work, back-compat bin alias
-# `trust-wp-rustc`, also usable directly as
-# `trust-wp-driver file.rs --crate-type=lib -- --force`).
-#
-# STATUS (verified 2026-08-15 against the signed pkg-trust-5520.toml published
-# 2026-08-11 to alabsystems/trust): all five bins ship in the trust bundle and are
-# in its `exposes` list — targo-trust-wp, trust-wp-driver, trust-wp,
-# cargo-trust-wp, trust-wp-rustc.
-#
-# RELOCATABILITY — SOLVED 2026-07-30, and confirmed in the shipped artifact.
-# scripts/trustc-private-wrapper.sh emits @executable_path/../lib and
-# @loader_path/../lib BEFORE the four machine-local absolute rpaths. At pack time
-# `atpkg relocate` DELETES every machine-local rpath (aterm crates/atpkg/src/
-# relocate.rs is_machine_local), so the loader-relative pair is all that survives —
-# and it is what resolves @rpath/librustc_driver-<hash>.dylib out of the bundle's
-# own lib/. otool on the shipped bin/trust-wp-driver shows exactly three LC_RPATHs:
-#   @executable_path/../lib, @loader_path/../lib, @loader_path/../lib/atpkg-vendored
-# Hiding that lib/ makes it die with "Library not loaded: @rpath/librustc_driver-…",
-# proving the loader-relative entries are load-bearing rather than decorative.
-# Only trust_wp_driver / trust_wp_rustc get this treatment (is_driver_bin matches
-# the crate name), so build scripts never get -Cprefer-dynamic; the three front-end
-# bins link statically and carry no rpaths at all.
-#
-# WHY NOT A STANDALONE MEMBER: trust-wp needs a Trust sysroot at RUNTIME, so it can
-# only ever ship ALONGSIDE the `trust` bundle (the `rustc` coherence group).
-# ay-core and ay-dpll are also exact path deps on the sibling ay checkout, so the
-# build host must carry it at the pinned rev. (Spelled without the literal
-# relative path on purpose: publish transform T1 treats that string as a private
-# dependency marker and refuses the export when it survives into the snapshot.)
-#
-#     when bundled:  EXPOSES="targo-trust-wp trust-wp-driver trust-wp"
-#                    (plus back-compat alias bins cargo-trust-wp, trust-wp-rustc)
-#     KNOWN DRIFT: the bins in build 5520 were compiled 2026-08-01; five trust-wp
-#     commits have landed since (through a224bb25), touching the encoder and the
-#     driver's ADT analysis. The next trust bundle re-pack picks them up.
+# `expose = []` must stay empty: trust-wp is not shipped from this bin lane. It
+# needs a Trust sysroot at RUNTIME, so it ships only inside the `trust` sysroot
+# bundle (the `rustc` coherence group), which exposes targo-trust-wp,
+# trust-wp-driver and trust-wp plus the back-compat alias bins. The wrapper
+# emits loader-relative rpaths for the two driver bins so the relocated bundle
+# resolves librustc_driver from its own lib/. The build host must carry the
+# sibling ay checkout; the relative path is deliberately not spelled here, since
+# publish transform T1 treats that string as a private-dependency marker.
 expose = []

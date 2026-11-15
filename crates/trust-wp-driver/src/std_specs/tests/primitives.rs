@@ -586,7 +586,12 @@ fn test_lookup_next_power_of_two() {
     ] {
         let spec = lookup_std_spec(path)
             .unwrap_or_else(|| panic!("{path} should have a next_power_of_two spec"));
-        assert!(spec.requires.is_empty());
+        assert_eq!(spec.requires.len(), 1, "{path} owes its overflow panic");
+        assert!(
+            !spec.requires[0].contains("Self::MAX"),
+            "{path}: Self::MAX must be resolved to the receiver type: {:?}",
+            spec.requires
+        );
         assert_eq!(
             spec.ensures.len(),
             3,
@@ -654,7 +659,11 @@ fn test_lookup_wrapping_mul() {
     assert!(spec.requires.is_empty());
     assert_eq!(spec.ensures.len(), 1);
     assert!(spec.ensures[0].contains("self@ * rhs@"));
-    assert!(spec.ensures[0].contains('%'));
+    // The reduction is EUCLIDEAN and must be spelled explicitly: pearlite `%`
+    // truncates (Creusot `int.ComputerDivision.mod`) and would be wrong for a
+    // negative `self * rhs - MIN`.
+    assert!(spec.ensures[0].contains(".rem_euclid("));
+    assert!(!spec.ensures[0].contains('%'));
 }
 
 // Self::MIN/Self::MAX resolution at lookup time (#967)

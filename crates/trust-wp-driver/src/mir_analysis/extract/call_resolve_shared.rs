@@ -20,11 +20,11 @@ use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{BasicBlock, Body, Local, Operand},
-    ty::TyCtxt,
+    ty::{TyCtxt, TypeVisitableExt},
 };
 use rustc_span::Spanned;
 use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
-use trust_wp_driver::{lookup_spec_with_extern, StdSpec};
+use trust_wp_driver::StdSpec;
 
 use super::{
     super::{
@@ -46,6 +46,10 @@ use super::{
 /// paths through the Creusot compatibility shim (`creusot_std::Int`).
 pub(super) fn is_trust_wp_int_type(tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) -> bool {
     if let rustc_middle::ty::TyKind::Adt(adt_def, _) = ty.kind() {
+        // Provenance: a local `mod trust_wp_std { struct Int }` prints alike.
+        if !crate::provenance::is_spec_library_item(tcx, adt_def.did()) {
+            return false;
+        }
         let path = tcx.def_path_str(adt_def.did());
         path == "trust_wp_std::logic::int::Int"
             || path == "trust_wp_std::logic::Int"
@@ -92,9 +96,14 @@ pub(super) fn try_int_passthrough(
     } else if call_path.ends_with("::mul") {
         Some(BinOp::Mul)
     } else if call_path.ends_with("::div") {
-        Some(BinOp::Div)
+        // `Div::div` truncates toward zero: trust-wp-std `Int` divides its
+        // i128 with Rust `/`, and Creusot's Int `/` is
+        // `int.ComputerDivision.div`. Euclidean `BinOp::Div` would model
+        // `(-7).div(2)` as -4 instead of -3; `div_euclid` stays Euclidean.
+        Some(BinOp::DivTrunc)
     } else if call_path.ends_with("::rem") {
-        Some(BinOp::Mod)
+        // `Rem::rem` on primitives (and trust-wp-std `Int`) truncates.
+        Some(BinOp::RemTrunc)
     } else {
         None
     };
@@ -252,18 +261,299 @@ fn box_new_wraps_closure_env<'tcx>(
 /// needed). Returns the first const-generic argument that resolves to a concrete
 /// integer. (syntax/13_vec_macro)
 fn box_assume_init_into_vec_array_len<'tcx>(func: &Operand<'tcx>) -> Option<PureExpr> {
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     let rustc_middle::ty::TyKind::FnDef(_, substs) = constant.ty().kind() else {
         return None;
     };
-    substs.iter().find_map(
-        |arg| match translate_const_generic_arg_expr(arg.as_const()?) {
+    substs.skip_binder().iter().find_map(|arg| {
+        match translate_const_generic_arg_expr(arg.as_const()?) {
             Some(PureExpr::Int(n)) => Some(PureExpr::Int(n)),
             _ => None,
-        },
-    )
+        }
+    })
+}
+
+/// True when `def_id` is `core::iter::Extend::extend` (or an impl of it) called
+/// with a `&mut Vec<T>` receiver and a `Vec<T>` argument of the SAME element
+/// type `T`. This is the only shape for which Creusot's `Vec::extend` contract
+/// collapses to `(^self)@ == self@.concat(iter@)` (see the call site).
+fn vec_extend_with_same_element_vec<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    def_id: DefId,
+    args: &[Spanned<Operand<'tcx>>],
+) -> bool {
+    if args.len() != 2 {
+        return false;
+    }
+    let trait_item = resolve_trait_method_def_id(tcx, def_id).unwrap_or(def_id);
+    if tcx.crate_name(trait_item.krate).as_str() != "core"
+        || tcx.item_name(trait_item).as_str() != "extend"
+    {
+        return false;
+    }
+    let trait_def = tcx.parent(trait_item);
+    if tcx.def_kind(trait_def) != rustc_hir::def::DefKind::Trait
+        || tcx.item_name(trait_def).as_str() != "Extend"
+    {
+        return false;
+    }
+    let receiver_ty = args[0].node.ty(&body.local_decls, tcx);
+    let rustc_middle::ty::TyKind::Ref(_, receiver_inner, rustc_middle::ty::Mutability::Mut) =
+        receiver_ty.kind()
+    else {
+        return false;
+    };
+    let (Some(self_elem), Some(arg_elem)) = (
+        vec_element_ty(tcx, *receiver_inner),
+        vec_element_ty(tcx, args[1].node.ty(&body.local_decls, tcx)),
+    ) else {
+        return false;
+    };
+    self_elem == arg_elem
+}
+
+/// Element type `T` of `alloc::vec::Vec<T, A>`, or `None` for any other type.
+fn vec_element_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    let rustc_middle::ty::TyKind::Adt(adt_def, substs) = ty.kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did()) {
+        return None;
+    }
+    substs.types().next()
+}
+
+/// Recover the element VALUES of a `vec![c0, .., cN-1]` literal from the MIR
+/// that feeds `box_assume_init_into_vec_unsafe::<T, N>(move a)`.
+///
+/// The macro lowers to `x = Box::<[T; N]>::new_uninit()`,
+/// `((*x).1.0) = [c0, .., cN-1]` (`MaybeUninit`'s `ManuallyDrop` value field and
+/// its value; borrowck MIR; after box-deref elaboration the write goes through
+/// `p = copy (x.0) as *const _ (BoxDerefTransmute)`, `x.0` the `BoxRaw`),
+/// `a = move x`, then the call. Returns the rendered constants only when:
+/// * `a` is assigned exactly once, from `move x` (or `a` is `x`);
+/// * exactly one statement writes the payload `(*x|*p).1.0`, and it is an
+///   array aggregate of exactly `n` operands, each a scalar integer/bool
+///   constant;
+/// * every other mention of `x`, `p` and `a` in the body is one of: the
+///   defining call, the move, the pointer definition, pointer-to-`*const ()`
+///   casts (address-only reads), drops, storage/no-op markers, or the vec call
+///   itself — i.e. no borrow, raw-pointer escape, or second write can alter the
+///   payload between initialization and the call.
+///
+/// Any other shape returns `None` (the caller then keeps only the length fact).
+fn vec_macro_constant_elements<'tcx>(
+    body: &Body<'tcx>,
+    call_bb: BasicBlock,
+    arg: &Operand<'tcx>,
+    n: i64,
+) -> Option<Vec<String>> {
+    use rustc_middle::mir::{
+        visit::{PlaceContext, Visitor},
+        AggregateKind, CastKind, Location, Place, ProjectionElem, Rvalue, StatementKind,
+        TerminatorKind,
+    };
+
+    // Borrowck MIR passes the box by `move`; after optimization the same
+    // single use can appear as `copy`. Either is accepted only because the
+    // alias guard below rejects every other mention of the local.
+    let (Operand::Move(arg_place) | Operand::Copy(arg_place)) = arg else {
+        return None;
+    };
+    if !arg_place.projection.is_empty() {
+        return None;
+    }
+    let a = arg_place.local;
+
+    let is_payload_write = |place: &Place<'tcx>, base: Local| {
+        place.local == base
+            && matches!(
+                place.projection.as_slice(),
+                [
+                    ProjectionElem::Deref,
+                    ProjectionElem::Field(f1, _),
+                    ProjectionElem::Field(f2, _),
+                ] if f1.as_u32() == 1 && f2.as_u32() == 0
+            )
+    };
+
+    // (1) `a = move x`, exactly once.
+    let mut a_defs = Vec::new();
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        for (idx, stmt) in data.statements.iter().enumerate() {
+            if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
+                if place.local == a && place.projection.is_empty() {
+                    a_defs.push((
+                        Location {
+                            block: bb,
+                            statement_index: idx,
+                        },
+                        rvalue,
+                    ));
+                }
+            }
+        }
+    }
+    let (x, a_def_loc) = match a_defs.as_slice() {
+        [] => (a, None),
+        [(loc, Rvalue::Use(Operand::Move(src) | Operand::Copy(src), ..))]
+            if src.projection.is_empty() =>
+        {
+            (src.local, Some(*loc))
+        }
+        _ => return None,
+    };
+
+    // (2) optional elaborated pointer `p = copy (x.0) as _ (BoxDerefTransmute)`,
+    //     and (3) the single payload write.
+    let mut pointer_defs = Vec::new();
+    let mut payload_writes = Vec::new();
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        for (idx, stmt) in data.statements.iter().enumerate() {
+            let StatementKind::Assign((place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            let loc = Location {
+                block: bb,
+                statement_index: idx,
+            };
+            if place.projection.is_empty() {
+                if let Rvalue::Cast(CastKind::BoxDerefTransmute, Operand::Copy(src), _) = rvalue {
+                    if src.local == x
+                        && matches!(
+                            src.projection.as_slice(),
+                            [ProjectionElem::Field(f, _)] if f.as_u32() == 0
+                        )
+                    {
+                        pointer_defs.push((place.local, loc));
+                    }
+                }
+            }
+            if !place.projection.is_empty() {
+                payload_writes.push((place.local, *place, rvalue, loc));
+            }
+        }
+    }
+    let pointer = match pointer_defs.as_slice() {
+        [] => None,
+        [(p, loc)] => Some((*p, *loc)),
+        _ => return None,
+    };
+    let bases: Vec<Local> = std::iter::once(x).chain(pointer.map(|(p, _)| p)).collect();
+    let mut matching = payload_writes.iter().filter(|(local, place, _, _)| {
+        bases
+            .iter()
+            .any(|b| is_payload_write(place, *b) && local == b)
+    });
+    let (_, _, payload_rvalue, payload_loc) = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    // No other projected write may target `x`/`p` (e.g. a second partial write).
+    if payload_writes
+        .iter()
+        .filter(|(local, ..)| bases.contains(local))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let Rvalue::Aggregate(AggregateKind::Array(_), operands) = payload_rvalue else {
+        return None;
+    };
+    if i64::try_from(operands.len()).ok()? != n {
+        return None;
+    }
+    let mut rendered = Vec::with_capacity(operands.len());
+    for operand in operands {
+        if !matches!(operand, Operand::Constant(_)) {
+            return None;
+        }
+        match translate_operand(operand, &HashMap::<Local, PureExpr>::new())? {
+            PureExpr::Int(v) => rendered.push(v.to_string()),
+            PureExpr::Bool(b) => rendered.push(b.to_string()),
+            _ => return None,
+        }
+    }
+
+    // (4) alias guard: every mention of x / p / a must be a whitelisted one.
+    struct Mentions {
+        tracked: Vec<Local>,
+        seen: Vec<(Local, PlaceContext, Location)>,
+    }
+    impl<'tcx> Visitor<'tcx> for Mentions {
+        fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
+            if self.tracked.contains(&local) {
+                self.seen.push((local, context, location));
+            }
+        }
+    }
+    let mut mentions = Mentions {
+        tracked: bases.iter().copied().chain(std::iter::once(a)).collect(),
+        seen: Vec::new(),
+    };
+    mentions.visit_body(body);
+    let call_loc = body.terminator_loc(call_bb);
+    for (_local, context, location) in &mentions.seen {
+        if matches!(context, PlaceContext::NonUse(_)) {
+            continue;
+        }
+        if *location == call_loc || Some(*location) == a_def_loc || location == payload_loc {
+            continue;
+        }
+        if pointer.is_some_and(|(_, loc)| loc == *location) {
+            continue;
+        }
+        let block = &body.basic_blocks[location.block];
+        if location.statement_index == block.statements.len() {
+            // Terminator: the defining `new_uninit()` call of `x`, or a drop.
+            match &block.terminator().kind {
+                TerminatorKind::Drop { place, .. } if place.projection.is_empty() => continue,
+                TerminatorKind::Call {
+                    destination,
+                    args: call_args,
+                    ..
+                } if destination.local == x
+                    && destination.projection.is_empty()
+                    && call_args.is_empty() =>
+                {
+                    continue
+                }
+                _ => return None,
+            }
+        }
+        let stmt = &block.statements[location.statement_index];
+        match &stmt.kind {
+            StatementKind::FakeRead(..)
+            | StatementKind::PlaceMention(..)
+            | StatementKind::AscribeUserType(..)
+            | StatementKind::StorageLive(..)
+            | StatementKind::StorageDead(..) => continue,
+            // Address-only reads of the elaborated pointer (alignment / null
+            // checks): `q = copy p as *const () (PtrToPtr)`. A `*const ()`
+            // cannot be written through to alter the payload.
+            StatementKind::Assign((
+                _,
+                Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(src), ty),
+            )) if src.projection.is_empty()
+                && pointer.is_some_and(|(p, _)| p == src.local)
+                && matches!(
+                    ty.kind(),
+                    rustc_middle::ty::TyKind::RawPtr(pointee, _) if pointee.is_unit()
+                ) =>
+            {
+                continue
+            }
+            _ => return None,
+        }
+    }
+    Some(rendered)
 }
 
 /// Resolve a function call against all spec tables.
@@ -309,7 +599,10 @@ pub(super) fn resolve_call<'tcx>(
 
     // Multi-arg len call shapes
     if args.len() > 1
-        && call_def_id.is_some_and(|def_id| tcx.def_path_str(def_id).ends_with("::len"))
+        && call_def_id.is_some_and(|def_id| {
+            crate::provenance::builtin_def_path_str(tcx, def_id)
+                .is_some_and(|path| path.ends_with("::len"))
+        })
     {
         if let Some(len_expr) = call_receiver_array_len_expr(body, bb, args) {
             return ResolvedCall {
@@ -327,16 +620,36 @@ pub(super) fn resolve_call<'tcx>(
     };
 
     // Step 2: Direct user/trait spec lookup
-    let direct_spec = user_specs.get(&def_id).or_else(|| trait_specs.get(&def_id));
+    let direct_spec = crate::trait_credit::lookup_user_or_trait_spec(
+        user_specs,
+        trait_specs,
+        def_id,
+        crate::trait_credit::GrantSite { tcx, body, func },
+    );
     if let Some(spec) = direct_spec {
+        // Logic-function identity: generic markers in the callee contract
+        // denote the impl selected by THIS call's generic arguments.
+        let spec = crate::logic::identity_typed::instantiate_generic_markers_for_call(
+            tcx,
+            body,
+            func,
+            def_id,
+            spec.clone(),
+        );
         return ResolvedCall {
             def_id: Some(def_id),
-            kind: ResolvedCallKind::DirectSpec(spec.clone()),
+            kind: ResolvedCallKind::DirectSpec(spec),
         };
     }
 
     let path = tcx.def_path_str(def_id);
     let extern_opt = (!extern_specs.is_empty()).then_some(extern_specs);
+    // Provenance (spec-provenance front): every recogniser below that grants
+    // semantics from the printed `path` applies only to callees DEFINED in a
+    // std / spec-library crate. A local item prints like a library item
+    // (`crate::core::cmp::max` prints `core::cmp::max`), so it must never
+    // reach them. Table lookups (steps 4-6) are gated by DefId separately.
+    let builtin_callee = crate::provenance::is_builtin_provider(tcx, def_id);
 
     // Step 2a: `vec![e1, ..., eN]` N-element literal length.
     //
@@ -349,11 +662,26 @@ pub(super) fn resolve_call<'tcx>(
     // count@`) length specs that already cover the `vec![]` and `vec![e; n]`
     // forms; without it the N-element form leaves `result@` unconstrained. The
     // fact is exactly the construct's semantics (SOUND). (syntax/13_vec_macro)
-    if path.ends_with("box_assume_init_into_vec_unsafe") {
+    if builtin_callee && path.ends_with("box_assume_init_into_vec_unsafe") {
         if let Some(PureExpr::Int(n)) = box_assume_init_into_vec_array_len(func) {
+            let mut ensures = vec![format!("result@.len() == {n}")];
+            // Element values (bug/874): when the boxed array is initialized by a
+            // single, alias-free `[c0, .., cN-1]` aggregate of scalar constants,
+            // the returned Vec's view is exactly that sequence. Any shape the
+            // recognizer cannot prove exact keeps the length-only fact.
+            if let Some(elements) = args
+                .first()
+                .and_then(|arg| vec_macro_constant_elements(body, bb, &arg.node, n))
+            {
+                for (i, value) in elements.iter().enumerate() {
+                    ensures.push(format!("result@.index_logic({i}) == {value}"));
+                }
+            }
             let spec = StdSpec {
+                inv_requires: Vec::new(),
+                capture_inv_requires: Vec::new(),
                 requires: Vec::new(),
-                ensures: vec![format!("result@.len() == {n}")],
+                ensures,
                 param_names: Some(vec!["self_".to_string()]),
             };
             return ResolvedCall {
@@ -361,6 +689,34 @@ pub(super) fn resolve_call<'tcx>(
                 kind: ResolvedCallKind::ExternSpec(spec),
             };
         }
+    }
+
+    // Step 2a': `<Vec<T> as Extend<T>>::extend::<Vec<T>>` — Creusot's exact
+    // `Vec::extend` contract (`creusot-std/src/std/vec.rs:175-180`) is
+    //   exists<start_, done, prod> I::into_iter.postcondition((iter,), start_)
+    //     && done.completed() && start_.produces(prod, *done)
+    //     && (^self)@ == self@.concat(prod).
+    // For an argument of type `Vec<T>` (and ONLY that type) every piece is
+    // determined: `Vec::into_iter` ensures `result@ == self@`, `vec::IntoIter`
+    // `produces(visited, o)` is `self@ == visited.concat(o@)`, and `completed`
+    // forces `o@ == Seq::empty()`, so `prod == iter@`. The instantiated
+    // theorem is therefore `(^self)@ == self@.concat(iter@)`. Every other
+    // argument type keeps the generic prefix-preservation spec below.
+    if vec_extend_with_same_element_vec(tcx, body, def_id, args) {
+        let spec = StdSpec {
+            inv_requires: Vec::new(),
+            capture_inv_requires: Vec::new(),
+            requires: Vec::new(),
+            ensures: vec![
+                "(^self)@ == self@.concat(iter@)".to_string(),
+                "(^self)@.len() == self@.len() + iter@.len()".to_string(),
+            ],
+            param_names: Some(vec!["self".to_string(), "iter".to_string()]),
+        };
+        return ResolvedCall {
+            def_id: Some(def_id),
+            kind: ResolvedCallKind::ExternSpec(spec),
+        };
     }
 
     // Step 2b: `Box::new` of a closure environment is a transparent wrapper.
@@ -378,7 +734,8 @@ pub(super) fn resolve_call<'tcx>(
     // shape. Narrowly gated to a *closure-typed* payload — value boxes (`Box<i32>`
     // etc.) keep their `*result == value` extern spec, so this is not general Box
     // deref-transparency. (closures/07 Box pair)
-    if is_box_new_call_path(&path)
+    if builtin_callee
+        && is_box_new_call_path(&path)
         && args.len() == 1
         && box_new_wraps_closure_env(tcx, body, &args[0].node)
     {
@@ -397,8 +754,9 @@ pub(super) fn resolve_call<'tcx>(
     // `<creusot_std::Int as std::convert::From>::from` or the plain path
     // `std::convert::From::from`), producing an unconstrained
     // `T::from.postcondition(...)` instead of the identity passthrough.
-    if let Some(int_expr) =
-        try_int_passthrough_if_int_type(tcx, body, destination, &path, args, local_exprs)
+    if let Some(int_expr) = builtin_callee
+        .then(|| try_int_passthrough_if_int_type(tcx, body, destination, &path, args, local_exprs))
+        .flatten()
     {
         return ResolvedCall {
             def_id: Some(def_id),
@@ -412,14 +770,20 @@ pub(super) fn resolve_call<'tcx>(
     // code calls `core::num::<impl usize>::leading_zeros(x)`. Preserve the
     // relationship by translating the runtime call to the corresponding logic
     // method expression during body extraction.
-    if let Some(expr) = try_primitive_numeric_logic_call(&path, args, local_exprs) {
+    if let Some(expr) = builtin_callee
+        .then(|| try_primitive_numeric_logic_call(&path, args, local_exprs))
+        .flatten()
+    {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::IntPassthrough(expr),
         };
     }
 
-    if let Some(expr) = try_int_partial_eq_call(&path, args, local_exprs) {
+    if let Some(expr) = builtin_callee
+        .then(|| try_int_partial_eq_call(tcx, body, &path, args, local_exprs))
+        .flatten()
+    {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::IntPassthrough(expr),
@@ -433,19 +797,40 @@ pub(super) fn resolve_call<'tcx>(
     // LogicFnCall expression. This bridges the runtime layout intrinsics to
     // the layout axiom system in trust-wp-ay, allowing `proof_assert!(t2@ ==
     // 2 * size_of_logic::<T>())` to connect with `let t2 = size_of::<[T; 2]>()`.
-    if let Some(layout_expr) = try_layout_intrinsic_passthrough(tcx, func, &path) {
+    if let Some(layout_expr) = builtin_callee
+        .then(|| try_layout_intrinsic_passthrough(tcx, func, &path))
+        .flatten()
+    {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::LayoutIntrinsic(layout_expr),
         };
     }
 
+    // Builtin-table contracts describe library behaviour only: admitted when
+    // the call resolves to library code whose trait bounds are discharged by
+    // library types (never a local impl of a std trait). User extern specs are
+    // unaffected.
+    let admission = crate::provenance::builtin_spec_admission_for_operand(
+        tcx,
+        func,
+        Some(body.source.def_id()),
+    );
+    // The call whose generic arguments size the element type of an
+    // allocation-sizing std spec.
+    let site = crate::provenance::CallSite::of_operand(func, Some(body.source.def_id()));
     // Step 4: UFCS-qualified lookup (#967)
-    let spec = ufcs_path_for_call(tcx, func)
-        .and_then(|ufcs_path| lookup_spec_with_extern(extern_opt, &ufcs_path));
+    let spec = ufcs_path_for_call(tcx, func).and_then(|ufcs_path| {
+        crate::provenance::lookup_spec_for_def(tcx, def_id, admission, extern_opt, &ufcs_path, site)
+    });
     // Step 5: Plain path lookup
-    let spec = spec.or_else(|| lookup_spec_with_extern(extern_opt, &path));
+    let spec = spec.or_else(|| {
+        crate::provenance::lookup_spec_for_def(tcx, def_id, admission, extern_opt, &path, site)
+    });
     if let Some(spec) = spec {
+        // `Iterator::collect`: the table entry is intentionally empty; append
+        // the roundtrip only for a whitelisted monomorphized `(Self, B)` pair.
+        let spec = super::collect_gate::refine_collect_spec(tcx, func, spec);
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::ExternSpec(spec),
@@ -457,10 +842,18 @@ pub(super) fn resolve_call<'tcx>(
         let trait_method_id = resolve_trait_method_def_id(tcx, def_id);
         trait_method_id.and_then(|tmid| {
             let trait_path = tcx.def_path_str(tmid);
-            lookup_spec_with_extern(extern_opt, &trait_path)
+            crate::provenance::lookup_spec_for_def(
+                tcx,
+                tmid,
+                admission,
+                extern_opt,
+                &trait_path,
+                site,
+            )
         })
     };
     if let Some(spec) = spec {
+        let spec = super::collect_gate::refine_collect_spec(tcx, func, spec);
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::ExternSpec(spec),
@@ -468,7 +861,7 @@ pub(super) fn resolve_call<'tcx>(
     }
 
     // Step 7: Try-operator pattern (#1266)
-    if is_try_branch_call(tcx, def_id) {
+    if builtin_callee && is_try_branch_call(tcx, def_id) {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::TryBranch,
@@ -476,14 +869,14 @@ pub(super) fn resolve_call<'tcx>(
     }
 
     // Step 8: Box::new alias-preserving fallback (#1277)
-    if is_box_new_call_path(&path) && args.len() == 1 {
+    if builtin_callee && is_box_new_call_path(&path) && args.len() == 1 {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::BoxNew,
         };
     }
     // Step 8b: Mapping::from_closure — connect closure body to Mapping value (#2316)
-    if is_mapping_from_closure_path(&path) {
+    if builtin_callee && is_mapping_from_closure_path(&path) {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::MappingFromClosure,
@@ -496,7 +889,11 @@ pub(super) fn resolve_call<'tcx>(
     // `map_inv` contract; the per-element fact is gated in the handler to fire
     // only when substituting `result := mapinv@[i]` leaves no dangling closure
     // formals (see `handle_map_inv_from_closure`). (#2170 "Slice 3")
-    if is_map_inv_path(&path) && args.len() == 2 {
+    if builtin_callee
+        && is_map_inv_path(&path)
+        && args.len() == 2
+        && is_trust_wp_std_item(tcx, def_id)
+    {
         return ResolvedCall {
             def_id: Some(def_id),
             kind: ResolvedCallKind::MapInvFromClosure,
@@ -534,6 +931,8 @@ pub(super) fn resolve_call<'tcx>(
                         trait_specs.get(&trait_method_id).cloned()
                     })
                     .unwrap_or_else(|| StdSpec {
+                        inv_requires: Vec::new(),
+                        capture_inv_requires: Vec::new(),
                         requires: Vec::new(),
                         ensures: Vec::new(),
                         param_names: None,
@@ -582,12 +981,110 @@ fn try_primitive_numeric_logic_call(
     })
 }
 
-fn try_int_partial_eq_call(
+/// True when `PartialEq::eq` on `ty` (with `Rhs = ty`) IS logical equality of
+/// values:
+/// - integers, `bool`, `char` (library impls);
+/// - tuples and arrays of such types (library impls compare componentwise);
+/// - `Option` / `Result` (library structural impls) over such types;
+/// - a LOCAL struct or enum whose `PartialEq` impl, as resolved for `ty`, is
+///   `#[automatically_derived]` and whose field types (instantiated) are
+///   themselves such types. A derived `eq` is "same variant and every field
+///   `eq`" by the definition of `#[derive(PartialEq)]`, which is logical
+///   equality once every field comparison is.
+///
+/// Anything else (a hand-written impl, a generic parameter, floats, `dyn`,
+/// pointers, other library containers) is `false`.
+fn partial_eq_is_logical_equality<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    depth: usize,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+    if depth > 8 {
+        return false;
+    }
+    match ty.kind() {
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char => true,
+        TyKind::Tuple(fields) => fields
+            .iter()
+            .all(|field| partial_eq_is_logical_equality(tcx, field, depth + 1)),
+        TyKind::Array(elem, _) => partial_eq_is_logical_equality(tcx, *elem, depth + 1),
+        TyKind::Adt(adt, args) => {
+            if adt.is_union() {
+                return false;
+            }
+            let did = adt.did();
+            let field_types_ok = || {
+                adt.all_fields().all(|field| {
+                    let field_ty = field.ty(tcx, *args).skip_norm_wip();
+                    partial_eq_is_logical_equality(tcx, field_ty, depth + 1)
+                })
+            };
+            if crate::provenance::is_std_item(tcx, did) {
+                let lang = tcx.lang_items();
+                let structural = lang.option_type() == Some(did)
+                    || tcx.is_diagnostic_item(rustc_span::sym::Result, did);
+                return structural && field_types_ok();
+            }
+            if !did.is_local() {
+                return false;
+            }
+            let Some(partial_eq) = tcx.lang_items().eq_trait() else {
+                return false;
+            };
+            let Some(eq_method) = tcx
+                .associated_items(partial_eq)
+                .in_definition_order()
+                .find(|item| item.name().as_str() == "eq")
+                .map(|item| item.def_id)
+            else {
+                return false;
+            };
+            if args.has_non_region_param() || args.has_aliases() {
+                return false;
+            }
+            let call_args = tcx.mk_args(&[ty.into(), ty.into()]);
+            let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
+                tcx,
+                rustc_middle::ty::TypingEnv::fully_monomorphized(),
+                eq_method,
+                call_args,
+            ) else {
+                return false;
+            };
+            let rustc_middle::ty::InstanceKind::Item(impl_method) = instance.def else {
+                return false;
+            };
+            let Some(impl_def_id) = tcx.impl_of_assoc(impl_method) else {
+                return false;
+            };
+            impl_method.is_local() && tcx.is_automatically_derived(impl_def_id) && field_types_ok()
+        }
+        _ => false,
+    }
+}
+
+/// `PartialEq::eq` / `ne` as logical `==` / `!=`.
+///
+/// SOUND only where `PartialEq` IS logical equality
+/// ([`partial_eq_is_logical_equality`]) for both operands (through
+/// references), and both operands have the same type. Any other operand type
+/// may run a user `eq` (a hand-written local impl, a generic `T`, `Option<S>`
+/// delegating to `S::eq`) or a non-reflexive one (floats), so it is left to
+/// the admitted table contract or treated opaque.
+fn try_int_partial_eq_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
     call_path: &str,
-    args: &[Spanned<Operand<'_>>],
+    args: &[Spanned<Operand<'tcx>>],
     local_exprs: &impl ExprLookup,
 ) -> Option<PureExpr> {
     if args.len() != 2 || !call_path.contains("PartialEq") {
+        return None;
+    }
+    let lhs_ty = args[0].node.ty(&body.local_decls, tcx).peel_refs();
+    let rhs_ty = args[1].node.ty(&body.local_decls, tcx).peel_refs();
+    if lhs_ty != rhs_ty || !partial_eq_is_logical_equality(tcx, lhs_ty, 0) {
         return None;
     }
     let op = if call_path.ends_with("::eq") {
@@ -735,6 +1232,14 @@ fn is_map_inv_path(path: &str) -> bool {
     path.ends_with("::map_inv") && path.contains("IteratorSpec")
 }
 
+/// True when `def_id` is defined in the (non-local) `trust_wp_std` crate,
+/// which owns `IteratorSpec`. `def_path_str` omits the crate for local items,
+/// so a local `trait IteratorSpec { fn map_inv(..) }` prints a matching path;
+/// the per-element closure facts must never be granted to it.
+fn is_trust_wp_std_item(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    !def_id.is_local() && tcx.crate_name(def_id.krate).as_str() == "trust_wp_std"
+}
+
 // ── Layout intrinsic passthrough (#2693) ───────────────────────────
 
 /// Recognized runtime layout intrinsic paths and their logic-level function
@@ -770,7 +1275,7 @@ fn try_layout_intrinsic_passthrough<'tcx>(
         .map(|(_, prefix)| *prefix)?;
 
     // Extract the type argument from the FnDef's generic substitutions.
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     let rustc_middle::ty::TyKind::FnDef(_, substs) = constant.ty().kind() else {
@@ -778,7 +1283,7 @@ fn try_layout_intrinsic_passthrough<'tcx>(
     };
 
     // `size_of::<T>()` has exactly one type parameter `T` as its first subst.
-    let type_arg = substs.types().next()?;
+    let type_arg = substs.skip_binder().types().next()?;
     let type_name = format_ty_for_layout_logic(tcx, type_arg);
 
     // Produce `size_of_logic__<type_name>()` as a zero-argument LogicFnCall.
@@ -935,6 +1440,10 @@ pub(super) fn recover_snapshot_capture_current_pointee<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     result_expr: PureExpr,
 ) -> PureExpr {
+    // Provenance: only the spec library's capture freezes the pointee.
+    if !crate::provenance::is_spec_library_item(tcx, def_id) {
+        return result_expr;
+    }
     let path = tcx.def_path_str(def_id);
     // Fires for the two capture-reading calls that carry the inline `&expr`:
     // a direct `Snapshot::capture(&expr)` and the type-directed

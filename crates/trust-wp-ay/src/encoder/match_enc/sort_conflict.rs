@@ -61,10 +61,7 @@ impl AYEncoder {
                     || name.starts_with("__trust_wp_mutref::")
                     || name.starts_with("Tuple")
                     || name.starts_with("ClosureEnv_");
-                if datatype.name.starts_with("Adt_") && !is_encoding_name {
-                    return true;
-                }
-                false
+                datatype.name.starts_with("Adt_") && !is_encoding_name
             }
             _ => false,
         }

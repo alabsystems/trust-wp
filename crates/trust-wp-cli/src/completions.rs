@@ -21,8 +21,6 @@ pub enum Value {
     None,
     /// One of a fixed set, which the shell can offer directly.
     Choices(&'static [&'static str]),
-    /// A file path.
-    Path,
     /// A directory.
     Dir,
     /// Free text the shell cannot guess (a function name, a number).
@@ -231,10 +229,6 @@ fn bash() -> String {
                 "        {})\n            COMPREPLY=($(compgen -d -- \"$cur\"))\n            return;;",
                 flag.long
             )),
-            Value::Path => Some(format!(
-                "        {})\n            COMPREPLY=($(compgen -f -- \"$cur\"))\n            return;;",
-                flag.long
-            )),
             // A function name or a number: the shell has nothing to offer, and
             // guessing filenames here would be worse than offering nothing.
             Value::Free | Value::None => None,
@@ -295,7 +289,6 @@ fn zsh() -> String {
         let spec = match flag.value {
             Value::None => String::new(),
             Value::Choices(values) => format!(":value:({})", values.join(" ")),
-            Value::Path => ":file:_files".to_string(),
             Value::Dir => ":directory:_files -/".to_string(),
             Value::Free => ":value:".to_string(),
         };
@@ -384,7 +377,6 @@ fn fish() -> String {
         let tail = match flag.value {
             Value::None => " -f".to_string(),
             Value::Choices(values) => format!(" -x -a '{}'", values.join(" ")),
-            Value::Path => " -r -F".to_string(),
             Value::Dir => " -x -a '(__fish_complete_directories)'".to_string(),
             Value::Free => " -x".to_string(),
         };
@@ -415,7 +407,6 @@ mod tests {
         match flag.value {
             Value::None => None,
             Value::Choices(values) => Some(values[0]),
-            Value::Path => Some("out.txt"),
             Value::Dir => Some("out"),
             Value::Free if flag.long == "--timeout" => Some("30"),
             Value::Free => Some("some_function"),

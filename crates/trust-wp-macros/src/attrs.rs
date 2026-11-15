@@ -14,6 +14,7 @@ use trust_wp_core::{
 
 use crate::{
     contract::{ContractExpr, ContractKind, ContractParseError, ContractValidationError},
+    spec_tc::{FnClause, LoopClause},
     transform::preprocess_view_syntax,
 };
 
@@ -21,8 +22,13 @@ pub(crate) fn requires(attr: &TokenStream, item: TokenStream) -> TokenStream {
     if let Err(e) = validate_contract_attr(attr, ContractKind::Requires) {
         return error_to_tokens("requires", &e);
     }
+    // Type-check the clause the way Creusot's expansion does (see `spec_tc`).
+    let helper = type_check_trait_signature(FnClause::Requires, attr, &item);
+    let closure_tc = type_check_closure_clause(FnClause::Requires, attr, &item);
+    let item = type_check_fn_clause(FnClause::Requires, attr, item);
     // Re-emit as tool attribute so rustc preserves it for the driver.
-    emit_tool_attr("requires", attr, item)
+    let out = prepend_items(helper, emit_tool_attr("requires", attr, item));
+    prepend_statement(closure_tc, out)
 }
 
 pub(crate) fn ensures(attr: &TokenStream, item: TokenStream) -> TokenStream {
@@ -32,24 +38,103 @@ pub(crate) fn ensures(attr: &TokenStream, item: TokenStream) -> TokenStream {
     if let Err(e) = ensures_result_requires_non_unit_return(attr, &item) {
         return error_to_tokens("ensures", &e);
     }
+    let helper = type_check_trait_signature(FnClause::Ensures, attr, &item);
+    let closure_tc = type_check_closure_clause(FnClause::Ensures, attr, &item);
+    let item = type_check_fn_clause(FnClause::Ensures, attr, item);
     // Re-emit as tool attribute so rustc preserves it for the driver.
-    emit_tool_attr("ensures", attr, item)
+    let out = prepend_items(helper, emit_tool_attr("ensures", attr, item));
+    prepend_statement(closure_tc, out)
 }
 
 pub(crate) fn invariant(attr: &TokenStream, item: TokenStream) -> TokenStream {
     if let Err(e) = validate_contract_attr(attr, ContractKind::Invariant) {
         return error_to_tokens("invariant", &e);
     }
+    let tc = type_check_loop_clause(LoopClause::Invariant, attr, &item);
     // Re-emit as tool attribute so rustc preserves it for the driver.
-    emit_tool_attr("invariant", attr, item)
+    prepend_statement(tc, emit_tool_attr("invariant", attr, item))
 }
 
 pub(crate) fn variant(attr: &TokenStream, item: TokenStream) -> TokenStream {
     if let Err(e) = validate_contract_attr(attr, ContractKind::Variant) {
         return error_to_tokens("variant", &e);
     }
+    let tc = type_check_loop_clause(LoopClause::Variant, attr, &item);
+    let item = type_check_fn_clause(FnClause::Variant, attr, item);
     // Re-emit as tool attribute so rustc preserves it for the driver.
-    emit_tool_attr("variant", attr, item)
+    prepend_statement(tc, emit_tool_attr("variant", attr, item))
+}
+
+/// Type-check statement for a contract on a closure expression (`None` for
+/// any other item); emitted before the closure inside a wrapping block.
+fn type_check_closure_clause(
+    kind: FnClause,
+    attr: &TokenStream,
+    item: &TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    let item = strip_trailing_comma(item.clone());
+    crate::spec_tc::closure_clause_statement(kind, &attr.clone().into(), &item.into())
+}
+
+/// Sibling type-check helper for a contract on a bodyless trait method
+/// (`None` for any other item).
+fn type_check_trait_signature(
+    kind: FnClause,
+    attr: &TokenStream,
+    item: &TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    let item = strip_trailing_comma(item.clone());
+    crate::spec_tc::trait_signature_helper(kind, &attr.clone().into(), &item.into())
+}
+
+/// Emit `helper` as a separate item BEFORE `rest` (the marked method), so
+/// the `trust-wp:` marker in `rest` stays attached to the method.
+fn prepend_items(helper: Option<proc_macro2::TokenStream>, rest: TokenStream) -> TokenStream {
+    match helper {
+        None => rest,
+        Some(helper) => {
+            let rest: proc_macro2::TokenStream = rest.into();
+            quote! { #helper #rest }.into()
+        }
+    }
+}
+
+/// Type-check statement for a loop clause (`None` unless `item` is a loop).
+/// It is emitted as a statement BEFORE the loop inside a wrapping block, so
+/// the loop expression — and the `trust-wp:` marker attached to it — are
+/// unchanged.
+fn type_check_loop_clause(
+    kind: LoopClause,
+    attr: &TokenStream,
+    item: &TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    let item = strip_trailing_comma(item.clone());
+    crate::spec_tc::loop_clause_statement(kind, &attr.clone().into(), &item.into())
+}
+
+fn prepend_statement(stmt: Option<proc_macro2::TokenStream>, rest: TokenStream) -> TokenStream {
+    match stmt {
+        None => rest,
+        Some(stmt) => {
+            // A statement/expression attribute's expansion is parsed as ONE
+            // expression: wrap as a block whose tail is the unchanged loop or
+            // closure (Creusot's loop desugaring is a block too), preserving
+            // its type and the expectation a closure is checked against.
+            let rest: proc_macro2::TokenStream = rest.into();
+            quote! { { #stmt #rest } }.into()
+        }
+    }
+}
+
+/// Insert the specification type-check closure for a fn-level clause.
+///
+/// The item's trailing comma (closure argument position) is stripped first
+/// so the body-group detection sees the real last token; `emit_tool_attr`
+/// strips it again idempotently. The doc marker text is built from `attr`,
+/// never from the inserted tokens.
+fn type_check_fn_clause(kind: FnClause, attr: &TokenStream, item: TokenStream) -> TokenStream {
+    let item = strip_trailing_comma(item);
+    crate::spec_tc::insert_fn_clause(kind, &attr.clone().into(), item.into()).into()
 }
 
 /// Validates a contract attribute, returning a parse error if invalid.

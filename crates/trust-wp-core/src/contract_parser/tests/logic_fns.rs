@@ -22,7 +22,7 @@ fn test_parse_logic_fn_call_nullary() {
     let expr = parse_contract("zero()").unwrap();
     if let PureExpr::LogicFnCall { name, args } = expr {
         assert_eq!(name, "zero");
-        assert!(args.is_empty());
+        assert_eq!(args.as_slice(), []);
     } else {
         panic!("Expected LogicFnCall, got {expr:?}");
     }

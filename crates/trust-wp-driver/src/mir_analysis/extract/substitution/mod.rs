@@ -85,8 +85,56 @@ pub(super) fn extract_substitutions_entry<'tcx>(
         trait_specs,
         extern_specs,
         closure_capture_names,
+        final_reborrow_sites: call_resolution::final_reborrow_sites(tcx, body),
+        written_deref_reads: crate::mir_analysis::deref_store_staleness::written_deref_reads(
+            tcx, body,
+        ),
+        loop_head_rebinds: super::loop_merges::loop_head_rebinds(
+            body,
+            body.arg_count,
+            &crate::mir_analysis::detect_loops(body),
+            &cutoff_blocks(body, &cutoff),
+        ),
+        renamable_params: match (cutoff.stop_location, cutoff.region_span) {
+            (Some(at), None) if !tcx.is_closure_like(body.source.def_id()) => {
+                super::param_writes::params_with_renamable_entry(tcx, body, at)
+                    .into_keys()
+                    .collect()
+            }
+            _ => HashSet::new(),
+        },
     };
     extract_substitutions_from_block(body, BasicBlock::from_u32(0), st, cutoff, arg_names, &ctx)
+}
+
+/// The blocks the walk stops in (D-187): the block of a location cutoff, or
+/// every block holding a statement or terminator whose span lies inside a
+/// span cutoff.
+fn cutoff_blocks(body: &Body<'_>, cutoff: &SubstitutionCutoff) -> HashSet<BasicBlock> {
+    if let Some(location) = cutoff.stop_location {
+        return HashSet::from([location.block]);
+    }
+    let Some(stop) = cutoff.stop_span else {
+        return HashSet::new();
+    };
+    let stop = stop.source_callsite();
+    if stop.is_dummy() {
+        return HashSet::new();
+    }
+    let inside = |span: rustc_span::Span| {
+        let span = span.source_callsite();
+        !span.is_dummy() && span.lo() >= stop.lo() && span.hi() <= stop.hi()
+    };
+    body.basic_blocks
+        .iter_enumerated()
+        .filter(|(_, data)| {
+            data.statements
+                .iter()
+                .any(|statement| inside(statement.source_info.span))
+                || inside(data.terminator().source_info.span)
+        })
+        .map(|(block, _)| block)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -100,7 +148,7 @@ pub(super) struct SubstitutionOutcome {
 /// [`branch_merge`].
 ///
 /// The visitor stores a `body` reference so that its `check_cutoff_at_*`
-/// callbacks can call `build_substitutions(body)` directly. (#2066, Phase 4)
+/// callbacks can call `build_substitutions(body)` directly.
 pub(super) fn extract_substitutions_from_block<'tcx>(
     body: &Body<'tcx>,
     bb: BasicBlock,
@@ -120,10 +168,27 @@ pub(super) fn extract_substitution_outcome_from_block<'tcx>(
     arg_names: &[String],
     ctx: &SubstitutionExtractionContext<'_, 'tcx>,
 ) -> SubstitutionOutcome {
+    // The blanket half of the interior-mutability rule, shared with the
+    // primary block walker (`super::extract_from_block_with_context`): on
+    // entry to a block that is the return target of a call, or of a `Drop`
+    // with glue, every local whose type can reach interior mutability is
+    // rebound to a fresh symbol. The callee may have written memory those
+    // locals reach even when it received none of them as an argument (two
+    // `&Cell<u8>` arguments may alias; a `Drop` impl may hold one), so the
+    // per-argument rule at the call site cannot cover them. Premise-removing:
+    // it only drops the identification of a pre-call read with a post-call
+    // one.
+    let mut local_exprs = st.local_exprs;
+    super::loop_body::rebind_interior_mutable_locals_at_effect_target(
+        ctx.tcx,
+        body,
+        bb,
+        &mut local_exprs,
+    );
     let mut visitor = SubstitutionVisitor {
         tcx: ctx.tcx,
         body,
-        local_exprs: st.local_exprs,
+        local_exprs,
         deref_exprs: st.deref_exprs,
         borrow_of: st.borrow_of,
         name_updates: st.name_updates,

@@ -155,9 +155,13 @@ pub mod specs {
 
     /// Contract for `String::truncate`
     ///
-    /// Shortens the string to the specified length.
+    /// Shortens the string to the specified length. Panics when `new_len` is
+    /// at most the byte length and not on a char boundary. The view counts
+    /// chars, not bytes, so no clause can state the boundary, and the call is
+    /// refused rather than trusted.
     pub const TRUNCATE: &str = r#"
         params: self, new_len
+        requires: __trust_wp_std_site_unmodelled_panic()
         ensures: (^self).len() <= self.len()
     "#;
 
@@ -214,24 +218,42 @@ pub mod specs {
     "#;
 
     /// Contract for `String::reserve`
+    ///
+    /// `Vec::<u8>::reserve` on the UTF-8 bytes. The view counts chars, and a
+    /// char is at most 4 bytes, so the requirement is `Vec::reserve`'s at a
+    /// byte length of `4 * self@.len()`: sufficient for every string whose
+    /// view this is.
     pub const RESERVE: &str = r#"
         params: self, additional
+        requires: additional@ == 0 || 2 * (4 * self@.len() + additional@ - 1) <= isize::MAX@
         ensures: (^self)@ == self@
     "#;
 
     /// Contract for `String::with_capacity`
+    ///
+    /// `Vec::<u8>::with_capacity`: panics when `capacity` exceeds
+    /// `isize::MAX` bytes.
     pub const WITH_CAPACITY: &str = r#"
+        params: capacity
+        requires: capacity@ <= isize::MAX@
         ensures: result@.len() == 0
     "#;
 
     /// Contract for `String::insert`
+    ///
+    /// Panics when `idx` is past the byte length or not on a char boundary,
+    /// which the char view cannot state: refused rather than trusted.
     pub const INSERT: &str = r#"
         params: self, idx, ch
+        requires: __trust_wp_std_site_unmodelled_panic()
     "#;
 
     /// Contract for `String::insert_str`
+    ///
+    /// Panics as `INSERT` does; refused for the same reason.
     pub const INSERT_STR: &str = r#"
         params: self, idx, string
+        requires: __trust_wp_std_site_unmodelled_panic()
     "#;
 
     /// Contract for `String::pop`
@@ -240,8 +262,12 @@ pub mod specs {
     "#;
 
     /// Contract for `String::remove`
+    ///
+    /// Panics when `idx` is not the byte offset of a char, which the char
+    /// view cannot state: refused rather than trusted.
     pub const REMOVE: &str = r#"
         params: self, idx
+        requires: __trust_wp_std_site_unmodelled_panic()
     "#;
 
     /// Contract for `String::retain`
@@ -277,12 +303,17 @@ pub mod specs {
 
     /// Contract for `str::split_at`.
     ///
-    /// `str::split_at` takes a byte index. The singleton UTF-8 clause recovers
-    /// the common Creusot pattern where a one-character string is split at that
-    /// character's encoded byte length. The singleton-case clauses use
-    /// `self@.index_logic(0).to_utf8().len()` so callers with view-level facts
-    /// (e.g. `s@ == seq!['c']` plus `'c'.to_utf8() == seq![...]`) can discharge
-    /// them without needing `self.len()`.
+    /// `str::split_at` takes a byte index and panics unless it is a char
+    /// boundary. The view counts chars, so the requirement is the boundaries
+    /// it CAN name: 0, and the end of a one-char string, whose byte length is
+    /// that char's encoded length. Neither `self.len()` (the CHAR count here,
+    /// see below) nor any char-count bound names a boundary:
+    /// `"aé".split_at(2)` and `"é".split_at(1)` panic. An all-one-byte string
+    /// would make every index up to its length a boundary, but that clause
+    /// quantifies over the view and the goal it sits in times out.
+    /// The singleton-case clauses use `self@.index_logic(0).to_utf8().len()`
+    /// so callers with view-level facts (e.g. `s@ == seq!['c']` plus
+    /// `'c'.to_utf8() == seq![...]`) can discharge them.
     ///
     /// The ensures guards deliberately do NOT use `self.len()`: in the contract
     /// DSL that lowers to `seq_len(self@)` = CHAR count (expr_printer
@@ -297,9 +328,8 @@ pub mod specs {
     /// to_utf8(c).len() and split_at(byte_len) == (self, ""). (#route-100 r4)
     pub const STR_SPLIT_AT: &str = r#"
         params: self, mid
-        requires: 0 <= mid@
-        requires: self@.len() == 1 ==> mid@ <= self@.index_logic(0).to_utf8().len()
-        requires: self@.len() != 1 ==> mid@ <= self.len()
+        requires: mid@ == 0
+            || (self@.len() == 1 && mid@ == self@.index_logic(0).to_utf8().len())
         ensures: self@.len() == 1 && mid@ == self@.index_logic(0).to_utf8().len() ==> result.0@ == self@
         ensures: self@.len() == 1 && mid@ == self@.index_logic(0).to_utf8().len() ==> result.1@ == Seq::empty()
     "#;
@@ -375,8 +405,12 @@ pub mod specs {
     "#;
 
     /// Contract for `str::repeat` — repeats a string n times.
+    ///
+    /// Panics ("capacity overflow") when the byte length times `n` overflows
+    /// or exceeds `isize::MAX`. The byte length is at most 4 bytes per char.
     pub const STR_REPEAT: &str = r#"
         params: self, n
+        requires: 4 * self@.len() * n@ <= isize::MAX@
         ensures: result@.len() == self@.len() * n
     "#;
 

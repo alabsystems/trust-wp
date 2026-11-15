@@ -124,12 +124,16 @@ impl AYEncoder {
 
                 // Build postcondition_mut(receiver, args..., witness(...), result) term
                 // The result is the last arg, the witness is inserted before it.
+                // split_last: "the leading args, and the result". Indexing
+                // `len() - 1` underflows on an empty arg vector; this fails
+                // closed the way the rest of this loop does.
+                let Some((result_term, leading_terms)) = arg_terms.split_last() else {
+                    continue;
+                };
                 let mut mut_args: Vec<ay_dpll::api::Term> = vec![receiver_term];
-                for arg_term in &arg_terms[..arg_terms.len() - 1] {
-                    mut_args.push(*arg_term);
-                }
+                mut_args.extend_from_slice(leading_terms);
                 mut_args.push(witness_term);
-                mut_args.push(arg_terms[arg_terms.len() - 1]); // result
+                mut_args.push(*result_term); // result
                 let Some(mut_term) =
                     self.axiom_apply_tracked("eager_fn_mut_once:mut", &mut_decl, &mut_args)
                 else {
@@ -344,10 +348,13 @@ impl AYEncoder {
                     args: witness_args,
                 };
 
-                let mut mut_args = Vec::with_capacity(args.len() + 1);
-                mut_args.extend(args[..args.len() - 1].iter().cloned());
+                let Some((result_arg, leading_args)) = args.split_last() else {
+                    continue;
+                };
+                let mut mut_args = Vec::with_capacity(args.len().saturating_add(1));
+                mut_args.extend(leading_args.iter().cloned());
                 mut_args.push(witness_expr);
-                mut_args.push(args[args.len() - 1].clone());
+                mut_args.push(result_arg.clone());
                 calls.push((normalized_receiver.clone(), mut_args));
             }
         }

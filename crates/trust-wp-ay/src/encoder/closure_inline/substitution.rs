@@ -411,7 +411,6 @@ pub(super) fn apply_substitution(expr: &PureExpr, subst: &HashMap<String, PureEx
 
 /// Substitute capture names whose receiver-projected field is a `MutRef`-sorted
 /// carrier `Var` with the carrier's CURRENT pointee `Deref(<carrier>)`.
-/// (#closure-capture-carriers)
 ///
 /// When the driver's closure-capture carrier lane rebinds a by-`&mut` capture's
 /// environment field to a per-borrow prophecy carrier, the capture's call-entry
@@ -421,7 +420,7 @@ pub(super) fn apply_substitution(expr: &PureExpr, subst: &HashMap<String, PureEx
 /// scope's binding of that name, which after a consuming call is the POST-state
 /// prophecy — the wrong state. Scoped narrowly: only fields that are literally
 /// `Var(_, Some(MutRef(_)))` (i.e. minted carriers) are substituted; every
-/// other capture keeps the legacy free-variable behavior.
+/// other capture stays a free variable.
 pub(super) fn substitute_mutref_capture_currents(
     expr: &PureExpr,
     capture_names: &[String],
@@ -529,4 +528,86 @@ pub(super) fn substitute_closure_body_mut(
             body_sub
         }
     }
+}
+
+/// Bind a closure contract clause's OWN formal params and `result` to the
+/// arguments of the call being inlined (D-30).
+///
+/// [`substitute_closure_ensures`] resolves a clause's CAPTURES against the
+/// receiver's pre/post state and nothing else: the clause's `result` and its
+/// formal params are left free. Free is not neutral. The encoder resolves a
+/// free `result` against the ENCLOSING function's result variable, so an
+/// inlined `#[ensures(result == 1)]` on a CALLED closure would be conjoined
+/// into the caller's postcondition assumption as `result == 1` about the
+/// CALLER's return value — a fact the closure's spec never states — and a
+/// function returning something other than the call result would be accepted
+/// on it (`tests/adversarial/cases/s71_closure_ensures_sole_owner_falsified.rs`).
+///
+/// Every clause is bound through [`substitute_closure_contract_expr`], the
+/// same helper the body-less ensures-only path `substitute_ensures_only`
+/// uses; a clause that cannot be bound soundly (a formal param named
+/// `result`, or a call with no result argument) yields `None`, and the caller
+/// falls back to the opaque UF encoding of the `postcondition*` call.
+pub(super) fn bind_closure_contract_clauses(
+    clauses: &[PureExpr],
+    param_names: &[String],
+    args: &[PureExpr],
+) -> Option<Vec<PureExpr>> {
+    clauses
+        .iter()
+        .map(|clause| substitute_closure_contract_expr(clause, param_names, args))
+        .collect()
+}
+
+/// Can this call site bind the closure's own `result` and formal params into
+/// its `ensures` without ambiguity? (D-30)
+///
+/// The binding runs AFTER the capture/state substitution, and it is positional.
+/// Three shapes make that unsound rather than merely imprecise, and each one
+/// fails closed here (the whole inlining falls back to the UF encoding):
+///
+/// 1. A formal param that shadows a capture name. The capture substitution has
+///    already rewritten that name to a state projection, so the source's
+///    `param` reads as the capture.
+/// 2. A pre/post state term that itself mentions a name about to be bound. The
+///    capture substitution splices those terms into the clause, so the
+///    positional binding would reach inside a term it did not come from.
+/// 3. An argument list that is not the flat `[param_0, .., param_{N-1},
+///    (final_state,)? result]` layout this module's positional substitutions
+///    assume — a contract that passes a single args-tuple, for instance. The
+///    RESULT is the last argument under either layout, so only a clause that
+///    names a formal param is refused here.
+pub(super) fn closure_clause_binding_is_unambiguous(
+    method: &str,
+    ensures: &[PureExpr],
+    param_names: &[String],
+    capture_names: &[String],
+    args: &[PureExpr],
+    pre_state: &PureExpr,
+    post_state: &PureExpr,
+) -> bool {
+    if param_names
+        .iter()
+        .any(|param| capture_names.contains(param))
+    {
+        return false;
+    }
+
+    let bound_names = param_names
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once("result"));
+    for name in bound_names {
+        if expr_mentions_var(pre_state, name) || expr_mentions_var(post_state, name) {
+            return false;
+        }
+    }
+
+    let result_tail = if method == "postcondition_mut" { 2 } else { 1 };
+    !(args.len() != param_names.len() + result_tail
+        && ensures.iter().any(|ensure| {
+            param_names
+                .iter()
+                .any(|param| expr_mentions_var(ensure, param))
+        }))
 }

@@ -25,9 +25,12 @@ fn sample_counter_adt_decls() -> trust_wp_core::logic::AdtDecls {
     )])
 }
 
+/// `Counter { value }` as the driver's placement pass hands it on: the
+/// constructor at its declared field order, without the field-name metadata
+/// the encoder's one door refuses (verify::placement_gate).
 fn counter_ctor(value: i64) -> PureExpr {
     PureExpr::LogicFnCall {
-        name: "Counter{value}".to_string(),
+        name: "Counter".to_string(),
         args: vec![int(value)],
     }
 }
@@ -83,10 +86,10 @@ fn loop_named_field_projection_verifies_with_adt_decls() {
         "pre-loop Counter{{value}} constructor should establish the field invariant: {:?}",
         result.initialization
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result.preservation),
         "loop body Counter{{value}} reconstruction should preserve the field invariant: {:?}",

@@ -26,9 +26,20 @@ use trust_wp_core::formula::{
 /// satisfiable. The driver can also preserve `MutRef` annotations on bare
 /// variables inside arithmetic/comparison subexpressions of a mut-borrow
 /// `return_expr`; those contexts still need the dereferenced current value
-/// rather than the whole-borrow carrier. (#431, #598, #2593)
+/// rather than the whole-borrow carrier. An explicit annotation is sufficient
+/// there even for a lent borrow omitted from the final-value map. Unannotated
+/// names still require parameter evidence. (#431, #598, #2593)
 pub(crate) fn canonicalize_mut_ref_vars(expr: &PureExpr, param_names: &HashSet<&str>) -> PureExpr {
-    canonicalize_inner(expr, param_names, 0, false)
+    let mut known_params = param_names.clone();
+    // A lent parameter may have no final-value entry. Its free occurrence's
+    // annotation supplies the missing type evidence; scoped traversal keeps
+    // a same-named local or quantified binder out of that evidence set.
+    expr.for_each_free_var(|name, sort| {
+        if matches!(sort, Some(ExprSort::MutRef(_))) {
+            known_params.insert(name);
+        }
+    });
+    canonicalize_inner(expr, &known_params, 0, false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -68,24 +79,28 @@ fn canonicalize_inner(
             PureExpr::Deref(Arc::new(PureExpr::Var(name.clone(), sort.clone())))
         }
         PureExpr::BinOp(l, op, r) => {
-            let force_deref_children = force_deref_annotated_mutrefs
-                || matches!(
-                    op,
-                    BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::Div
-                        | BinOp::Mod
-                        | BinOp::Shl
-                        | BinOp::Shr
-                        | BinOp::BitAnd
-                        | BinOp::BitXor
-                        | BinOp::BitOr
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge
-                );
+            // Operand demand belongs to this operator. Inheriting an outer
+            // arithmetic demand through a boolean guard would turn borrow
+            // identity into equality of pointees.
+            let force_deref_children = matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::DivTrunc
+                    | BinOp::RemTrunc
+                    | BinOp::Shl
+                    | BinOp::Shr
+                    | BinOp::BitAnd
+                    | BinOp::BitXor
+                    | BinOp::BitOr
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+            );
             let new_l = rec_with_force(l, force_deref_children);
             let new_r = rec_with_force(r, force_deref_children);
             reuse_node(
@@ -94,11 +109,15 @@ fn canonicalize_inner(
             )
         }
         PureExpr::UnOp(op, inner) => {
-            let new_inner = rec_with_force(inner, force_deref_annotated_mutrefs);
+            let numeric_operand = matches!(
+                op,
+                trust_wp_core::formula::UnOp::Neg | trust_wp_core::formula::UnOp::BitNot
+            );
+            let new_inner = rec_with_force(inner, numeric_operand);
             reuse_node(expr, PureExpr::UnOp(*op, reuse_arc(inner, new_inner)))
         }
         PureExpr::Ite(c, t, e) => {
-            let new_c = rec_with_force(c, force_deref_annotated_mutrefs);
+            let new_c = rec_with_force(c, false);
             let new_t = rec_with_force(t, force_deref_annotated_mutrefs);
             let new_e = rec_with_force(e, force_deref_annotated_mutrefs);
             reuse_node(
@@ -126,11 +145,9 @@ fn canonicalize_inner(
             method,
             args,
         } => {
-            let new_receiver = rec_with_force(receiver, force_deref_annotated_mutrefs);
-            let new_args: Vec<PureExpr> = args
-                .iter()
-                .map(|arg| rec_with_force(arg, force_deref_annotated_mutrefs))
-                .collect();
+            let new_receiver = rec_with_force(receiver, false);
+            let new_args: Vec<PureExpr> =
+                args.iter().map(|arg| rec_with_force(arg, false)).collect();
             reuse_node(
                 expr,
                 PureExpr::MethodCall {
@@ -141,10 +158,8 @@ fn canonicalize_inner(
             )
         }
         PureExpr::LogicFnCall { name, args } => {
-            let new_args: Vec<PureExpr> = args
-                .iter()
-                .map(|arg| rec_with_force(arg, force_deref_annotated_mutrefs))
-                .collect();
+            let new_args: Vec<PureExpr> =
+                args.iter().map(|arg| rec_with_force(arg, false)).collect();
             reuse_node(
                 expr,
                 PureExpr::LogicFnCall {
@@ -154,7 +169,7 @@ fn canonicalize_inner(
             )
         }
         PureExpr::Match { scrutinee, arms } => {
-            let new_scrutinee = rec_with_force(scrutinee, force_deref_annotated_mutrefs);
+            let new_scrutinee = rec_with_force(scrutinee, false);
             let new_arms: Vec<MatchArm> = arms
                 .iter()
                 .map(|arm| {
@@ -179,7 +194,7 @@ fn canonicalize_inner(
             )
         }
         PureExpr::Let { var, value, body } => {
-            let new_value = rec_with_force(value, force_deref_annotated_mutrefs);
+            let new_value = rec_with_force(value, false);
             let body_params = params_excluding(param_names, var);
             let new_body =
                 canonicalize_inner(body, &body_params, depth + 1, force_deref_annotated_mutrefs);
@@ -199,9 +214,8 @@ fn canonicalize_inner(
             triggers,
         } => {
             let bp = params_excluding(param_names, var);
-            let new_body = canonicalize_inner(body, &bp, depth + 1, force_deref_annotated_mutrefs);
-            let new_triggers =
-                canonicalize_triggers(triggers, &bp, depth + 1, force_deref_annotated_mutrefs);
+            let new_body = canonicalize_inner(body, &bp, depth + 1, false);
+            let new_triggers = canonicalize_triggers(triggers, &bp, depth + 1, false);
             reuse_node(
                 expr,
                 PureExpr::Forall {
@@ -219,9 +233,8 @@ fn canonicalize_inner(
             triggers,
         } => {
             let bp = params_excluding(param_names, var);
-            let new_body = canonicalize_inner(body, &bp, depth + 1, force_deref_annotated_mutrefs);
-            let new_triggers =
-                canonicalize_triggers(triggers, &bp, depth + 1, force_deref_annotated_mutrefs);
+            let new_body = canonicalize_inner(body, &bp, depth + 1, false);
+            let new_triggers = canonicalize_triggers(triggers, &bp, depth + 1, false);
             reuse_node(
                 expr,
                 PureExpr::Exists {
@@ -233,7 +246,7 @@ fn canonicalize_inner(
             )
         }
         PureExpr::LetAssume { assumption, body } => {
-            let new_assumption = rec_with_force(assumption, force_deref_annotated_mutrefs);
+            let new_assumption = rec_with_force(assumption, false);
             let new_body = rec_with_force(body, force_deref_annotated_mutrefs);
             reuse_node(
                 expr,
@@ -244,7 +257,7 @@ fn canonicalize_inner(
             )
         }
         PureExpr::LetObligation { obligation, body } => {
-            let new_obligation = rec_with_force(obligation, force_deref_annotated_mutrefs);
+            let new_obligation = rec_with_force(obligation, false);
             let new_body = rec_with_force(body, force_deref_annotated_mutrefs);
             reuse_node(
                 expr,
@@ -259,7 +272,7 @@ fn canonicalize_inner(
             for (name, _) in params {
                 bp.remove(name.as_str());
             }
-            let new_body = canonicalize_inner(body, &bp, depth + 1, force_deref_annotated_mutrefs);
+            let new_body = canonicalize_inner(body, &bp, depth + 1, false);
             reuse_node(
                 expr,
                 PureExpr::Closure {
@@ -515,6 +528,107 @@ mod tests {
     use trust_wp_core::formula::PureExpr;
 
     use crate::tests::helpers::{deref, eq, final_expr, var};
+
+    #[test]
+    fn lent_borrow_comparisons_use_currents_without_erasing_returned_identity() {
+        use trust_wp_core::formula::ExprSort;
+
+        use crate::tests::helpers::{ge, ite, var_with_sort};
+
+        let sort = ExprSort::MutRef(Box::new(ExprSort::Int));
+        let left = var_with_sort("left", sort.clone());
+        let right = var_with_sort("right", sort);
+        let expression = ite(ge(left.clone(), right.clone()), left.clone(), right.clone());
+        let actual = super::canonicalize_mut_ref_vars(&expression, &Default::default());
+        assert_eq!(
+            actual,
+            ite(
+                ge(deref(left.clone()), deref(right.clone())),
+                left.clone(),
+                right.clone()
+            )
+        );
+        // Equality on whole borrow carriers is identity, not pointee equality.
+        let identity = eq(left, right);
+        assert_eq!(
+            super::canonicalize_mut_ref_vars(&identity, &Default::default()),
+            identity
+        );
+    }
+
+    #[test]
+    fn unannotated_comparison_operands_are_not_guessed_to_be_lent_borrows() {
+        use crate::tests::helpers::ge;
+        let expression = ge(var("left"), var("right"));
+        assert_eq!(
+            super::canonicalize_mut_ref_vars(&expression, &Default::default()),
+            expression
+        );
+    }
+
+    #[test]
+    fn arithmetic_result_demand_does_not_change_nested_borrow_identity() {
+        use trust_wp_core::formula::ExprSort;
+
+        use crate::tests::helpers::{add, int, ite, logic_fn_call, var_with_sort};
+
+        let sort = ExprSort::MutRef(Box::new(ExprSort::Int));
+        let identity = eq(
+            var_with_sort("left", sort.clone()),
+            var_with_sort("right", sort),
+        );
+        let expressions = [
+            add(ite(identity.clone(), int(0), int(1)), int(2)),
+            add(
+                logic_fn_call("consume_identity", vec![identity.clone()]),
+                int(2),
+            ),
+            add(
+                PureExpr::Let {
+                    var: "same".into(),
+                    value: Arc::new(identity.clone()),
+                    body: Arc::new(ite(var("same"), int(0), int(1))),
+                },
+                int(2),
+            ),
+            add(
+                PureExpr::MethodCall {
+                    receiver: Arc::new(var("owner")),
+                    method: "consume_identity".into(),
+                    args: vec![identity],
+                },
+                int(2),
+            ),
+        ];
+        for expression in expressions {
+            assert_eq!(
+                super::canonicalize_mut_ref_vars(&expression, &Default::default()),
+                expression
+            );
+        }
+    }
+
+    #[test]
+    fn shadowed_annotations_do_not_supply_free_borrow_evidence() {
+        use trust_wp_core::formula::ExprSort;
+
+        use crate::tests::helpers::{add, int, var_with_sort};
+
+        let expression = PureExpr::Let {
+            var: "local".into(),
+            value: Arc::new(int(0)),
+            body: Arc::new(add(
+                var_with_sort("local", ExprSort::MutRef(Box::new(ExprSort::Int))),
+                int(1),
+            )),
+        };
+        // An inconsistent annotation inside a binder is not authority to
+        // reinterpret that binder as a free borrowed parameter.
+        assert_eq!(
+            super::canonicalize_mut_ref_vars(&expression, &Default::default()),
+            expression
+        );
+    }
 
     #[test]
     #[timeout(30000)]

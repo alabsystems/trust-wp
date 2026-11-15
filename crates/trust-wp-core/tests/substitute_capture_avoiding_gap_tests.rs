@@ -46,7 +46,7 @@ fn opts() -> CaptureAvoidingSubstOptions {
 fn capture_avoiding_let_renames_to_avoid_capture() {
     // let x = a in (x + y) with {y → x}
     // Without capture avoidance: let x = a in (x + x) — WRONG
-    // With capture avoidance: let x_α0 = a in (x_α0 + x)
+    // With capture avoidance: let x$α0 = a in (x$α0 + x)
     let expr = PureExpr::Let {
         var: "x".to_string(),
         value: Arc::new(mk_var("a")),
@@ -476,8 +476,8 @@ fn expr_has_free_occurrence_in_closure_free() {
 #[test]
 fn capture_avoiding_forall_renames_triggers_when_binder_renamed() {
     // forall<x> [trigger: x + 1] (x > y) with {y → x}
-    // When x is renamed to x_α0 to avoid capture, the trigger must also
-    // have its free x occurrences renamed to x_α0.
+    // When x is renamed to x$α0 to avoid capture, the trigger must also
+    // have its free x occurrences renamed to x$α0.
     let trigger = PureExpr::BinOp(Arc::new(mk_var("x")), BinOp::Add, Arc::new(int(1)));
     let expr = PureExpr::Forall {
         var: "x".to_string(),

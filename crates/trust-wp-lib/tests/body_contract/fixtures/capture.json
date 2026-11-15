@@ -1,0 +1,10 @@
+{
+  "source_compiler": "6c9ad76dd38f001df3397e621667e038679ce3da",
+  "source": "fn identity(x: bool) -> bool ensures result == x { x }; fn wrong(x: bool) -> bool ensures result == x { false }",
+  "capture": "targo trust check --dump-verifier-inputs; functions retained verbatim from exported native bundles",
+  "functions": {
+    "wrong_function.json": "303d1751b6789a97e86709d8e14885f6b09eb58ac603beb758bb95be748a21d6",
+    "identity_function.json": "ba2a00b060c18d97cb57cb45e5e9528f88cc0d426f1662bc70b72d10fd553e8c"
+  },
+  "scope": "Real compiler Function values, embedded in the existing native request fixture for body-WP verification; not a claim of production source-to-IR proof."
+}

@@ -425,6 +425,27 @@ pub(in crate::verify::loops) fn propagate_bool_and_predeclare(
     plan.apply(encoder)
 }
 
+/// Assert the premises a header loop condition carries about the value it
+/// reads from a call (`LoopEncoderConfig::condition_facts`). Every VC that
+/// assumes the condition or its negation calls this beside it, so a model of
+/// one satisfies the callee's postcondition at that value
+/// (loop_condition_call_postcondition_control).
+pub(in crate::verify::loops) fn assert_condition_facts(
+    encoder: &mut AYEncoder,
+    config: &LoopEncoderConfig<'_>,
+) -> Result<(), EncodingError> {
+    if config.condition_facts.is_empty() {
+        return Ok(());
+    }
+    encoder.register_sort_hints(&config.condition_facts);
+    encoder.register_formula_sort_hints(&config.condition_facts);
+    for fact in &config.condition_facts {
+        let term = encoder.encode_pure(fact)?;
+        encoder.assert_term(term);
+    }
+    Ok(())
+}
+
 /// Encode and assert the loop condition.
 pub(in crate::verify::loops) fn encode_and_assert_condition(
     encoder: &mut AYEncoder,

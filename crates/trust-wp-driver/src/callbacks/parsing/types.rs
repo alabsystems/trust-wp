@@ -19,6 +19,33 @@ pub(in crate::callbacks) struct LoopObligationGroup {
     /// The loop condition expression (e.g., `i < n`), used as an additional
     /// assumption when verifying this loop's in-body call obligations.
     pub(in crate::callbacks) condition: Option<PureExpr>,
+    /// Index (into `loop_analysis.loops`) of the loop whose lane produced this
+    /// group. The group's VC may assume ONLY that loop's effective invariants:
+    /// another loop's invariants and stable pre-loop bindings hold at that
+    /// loop's header, not here (`let _y = 10 - i; i = 0; #[invariant(i == 0)]
+    /// loop {}` would discharge the first loop's exit-tail check from `i == 0`;
+    /// s40v5_seqloop_tail_var_reuse_invariant.rs). `None` assumes no loop
+    /// invariant.
+    pub(in crate::callbacks) loop_index: Option<usize>,
+    /// Why `condition` reads a call result no premise constrains, when it
+    /// does: a model of this group's VC picks that value freely, so it is
+    /// not a counterexample (`LoopBodyExpr::condition_unstated`).
+    pub(in crate::callbacks) condition_unstated: Option<String>,
+    /// Names a store through a reference before the loop may have changed
+    /// (`LoopBodyExpr::pre_loop_deref_stored_names`). The group's VC reads
+    /// each at its entry value, so a model of it is a run of the program only
+    /// when no premise links one to what an obligation reads (`PreLoopStoreLinks`).
+    pub(in crate::callbacks) pre_loop_stored_names: HashSet<String>,
+    /// Havoc variables the arithmetic walk bound for locals no loop writes
+    /// (`LoopBodyObligations::unstated_entry_values`): code before the loop
+    /// fixes their values and the VC states none, so a model of it is a run
+    /// of the program only when no premise links one to what an obligation
+    /// reads (`PreLoopStoreLinks`).
+    pub(in crate::callbacks) unstated_entry_values: HashSet<String>,
+    /// Whether an obligation is a fail-closed `false` the loop body walk
+    /// injected under its path (`LoopBodyObligations::injected_fail_closed`):
+    /// the group's VC is then unprovable, and a model of it refutes nothing.
+    pub(in crate::callbacks) injected_fail_closed: bool,
 }
 
 /// Loop-specific fields from contract parsing.
@@ -59,12 +86,34 @@ impl LoopFields {
     /// For multi-loop functions, returns `None` — per-loop conditions are
     /// only used in obligation verification, not in exit assumptions.
     /// Used by `build_loop_exit_assumptions` for the compositional path (#2085).
+    ///
+    /// Groups are one per detected loop, in `loop_analysis.loops` order,
+    /// FOLLOWED by condition-free groups (condition `None`), so the
+    /// single-loop test counts loops, not groups.
     pub(in crate::callbacks) fn single_loop_condition(&self) -> Option<&PureExpr> {
-        if self.loop_obligation_groups.len() == 1 {
-            self.loop_obligation_groups[0].condition.as_ref()
+        let loop_count = self
+            .loop_analysis
+            .as_ref()
+            .map_or(self.loop_obligation_groups.len(), |analysis| {
+                analysis.loops.len()
+            });
+        if loop_count == 1 {
+            self.loop_obligation_groups
+                .first()
+                .and_then(|group| group.condition.as_ref())
         } else {
             None
         }
+    }
+
+    /// Why the single loop's condition reads a value no premise states, for
+    /// single-loop functions; the exit assumptions carry its negation, so a
+    /// model of a VC assuming them picks that value freely.
+    pub(in crate::callbacks) fn single_loop_condition_unstated(&self) -> Option<&str> {
+        self.single_loop_condition()?;
+        self.loop_obligation_groups
+            .first()
+            .and_then(|group| group.condition_unstated.as_deref())
     }
 }
 
@@ -81,10 +130,28 @@ pub(in crate::callbacks) struct MutBorrowFields {
     /// mut-ref rewriting can run even when mut-borrow body extraction returns
     /// `None` (e.g., call-heavy bodies like deref wrappers). (#717)
     pub(in crate::callbacks) mut_ref_param_names: HashSet<String>,
+    /// The `&mut`-holding parameters of the contract's `Signature`
+    /// (`mir_analysis::contract_signature`): the set a postcondition's states
+    /// are read over (`formula::elaborate::postcondition_states`), here and at
+    /// every call of the function (`call_signature`). Not the MIR-derived
+    /// set above, which body extraction widens: a clause's dialect and the
+    /// state of each `*p` must be decided over the one set every caller sees.
+    pub(in crate::callbacks) state_params: HashSet<String>,
     /// Caller-side expiry pins for `&mut` borrows reached out of a call result
     /// (#prophecy-slots M5). Empty unless `projected_expiry` PROVED a death
     /// point; see that module's R0..R11 table.
     pub(in crate::callbacks) projected_final_pins: Vec<ProjectedFinalPin>,
+    /// Parameters carrying a `&mut` whose call-site prophecy credit (`^p`
+    /// collapsed onto `Final(<param>)`) is dead because something other than
+    /// that call can still decide the referent: a later write, or an ESCAPE
+    /// that leaves the borrow for the caller to resolve.
+    ///
+    /// Populated straight from MIR, like `mut_ref_param_names` and for the
+    /// same reason: the premise it disqualifies is emitted whether or not
+    /// mut-borrow body extraction succeeds, and the shape that needs it most
+    /// (a write reaching the call through a loop back edge) is one extraction
+    /// gives up on.
+    pub(in crate::callbacks) stale_call_final_params: HashSet<String>,
 }
 
 /// Parsed and extracted contract data ready for verification.
@@ -134,16 +201,92 @@ pub(in crate::callbacks) struct ParsedContract {
     /// These force `ContinueWithAssumptions` even when the function has no
     /// user postconditions: they still need the post-loop function-level path.
     pub(in crate::callbacks) post_loop_call_obligations: Vec<PureExpr>,
+    /// #1075/#1401 returning-path facts: conditions that hold on every path
+    /// that returns from the function (a sibling arm can never return). They
+    /// premise ONLY the function's own postconditions (`facts ==> ensures`,
+    /// `contract_transform` step F); never requires, call obligations,
+    /// loop obligations or proof_asserts.
+    pub(in crate::callbacks) returning_path_facts: Vec<PureExpr>,
+    /// Fail-closed marker: context extraction gave up (the rendered gap kind)
+    /// before walking a body that can still carry obligations. A `Verified`
+    /// function-contract verdict is demoted to unknown when this is set.
+    pub(in crate::callbacks) extraction_fail_closed_reason: Option<String>,
+    /// How many of `call_obligations` are the panic-unreachability goal for a
+    /// body that can never return (`fn f() { panic!() }`).
+    ///
+    /// Every OTHER literal `false` in `call_obligations` is a lane failing
+    /// closed because it could not MODEL something, and a refutation over one
+    /// of those is trust-wp refuting its own placeholder (D-27). This one is
+    /// different — Creusot states the same goal and trust-wp really can refute
+    /// it — so the verdict gate subtracts it before asking whether the goal set
+    /// carries a marker. Without the subtraction an unconditionally panicking
+    /// body would stop reporting FAILED.
+    ///
+    /// A non-zero value also means THE BODY CAN NEVER RETURN, and that is how
+    /// the verdict gate reads it. `panic!("msg")` lowers through a returning
+    /// `Arguments::new_const` call with no spec, so the panic prologue injects
+    /// a marker of its own; a count-minus-one rule would see `2 > 1` and
+    /// withhold a refutation trust-wp can genuinely make. For a body with no
+    /// reachable `Return` there is no user-facing claim to manufacture: every
+    /// goal in it says only "this body is unreachable", which is the goal
+    /// Creusot states too, so the whole marker count is subsumed rather than
+    /// decremented.
+    pub(in crate::callbacks) panic_unreachability_obligations: usize,
+    /// How many of `call_obligations` are a callee's USER-WRITTEN
+    /// `#[requires(false)]`, substituted at the call site.
+    ///
+    /// `PureExpr::Bool(false)` is the spelling of both an injected fail-closed
+    /// marker and a written literal `false`, so the written ones are counted
+    /// where they are written (`spec_apply::precondition`) and subtracted
+    /// before the gate asks its question. This is the same distinction the
+    /// ensures side draws by reading `parsed.call_obligations` rather than
+    /// `effective_ensures`: a clause a user wrote is a clause a program can
+    /// violate, and its refutation keeps its FAILED.
+    pub(in crate::callbacks) user_written_false_obligations: usize,
+    /// Switch edges the primary walk of a loop-free, exactly-valued body proved
+    /// are never taken, on every path to the switch, each by an obligation in
+    /// `call_obligations` or a value-stable literal discriminant (D-142).
+    /// While this contract's verdict holds no execution crosses one, so
+    /// `cap_clause_free_verdict` does not count a panic site only such an edge
+    /// leads to.
+    pub(in crate::callbacks) proved_dead_edges: crate::mir_analysis::ProvedDeadEdges,
     /// Loop-specific fields (invariants, variants, loop analysis).
     pub(in crate::callbacks) loop_fields: LoopFields,
     /// Mutable borrow analysis fields.
     pub(in crate::callbacks) mut_borrow: MutBorrowFields,
     /// Recognized recursive `&mut self` match-reborrow shape (rusthorn
-    /// `take_some`), used to synthesize the prophecy-pinning premise.
+    /// `take_some`), from which the prophecy-pinning premise is synthesized.
     pub(in crate::callbacks) reborrow_prophecy: Option<crate::mir_analysis::ReborrowProphecyInfo>,
 }
 
 impl ParsedContract {
+    /// Rewrite the CALL-SITE OBLIGATION expressions and nothing else.
+    ///
+    /// The four vectors here are what a caller owes its callees; every other
+    /// expression-holding field is the caller's own clauses, an assumption, or
+    /// borrow bookkeeping. A pass that may only touch what is proved, never
+    /// what is assumed, states that by taking this entry instead of
+    /// `rewrite_all_exprs`.
+    pub(in crate::callbacks) fn rewrite_each_call_obligation(
+        &mut self,
+        mut f: impl FnMut(&PureExpr) -> PureExpr,
+    ) {
+        for expr in &mut self.call_obligations {
+            *expr = f(expr);
+        }
+        for expr in &mut self.pre_loop_call_obligations {
+            *expr = f(expr);
+        }
+        for expr in &mut self.post_loop_call_obligations {
+            *expr = f(expr);
+        }
+        for group in &mut self.loop_fields.loop_obligation_groups {
+            for expr in &mut group.obligations {
+                *expr = f(expr);
+            }
+        }
+    }
+
     /// Apply a rewriting function to every `PureExpr` in this contract.
     ///
     /// This eliminates the need for each rewriting pass to enumerate all
@@ -172,6 +315,9 @@ impl ParsedContract {
             *expr = f(expr);
         }
         for expr in &mut self.call_obligations {
+            *expr = f(expr);
+        }
+        for expr in &mut self.returning_path_facts {
             *expr = f(expr);
         }
         for expr in &mut self.pre_loop_call_obligations {
@@ -259,6 +405,9 @@ impl ParsedContract {
             *expr = f(expr);
         }
         for expr in &mut self.call_obligations {
+            *expr = f(expr);
+        }
+        for expr in &mut self.returning_path_facts {
             *expr = f(expr);
         }
         // Loop fields

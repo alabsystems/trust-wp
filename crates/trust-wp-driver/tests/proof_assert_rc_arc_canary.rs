@@ -8,12 +8,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::trust_wp_rustc_path;
+use trust_wp_test_utils::{nested_cargo, trust_wp_rustc_path};
 
 #[allow(clippy::too_many_lines)]
 fn run_fixture() -> std::process::Output {
@@ -132,14 +131,14 @@ fn main() {
     let target_dir: PathBuf =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/proof_assert_tests_verify_rc_arc");
 
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(&fixture_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", "--verify")
-        .args(["check", "--quiet"])
+        .args(["--quiet"])
         .output()
-        .expect("failed to run cargo check for Rc/Arc proof_assert fixture");
+        .expect("failed to run targo check for Rc/Arc proof_assert fixture");
     let _ = fs::remove_dir_all(&fixture_dir);
     output
 }
@@ -165,12 +164,21 @@ fn proof_assert_rc_arc_canary_verify() {
         stderr.contains("proof_assert in proof_assert_rc_arc_canary_fixture::rc_eq_clone verified"),
         "expected rc_eq_clone proof_assert to verify; stderr: {stderr}"
     );
+    // `ptr_eq` states only that one allocation holds one value: the encoding
+    // reads an `Rc` as its value and has no allocation identity, so it cannot
+    // tell a clone (one allocation) from a second `new` of the same value
+    // (two). `ptr_eq` after a clone is the price (D-190).
+    for unproved in ["rc_ptr_eq_clone", "arc_ptr_eq_clone"] {
+        assert!(
+            !stderr.contains(&format!(
+                "proof_assert in proof_assert_rc_arc_canary_fixture::{unproved} verified"
+            )),
+            "{unproved} must not verify: ptr_eq has no allocation identity (D-190); \
+             stderr: {stderr}"
+        );
+    }
     assert!(
-        stderr.contains("trust-wp: proof_assert: 10 verified, 0 failed, 0 errors"),
+        stderr.contains("trust-wp: proof_assert: 8 verified, 2 failed, 0 errors"),
         "expected exact proof_assert summary for the Rc/Arc canary; stderr: {stderr}"
-    );
-    assert!(
-        output.status.success(),
-        "Rc/Arc proof_assert fixture should verify successfully; stderr: {stderr}"
     );
 }

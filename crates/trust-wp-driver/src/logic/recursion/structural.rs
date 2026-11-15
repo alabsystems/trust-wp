@@ -201,23 +201,55 @@ impl<'a> StructuralRecursion<'a> {
                 }
             }
             PureExpr::Let { var, value, body } => {
+                // Visit the value first: it is evaluated in the OUTER scope.
+                self.visit(value);
+                // The binding is visible in `body` only: restore the outer
+                // scope afterwards so it never leaks into sibling terms.
+                let saved = self.smaller_than.clone();
                 if let Some(SmallerThan { root, strictly }) = self.root(value) {
                     self.bind_smaller(root, strictly, &Pattern::Binding(var.clone()));
+                } else {
+                    // A binder whose value is not a substructure must not
+                    // inherit a mapping left by an outer binder of the same
+                    // name (`Cons(_, t) => { let t = Cons(0, l); f(t) }`).
+                    self.smaller_than.remove(var);
                 }
-                self.visit(value);
                 self.visit(body);
+                self.smaller_than = saved;
                 return;
             }
             PureExpr::Match { scrutinee, arms } => {
-                if let Some(SmallerThan { root, strictly }) = self.root(scrutinee) {
-                    for MatchArm { pattern, .. } in arms {
+                self.visit(scrutinee);
+                let scrutinee_root = self.root(scrutinee);
+                for MatchArm { pattern, body } in arms {
+                    // Each arm's bindings are scoped to that arm: a binding
+                    // from `Cons(_, t) => ..` must not reach `Nil => f(t)`.
+                    let saved = self.smaller_than.clone();
+                    for name in pattern.bound_names() {
+                        self.smaller_than.remove(name);
+                    }
+                    if let Some(SmallerThan { root, strictly }) = scrutinee_root {
                         self.bind_smaller(root, strictly, pattern);
                     }
-                }
-                self.visit(scrutinee);
-                for MatchArm { body, .. } in arms {
                     self.visit(body);
+                    self.smaller_than = saved;
                 }
+                return;
+            }
+            PureExpr::Forall { var, .. } | PureExpr::Exists { var, .. } => {
+                let saved = self.smaller_than.clone();
+                self.smaller_than.remove(var);
+                for_each_child(expr, &mut |child| self.visit(child));
+                self.smaller_than = saved;
+                return;
+            }
+            PureExpr::Closure { params, .. } => {
+                let saved = self.smaller_than.clone();
+                for (name, _) in params {
+                    self.smaller_than.remove(name);
+                }
+                for_each_child(expr, &mut |child| self.visit(child));
+                self.smaller_than = saved;
                 return;
             }
             _ => {}

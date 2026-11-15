@@ -265,6 +265,14 @@ fn test_ext_eq_concat_empty_wrong_operand_fails() {
     encoder.assert_term(a0_is_one);
     encoder.assert_term(b0_is_two);
 
+    // Capture before solving so a timed-out query remains reproducible.
+    if std::env::var_os("TWP_BR_DBG").is_some() {
+        encoder.refresh_native_replay_json();
+        if let Some(replay) = encoder.native_replay_json() {
+            eprintln!("SEQ_WRONG_OPERAND_NATIVE_REPLAY_BEGIN\n{replay}\nSEQ_WRONG_OPERAND_NATIVE_REPLAY_END");
+        }
+    }
+
     let result = encoder.check_sat();
     assert!(
         matches!(result, SolveResult::Unsat(_)),

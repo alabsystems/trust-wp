@@ -147,7 +147,7 @@ pub(crate) fn collect_mut_ref_pin_paths_with_tcx<'tcx>(
                     let Ok(field_idx) = u32::try_from(idx) else {
                         continue;
                     };
-                    let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                    let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                     path.push(MutRefPinStep::Field(field_idx));
                     rec(tcx, field_ty, path, out, depth + 1, budget);
                     path.pop();
@@ -165,7 +165,7 @@ pub(crate) fn collect_mut_ref_pin_paths_with_tcx<'tcx>(
                         let Ok(field_idx) = u32::try_from(field_pos) else {
                             continue;
                         };
-                        let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                        let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                         path.push(MutRefPinStep::Variant {
                             variant_idx: variant_u32,
                             ctor: variant.name.to_string(),
@@ -244,7 +244,7 @@ fn legacy_field_path<'tcx>(
                     return None; // legacy unwrapped NEWTYPES only
                 }
                 let field = variant.fields.iter().next()?;
-                current = field.ty(tcx, substs).skip_norm_wip();
+                current = field.ty(tcx, *substs).skip_norm_wip();
             }
             _ => return None,
         }
@@ -378,7 +378,7 @@ fn deep_contains_mut_ref<'tcx>(
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             if let Some(variant) = adt_def.variants().iter().next() {
                 variant.fields.iter().any(|field| {
-                    let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                    let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                     deep_contains_mut_ref(tcx, field_ty, depth + 1)
                 })
             } else {
@@ -404,7 +404,7 @@ pub(super) fn is_newtype_wrapping_mut<'tcx>(
             if let Some(variant) = adt_def.variants().iter().next() {
                 let mut fields = variant.fields.iter();
                 if let (Some(only_field), 1) = (fields.next(), variant.fields.len()) {
-                    let field_ty = only_field.ty(tcx, substs).skip_norm_wip();
+                    let field_ty = only_field.ty(tcx, *substs).skip_norm_wip();
                     return matches!(
                         field_ty.kind(),
                         TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
@@ -417,15 +417,18 @@ pub(super) fn is_newtype_wrapping_mut<'tcx>(
     }
 }
 
-/// Get the field count of a multi-field struct behind `&mut T`.
+/// Get the field count of a struct or tuple behind `&mut T`.
 ///
 /// Peels one layer of `&mut` to examine the referent type. Returns `Some(n)`
-/// when the referent is a struct with `n >= 2` fields that is NOT a newtype
-/// wrapping `&mut`. Returns `None` for primitives, enums, tuples, newtypes,
-/// and non-struct ADTs.
+/// when the referent is a struct or tuple with `n >= 1` fields. Returns `None`
+/// for primitives, enums, the unit tuple and non-struct ADTs.
 ///
 /// Used to reconstruct whole-struct final values from per-field final values
-/// when field-level writes occur (e.g., `x.a = 34` on `&mut S { a, b }`).
+/// when field-level writes occur (e.g., `x.a = 34` on `&mut S { a, b }`, or
+/// `*x.m = 5` on `&mut M { m: &mut i32 }`). A ONE-field referent is a record
+/// like any other: `M` is what `&mut M` points at, not a by-value newtype
+/// parameter (that is `is_newtype_wrapping_mut`), so its field write must
+/// reach `^x` exactly as a two-field one does (D-184).
 pub(super) fn struct_field_count_behind_mut<'tcx>(
     _tcx: TyCtxt<'tcx>,
     ty: rustc_middle::ty::Ty<'tcx>,
@@ -439,14 +442,9 @@ pub(super) fn struct_field_count_behind_mut<'tcx>(
         TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
             let variant = adt_def.variants().iter().next()?;
             let count = variant.fields.len();
-            if count >= 2 {
-                // Exclude newtypes (handled separately)
-                Some(count)
-            } else {
-                None
-            }
+            (count >= 1).then_some(count)
         }
-        TyKind::Tuple(fields) if fields.len() >= 2 => Some(fields.len()),
+        TyKind::Tuple(fields) if !fields.is_empty() => Some(fields.len()),
         _ => None,
     }
 }

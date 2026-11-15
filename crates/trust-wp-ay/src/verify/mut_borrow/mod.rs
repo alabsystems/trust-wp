@@ -135,8 +135,14 @@ fn bind_whole_mut_ref_result(
     encoder.assert_eq(result_current, result_current_term);
 
     let result_final = encoder.get_or_declare_var("result_final", inner_sort.clone())?;
-    let result_final_term = encoder.encode_pure(&PureExpr::Final(Arc::new(result_expr.clone())))?;
-    encoder.assert_eq(result_final, result_final_term);
+    // Only a returned borrow VARIABLE has `Final(result_expr)` as its prophecy.
+    // For a reborrow through an outer layer (`&mut **x`), `Final(*x)` is the
+    // inner borrow's prophecy, not the reborrow's; leave it unbound.
+    if final_of_expr_is_result_prophecy(result_expr) {
+        let result_final_term =
+            encoder.encode_pure(&PureExpr::Final(Arc::new(result_expr.clone())))?;
+        encoder.assert_eq(result_final, result_final_term);
+    }
 
     let result_id = encoder.get_or_declare_var("result_id", Sort::Int)?;
     let source_id = encoder.get_or_declare_var(&format!("{source_name}_id"), Sort::Int)?;
@@ -481,11 +487,12 @@ fn bind_final_nested_reborrow_result(
         .and_then(|name| encoder.var_sort(&name).cloned())
         .unwrap_or_else(|| encoder.infer_expr_sort_with_context(&target_expr, None));
     let result_current = encoder.get_or_declare_var("result_current", target_sort.clone())?;
-    let result_final = encoder.get_or_declare_var("result_final", target_sort)?;
+    // `result_final` is deliberately left unbound: equating it with the same
+    // term as `result_current` asserts `*result == ^result`, which is false
+    // whenever the caller writes through the returned reborrow. (soundness)
+    let _result_final = encoder.get_or_declare_var("result_final", target_sort)?;
     encoder.assert_eq(result_current, target_term);
-    encoder.assert_eq(result_final, target_term);
     encoder.propagate_seq_value(target_term, result_current);
-    encoder.propagate_seq_value(target_term, result_final);
     Ok(true)
 }
 
@@ -518,9 +525,9 @@ fn final_nested_reborrow_target(
 
 fn peel_deref_var_chain(expr: &PureExpr) -> Option<(&str, Option<ExprSort>, usize)> {
     let mut current = expr;
-    let mut depth = 0;
+    let mut depth = 0usize;
     while let PureExpr::Deref(inner) = current {
-        depth += 1;
+        depth = depth.saturating_add(1);
         current = inner;
     }
     match current {
@@ -567,6 +574,112 @@ fn bind_result_projection_component(
     let result_component = encoder.get_or_declare_var(name, sort)?;
     encoder.assert_eq(result_component, term);
     Ok(())
+}
+
+/// Defence in depth for borrows lent into the return value.
+///
+/// A `&mut` parameter whose borrow (whole, a tuple-field reborrow, or a
+/// reborrow through an outer borrow layer) sits in a borrow position of the
+/// return expression is written by the caller through `result`; its prophecy
+/// is not the callee's to pin. Treat every such name (and its `name.*` field
+/// entries) as mutation-continued so no `final_values` entry is asserted as a
+/// fact and the structural gates never read it. Only removes premises.
+fn continue_params_lent_into_return(
+    mutation_continued_params: Option<HashSet<String>>,
+    return_expr: Option<&PureExpr>,
+    final_values: &HashMap<String, PureExpr>,
+) -> Option<HashSet<String>> {
+    let mut lent: Vec<String> = Vec::new();
+    if let Some(ret) = return_expr {
+        collect_return_lent_borrow_names(ret, &mut lent, 0);
+    }
+    if lent.is_empty() {
+        return mutation_continued_params;
+    }
+    let mut params = mutation_continued_params.unwrap_or_default();
+    for name in lent {
+        let field_prefix = format!("{name}.");
+        for key in final_values.keys() {
+            if key.starts_with(&field_prefix) {
+                params.insert(key.clone());
+            }
+        }
+        params.insert(name);
+    }
+    Some(params)
+}
+
+fn collect_return_lent_borrow_names(expr: &PureExpr, out: &mut Vec<String>, depth: usize) {
+    if depth > crate::encoder::MAX_ENCODING_DEPTH {
+        return;
+    }
+    match expr {
+        PureExpr::Var(name, Some(ExprSort::MutRef(_))) => out.push(name.clone()),
+        PureExpr::Let { body, .. }
+        | PureExpr::LetAssume { body, .. }
+        | PureExpr::LetObligation { body, .. } => {
+            collect_return_lent_borrow_names(body, out, depth + 1);
+        }
+        PureExpr::Ite(_, then_branch, else_branch) => {
+            collect_return_lent_borrow_names(then_branch, out, depth + 1);
+            collect_return_lent_borrow_names(else_branch, out, depth + 1);
+        }
+        PureExpr::LogicFnCall { name, args } if name.starts_with("__trust_wp_tuple") => {
+            for arg in args {
+                match arg {
+                    // A field projection of a borrow is a field reborrow.
+                    PureExpr::Var(base, Some(ExprSort::MutRef(_))) => out.push(base.clone()),
+                    other => collect_return_lent_borrow_names(other, out, depth + 1),
+                }
+            }
+        }
+        PureExpr::Deref(_) => {
+            if let Some((base, Some(sort), deref_depth)) = peel_deref_var_chain(expr) {
+                if deref_depth < reference_like_layer_count(&sort) {
+                    out.push(base.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does `expr` mention a borrow carrier (a `MutRef`-sorted variable) or a
+/// parameter with tracked finality? Such an expression's `transform_postcondition_for_mut_refs`
+/// image is not a sound description of the returned borrow's prophecy.
+fn expr_mentions_borrow_state(expr: &PureExpr, final_values: &HashMap<String, PureExpr>) -> bool {
+    let mut found = false;
+    let _ = expr.rewrite_bottom_up_with_depth_limit(crate::encoder::MAX_ENCODING_DEPTH, |node| {
+        if let PureExpr::Var(name, sort) = &node {
+            let base = name.split('.').next().unwrap_or(name);
+            if matches!(sort, Some(ExprSort::MutRef(_)))
+                || final_values.contains_key(name.as_str())
+                || final_values.contains_key(base)
+            {
+                found = true;
+            }
+        }
+        node
+    });
+    found
+}
+
+/// `Final(expr)` is the returned borrow's prophecy only when `expr` IS the
+/// borrow (a variable, or a branch-merge of variables). For a field or deeper
+/// reborrow, `Final(tuple_get_i(x))` / `Final(*x)` names a DIFFERENT prophecy
+/// (and collapses to the current value when `x` has an identity final).
+fn final_of_expr_is_result_prophecy(expr: &PureExpr) -> bool {
+    match expr {
+        PureExpr::Var(..) => true,
+        PureExpr::Let { body, .. }
+        | PureExpr::LetAssume { body, .. }
+        | PureExpr::LetObligation { body, .. } => final_of_expr_is_result_prophecy(body),
+        PureExpr::Ite(_, then_branch, else_branch) => {
+            final_of_expr_is_result_prophecy(then_branch)
+                && final_of_expr_is_result_prophecy(else_branch)
+        }
+        _ => false,
+    }
 }
 
 fn reference_like_layer_count(sort: &ExprSort) -> usize {
@@ -654,6 +767,29 @@ fn legacy_verified_evidence_gap_reason(
 pub fn verify_mut_borrow_function_with_modes_outcome(
     request: MutBorrowRequest<'_>,
 ) -> Result<VerificationOutcome, EncodingError> {
+    let retry = request.clone();
+    let original = verify_mut_borrow_function_with_modes_outcome_single(request)?;
+    Ok(super::guard_split::retry_with_guard_split(
+        retry.base.requires,
+        retry.base.ensures,
+        original,
+        |requires, ensures| {
+            let mut sub = retry.clone();
+            sub.base.requires = requires;
+            sub.base.ensures = ensures;
+            verify_mut_borrow_function_with_modes_outcome_single(sub)
+        },
+    ))
+}
+
+/// One unsplit mutable-borrow query (see [`super::guard_split`]).
+fn verify_mut_borrow_function_with_modes_outcome_single(
+    request: MutBorrowRequest<'_>,
+) -> Result<VerificationOutcome, EncodingError> {
+    // Read BEFORE the request moves into the child: see the same gate on the
+    // pure-function boundary.
+    let injected_fail_closed_goal = request.base.injected_fail_closed_goal;
+    let gate_goals: Vec<PureExpr> = request.base.ensures.to_vec();
     // Silently drop mode_overrides when lengths don't match (#2316, #2700).
     let mut request = request;
     if let (Some(logic_fns), Some(mode_overrides)) =
@@ -669,7 +805,7 @@ pub fn verify_mut_borrow_function_with_modes_outcome(
         }
     }
 
-    // Demotion (Verified → Unknown for encoding approximations) is now
+    // Demotion (Verified → Unknown for encoding approximations) is
     // applied INSIDE verify_mut_borrow_function_with_modes_inner using a
     // post-bootstrap snapshot as the baseline. This absorbs false-positive
     // SortFallbackToIntFromLogicFn increments from sort hint collection
@@ -681,7 +817,11 @@ pub fn verify_mut_borrow_function_with_modes_outcome(
         .iter()
         .any(is_type_invariant_obligation_expr);
 
-    let result = process_isolation::run_outcome_in_child(request.base.timeout, || {
+    // THE PLACEMENT GATE — see `super::placement_gate`.
+    let timeout = request.base.timeout;
+    let request = crate::verify::placement_gate::CheckPlacement::into_placed(request)?;
+
+    let result = process_isolation::run_outcome_in_child(timeout, || {
         catch_ay_sort_panics_outcome(AssertUnwindSafe(|| {
             verify_mut_borrow_function_with_modes_inner(request)
         }))
@@ -704,7 +844,10 @@ pub fn verify_mut_borrow_function_with_modes_outcome(
         }
         other => other?,
     };
-    Ok(outcome.apply_mandatory_proof_authority())
+    Ok(outcome
+        .apply_mandatory_proof_authority()
+        .apply_injected_goal_refutation_authority(injected_fail_closed_goal, &gate_goals)
+        .apply_opaque_type_param_goal_refutation_authority(&gate_goals))
 }
 
 fn is_type_invariant_obligation_expr(expr: &PureExpr) -> bool {
@@ -973,20 +1116,29 @@ fn bind_result_expr(
                 projection_component_expr(&canonicalized, ProjectionComponent::Current);
             bind_result_projection_component(encoder, "result_current", &result_current_expr)?;
 
-            let result_final_expr =
-                projection_component_expr(&canonicalized, ProjectionComponent::Final);
-            bind_result_projection_component(encoder, "result_final", &result_final_expr)?;
+            if final_of_expr_is_result_prophecy(&canonicalized) {
+                let result_final_expr =
+                    projection_component_expr(&canonicalized, ProjectionComponent::Final);
+                bind_result_projection_component(encoder, "result_final", &result_final_expr)?;
+            }
         } else {
             let result_current =
                 encoder.get_or_declare_var("result_current", result_sort.clone())?;
             encoder.assert_eq(result_current, body_term);
 
-            let mut_ref_param_names: HashSet<String> = final_values.keys().cloned().collect();
-            let result_final_expr =
-                canonicalized.transform_postcondition_for_mut_refs(&mut_ref_param_names);
-            let result_final = encoder.get_or_declare_var("result_final", result_sort.clone())?;
-            let result_final_term = encoder.encode_pure(&result_final_expr)?;
-            encoder.assert_eq(result_final, result_final_term);
+            // A field/projection of a `&mut` param returned as a borrow: its
+            // prophecy is NOT the current-state term with `*x` rewritten to
+            // `^x` (which leaves `Var(x, MutRef)` unchanged and so equates
+            // `^result` with `*result`). Leave it unbound in that case.
+            if !expr_mentions_borrow_state(&canonicalized, final_values) {
+                let mut_ref_param_names: HashSet<String> = final_values.keys().cloned().collect();
+                let result_final_expr =
+                    canonicalized.transform_postcondition_for_mut_refs(&mut_ref_param_names);
+                let result_final =
+                    encoder.get_or_declare_var("result_final", result_sort.clone())?;
+                let result_final_term = encoder.encode_pure(&result_final_expr)?;
+                encoder.assert_eq(result_final, result_final_term);
+            }
         }
     }
 
@@ -1234,12 +1386,24 @@ fn fresh_mut_borrow_base_recheck(
         encoder.maybe_assert_logic_ground_instances()?;
     }
 
-    Ok(super::solver_tail::resolve_base_sat_result_with_tight_timeout(&mut encoder))
+    Ok(match mode {
+        // The AxiomLight recheck classifies literal-`false` / unconstrained
+        // closure-capture obligations: its SAT base IS the refutation, so it
+        // must leave a validated model behind (see
+        // `resolve_base_sat_result_with_witness`).
+        FreshMutBorrowBaseMode::AxiomLight => {
+            super::solver_tail::resolve_base_sat_result_with_witness(&mut encoder)
+        }
+        FreshMutBorrowBaseMode::Full => {
+            super::solver_tail::resolve_base_sat_result_with_tight_timeout(&mut encoder)
+        }
+    })
 }
 
 fn verify_mut_borrow_function_with_modes_inner(
-    request: MutBorrowRequest<'_>,
+    request: crate::verify::placement_gate::Placed<MutBorrowRequest<'_>>,
 ) -> Result<VerificationOutcome, EncodingError> {
+    let request = request.into_inner();
     let MutBorrowRequest {
         mut base,
         final_values,
@@ -1251,6 +1415,8 @@ fn verify_mut_borrow_function_with_modes_inner(
         slice_length_stable_vars,
         projected_final_pins,
     } = request;
+    let mutation_continued_params =
+        continue_params_lent_into_return(mutation_continued_params, base.return_expr, final_values);
     let original_requires = base.requires;
     let original_ensures = base.ensures;
     let original_ghost_context = base.ghost_context;

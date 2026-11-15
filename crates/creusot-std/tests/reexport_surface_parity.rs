@@ -590,9 +590,17 @@ mod std_mem_surface {
 
     // Verify that size_of_logic and align_of_logic resolve through
     // creusot_std::std::mem (used by lang/size_of.rs).
+    //
+    // The two return DIFFERENT types, and that asymmetry is the parity:
+    // upstream `creusot-std/src/std/mem.rs` declares
+    //   pub fn size_of_logic<T>() -> Int
+    //   pub fn align_of_logic<T>() -> usize
+    // which is why upstream's `size_of` ensures `result@ == size_of_logic::<T>()`
+    // (through the view) while `align_of` ensures `result == align_of_logic::<T>()`
+    // directly. Binding align_of_logic at `Int` here would assert a NON-parity.
     fn typecheck() {
         let _: Int = size_of_logic::<i32>();
-        let _: Int = align_of_logic::<u64>();
+        let _: usize = align_of_logic::<u64>();
     }
 }
 

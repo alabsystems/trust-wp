@@ -42,6 +42,46 @@ fn simplify_proof_assert_expr_rewrites_reflexive_quantifier_tautologies() {
     assert_eq!(simplify_proof_assert_expr(expr), PureExpr::Bool(true));
 }
 
+fn x_int() -> Arc<PureExpr> {
+    Arc::new(PureExpr::Var("x".to_string(), Some(ExprSort::Int)))
+}
+
+fn x_cmp(op: BinOp, bound: i64) -> Arc<PureExpr> {
+    Arc::new(PureExpr::BinOp(x_int(), op, Arc::new(PureExpr::Int(bound))))
+}
+
+/// `forall<x: u8> body` as the parser states it: the range premise wraps the
+/// body (D-203).
+fn u8_ranged_forall(body: PureExpr) -> PureExpr {
+    let range = PureExpr::BinOp(x_cmp(BinOp::Ge, 0), BinOp::And, x_cmp(BinOp::Lt, 256));
+    PureExpr::Forall {
+        var: "x".to_string(),
+        var_sort: Some(ExprSort::Int),
+        body: Arc::new(PureExpr::BinOp(
+            Arc::new(range),
+            BinOp::Implies,
+            Arc::new(body),
+        )),
+        triggers: Vec::new(),
+    }
+}
+
+#[test]
+fn simplify_proof_assert_expr_sees_a_tautology_under_a_binder_range_premise() {
+    let tautology = PureExpr::BinOp(x_cmp(BinOp::Ge, 0), BinOp::Implies, x_cmp(BinOp::Ge, 0));
+    assert_eq!(
+        simplify_proof_assert_expr(u8_ranged_forall(tautology)),
+        PureExpr::Bool(true)
+    );
+}
+
+#[test]
+fn simplify_proof_assert_expr_keeps_a_non_tautology_under_a_binder_range_premise() {
+    let claim = PureExpr::BinOp(x_cmp(BinOp::Ge, 0), BinOp::Implies, x_cmp(BinOp::Ge, 1));
+    let expr = u8_ranged_forall(claim);
+    assert_eq!(simplify_proof_assert_expr(expr.clone()), expr);
+}
+
 #[test]
 fn simplify_proof_assert_expr_rewrites_exists_reflexive_equality() {
     let expr = PureExpr::Exists {

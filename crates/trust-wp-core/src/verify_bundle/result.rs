@@ -32,7 +32,8 @@ pub struct VerifyBundleResult {
 }
 
 impl VerifyBundleResult {
-    /// Build an aggregate result from per-obligation results.
+    /// Build an aggregate result after replaying every verified native leaf.
+    /// Other proof formats remain readable data but have no checker here.
     #[must_use]
     pub fn from_obligation_results(
         request: VerifyBundleRequest,
@@ -81,19 +82,17 @@ impl VerifyBundleResult {
                         ),
                     ));
                 }
-                if evidence.format == ProofEvidenceFormat::TrustWpNativePureReplayV1 {
-                    if let Some(obligation) = obligations_by_id.get(result.obligation_id.as_str()) {
-                        if let Err(err) = super::proof::replay_native_pure_evidence(
-                            &request, obligation, evidence,
-                        ) {
-                            diagnostics.push(BundleDiagnostic::invalid(
-                                "proof_evidence.replay",
-                                format!(
-                                    "verified obligation `{}` failed native proof replay: {err}",
-                                    result.obligation_id
-                                ),
-                            ));
-                        }
+                if let Some(obligation) = obligations_by_id.get(result.obligation_id.as_str()) {
+                    if let Err(err) =
+                        super::proof::replay_native_pure_evidence(&request, obligation, evidence)
+                    {
+                        diagnostics.push(BundleDiagnostic::invalid(
+                            "proof_evidence.replay",
+                            format!(
+                                "verified obligation `{}` failed native proof replay: {err}",
+                                result.obligation_id
+                            ),
+                        ));
                     }
                 }
             }
@@ -150,8 +149,9 @@ impl VerifyBundleResult {
         }
     }
 
-    /// Returns true only when every obligation and the aggregate bundle result
-    /// have proof-grade checked evidence.
+    /// Inspect the reported status and structural evidence metadata.
+    /// This does not validate a current request or check any mathematics;
+    /// serialized results require `replay_verify_bundle_result_evidence`.
     #[must_use]
     pub fn is_verified(&self) -> bool {
         matches!(self.status, VerifyBundleStatus::Verified)
@@ -179,7 +179,8 @@ impl VerifyBundleResult {
 
     /// trust-wp-style fail-closed process code.
     ///
-    /// `0` means fully verified. Every other status is non-success.
+    /// `0` reports verified status. Deserialized data still requires proof
+    /// replay before that status can be accepted. Every other status is non-success.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self.status {
@@ -481,7 +482,8 @@ impl fmt::Display for ProofEvidenceWireError {
 impl std::error::Error for ProofEvidenceWireError {}
 
 impl ProofEvidence {
-    /// Construct checked proof evidence.
+    /// Record a producer's claimed checker and format. This constructs metadata;
+    /// only the corresponding proof checker can establish that claim.
     #[must_use]
     pub fn checked(
         producer: impl Into<String>,
@@ -520,7 +522,7 @@ impl ProofEvidence {
         self
     }
 
-    /// Returns true when an external checker is recorded.
+    /// Returns true when a nonempty checker name is recorded as metadata.
     #[must_use]
     pub fn is_checked(&self) -> bool {
         self.checked_by
@@ -528,7 +530,8 @@ impl ProofEvidence {
             .is_some_and(|checker| !checker.trim().is_empty())
     }
 
-    /// Returns true when the evidence is proof-grade and replay/check backed.
+    /// Inspect claimed strength and hash-addressed evidence metadata.
+    /// This does not run a proof checker or establish replay authority.
     #[must_use]
     pub fn is_proof_grade(&self) -> bool {
         self.schema_version == PROOF_EVIDENCE_SCHEMA_VERSION
@@ -1050,11 +1053,18 @@ impl StableWireFields {
         }
 
         let mut fields = HashMap::new();
+        // `line_index + 2` converts a 0-based enumerate index into a 1-based
+        // line number past the prefix. It cannot realistically overflow, but
+        // that is a fact about the input's size rather than about this line,
+        // and these are the ERROR paths — the last place that should panic.
         for (line_index, line) in lines.enumerate() {
             if line.is_empty() {
                 return Err(ProofEvidenceWireError::new(
                     "proof_evidence_wire.line",
-                    format!("empty proof evidence wire line at index {}", line_index + 2),
+                    format!(
+                        "empty proof evidence wire line at index {}",
+                        line_index.saturating_add(2)
+                    ),
                 ));
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -1062,7 +1072,7 @@ impl StableWireFields {
                     "proof_evidence_wire.line",
                     format!(
                         "proof evidence wire line {} does not contain `=`",
-                        line_index + 2
+                        line_index.saturating_add(2)
                     ),
                 ));
             };
@@ -1071,7 +1081,7 @@ impl StableWireFields {
                     "proof_evidence_wire.line",
                     format!(
                         "proof evidence wire line {} has an empty key",
-                        line_index + 2
+                        line_index.saturating_add(2)
                     ),
                 ));
             }
@@ -1200,14 +1210,16 @@ fn decode_hex_bytes(field: &str, value: &str) -> Result<Vec<u8>, ProofEvidenceWi
 
     let mut bytes = Vec::with_capacity(value.len() / 2);
     let raw = value.as_bytes();
-    for index in (0..raw.len()).step_by(2) {
-        let hi = hex_nibble(raw[index]).ok_or_else(|| {
+    // The odd-length guard leaves no remainder, and each pair is statically
+    // two bytes, so decoding needs no unchecked indexing.
+    for &[high_byte, low_byte] in raw.as_chunks::<2>().0 {
+        let hi = hex_nibble(high_byte).ok_or_else(|| {
             ProofEvidenceWireError::new(
                 "proof_evidence_wire.hex",
                 format!("proof evidence wire field `{field}` contains non-hex data"),
             )
         })?;
-        let lo = hex_nibble(raw[index + 1]).ok_or_else(|| {
+        let lo = hex_nibble(low_byte).ok_or_else(|| {
             ProofEvidenceWireError::new(
                 "proof_evidence_wire.hex",
                 format!("proof evidence wire field `{field}` contains non-hex data"),
@@ -1229,11 +1241,17 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    // Formatting rather than a lookup table. The table indices are provably
+    // 0..=15 and the capacity product provably fits for any real slice, but
+    // both are obligations this function cannot discharge from its own body:
+    // the shift/mask range and the length bound belong to the caller. `{:02x}`
+    // has neither an index nor a product and emits the identical lowercase
+    // two-digit hex.
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        // Writing to a String cannot fail.
+        let _ = write!(encoded, "{byte:02x}");
     }
     encoded
 }

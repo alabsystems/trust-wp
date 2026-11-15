@@ -35,6 +35,13 @@ pub(in crate::encoder) struct VarEnv {
     /// equality witness separately lets counterexample extraction recover the
     /// active value without falling back to an unconstrained stale declaration.
     counterexample_witnesses: HashMap<String, Term>,
+    /// Solver constants a phantom sort upgrade left behind, each with the
+    /// source name it was bound to. Facts asserted before the upgrade still
+    /// constrain the old constant while every later read is of the new one,
+    /// and nothing relates the two, so a model may give them values no single
+    /// execution has. Read by the refutation gate only
+    /// (`AYEncoder::split_source_read_by_assertions`).
+    split_sources: Vec<(String, Term)>,
     /// Monotonic discriminator for source-derived solver identities.
     ///
     /// A source binding can be repaired more than once as stronger sort
@@ -75,6 +82,14 @@ impl VarEnv {
 
     pub(in crate::encoder) fn record_counterexample_witness(&mut self, name: &str, term: Term) {
         self.counterexample_witnesses.insert(name.to_string(), term);
+    }
+
+    pub(in crate::encoder) fn record_split_source(&mut self, name: &str, abandoned: Term) {
+        self.split_sources.push((name.to_string(), abandoned));
+    }
+
+    pub(in crate::encoder) fn split_sources(&self) -> &[(String, Term)] {
+        &self.split_sources
     }
 
     pub(in crate::encoder) fn next_source_derived_id(&mut self) -> u64 {

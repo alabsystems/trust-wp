@@ -632,18 +632,24 @@ fn eval_ground_bool(expr: &PureExpr) -> Option<bool> {
     }
 }
 
+/// The value of a ground integer term, or `None` when it has no `i64` value.
+///
+/// Checked, because the answer decides which implication consequents are
+/// asserted as facts: an `Int` literal is an `i64`, so a larger constant is a
+/// term (`u64::MAX` is `4294967295 * 4294967296 + 4294967295`), and wrapping
+/// arithmetic would give it the value of some other number.
 fn eval_ground_int(expr: &PureExpr) -> Option<i64> {
     match expr {
         PureExpr::Int(value) => Some(*value),
-        PureExpr::UnOp(UnOp::Neg, inner) => Some(-eval_ground_int(inner)?),
+        PureExpr::UnOp(UnOp::Neg, inner) => eval_ground_int(inner)?.checked_neg(),
         PureExpr::BinOp(left, BinOp::Add, right) => {
-            Some(eval_ground_int(left)? + eval_ground_int(right)?)
+            eval_ground_int(left)?.checked_add(eval_ground_int(right)?)
         }
         PureExpr::BinOp(left, BinOp::Sub, right) => {
-            Some(eval_ground_int(left)? - eval_ground_int(right)?)
+            eval_ground_int(left)?.checked_sub(eval_ground_int(right)?)
         }
         PureExpr::BinOp(left, BinOp::Mul, right) => {
-            Some(eval_ground_int(left)? * eval_ground_int(right)?)
+            eval_ground_int(left)?.checked_mul(eval_ground_int(right)?)
         }
         _ => None,
     }
@@ -1321,6 +1327,54 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn int(value: i64) -> PureExpr {
+        PureExpr::Int(value)
+    }
+
+    fn bin(left: PureExpr, op: BinOp, right: PureExpr) -> PureExpr {
+        PureExpr::BinOp(Arc::new(left), op, Arc::new(right))
+    }
+
+    /// `u64::MAX` as the contract parser spells it: `i64` has no room for it.
+    fn u64_max() -> PureExpr {
+        let high = bin(int(4_294_967_295), BinOp::Mul, int(4_294_967_296));
+        bin(high, BinOp::Add, int(4_294_967_295))
+    }
+
+    #[test]
+    fn a_ground_term_past_i64_has_no_value_and_no_truth() {
+        assert_eq!(eval_ground_int(&u64_max()), None);
+        assert_eq!(
+            eval_ground_int(&bin(int(i64::MAX), BinOp::Add, int(1))),
+            None
+        );
+        assert_eq!(
+            eval_ground_int(&bin(int(i64::MIN), BinOp::Sub, int(1))),
+            None
+        );
+        let neg_min = PureExpr::UnOp(UnOp::Neg, Arc::new(int(i64::MIN)));
+        assert_eq!(eval_ground_int(&neg_min), None);
+        // Wrapped, `u64::MAX` is -1, so `u64::MAX < 0` would be known true and
+        // its implication consequents asserted as facts.
+        assert_eq!(eval_ground_bool(&bin(u64_max(), BinOp::Lt, int(0))), None);
+        assert!(!is_known_true(
+            &bin(u64_max(), BinOp::Lt, int(0)),
+            &KnownBoolFacts::default()
+        ));
+    }
+
+    #[test]
+    fn a_ground_term_within_i64_keeps_its_value() {
+        assert_eq!(
+            eval_ground_int(&bin(int(3), BinOp::Mul, int(-4))),
+            Some(-12)
+        );
+        assert_eq!(
+            eval_ground_bool(&bin(int(2), BinOp::Le, int(2))),
+            Some(true)
+        );
+    }
 
     #[test]
     fn test_is_ground_constant() {

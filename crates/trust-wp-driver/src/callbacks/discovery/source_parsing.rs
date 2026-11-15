@@ -8,11 +8,13 @@
 //! collection from function bodies via HIR visitor, and source-level
 //! fallback extraction for attributes not preserved in HIR.
 
+use rustc_ast::attr::AttributeExt;
+use rustc_attr_ir::Attribute;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, LocalDefId},
     intravisit::{self, Visitor},
-    Attribute, Expr, ExprKind,
+    Expr, ExprKind,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 
@@ -34,7 +36,7 @@ pub(super) fn get_contract_attrs(attrs: &[Attribute], path: &[&str]) -> Vec<Stri
         }
 
         // Check if this is an unparsed (custom) attribute
-        let Attribute::Unparsed(item) = attr else {
+        let (Attribute::Tool(item) | Attribute::DeriveHelper(item)) = attr else {
             continue;
         };
 
@@ -203,7 +205,7 @@ pub(super) fn extend_unique(dst: &mut Vec<String>, src: Vec<String>) {
 /// Some Creusot-style statement attributes (`#[invariant]`, `#[variant]`) can
 /// be missing from the post-expansion HIR attribute list even though they are
 /// present in the source snippet. Scan the function source as a fallback.
-pub(super) fn collect_loop_contract_attrs_from_source(
+pub(in crate::callbacks) fn collect_loop_contract_attrs_from_source(
     tcx: TyCtxt<'_>,
     def_id: DefId,
 ) -> (Vec<String>, Vec<String>) {

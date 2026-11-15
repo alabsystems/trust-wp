@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::Arc};
 use rustc_hir::def_id::DefId;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use trust_wp_core::formula::{NamedBindingValue, PureExpr};
-use trust_wp_driver::{lookup_spec_with_extern, StdSpec};
+use trust_wp_driver::StdSpec;
 
 use super::{
     super::{
@@ -310,6 +310,7 @@ fn resolve_pre_loop_call_locals_inner(
                 resolved = resolve_call_via_spec(
                     tcx,
                     call.def_id,
+                    call.builtin_admission,
                     &path,
                     trait_path.as_deref(),
                     call.dest_local,
@@ -317,6 +318,7 @@ fn resolve_pre_loop_call_locals_inner(
                     receiver_expr.as_ref(),
                     &call.arg_exprs,
                     &call.arg_locals,
+                    &call.arg_stale,
                     &resolved_locals,
                     user_specs,
                     trait_specs,
@@ -399,7 +401,9 @@ fn append_call_postcondition_facts(
     facts: &mut Vec<PureExpr>,
 ) {
     let Some(spec) = lookup_pre_loop_spec(
+        tcx,
         call.def_id,
+        call.builtin_admission,
         path,
         trait_path,
         user_specs,
@@ -420,6 +424,7 @@ fn append_call_postcondition_facts(
         receiver_expr.as_ref(),
         &call.arg_exprs,
         &call.arg_locals,
+        &call.arg_stale,
         resolved_locals,
     );
     let hir_param_names = arg_names_for_def_id(tcx, call.def_id);
@@ -428,6 +433,7 @@ fn append_call_postcondition_facts(
     let mut effects = CallEffects::new();
     let _ = apply_postconditions_with_effects(
         &spec.ensures,
+        &crate::mir_analysis::call_signature(tcx, call.def_id, param_names.as_deref(), None),
         &result_var,
         &translated_args,
         param_names.as_deref(),
@@ -454,12 +460,15 @@ fn call_effective_receiver_expr(
         .or_else(|| call.arg_exprs.first().and_then(|expr| expr.clone()))
 }
 
+/// The call's arguments, each marked stale as the collection found it
+/// (`UnresolvedPreLoopCall::arg_stale`), as every call-site lane marks them.
 fn translated_args_for_pre_loop_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     sig: &rustc_middle::ty::FnSig<'tcx>,
     receiver_expr: Option<&PureExpr>,
     arg_exprs: &[Option<PureExpr>],
     arg_locals: &[Option<Local>],
+    arg_stale: &[bool],
     resolved_locals: &HashMap<Local, PureExpr>,
 ) -> Vec<TranslatedArg> {
     let arg_count = arg_locals.len().max(arg_exprs.len());
@@ -475,16 +484,18 @@ fn translated_args_for_pre_loop_call<'tcx>(
                 .cloned()
                 .or_else(|| (idx == 0).then(|| receiver_expr.cloned()).flatten())
                 .or_else(|| arg_exprs.get(idx).and_then(|expr| expr.clone()));
-            expr.map_or_else(
+            let mut translated = expr.map_or_else(
                 || {
                     let sort = sig
                         .inputs()
                         .get(idx)
                         .and_then(|ty| ty_to_expr_sort_enriched(tcx, *ty));
-                    TranslatedArg::fallback(PureExpr::Var(format!("arg{idx}"), sort))
+                    TranslatedArg::fallback(crate::mir_analysis::fresh_fallback_arg_var(idx, sort))
                 },
                 TranslatedArg::new,
-            )
+            );
+            translated.stale = arg_stale.get(idx).copied().unwrap_or(false);
+            translated
         })
         .collect()
 }
@@ -499,6 +510,7 @@ fn translated_args_for_pre_loop_call<'tcx>(
 fn resolve_call_via_spec(
     tcx: TyCtxt<'_>,
     def_id: DefId,
+    admission: crate::provenance::BuiltinSpecAdmission,
     path: &str,
     trait_path: Option<&str>,
     dest_local: Local,
@@ -506,13 +518,16 @@ fn resolve_call_via_spec(
     receiver_expr: Option<&PureExpr>,
     arg_exprs: &[Option<PureExpr>],
     arg_locals: &[Option<Local>],
+    arg_stale: &[bool],
     resolved_locals: &HashMap<Local, PureExpr>,
     user_specs: Option<&HashMap<DefId, StdSpec>>,
     trait_specs: Option<&HashMap<DefId, StdSpec>>,
     extern_specs: &HashMap<String, StdSpec>,
 ) -> Option<PureExpr> {
     let spec = lookup_pre_loop_spec(
+        tcx,
         def_id,
+        admission,
         path,
         trait_path,
         user_specs,
@@ -532,6 +547,7 @@ fn resolve_call_via_spec(
         receiver_expr,
         arg_exprs,
         arg_locals,
+        arg_stale,
         resolved_locals,
     );
 
@@ -539,7 +555,7 @@ fn resolve_call_via_spec(
     let param_names = spec.param_names.clone().or(hir_param_names);
 
     let result_var = PureExpr::Var(
-        format!("call_{}", dest_local.as_u32()),
+        format!("$call_{}", dest_local.as_u32()),
         result_sort.or_else(|| ty_to_expr_sort_enriched(tcx, sig.output())),
     );
     // Effects (assumptions/obligations) are collected but not consumed — pre-loop
@@ -547,6 +563,7 @@ fn resolve_call_via_spec(
     let mut call_effects = CallEffects::new();
     let result_expr = apply_postconditions_for_loop_body_with_effects(
         &spec.ensures,
+        &crate::mir_analysis::call_signature(tcx, def_id, param_names.as_deref(), None),
         &result_var,
         &translated_args,
         param_names.as_deref(),
@@ -598,8 +615,11 @@ fn resolve_mutating_receiver_via_method(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lookup_pre_loop_spec(
+    tcx: TyCtxt<'_>,
     def_id: DefId,
+    admission: crate::provenance::BuiltinSpecAdmission,
     path: &str,
     trait_path: Option<&str>,
     user_specs: Option<&HashMap<DefId, StdSpec>>,
@@ -620,10 +640,26 @@ fn lookup_pre_loop_spec(
     } else {
         Some(extern_specs)
     };
-    lookup_spec_with_extern(extern_opt, path).or_else(|| {
-        let trait_path = trait_path?;
-        lookup_spec_with_extern(extern_opt, trait_path)
-    })
+    // Provenance: `path` / `trait_path` are the printed paths of `def_id` and
+    // of its trait method; the table lookups are gated on those DefIds.
+    //
+    // No call site: this lane reads only the callee's `ensures`. The
+    // `requires` the main extraction lane owes at the same call is looked up
+    // there, with the call's generic arguments.
+    crate::provenance::lookup_spec_for_def(tcx, def_id, admission, extern_opt, path, None).or_else(
+        || {
+            let trait_path = trait_path?;
+            let trait_method_id = resolve_trait_method_def_id(tcx, def_id)?;
+            crate::provenance::lookup_spec_for_def(
+                tcx,
+                trait_method_id,
+                admission,
+                extern_opt,
+                trait_path,
+                None,
+            )
+        },
+    )
 }
 
 /// Extract the method name from a def path like `core::slice::<impl [u8]>::len`

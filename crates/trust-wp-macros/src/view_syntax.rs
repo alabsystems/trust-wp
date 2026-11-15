@@ -79,12 +79,12 @@ fn transform_final_tokens(tokens: &[TokenTree]) -> TokenStream {
             } else {
                 // Lone ^ at end - just pass through
                 result.push(tokens[i].clone());
-                i += 1;
+                i = i.saturating_add(1);
             }
         } else {
             // Not ^, process normally (recursing into groups)
             result.push(transform_final_token(&tokens[i]));
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
 
@@ -177,7 +177,7 @@ fn transform_tokens(tokens: &[TokenTree]) -> TokenStream {
         } else {
             // No @, process normally (recursing into groups)
             result.push(transform_token(&tokens[i]));
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
 
@@ -213,7 +213,9 @@ fn collect_view_expr(tokens: &[TokenTree]) -> TokenStream {
     }
 
     let start = find_view_expr_start(tokens);
-    tokens[start..].iter().cloned().collect()
+    // Same reason as `view_expr_len`: the index is in range, and `get` proves it
+    // here rather than relying on the callee's postcondition.
+    tokens.get(start..).unwrap_or(&[]).iter().cloned().collect()
 }
 
 /// Count how many tokens are in the view expression.
@@ -223,12 +225,22 @@ fn view_expr_len(tokens: &[TokenTree]) -> usize {
     }
 
     let start = find_view_expr_start(tokens);
-    tokens.len() - start
+    // `find_view_expr_start` returns an index within `tokens`, so this never
+    // wraps; saturating says so in a form the verifier discharges instead of
+    // one that needs the callee's range as a caller-visible fact.
+    tokens.len().saturating_sub(start)
 }
 
 fn find_view_expr_start(tokens: &[TokenTree]) -> usize {
     // Start from the end and work backwards.
     let end = tokens.len();
+    // Total on the empty slice. Both callers happen to guard this today, but
+    // Trust proves each function against its OWN body: a caller's check is not
+    // part of this one's contract, and `end - 1` underflows for `&[]`. Every
+    // decrement below is already guarded by `while start > 0` / `start >= 2`.
+    if end == 0 {
+        return 0;
+    }
     let mut start = end - 1;
 
     // If last token is a group (e.g., method args `()`), include the identifier before it
@@ -301,6 +313,27 @@ mod tests {
     fn transform_str(input: &str) -> String {
         let tokens: TokenStream = input.parse().unwrap();
         transform_view_syntax(tokens).to_string()
+    }
+
+    /// The empty slice reaches all three of these directly, and before the
+    /// guard `find_view_expr_start` computed `0 - 1`. A caller's `is_empty`
+    /// check is not part of this function's contract — Trust refuted it on the
+    /// body it actually has, and it was right to.
+    #[test]
+    fn the_empty_token_slice_is_total_in_every_view_expr_helper() {
+        let empty: &[TokenTree] = &[];
+        assert_eq!(find_view_expr_start(empty), 0);
+        assert_eq!(view_expr_len(empty), 0);
+        assert!(collect_view_expr(empty).is_empty());
+    }
+
+    /// A single token is the boundary the `end - 1` arithmetic lands on.
+    #[test]
+    fn a_single_token_starts_at_zero_and_spans_the_whole_slice() {
+        let tokens: Vec<TokenTree> = "x".parse::<TokenStream>().unwrap().into_iter().collect();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(find_view_expr_start(&tokens), 0);
+        assert_eq!(view_expr_len(&tokens), 1);
     }
 
     #[test]

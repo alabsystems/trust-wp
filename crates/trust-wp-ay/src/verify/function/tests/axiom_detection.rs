@@ -182,57 +182,6 @@ fn embedded_universal_top_level_returns_false() {
     );
 }
 
-// --- is_axiom_only_function: logic_fns guard (#2082) ---
-// The logic_fns guard at axiom_detection.rs:90-95 rejects functions that have
-// Open-mode logic functions, because their defining axioms can make quantified
-// postconditions provable (making them lemmas, not axioms).
-
-#[test]
-#[timeout(30000)]
-fn test_axiom_only_false_when_open_logic_fns_present() {
-    let ensures = vec![forall("x", bool_expr(true))];
-    let logic_fn = LogicFnDef::new(
-        "id".to_string(),
-        "test::id".to_string(),
-        vec!["x".to_string()],
-        var("x"),
-    )
-    .with_mode(LogicMode::Open);
-    assert!(
-        !is_axiom_only_function(&[], &ensures, None, None, None, Some(&[logic_fn])),
-        "Open-mode logic fn should prevent axiom-only classification"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_axiom_only_true_when_opaque_logic_fns_present() {
-    let ensures = vec![forall("x", bool_expr(true))];
-    let mut logic_fn = LogicFnDef::new(
-        "id".to_string(),
-        "test::id".to_string(),
-        vec!["x".to_string()],
-        var("x"),
-    )
-    .with_mode(LogicMode::Open);
-    logic_fn.set_is_opaque(true);
-    assert!(
-        is_axiom_only_function(&[], &ensures, None, None, None, Some(&[logic_fn])),
-        "Opaque logic fn should not prevent axiom-only classification"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_axiom_only_true_when_empty_logic_fns() {
-    let ensures = vec![forall("x", bool_expr(true))];
-    let empty: Vec<trust_wp_core::logic::LogicFnDef> = vec![];
-    assert!(
-        is_axiom_only_function(&[], &ensures, None, None, None, Some(&empty)),
-        "Empty logic_fns slice should not prevent axiom-only classification"
-    );
-}
-
 // --- has_open_logic_fns (#2082) ---
 
 #[test]

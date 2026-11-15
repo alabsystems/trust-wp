@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-core"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "num-bigint",
  "serde",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-macros"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-std"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "trust-wp-macros",
 ]

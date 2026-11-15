@@ -170,10 +170,39 @@ fn test_parse_modulo() {
     let expr = parse_ok("n % 2");
     assert!(matches!(
         expr,
-        PureExpr::BinOp(l, BinOp::Mod, r)
+        PureExpr::BinOp(l, BinOp::RemTrunc, r)
         if matches!(l.as_ref(), PureExpr::Var(v, _) if v == "n")
         && matches!(r.as_ref(), PureExpr::Int(2))
     ));
+}
+
+#[test]
+fn test_parse_modulo_is_truncating_not_euclidean() {
+    // Creusot's `Int` `%` is `int.ComputerDivision.mod` (sign of the dividend):
+    // it must never lower to the Euclidean `BinOp::Mod`.
+    let expr = parse_ok("-3 % 2 == -1");
+    let PureExpr::BinOp(lhs, BinOp::Eq, _) = &expr else {
+        panic!("expected Eq at top level, got {expr:?}");
+    };
+    assert!(
+        matches!(lhs.as_ref(), PureExpr::BinOp(_, BinOp::RemTrunc, _)),
+        "`%` must lower to RemTrunc, got {lhs:?}"
+    );
+    let spanned = parse_spanned_ok("x@ % y@").expr;
+    assert!(
+        matches!(spanned, PureExpr::BinOp(_, BinOp::RemTrunc, _)),
+        "spanned `%` must lower to RemTrunc, got {spanned:?}"
+    );
+}
+
+#[test]
+fn test_parse_rem_euclid_stays_a_method_call() {
+    // The Euclidean remainder is spelled explicitly (creusot-std `Int::rem_euclid`).
+    let expr = parse_ok("(a - b).rem_euclid(256)");
+    assert!(
+        matches!(&expr, PureExpr::MethodCall { method, args, .. } if method == "rem_euclid" && args.len() == 1),
+        "got {expr:?}"
+    );
 }
 
 #[test]
@@ -185,7 +214,7 @@ fn test_parse_modulo_precedence() {
         assert!(matches!(left.as_ref(), PureExpr::Var(v, _) if v == "x"));
         assert!(matches!(
             right.as_ref(),
-            PureExpr::BinOp(l, BinOp::Mod, r)
+            PureExpr::BinOp(l, BinOp::RemTrunc, r)
             if matches!(l.as_ref(), PureExpr::Var(v, _) if v == "y")
             && matches!(r.as_ref(), PureExpr::Int(2))
         ));
@@ -291,15 +320,36 @@ fn test_parse_old_as_binding_name_in_match() {
 }
 
 #[test]
-fn test_parse_cast_expression_as_noop() {
-    let expr = parse_ok("result == p as *const T");
+fn test_parse_pointer_cast_is_a_pending_marker_not_dropped() {
+    // The cast is never its operand: whether it is the identity or `thin`
+    // is the driver's to read, and the encoder refuses the marker.
+    let expr = parse_ok("result == (p as *mut T) as *const [T]");
+    let pending = |pointee: &str, arg: PureExpr| PureExpr::LogicFnCall {
+        name: format!(
+            "{}{pointee}",
+            crate::formula::internal::builtins::PTR_CAST_PENDING_PREFIX
+        ),
+        args: vec![arg],
+    };
     assert_eq!(
         expr,
         PureExpr::BinOp(
             Arc::new(PureExpr::Var("result".into(), None)),
             BinOp::Eq,
-            Arc::new(PureExpr::Var("p".into(), None)),
+            Arc::new(pending(
+                "[T]",
+                pending("T", PureExpr::Var("p".into(), None))
+            )),
         )
+    );
+}
+
+#[test]
+fn test_parse_pointer_to_address_cast_is_still_refused() {
+    let err = parse_contract("result == p as usize").unwrap_err();
+    assert!(
+        err.message.contains("cast `as usize` is not modeled"),
+        "{err}"
     );
 }
 

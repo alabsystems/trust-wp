@@ -37,8 +37,26 @@ use crate::mir_analysis::NameSubstitutions;
 /// values into its expression. This handles one level of indirection,
 /// which covers the common pattern of ghost method calls referencing
 /// previously-assigned locals.
+#[cfg(test)]
 pub(in crate::callbacks) fn resolve_internal_references(
     substitutions: &mut HashMap<String, PureExpr>,
+) {
+    resolve_internal_references_at_current_state(substitutions, &HashSet::new());
+}
+
+/// [`resolve_internal_references`] for a map whose `written_memory` names
+/// read memory a write may have changed before the cutoff (D-185).
+///
+/// Each binding was translated at its own program point, so a `Deref(Var
+/// x)` inside one is the pointee as it was read there: before any write, the
+/// entry value. The `*x` entry is the pointee at the cutoff, and `x ->
+/// ^x`-style advances are the reference after a later call; resolving either
+/// into another binding moved that binding's read past the write (`let v = *x
+/// + 1; *x = 5;` resolved `v` to `5 + 1`). Neither resolves into another
+/// binding for a name in `written_memory`.
+pub(in crate::callbacks) fn resolve_internal_references_at_current_state(
+    substitutions: &mut HashMap<String, PureExpr>,
+    written_memory: &HashSet<String>,
 ) {
     // Build the full resolution map (name → concrete expression).
     // We need a snapshot to avoid borrowing issues.
@@ -78,6 +96,16 @@ pub(in crate::callbacks) fn resolve_internal_references(
                 if advances_self_ref || is_self_post_call_deref {
                     continue;
                 }
+            }
+            if let Some(root) = other_name.strip_prefix('*') {
+                if written_memory.contains(root) {
+                    continue;
+                }
+            }
+            if written_memory.contains(other_name.as_str())
+                && advances_carrier_to_final(other_name, other_expr)
+            {
+                continue;
             }
             resolve_map.insert(other_name.clone(), other_expr.clone());
         }
@@ -122,6 +150,29 @@ fn final_carrier_leaf(expr: &PureExpr) -> bool {
         PureExpr::Final(inner) | PureExpr::Deref(inner) => final_carrier_leaf(inner),
         _ => false,
     }
+}
+
+/// `substitutions` without the `name` and `*name` entries of the names in
+/// `written_memory` (D-185): those entries are the CURRENT value of memory a
+/// write changed, and as a fact `*name == v` (or `name == v` of a capture or
+/// an advanced borrow) they would equate it with the entry value (the
+/// encoders name both by the one symbol, `name_current` or the capture),
+/// turning every entry fact and every copy taken before the write into one
+/// about the written value. The assertion still reads the current value
+/// through the substitution itself.
+pub(in crate::callbacks) fn without_current_pointee_keys(
+    substitutions: &NameSubstitutions,
+    written_memory: &HashSet<String>,
+) -> NameSubstitutions {
+    if written_memory.is_empty() {
+        return substitutions.clone();
+    }
+    let mut kept = substitutions.clone();
+    kept.exprs.retain(|key, _| {
+        let root = key.strip_prefix('*').unwrap_or(key);
+        !written_memory.contains(root)
+    });
+    kept
 }
 
 pub(in crate::callbacks) fn substitution_assumptions(
@@ -602,6 +653,8 @@ pub(in crate::callbacks) fn infer_substitution_expr_sort(expr: &PureExpr) -> Opt
             | BinOp::Mul
             | BinOp::Div
             | BinOp::Mod
+            | BinOp::DivTrunc
+            | BinOp::RemTrunc
             | BinOp::Shl
             | BinOp::Shr
             | BinOp::BitAnd
@@ -672,6 +725,11 @@ fn infer_logic_fn_call_sort(name: &str) -> Option<ExprSort> {
         "resolve" => Some(ExprSort::Bool),
         "Some" | "None" => Some(ExprSort::Datatype(intern_sort_name("core::option::Option"))),
         "Ok" | "Err" => Some(ExprSort::Datatype(intern_sort_name("core::result::Result"))),
+        // A machine bit operation at its type (D-242) is an integer, as the
+        // bare operator it wraps is.
+        _ if trust_wp_core::formula::internal::machine_bitop::parse(name).is_some() => {
+            Some(ExprSort::Int)
+        }
         _ => tuple_logic_fn_arity(name)
             .and_then(|arity| u8::try_from(arity).ok().map(ExprSort::Tuple)),
     }
@@ -700,12 +758,8 @@ pub(in crate::callbacks) fn is_deref_precondition(expr: &PureExpr) -> bool {
 }
 
 pub(in crate::callbacks) fn is_simple_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    // A renamed shadowed binding names a source binding too (D-237).
+    crate::mir_analysis::binding_identity::is_binding_ident(name)
 }
 
 fn is_existing_view_domain_sort(sort: &ExprSort) -> bool {
@@ -714,7 +768,7 @@ fn is_existing_view_domain_sort(sort: &ExprSort) -> bool {
 
 pub(in crate::callbacks) fn is_scalar_view_identity_sort(sort: &ExprSort) -> bool {
     match sort {
-        ExprSort::Int | ExprSort::Bool | ExprSort::Float | ExprSort::Unit => true,
+        ExprSort::Int | ExprSort::Bool | ExprSort::Float(_) | ExprSort::Unit => true,
         // The creusot/trust-wp logic integer type `Int` is carried as an
         // `ExprSort::Datatype("…::Int")` (ty_to_expr_sort_enriched maps every
         // ADT to a Datatype sort). Semantically it IS the mathematical integer

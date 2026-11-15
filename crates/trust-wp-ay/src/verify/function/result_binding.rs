@@ -6,7 +6,6 @@
 //!
 //! Encodes `result = body` with Bool sort dispatch, Datatype wrapping
 //! (Option/Result), SeqValue propagation, and ITE rebinding.
-//! Extracted from `verify/function/mod.rs` per #2328.
 
 use std::{
     collections::HashMap,
@@ -28,7 +27,7 @@ static RESULT_DT_BRIDGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 use tracing::debug;
 
 use super::super::{
-    detect_body_constructor_name, expr_contains_result_var, option_datatype_from_constructor_expr,
+    expr_contains_result_var, option_datatype_from_constructor_expr,
     result_collection_sort_from_postcondition_with_context,
     result_is_bool_by_postcondition_with_context, result_match_datatype_from_postcondition,
     shared_constraints::infer_result_sort,
@@ -701,7 +700,7 @@ fn collect_forall_skolem_substitutions(
     {
         substitutions.insert(
             var.clone(),
-            PureExpr::Var(format!("sk_{var}"), var_sort.clone()),
+            PureExpr::Var(format!("sk${var}"), var_sort.clone()),
         );
         current = body;
     }
@@ -1190,7 +1189,7 @@ fn expr_references_result_temporal_component(
 }
 
 fn is_call_result_alias(name: &str) -> bool {
-    name.starts_with("call_") || name.starts_with("_call_")
+    name.starts_with("$call_") || name.starts_with("$_call_")
 }
 
 #[derive(Default)]
@@ -1628,23 +1627,28 @@ fn postcondition_wraps_result_in_constructor(encoder: &AYEncoder, ensures: &[Pur
     })
 }
 
-/// Datatype result binding: wrap body in Option/Result constructor.
+/// Datatype result binding: `result` is the body's value at the datatype sort.
+///
+/// A body that is a constructor application (`Some(x)`, `Ok(x)`, `None`) is
+/// built as that constructor. Any other body already HAS the datatype -- a
+/// parameter, a field, a call, a local -- and `result` is that value, read at
+/// the datatype sort through the same bridge an equality with it reads
+/// elsewhere. It is never wrapped in a constructor: nothing at this layer can
+/// tell a payload the driver unwrapped from a datatype value encoded at a
+/// scalar sort, and wrapping the second as `Some`/`Ok` fixes a variant the
+/// program does not choose. A body the datatype sort cannot read is left
+/// unbound (see [`encode_branch_as_datatype`]).
 fn assert_result_datatype_binding(
     encoder: &mut AYEncoder,
     result_expr: &PureExpr,
     dt_kind: &MatchDatatypeKind,
     requires: &[PureExpr],
 ) -> Result<(), EncodingError> {
-    // Postcondition uses `result` in a match with Option/Result
-    // constructors, but MIR unwrapped the enum constructor so
-    // `return_expr` is a bare scalar (e.g., `Bool(true)` instead of
-    // `Some(Bool(true))`). Re-wrap the body into the datatype
-    // constructor and declare `result` as Datatype sort. (#1055)
     let dt = dt_kind.datatype();
     encoder.ensure_datatype_declared(&dt);
     let result_var = encoder.get_or_declare_var("result", Sort::Datatype(dt.clone()))?;
 
-    debug!("  encoding body (datatype wrap): {result_expr:?}");
+    debug!("  encoding body (datatype binding): {result_expr:?}");
     debug!("  vars before: {:?}", encoder.var_names());
 
     let datatype_ite_expr = strip_let_assume(result_expr);
@@ -1662,17 +1666,23 @@ fn assert_result_datatype_binding(
         // constructors.
         let cond_term = encoder.encode_pure(cond)?;
         let cond_bool = encoder.coerce_bool_operand(cond_term);
+        let not_cond = encoder.solver.not(cond_bool.clone());
         let then_value_expr = strip_let_assume(then_expr);
         let else_value_expr = strip_let_assume(else_expr);
-        let then_term = encode_branch_as_datatype(encoder, then_value_expr, dt_kind, &dt)?;
-        let else_term = encode_branch_as_datatype(encoder, else_value_expr, dt_kind, &dt)?;
-        let then_eq = encoder.eq_or_iff(result_var, then_term, &Sort::Datatype(dt.clone()));
-        let else_eq = encoder.eq_or_iff(result_var, else_term, &Sort::Datatype(dt.clone()));
-        let then_guarded = encoder.solver.implies(cond_bool.clone(), then_eq);
-        let not_cond = encoder.solver.not(cond_bool.clone());
-        let else_guarded = encoder.solver.implies(not_cond.clone(), else_eq);
-        encoder.assert_term(then_guarded);
-        encoder.assert_term(else_guarded);
+        for (guard, branch_expr) in [
+            (cond_bool.clone(), then_value_expr),
+            (not_cond.clone(), else_value_expr),
+        ] {
+            match encode_branch_as_datatype(encoder, branch_expr, &dt)? {
+                Some(branch_term) => {
+                    let eq =
+                        encoder.eq_or_iff(result_var, branch_term, &Sort::Datatype(dt.clone()));
+                    let guarded = encoder.solver.implies(guard, eq);
+                    encoder.assert_term(guarded);
+                }
+                None => result_binding_premise_withheld(branch_expr),
+            }
+        }
         assert_guarded_branch_let_assume_path_conditions(encoder, cond_bool.clone(), then_expr)?;
         assert_guarded_branch_let_assume_path_conditions(encoder, not_cond.clone(), else_expr)?;
         assert_result_constructor_branch_guards(
@@ -1684,15 +1694,16 @@ fn assert_result_datatype_binding(
         return Ok(());
     }
 
-    // Use the same branch encoder for non-ITE bodies so constructor
-    // detection, sort probing, and bridge fallback stay aligned with the
-    // guarded ITE path above.
-    let ctor_term = encode_branch_as_datatype(encoder, result_expr, dt_kind, &dt)?;
+    let body_term = encode_branch_as_datatype(encoder, result_expr, &dt)?;
 
     debug!("  vars after body: {:?}", encoder.var_names());
 
-    let eq = encoder.eq_or_iff(result_var, ctor_term, &Sort::Datatype(dt.clone()));
-    encoder.assert_term(eq);
+    if let Some(body_term) = body_term {
+        let eq = encoder.eq_or_iff(result_var, body_term, &Sort::Datatype(dt.clone()));
+        encoder.assert_term(eq);
+    } else {
+        result_binding_premise_withheld(result_expr);
+    }
     assert_guarded_ite_result_equalities(
         encoder,
         result_var,
@@ -1703,34 +1714,51 @@ fn assert_result_datatype_binding(
     // Rebind `result` to the datatype body term so postcondition
     // encoding inlines the body directly, bypassing ay-dpll's
     // ITE transitivity limitation (#1310, #1572).
-    if should_rebind_result_var(result_expr) {
-        encoder.rebind_var_with_authenticated_witness(
-            "result",
-            ctor_term,
-            Sort::Datatype(dt),
-            result_var,
-        );
-        encoder.record_var_expr_alias("result", result_expr.clone());
+    if let Some(body_term) = body_term {
+        if should_rebind_result_var(result_expr) {
+            encoder.rebind_var_with_authenticated_witness(
+                "result",
+                body_term,
+                Sort::Datatype(dt),
+                result_var,
+            );
+            encoder.record_var_expr_alias("result", result_expr.clone());
+        }
     }
     Ok(())
 }
 
-/// Encode a single expression as a Datatype constructor term.
+/// A body branch the datatype sort cannot read leaves `result` free on that
+/// branch. That is a premise withheld, never a fact invented: a proof found
+/// without it holds for every value `result` can take, but a counterexample
+/// may choose a `result` the program never returns, so the premise-neutralized
+/// counter withholds a `Failed` verdict (`demote_if_unsound`).
+fn result_binding_premise_withheld(branch_expr: &PureExpr) {
+    debug!("  result datatype binding withheld for body {branch_expr:?}");
+    unsoundness::increment(unsoundness::UnsoundnessCategory::PremiseNeutralizedEq);
+}
+
+/// The value of one body branch at the result's datatype sort, or `None`
+/// when it has none.
 ///
-/// First tries structural constructor matching via
-/// [`try_encode_result_constructor_term`]. If that fails (returns `None`),
-/// falls back to encoding the body and wrapping in the default constructor.
+/// A constructor application is built by
+/// [`try_encode_result_constructor_term`]. Every other branch is a value of
+/// the result's type already: it is read at the datatype sort when it has
+/// that sort or another encoding of the same enum
+/// ([`AYEncoder::same_family_view_at`]), and otherwise has no reading here --
+/// a scalar may be a payload the driver unwrapped from an unknown
+/// constructor, or a datatype value encoded as a scalar, and wrapping either
+/// in a default constructor would decide a variant the body does not.
 ///
-/// Extracted as a helper for ITE branch handling (#2675): each branch of an
-/// ITE body is encoded independently so that different constructors can
-/// appear in different branches (e.g., `Some(x)` in the then-branch and
-/// `None` in the else-branch).
+/// Applied per ITE branch (#2675): each branch of an ITE body is encoded
+/// independently so that different constructors can appear in different
+/// branches (e.g., `Some(x)` in the then-branch and `None` in the
+/// else-branch).
 fn encode_branch_as_datatype(
     encoder: &mut AYEncoder,
     branch_expr: &PureExpr,
-    dt_kind: &MatchDatatypeKind,
     dt: &DatatypeSort,
-) -> Result<Term, EncodingError> {
+) -> Result<Option<Term>, EncodingError> {
     // Recurse into nested ITE bodies so deeply nested conditionals
     // (e.g., if-else chains returning different constructors) are
     // handled correctly at each level. Path conditions are not pushed
@@ -1740,111 +1768,39 @@ fn encode_branch_as_datatype(
         let c_raw = encoder.encode_pure(cond)?;
         let c = encoder.coerce_bool_operand(c_raw);
 
-        let then_dt = encode_branch_as_datatype(encoder, then_expr, dt_kind, dt)?;
-        let else_dt = encode_branch_as_datatype(encoder, else_expr, dt_kind, dt)?;
+        let then_dt = encode_branch_as_datatype(encoder, then_expr, dt)?;
+        let else_dt = encode_branch_as_datatype(encoder, else_expr, dt)?;
 
-        return Ok(encoder.safe_ite(c, then_dt, else_dt));
+        return Ok(match (then_dt, else_dt) {
+            (Some(then_dt), Some(else_dt)) => Some(encoder.safe_ite(c, then_dt, else_dt)),
+            _ => None,
+        });
     }
 
     if let Some(term) = try_encode_result_constructor_term(encoder, dt, branch_expr)? {
-        return Ok(term);
+        return Ok(Some(term));
     }
 
-    // Fallback: encode the body and coerce to Int if necessary (Datatype
-    // fields are Sort::Int in OptionInt/ResultIntInt).
-    let body_term = encoder.encode_pure(branch_expr)?;
-    // Context-aware sort for body coercion decision. (#1965)
-    let body_sort = encoder.infer_expr_sort_with_context(branch_expr, None);
-    let body_int = if body_sort == Sort::Bool {
-        let one = encoder.solver_mut().int_const(1);
-        let zero = encoder.solver_mut().int_const(0);
-        encoder.solver_mut().ite(body_term, one, zero)
-    } else {
-        body_term
-    };
-    // Wrap in the constructor: e.g., Some(ite(true, 1, 0)).
-    //
-    // If the encoded body is already a datatype value of this sort
-    // (e.g., branch_expr is `Some(1)` which encodes to OptionInt),
-    // avoid double-wrapping into `Some(Some(1))`. (#1553)
-    //
-    // When the body is a LogicFnCall with a recognized constructor
-    // (e.g., `Err(42)`), use that constructor instead of always
-    // defaulting to `Ok`/`Some`. (#1811)
-    let ctor_name = detect_body_constructor_name(branch_expr)
-        .unwrap_or_else(|| dt_kind.value_constructor_name());
-    match encoder.safe_datatype_constructor("result datatype wrap", dt, ctor_name, &[body_int]) {
-        Ok(term) => {
-            encoder.materialize_ground_native_constructor(dt, ctor_name, term, &[body_int]);
-            Ok(term)
-        }
-        Err(ctor_err) => {
-            // Probe whether `body_int` is already a term of the
-            // target datatype sort; tester succeeds only when the
-            // argument sort matches the datatype.
-            if encoder
-                .safe_datatype_tester("result datatype wrap body probe", dt, ctor_name, body_int)
-                .is_ok()
-            {
-                Ok(body_int)
-            } else {
-                // Sort mismatch: the body encodes with a sort that
-                // the constructor cannot accept. Bridge to the actual
-                // field sort from the constructor definition rather than
-                // always bridging to Int. (#2699)
-                //
-                // Look up the constructor's first field sort to use as
-                // the bridge target. This handles cases like:
-                // - Option<Vec<T>>: body is Seq(Int), ctor wants Int → bridge to Int
-                // - Option<HashMap<K,V>>: body is FMap, ctor wants Seq → bridge to Seq
-                // - Custom Result<T, E>: body sort varies per ctor field
-                let actual_term_sort = encoder.solver_mut().get_sort(body_int);
-                let target_field_sort = dt
-                    .constructors
-                    .iter()
-                    .find(|c| datatype_constructor_matches(dt, &c.name, ctor_name))
-                    .and_then(|c| c.fields.first())
-                    .map(|f| f.sort.clone());
-                if actual_term_sort != Sort::Int
-                    || target_field_sort
-                        .as_ref()
-                        .is_some_and(|fs| *fs != Sort::Int)
-                {
-                    let bridge_sort = target_field_sort.unwrap_or(Sort::Int);
-                    unsoundness::increment(unsoundness::UnsoundnessCategory::SortCoercionBridge);
-                    let id = RESULT_DT_BRIDGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    let bridged = encoder
-                        .solver_mut()
-                        .declare_const(&format!("__result_dt_bridge_{id}"), bridge_sort);
-                    match encoder.safe_datatype_constructor(
-                        "result datatype wrap bridged",
-                        dt,
-                        ctor_name,
-                        &[bridged],
-                    ) {
-                        Ok(term) => {
-                            encoder.materialize_ground_native_constructor(
-                                dt,
-                                ctor_name,
-                                term,
-                                &[bridged],
-                            );
-                            Ok(term)
-                        }
-                        Err(bridge_err) => Err(EncodingError::solver_error(format!(
-                            "result datatype wrap failed for constructor \
-                                 {ctor_name} (bridged): {bridge_err}"
-                        ))),
-                    }
-                } else {
-                    Err(EncodingError::solver_error(format!(
-                        "result datatype wrap failed for constructor \
-                             {ctor_name}: {ctor_err}"
-                    )))
-                }
+    // A branch that is a bare variable has the function's return type, so a
+    // variable nothing has declared or hinted yet (a logic parameter reaches
+    // here with no sort annotation, and would otherwise be read as an `Int`
+    // no datatype sort can view) is declared at the sort `result` has. A
+    // declared or hinted one keeps the sort its other uses fixed.
+    if let PureExpr::Var(name, None) = branch_expr {
+        if encoder.var_sort(name).is_none() {
+            // Analytical probe, not an encoding step: its Int fallback must not
+            // count toward demotion.
+            let snap = unsoundness::snapshot();
+            let inferred = encoder.infer_expr_sort_with_context(branch_expr, None);
+            unsoundness::restore(&snap);
+            if inferred == Sort::Int {
+                encoder.get_or_declare_var(name, Sort::Datatype(dt.clone()))?;
             }
         }
     }
+
+    let body_term = encoder.encode_pure(branch_expr)?;
+    Ok(encoder.same_family_view_at(body_term, &Sort::Datatype(dt.clone())))
 }
 
 /// Scalar result binding: standard equality with SeqValue propagation.
@@ -1873,9 +1829,7 @@ fn assert_result_scalar_binding(
         // Without the bracket this fires as a false demotion whenever a logic
         // function's body matches on a user enum and rebuilds it — the goal
         // proves (`ay_result=unsat`) but the verdict is downgraded to
-        // "postcondition unverified". It was previously masked by the
-        // encoder-lifetime sort-inference memo swallowing the repeat walk;
-        // that memo was a use-after-free oracle and is gone.
+        // "postcondition unverified".
         let before_result_infer = unsoundness::snapshot();
         let inferred = infer_result_sort(encoder, result_expr);
         unsoundness::restore_category(
@@ -1885,7 +1839,7 @@ fn assert_result_scalar_binding(
         // When syntactic inference returns Int (the default fallback),
         // consult the ExprSort annotation from `result_expr` (MIR type
         // info) and sort hints. The annotation is authoritative for
-        // non-Int sorts, bypassing the heuristic cascade. (#994 Phase 2d)
+        // non-Int sorts, bypassing the heuristic cascade. (#994)
         if inferred == Sort::Int {
             let ann = extract_inner_var_annotation(result_expr);
             let resolved = encoder.resolve_var_sort_or_int_with_annotation("result", ann);
@@ -1955,7 +1909,7 @@ fn assert_result_scalar_binding(
     // the body term in the variable map so postcondition encoding
     // inlines the body (#1310).
     //
-    // ay-dpll (rev 715ed260) cannot prove transitive equality through
+    // ay-dpll cannot prove transitive equality through
     // ITE terms: `result = ite(c,a,b)` + `f = ite(c,a,b)` ⊬ `result = f`.
     // By binding `result` to the body term, postconditions that reference
     // `result` use the body term inline, allowing the solver to match it

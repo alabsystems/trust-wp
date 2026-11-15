@@ -2488,3 +2488,20 @@ fn test_nonzero_legacy_usize_size() {
         "size_of_logic__NonZeroUsize() != size_of_logic__usize() should be UNSAT (#2669)"
     );
 }
+
+/// The old body sliced off `RESULT_TYPE_PREFIX.len()` bytes without checking
+/// the input began with that prefix — or was that long — so anything shorter
+/// panicked on a byte range. These inputs reach this function from encoded SMT
+/// type suffixes, which are not guaranteed to be Result types at all.
+#[test]
+fn extract_result_inner_types_answers_none_instead_of_panicking_on_short_input() {
+    use super::extract_result_inner_types;
+    assert_eq!(extract_result_inner_types(""), None);
+    assert_eq!(extract_result_inner_types("__"), None);
+    assert_eq!(extract_result_inner_types("____Option_LT_u32_GT_"), None);
+    // A well-formed Result suffix still splits exactly as before.
+    assert_eq!(
+        extract_result_inner_types("____Result_LT_u32_C__S_String_GT_"),
+        Some(("u32", "String"))
+    );
+}

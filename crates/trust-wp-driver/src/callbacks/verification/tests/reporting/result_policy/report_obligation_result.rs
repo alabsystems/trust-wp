@@ -68,8 +68,44 @@ fn report_obligation_assumed_increments_assumed_only() {
     assert_eq!(counters.assumed, 1, "Assumed must remain visible");
 }
 
+/// A `Failed` carrying a VALIDATED counterexample — the only kind trust-wp may
+/// publish as a refutation — increments `failed` and nothing else.
 #[test]
 fn report_obligation_failed_increments_failed_counter() {
+    let mut counters = VerificationCounters {
+        failed: 2,
+        errors: 1,
+        ..VerificationCounters::default()
+    };
+    let cex = Counterexample {
+        values: vec![],
+        violated_postcondition: None,
+    };
+    let outcome = apply_ok_outcome_branch(
+        &mut counters,
+        VerificationOutcome::new(
+            VerificationResult::Failed(cex),
+            Some(validated_sat_provenance()),
+        ),
+    );
+    assert_eq!(outcome, ObligationOutcome::ErrorRecorded);
+    assert_eq!(
+        counters.failed, 3,
+        "Failed must increment failed from 2 to 3"
+    );
+    assert_eq!(counters.errors, 1, "Failed must not touch errors");
+    assert_eq!(counters.demoted, 0, "Failed must not touch demoted");
+    assert_eq!(
+        counters.refutations_withheld, 0,
+        "a validated refutation is not withheld"
+    );
+}
+
+/// The same `Failed` WITHOUT a validated model lands in the error channel
+/// instead. The two tests are a pair: revert the rule and this one fails;
+/// over-apply it and the one above does.
+#[test]
+fn report_obligation_failed_without_validated_model_increments_errors() {
     let mut counters = VerificationCounters {
         failed: 2,
         errors: 1,
@@ -85,11 +121,11 @@ fn report_obligation_failed_increments_failed_counter() {
     );
     assert_eq!(outcome, ObligationOutcome::ErrorRecorded);
     assert_eq!(
-        counters.failed, 3,
-        "Failed must increment failed from 2 to 3"
+        counters.failed, 2,
+        "an unvalidated refutation must NOT increment failed"
     );
-    assert_eq!(counters.errors, 1, "Failed must not touch errors");
-    assert_eq!(counters.demoted, 0, "Failed must not touch demoted");
+    assert_eq!(counters.errors, 2, "it is an inconclusive: count it");
+    assert_eq!(counters.demoted, 0);
 }
 
 #[test]
@@ -242,14 +278,17 @@ fn report_obligation_sequential_accumulation() {
     );
     assert_eq!(counters.evidence_gaps, 1);
 
-    // 2nd: Failed -- failed += 1
+    // 2nd: Failed with a validated counterexample -- failed += 1
     let cex = Counterexample {
         values: vec![],
         violated_postcondition: None,
     };
     let _ = apply_ok_outcome_branch(
         &mut counters,
-        VerificationOutcome::without_provenance(VerificationResult::Failed(cex)),
+        VerificationOutcome::new(
+            VerificationResult::Failed(cex),
+            Some(validated_sat_provenance()),
+        ),
     );
     assert_eq!(
         (counters.failed, counters.errors, counters.demoted),

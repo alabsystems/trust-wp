@@ -114,7 +114,7 @@ fn capture_field_name_from_string() {
 fn closure_capture_info_new_defaults() {
     let info = ClosureCaptureInfo::new("my::closure".to_string(), vec![]);
     assert_eq!(info.def_id(), "my::closure");
-    assert!(info.captures().is_empty());
+    assert_eq!(info.captures(), []);
     assert_eq!(info.param_name(), None);
     assert_eq!(info.body_expr(), None);
     assert_eq!(info.param_names(), None);

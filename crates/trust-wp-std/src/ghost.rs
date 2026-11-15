@@ -34,10 +34,6 @@
 //!     x += 1; // Program code continues
 //! }
 //! ```
-//!
-//! # Design
-//!
-//! See `designs/2026-02-01-ghost-code.md` for the full design document.
 
 use core::{
     fmt,
@@ -54,9 +50,39 @@ use core::{
 /// # Properties
 ///
 /// - Zero-sized at runtime (no memory overhead)
-/// - `Copy` when `T: Copy`
+/// - `Copy` when `T: Copy`, and only then: a permission it holds is used once
 /// - Cannot be dereferenced at runtime (panics)
 /// - Value is available to the verifier
+///
+/// A permission that owns an allocation is not duplicated:
+///
+/// ```compile_fail,E0382
+/// use trust_wp_std::ghost::perm::Perm;
+/// let (p, own) = Perm::new(1i32);
+/// let _b1 = unsafe { Perm::to_box(p, own) };
+/// let _b2 = unsafe { Perm::to_box(p, own) };
+/// ```
+///
+/// nor is a unique borrow of one:
+///
+/// ```compile_fail,E0382
+/// use trust_wp_std::{ghost, ghost::perm::Perm};
+/// let (p, mut own) = Perm::new(1i32);
+/// let g = ghost!(&mut *own);
+/// let _r1 = unsafe { Perm::as_mut(p, g) };
+/// let _r2 = unsafe { Perm::as_mut(p, g) };
+/// ```
+///
+/// while a shared borrow is, as `&T` is:
+///
+/// ```
+/// use trust_wp_std::{ghost, ghost::perm::Perm};
+/// let (p, own) = Perm::new(1i32);
+/// let g = ghost!(&*own);
+/// let r1 = unsafe { Perm::as_ref(p, g) };
+/// let r2 = unsafe { Perm::as_ref(p, g) };
+/// assert_eq!(*r1 + *r2, 2);
+/// ```
 ///
 /// # Example
 ///
@@ -77,9 +103,15 @@ use core::{
 #[must_use]
 pub struct Ghost<T: ?Sized>(PhantomData<T>);
 
-impl<T: ?Sized> Copy for Ghost<T> {}
+// A ghost value is duplicated only when its type is, as Creusot's
+// `impl<T: Copy> Copy for Ghost<T>`. A `Ghost<Box<Perm<_>>>` is the one owner
+// of what its permission guards, and a `Ghost<&mut _>` one unique borrow; a copy
+// of either discharges a permission's obligations a second time, so one
+// allocation is boxed back twice or one place is lent out as two live `&mut`
+// (D-138; pinned by `tests::test_ghost_permission_is_copied_only_when_its_type_is`).
+impl<T: Copy> Copy for Ghost<T> {}
 
-impl<T: ?Sized> Clone for Ghost<T> {
+impl<T: Copy> Clone for Ghost<T> {
     fn clone(&self) -> Self {
         *self
     }
@@ -88,8 +120,8 @@ impl<T: ?Sized> Clone for Ghost<T> {
 impl<T> Ghost<T> {
     /// Creusot-compatible ghost clone of the wrapped logical value.
     ///
-    /// `Ghost<T>` is `Copy`, so the standard `Clone` impl returns another
-    /// `Ghost<T>`. Creusot examples also use `ghost!(g.clone())` to clone the
+    /// `Ghost<T>` is `Copy` when `T` is, and its `Clone` impl then returns
+    /// another `Ghost<T>`. Creusot examples also use `ghost!(g.clone())` to clone the
     /// logical payload and then wrap it back in `Ghost<T>`. This inherent
     /// method gives method-call syntax that shape without producing
     /// `Ghost<Ghost<T>>`.
@@ -309,27 +341,42 @@ pub mod specs {
 
     /// `Perm<*const T>::from_ref(&T)` — decompose a shared reference.
     ///
-    /// Returns `(*const T, Ghost<&Perm<*const T>>)`. Prevents opaque
-    /// classification. The relationship between the pointer and the
-    /// permission is implicit in the ghost encoding. (#1804)
-    pub const PERM_FROM_REF: &str = "";
+    /// Returns `(*const T, Ghost<&Perm<*const T>>)`. The permission guards
+    /// the pointer, Creusot's `*result.1.ward() == result.0`: it is what
+    /// `PERM_AS_REF` owes.
+    pub const PERM_FROM_REF: &str = r"
+        params: r
+        ensures: *result.1.ward() == result.0
+    ";
 
     /// `Perm<*const T>::from_mut(&mut T)` — decompose a mutable reference.
     ///
-    /// Returns `(*mut T, Ghost<&mut Perm<*const T>>)`. Prevents opaque
-    /// classification. (#1804)
-    pub const PERM_FROM_MUT: &str = "";
+    /// Returns `(*mut T, Ghost<&mut Perm<*const T>>)`; the permission guards
+    /// the pointer, as `PERM_FROM_REF`.
+    pub const PERM_FROM_MUT: &str = r"
+        params: r
+        ensures: *result.1.ward() == result.0
+    ";
 
     /// `Perm<*const T>::from_box(Box<T>)` — decompose a box.
     ///
-    /// Returns `(*mut T, Ghost<Box<Perm<*const T>>>)`. Prevents opaque
-    /// classification. (#1804)
-    pub const PERM_FROM_BOX: &str = "";
+    /// Returns `(*mut T, Ghost<Box<Perm<*const T>>>)`; the permission guards
+    /// the pointer, as `PERM_FROM_REF`.
+    pub const PERM_FROM_BOX: &str = r"
+        params: val
+        ensures: *result.1.ward() == result.0
+    ";
 
     /// `Perm<*const T>::to_box(ptr, own)` — reconstruct a Box from a raw pointer.
     ///
-    /// Returns `Box<T>`. Prevents opaque classification. Part of #2682.
-    pub const PERM_TO_BOX: &str = "";
+    /// `Box::from_raw(ptr)`: a pointer the permission does not guard is a
+    /// null `Box` or a second owner of another allocation, freed twice.
+    /// Creusot's precondition, its `ptr as *const T` cast elided because the
+    /// contract language refuses pointer casts and both pointers are one term.
+    pub const PERM_TO_BOX: &str = r"
+        params: ptr, own
+        requires: ptr == *own.ward()
+    ";
 
     /// `Resource::alloc(r)` — allocate a fresh resource.
     ///
@@ -340,8 +387,8 @@ pub mod specs {
     /// `creusot-std/src/ghost/resource.rs` `Resource::alloc`:
     /// `#[ensures(result@ == *r)]` (the allocated resource's view is the
     /// snapshot's payload). Without it `result@` is completely free and
-    /// `Authority::new`-style wrappers fail on an unconstrained view.
-    /// (ce-census 2026-08-20, resource_algebras/fmap_view_view.rs `new`)
+    /// `Authority::new`-style wrappers fail on an unconstrained view
+    /// (`resource_algebras/fmap_view_view.rs`, `new`).
     pub const RESOURCE_ALLOC: &str = r"
         params: arg0
         ensures: result@ == *arg0
@@ -398,13 +445,21 @@ pub mod specs {
     /// Prevents opaque classification. (#2316)
     pub const RESOURCE_NEW_UNIT: &str = "";
 
-    /// `Perm::disjoint_lemma(&mut a, &b)` -> `a != b`
+    /// `Perm::disjoint_lemma(&mut a, &b)` -> `a != b` where the containers
+    /// are distinct.
     ///
-    /// Ghost lemma: two distinct permissions are disjoint. References are
-    /// transparent in SMT, so `arg0` and `arg1` are the inner `Perm<T>` values.
-    /// The postcondition is a predicate (no `result == ...`) so it is pushed
-    /// as a `CALL_ASSUMPTION` for subsequent `proof_asserts`. (#1581)
-    pub const PERM_DISJOINT_LEMMA: &str = "ensures: arg0 != arg1";
+    /// Two permissions held at once guard distinct containers, and a
+    /// permission is the same term as the pointer or cell it guards (`PERM_NEW`,
+    /// `PERMCELL_NEW`), so the fact is `ptr1 != ptr2`. Creusot's lemma for a raw
+    /// pointer holds only when both pointees have a non-zero size: two
+    /// zero-sized values share an address. The call site answers
+    /// `distinct_containers_T()` from the container type, and a caller's
+    /// generic parameter, whose instance may be zero-sized, gets no fact.
+    /// References are transparent in SMT, so `arg0` and `arg1` are the inner
+    /// `Perm<T>` values. The postcondition is a predicate (no `result == ...`)
+    /// so it is pushed as a `CALL_ASSUMPTION` for subsequent `proof_asserts`.
+    pub const PERM_DISJOINT_LEMMA: &str =
+        "ensures: __trust_wp_std_site_distinct_containers_T() ==> arg0 != arg1";
 
     /// `Perm::new(value)` -> `result.0 == *result.1`
     ///
@@ -412,8 +467,12 @@ pub mod specs {
     /// In the SMT encoding, the pointer and the permission token are the same
     /// abstract identity: `result.0 == *result.1`. Combined with
     /// `disjoint_lemma`, this lets the solver derive `p1 != p2` from
-    /// `own1 != own2`. (#1581)
-    pub const PERM_NEW: &str = "ensures: result.0 == *result.1";
+    /// `own1 != own2`. (#1581) The permission guards the pointer, as
+    /// `PERM_FROM_REF`.
+    pub const PERM_NEW: &str = r"
+        ensures: result.0 == *result.1
+        ensures: *result.1.ward() == result.0
+    ";
 
     /// `Perm::val(&self) -> &C::Value` — ghost logical value accessor.
     ///
@@ -430,16 +489,23 @@ pub mod specs {
 
     /// `Perm::as_ref(ptr, own) -> &T` — ghost shared dereference.
     ///
-    /// In Creusot: `#[ensures(*result == *own.val())]`. Prevents opaque
-    /// classification without adding semantic constraints that could
-    /// conflict with the flat ghost encoding model. (#2315)
-    pub const PERM_AS_REF: &str = "params: ptr, own";
+    /// `&*ptr`: a pointer the permission does not guard may be null or
+    /// dangling, so the call owes Creusot's `ptr == *own.ward()`. Its
+    /// `*result == *own.val()` is not stated: the flat ghost encoding carries
+    /// no value for a permission.
+    pub const PERM_AS_REF: &str = r"
+        params: ptr, own
+        requires: ptr == *own.ward()
+    ";
 
     /// `Perm::as_mut(ptr, own) -> &mut T` — ghost mutable dereference.
     ///
-    /// In Creusot: `#[ensures(*result == *own.val())]` plus prophecy frame.
-    /// Prevents opaque classification. (#2315)
-    pub const PERM_AS_MUT: &str = "params: ptr, own";
+    /// `&mut *ptr`: owes what `PERM_AS_REF` owes, Creusot's precondition with
+    /// its pointer cast elided as in `PERM_TO_BOX`.
+    pub const PERM_AS_MUT: &str = r"
+        params: ptr, own
+        requires: ptr == *own.ward()
+    ";
 
     /// `Resource::val(&self) -> &R` — ghost logical value accessor.
     ///
@@ -465,7 +531,7 @@ pub mod specs {
     /// `self.id() == other.id()` to be unsatisfiable — i.e. the lemma is
     /// vacuous for Excl. Asserting the `op != None` ensures UNGATED would create
     /// a global contradiction with `Excl::op == None` and false-accept
-    /// everything (the 9aec447 regression). Gated, the contradiction is local to
+    /// everything. Gated, the contradiction is local to
     /// a caller that has already established `self.id() == other.id()` (e.g.
     /// excl.rs's `if x.id_ghost()==y.id_ghost()` branch), proving that branch
     /// dead. (#2315)
@@ -500,20 +566,19 @@ pub mod specs {
     ///   #[ensures(self@.incl_eq(result@) && other@.incl_eq(result@))]
     /// ```
     ///
-    /// ★ SOUNDNESS (2026-08-27 quantifier-frontier adjudication). This const
-    /// previously rendered `ensures: self@ == other@` as a "bounded Phase 1"
-    /// approximation of the `incl_eq` clause. That is NOT entailed by Creusot's
+    /// ★ SOUNDNESS. The `incl_eq` clause must NOT be approximated as
+    /// `ensures: self@ == other@`. That equality is not entailed by Creusot's
     /// contract: `incl_eq(a, b) == a.eq(b) || a.incl(b)` (reference
     /// `creusot-std/src/logic/ra.rs`, `incl_eq`), so
     /// `self@.incl_eq(result@) && other@.incl_eq(result@)` only places both
     /// operands BELOW the join — for any RA with non-trivial inclusion (Frac,
     /// Auth/ViewRA) two distinct fragments join without being equal. Asserting
-    /// the equality as a callee `ensures` is therefore a premise
-    /// STRENGTHENING: a trusted, false assumption handed to the caller, i.e. a
-    /// latent false accept. Per the withhold rule (a clause that cannot be
-    /// rendered faithfully must be WITHHELD, not approximated) the `incl_eq`
-    /// conjunct is now withheld entirely, and the two clauses that DO render
-    /// faithfully are committed here.
+    /// the equality as a callee `ensures` would be a premise STRENGTHENING: a
+    /// trusted, false assumption handed to the caller, i.e. a latent false
+    /// accept. Per the withhold rule (a clause that cannot be rendered
+    /// faithfully must be WITHHELD, not approximated) the `incl_eq` conjunct is
+    /// withheld entirely, and only the two clauses that DO render faithfully
+    /// are committed here.
     ///
     /// The RA-specific consequence survives for the Agree RA ONLY, injected by
     /// the strictly gated driver specialization `ag_join_shared_ensures`
@@ -779,24 +844,19 @@ impl<T: ?Sized> Ghost<T> {
 
     /// Convert `&Ghost<T>` into `Ghost<&T>`.
     ///
-    /// # Panics
-    ///
-    /// Always panics at runtime. This method is only valid in verification
-    /// context where the verifier intercepts the call.
+    /// Program code calls it (Creusot's `NonAtomicInvariant::open(inv.borrow(), ..)`),
+    /// and its spec is the ghost itself with no precondition, so at run time
+    /// it is the zero-sized ghost handle, as Creusot's `#[erasure(_)]` borrow.
     #[doc(hidden)]
     pub fn borrow(&self) -> Ghost<&T> {
-        panic!("Ghost::borrow called at runtime - only valid in verification context")
+        Ghost(PhantomData)
     }
 
-    /// Convert `&mut Ghost<T>` into `Ghost<&mut T>`.
-    ///
-    /// # Panics
-    ///
-    /// Always panics at runtime. This method is only valid in verification
-    /// context where the verifier intercepts the call.
+    /// Convert `&mut Ghost<T>` into `Ghost<&mut T>`: the zero-sized ghost
+    /// handle at run time, as `borrow`.
     #[doc(hidden)]
     pub fn borrow_mut(&mut self) -> Ghost<&mut T> {
-        panic!("Ghost::borrow_mut called at runtime - only valid in verification context")
+        Ghost(PhantomData)
     }
 }
 
@@ -869,7 +929,7 @@ unsafe impl<T: ?Sized> Sync for Ghost<T> {}
 /// | Property | `Ghost<T>` | `Snapshot<T>` |
 /// |----------|------------|---------------|
 /// | Mutable | Yes (in ghost context) | No |
-/// | Copy | Always Copy | Always Copy |
+/// | Copy | When `T: Copy` | Always Copy |
 /// | Use case | Auxiliary proof state | Capturing values at program points |
 ///
 /// # Example
@@ -884,10 +944,6 @@ unsafe impl<T: ?Sized> Sync for Ghost<T> {}
 ///     // In verification: *original_len == v.len() - 1
 /// }
 /// ```
-///
-/// # Design
-///
-/// See `designs/2026-02-01-snapshot-type.md` for the full design document.
 #[repr(transparent)]
 #[must_use]
 pub struct Snapshot<T: ?Sized>(PhantomData<T>);
@@ -980,18 +1036,20 @@ impl<T> Snapshot<T> {
         unreachable!("Snapshot::into_inner is verification-only")
     }
 
-    /// Convert a snapshot into a ghost value.
+    /// Convert a snapshot into a ghost value, for a `Plain` type only, as
+    /// Creusot's: a snapshot is `Copy` whatever it holds, so a ghost made from
+    /// one of a permission is a second owner of what the permission guards.
     ///
-    /// In Creusot, `into_ghost` converts a `Snapshot<T>` (logical, immutable
-    /// view) into a `Ghost<T>` (ghost, ownable value) for types implementing
-    /// the `Plain` trait. Since trust-wp's ghost types are all specification-only
-    /// (zero-sized phantoms), this is always safe.
+    /// Program code may call it (`program_context` lets it run), so its body
+    /// is the zero-sized handle rather than `T`'s `Plain::into_ghost`, which a
+    /// user's impl may override with a body the verifier never reads.
     ///
     /// Reference: Creusot `creusot-std/src/snapshot.rs:111-117`
     pub fn into_ghost(self) -> Ghost<T>
     where
-        T: Sized,
+        T: Plain,
     {
+        let _ = self;
         Ghost::conjure()
     }
 }
@@ -1068,7 +1126,7 @@ where
     }
 }
 
-impl<T> Deref for Snapshot<T> {
+impl<T: ?Sized> Deref for Snapshot<T> {
     type Target = T;
 
     /// Dereference the snapshot to access the captured value.
@@ -1259,6 +1317,147 @@ mod tests {
         let _ = (ghost2, ghost3);
     }
 
+    /// Resolves only when `T` is not `Copy`: a `Copy` type satisfies both
+    /// impls, and the `_` in `not_copy::<T>()` is then ambiguous (E0283), so
+    /// the test crate stops compiling. Doctests cannot pin this here, since
+    /// the campaign toolchain ships no `rustdoc`.
+    trait AmbiguousIfCopy<Marker> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+    impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+    fn not_copy<T: ?Sized + AmbiguousIfCopy<M>, M>() {
+        T::check();
+    }
+    fn is_copy<T: Copy>() {}
+
+    /// A ghost permission that owns an allocation, or that is a unique borrow
+    /// of one, is used once (D-138); a shared borrow of one is copied as `&T`
+    /// is.
+    #[test]
+    fn test_ghost_permission_is_copied_only_when_its_type_is() {
+        use super::perm::Perm;
+        not_copy::<Ghost<Box<Perm<*const i32>>>, _>();
+        not_copy::<Ghost<&mut Perm<*const i32>>, _>();
+        not_copy::<Ghost<&mut Box<Perm<*const i32>>>, _>();
+        not_copy::<Ghost<Box<Perm<crate::std::cell::PermCell<i32>>>>, _>();
+        not_copy::<Ghost<&mut Perm<crate::std::cell::PermCell<i32>>>, _>();
+        is_copy::<Ghost<&Perm<*const i32>>>();
+        is_copy::<Ghost<&Box<Perm<*const i32>>>>();
+        is_copy::<Ghost<i32>>();
+    }
+
+    /// Resolves only when `T` is not `Clone`, as `AmbiguousIfCopy` for `Copy`.
+    trait AmbiguousIfClone<Marker> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+    fn not_clone<T: ?Sized + AmbiguousIfClone<M>, M>() {
+        T::check();
+    }
+
+    /// A `PermCell` is a cell with an identity of its own and no `Clone`, as
+    /// Creusot's: a clone had no run-time body but a panic (D-139).
+    #[test]
+    fn test_permcell_is_not_clone() {
+        not_clone::<crate::std::cell::PermCell<i32>, _>();
+    }
+
+    /// `Perm::as_mut` takes its permission as a unique borrow, as Creusot's
+    /// `Ghost<&mut Perm<*const T>>`: one lent out of a shared reference by
+    /// `from_ref` has no such type. A signature that took any `Own` again
+    /// would not coerce to this pointer type.
+    #[test]
+    fn test_perm_as_mut_takes_a_unique_permission() {
+        use super::perm::Perm;
+        let _: for<'a> unsafe fn(*mut i32, Ghost<&'a mut Perm<*const i32>>) -> &'a mut i32 =
+            Perm::<*const i32>::as_mut::<Perm<*const i32>>;
+        let _: unsafe fn(*mut i32, Ghost<Box<Perm<*const i32>>>) -> Box<i32> =
+            Perm::<*const i32>::to_box;
+    }
+
+    /// `Perm::as_ref`'s result lives as long as its permission stays lent, as
+    /// Creusot's `Ghost<&'a Perm<*const T>> -> &'a T`, so `to_box` cannot
+    /// consume the permission while the reference is read. The signature
+    /// that took any `Own` bound the result by nothing and would not coerce
+    /// to this pointer type.
+    #[test]
+    fn test_perm_as_ref_result_lives_while_the_permission_is_lent() {
+        use super::perm::Perm;
+        let _: for<'a> unsafe fn(*const i32, Ghost<&'a Perm<*const i32>>) -> &'a i32 =
+            Perm::<*const i32>::as_ref::<Perm<*const i32>>;
+        let _: for<'a> unsafe fn(*const i32, Ghost<&'a Box<Perm<*const i32>>>) -> &'a i32 =
+            Perm::<*const i32>::as_ref::<Box<Perm<*const i32>>>;
+    }
+
+    /// Resolves only when `T` is not `Plain`, as `AmbiguousIfCopy` for `Copy`.
+    trait AmbiguousIfPlain<Marker> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfPlain<()> for T {}
+    impl<T: Plain> AmbiguousIfPlain<u8> for T {}
+    fn not_plain<T: ?Sized + AmbiguousIfPlain<M>, M>() {
+        T::check();
+    }
+    fn is_plain<T: Plain>() {}
+
+    /// A snapshot is taken into ghost code only for plain data, as Creusot's
+    /// `Snapshot::into_ghost` (`T: Plain`, which its body needs): a snapshot
+    /// is `Copy` whatever it holds, and a ghost made of a permission would be
+    /// a second owner of the allocation it guards, boxed back twice.
+    #[test]
+    fn test_snapshot_into_ghost_takes_plain_data_only() {
+        use super::perm::Perm;
+        not_plain::<Box<Perm<*const i32>>, _>();
+        not_plain::<Perm<*const i32>, _>();
+        not_plain::<&mut Perm<*const i32>, _>();
+        not_plain::<&Perm<*const i32>, _>();
+        not_plain::<&i32, _>();
+        is_plain::<i32>();
+        is_plain::<bool>();
+        is_plain::<*const i32>();
+        is_plain::<crate::logic::Int>();
+        let snapshot: Snapshot<u64> = Snapshot::capture(&7);
+        let _: Ghost<u64> = snapshot.into_ghost();
+    }
+
+    /// A `Plain` impl's own `into_ghost` is a user body the verifier does not
+    /// read, so `Snapshot::into_ghost`, which program code runs, never runs it.
+    #[test]
+    fn test_snapshot_into_ghost_runs_no_plain_impl_body() {
+        #[derive(Clone, Copy)]
+        struct Tag;
+        impl Plain for Tag {
+            fn into_ghost(_: Snapshot<Self>) -> Ghost<Self> {
+                panic!("a Plain impl's body ran")
+            }
+        }
+        let snapshot: Snapshot<Tag> = Snapshot::capture(&Tag);
+        let _: Ghost<Tag> = snapshot.into_ghost();
+    }
+
+    /// Program code borrows a ghost (Creusot's `open(inv.borrow(), ..)`), so
+    /// at run time the borrow is the zero-sized handle, never a panic (D-139).
+    #[test]
+    fn test_ghost_borrow_is_the_zero_sized_handle_at_run_time() {
+        let mut ghost: Ghost<i32> = Ghost::conjure();
+        let _shared: Ghost<&i32> = ghost.borrow();
+        let _unique: Ghost<&mut i32> = ghost.borrow_mut();
+        assert_eq!(core::mem::size_of::<Ghost<&mut i32>>(), 0);
+    }
+
+    /// `main` creates its tokens in program code, so at run time
+    /// `Tokens::new()` is the zero-sized handle, never a panic (D-139).
+    #[test]
+    fn test_tokens_new_is_the_zero_sized_handle_at_run_time() {
+        let _tokens: Ghost<super::invariant::Tokens<'static>> = super::invariant::Tokens::new();
+        assert_eq!(
+            core::mem::size_of::<Ghost<super::invariant::Tokens<'static>>>(),
+            0
+        );
+    }
+
     #[test]
     #[should_panic(expected = "Ghost::inner called at runtime")]
     fn test_ghost_inner_panics() {
@@ -1353,6 +1552,52 @@ mod tests {
 // Ghost submodules (Creusot compatibility stubs)
 // =============================================================================
 
+/// A type whose values can be taken out of a snapshot into ghost code:
+/// plain data whose ownership conveys nothing, as Creusot's `Plain`.
+///
+/// A permission (`Perm`, `Box<Perm<_>>`) or a reference is not plain: a
+/// snapshot is `Copy` whatever it holds, so `Snapshot::into_ghost` on one
+/// would make a second owner of what a single permission guards, and each
+/// would discharge the obligation of a `Perm::to_box` for one allocation.
+///
+/// Source: Creusot `creusot-std/src/ghost.rs` (`Plain`)
+pub trait Plain: Copy {
+    /// The ghost value a snapshot holds (`*result == *snap`).
+    #[must_use]
+    fn into_ghost(snap: Snapshot<Self>) -> Ghost<Self> {
+        let _ = snap;
+        Ghost::conjure()
+    }
+}
+
+macro_rules! plain_impls {
+    ($($t:ty),* $(,)?) => {
+        $(impl Plain for $t {})*
+    };
+}
+
+plain_impls!(
+    bool,
+    char,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    crate::logic::Int,
+    crate::logic::ra::Id,
+);
+
+impl<T: ?Sized> Plain for *const T {}
+impl<T: ?Sized> Plain for *mut T {}
+
 /// Marker trait for ghost-callable function types.
 ///
 /// In Creusot, `FnGhost` marks closures/functions that can be called in
@@ -1432,7 +1677,11 @@ pub mod perm {
         /// value for use in specifications. Ghost-only.
         ///
         /// Reference: Creusot `creusot-std/src/ghost/perm.rs:67-69`
-        pub fn val(&self) -> &T {
+        /// (`fn val<'a>(self) -> &'a C::Value`).
+        pub fn val(&self) -> &T::Value
+        where
+            T: Container,
+        {
             panic!("ghost code only")
         }
     }
@@ -1469,39 +1718,52 @@ pub mod perm {
     impl<T> Perm<*const T> {
         /// Borrow the underlying value through a raw pointer permission.
         ///
-        /// In Creusot, this dereferences the pointer and validates the
-        /// permission. At runtime, it simply dereferences the pointer.
-        /// The `Own` parameter is generic to accept both `Ghost<&Perm<...>>`
-        /// and `Ghost<&Box<Perm<...>>>` (from `ghost!(&*self.perm)` patterns
-        /// where Box auto-deref doesn't chain through the ghost! macro).
+        /// The result lives as long as the permission stays lent, as under
+        /// Creusot's `Ghost<&'a Perm<*const T>>`: a result bound by nothing
+        /// outlived the permission `to_box` consumed, and was read after the
+        /// allocation was freed. `Borrow` admits the `&Box<Perm<_>>` that
+        /// `ghost!(&*own)` yields.
         ///
         /// # Safety
         ///
         /// The pointer must be valid and properly aligned.
         ///
         /// Reference: Creusot `creusot-std/src/std/ptr.rs:559-561`
-        #[allow(
-            unused_variables,
-            clippy::needless_lifetimes,
-            clippy::needless_pass_by_value
-        )]
-        pub unsafe fn as_ref<'a, Own>(ptr: *const T, own: Own) -> &'a T {
+        #[allow(unused_variables, clippy::needless_pass_by_value)]
+        pub unsafe fn as_ref<'a, P>(ptr: *const T, own: Ghost<&'a P>) -> &'a T
+        where
+            P: core::borrow::Borrow<Perm<*const T>> + ?Sized,
+        {
             unsafe { &*ptr }
         }
 
         /// Mutably borrow the underlying value through a raw pointer permission.
+        ///
+        /// The permission is lent uniquely, as Creusot's
+        /// `Ghost<&mut Perm<*const T>>`, for as long as the result lives: the
+        /// ward alone cannot tell a unique permission from one `from_ref` lent
+        /// out of a shared reference, and only this type refuses the latter.
+        /// `BorrowMut` admits the `&mut Box<Perm<_>>` that `ghost!(&mut *own)`
+        /// yields.
+        ///
+        /// ```compile_fail,E0308
+        /// use trust_wp_std::ghost::perm::Perm;
+        /// let x = 5i32;
+        /// let (p, own) = Perm::from_ref(&x);
+        /// let r = unsafe { Perm::as_mut(p.cast_mut(), own) };
+        /// *r = 6;
+        /// ```
         ///
         /// # Safety
         ///
         /// The pointer must be valid, properly aligned, and unique.
         ///
         /// Reference: Creusot `creusot-std/src/std/ptr.rs:589-591`
-        #[allow(
-            unused_variables,
-            clippy::needless_lifetimes,
-            clippy::needless_pass_by_value
-        )]
-        pub unsafe fn as_mut<'a, Own>(ptr: *mut T, own: Own) -> &'a mut T {
+        #[allow(unused_variables, clippy::needless_pass_by_value)]
+        pub unsafe fn as_mut<'a, P>(ptr: *mut T, own: Ghost<&'a mut P>) -> &'a mut T
+        where
+            P: core::borrow::BorrowMut<Perm<*const T>> + ?Sized,
+        {
             unsafe { &mut *ptr }
         }
 
@@ -2075,18 +2337,22 @@ pub mod invariant {
         }
     }
 
+    // Each takes the wrapper by shared borrow, as Creusot opens an invariant
+    // through `Ghost<&NonAtomicInvariant<_>>`: the invariant is not consumed,
+    // and a `Ghost` of it is not `Copy`, so a field behind `&self` is read in
+    // place (non_atomic_invariant_cellinv's `self.permission.open(..)`).
     impl<P: Protocol> Ghost<NonAtomicInvariant<P>> {
         /// Get the namespace this invariant belongs to (logic function).
         ///
         /// Ghost-only — panics at runtime.
-        pub fn namespace(self) -> Namespace {
+        pub fn namespace(&self) -> Namespace {
             panic!("ghost code only")
         }
 
         /// Get the public state guarded by this invariant (logic function).
         ///
         /// Ghost-only — panics at runtime.
-        pub fn public(self) -> P::Public {
+        pub fn public(&self) -> P::Public {
             panic!("ghost code only")
         }
 
@@ -2094,7 +2360,7 @@ pub mod invariant {
         ///
         /// Ghost-only — panics at runtime.
         pub fn open<'a, R>(
-            self,
+            &'a self,
             _tokens: Ghost<Tokens<'a>>,
             _f: impl FnOnce(Ghost<&'a mut P>) -> R,
         ) -> R
@@ -2120,17 +2386,6 @@ pub mod invariant {
         fn open<R, F>(self, tokens: Ghost<Tokens<'a>>, f: F) -> R
         where
             F: FnOnce(Ghost<&'a mut Self::Inner>) -> R;
-    }
-
-    impl<'a, P: Protocol + 'a> NonAtomicInvariantExt<'a> for Ghost<NonAtomicInvariant<P>> {
-        type Inner = P;
-
-        fn open<R, F>(self, tokens: Ghost<Tokens<'a>>, f: F) -> R
-        where
-            F: FnOnce(Ghost<&'a mut P>) -> R,
-        {
-            Ghost::<NonAtomicInvariant<P>>::open(self, tokens, f)
-        }
     }
 
     impl<'a, P: Protocol + 'a> NonAtomicInvariantExt<'a> for Ghost<&'a NonAtomicInvariant<P>> {
@@ -2233,12 +2488,13 @@ pub mod invariant {
 
         /// Get the tokens for all the namespaces.
         ///
-        /// This is only callable once, in `main`. Ghost-only — panics at
-        /// runtime.
+        /// Program code calls it, once, in `main` (the validator's
+        /// `validate_tokens_new`), and its spec owes nothing, so at run time it
+        /// is the zero-sized ghost handle, as Creusot's `Ghost::conjure()`.
         ///
         /// Reference: Creusot `creusot-std/src/ghost/invariant.rs:155-161`
         pub fn new() -> Ghost<Self> {
-            panic!("ghost code only")
+            Ghost::conjure()
         }
 
         /// Reborrow the token, allowing it to be reused later.
@@ -2328,19 +2584,20 @@ pub mod invariant {
         }
     }
 
+    // By shared borrow, as `Ghost<NonAtomicInvariant<_>>`'s.
     impl<P: Protocol> Ghost<AtomicInvariant<P>> {
         /// Get the namespace (delegating through ghost wrapper).
-        pub fn namespace(self) -> usize {
+        pub fn namespace(&self) -> usize {
             panic!("ghost code only")
         }
 
         /// Get the public state (delegating through ghost wrapper).
-        pub fn public(self) -> P::Public {
+        pub fn public(&self) -> P::Public {
             panic!("ghost code only")
         }
 
         /// Open the invariant through a ghost wrapper.
-        pub fn open<'a, R>(self, _tokens: Tokens<'a>, _f: impl FnOnce(&mut P) -> R) -> R
+        pub fn open<'a, R>(&'a self, _tokens: Tokens<'a>, _f: impl FnOnce(&mut P) -> R) -> R
         where
             P: 'a,
         {
@@ -2425,19 +2682,20 @@ pub mod invariant {
         }
     }
 
+    // By shared borrow, as `Ghost<NonAtomicInvariant<_>>`'s.
     impl<P: Protocol> Ghost<AtomicInvariantSC<P>> {
         /// Get the namespace (delegating through ghost wrapper).
-        pub fn namespace(self) -> usize {
+        pub fn namespace(&self) -> usize {
             panic!("ghost code only")
         }
 
         /// Get the public state (delegating through ghost wrapper).
-        pub fn public(self) -> P::Public {
+        pub fn public(&self) -> P::Public {
             panic!("ghost code only")
         }
 
         /// Open the invariant through a ghost wrapper.
-        pub fn open<'a, R>(self, _tokens: Tokens<'a>, _f: impl FnOnce(&mut P) -> R) -> R
+        pub fn open<'a, R>(&'a self, _tokens: Tokens<'a>, _f: impl FnOnce(&mut P) -> R) -> R
         where
             P: 'a,
         {

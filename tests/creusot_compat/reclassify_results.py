@@ -44,7 +44,9 @@ from harness_classify import (  # noqa: E402
     classify_error_category,
     classify_failure,
     classify_no_replay_result,
-    classify_should_fail_result,
+    classify_should_fail_result_with_credit,
+    is_rejection_pass_message,
+    rejection_pass_message,
     classify_unknown_category,
 )
 from harness_baseline import TRUNCATED_OUTPUT_MARKER, TRUNCATED_OUTPUT_SENTINEL
@@ -160,7 +162,11 @@ def reclassify(
         needs_reclass = (
             old_status != "pass"
             or (old_status == "pass" and is_no_replay)
-            or (is_should_fail and old_status == "pass" and message != "Correctly rejected")
+            or (
+                is_should_fail
+                and old_status == "pass"
+                and not is_rejection_pass_message(message)
+            )
         )
         is_truncated = _message_is_truncated(entry)
 
@@ -230,6 +236,7 @@ def reclassify(
             ):
                 pass  # skip status reclassification, fall through to tier backfill
             else:
+                credit = None
                 if not is_should_fail and is_no_replay:
                     new_status, new_skip = classify_no_replay_result(
                         message, exit_code=exit_code, test_name=name
@@ -239,8 +246,10 @@ def reclassify(
                     # non-success as "correctly rejected" (pass) by default.
                     # The success flag is inferred: exit_code==0 means success.
                     success = exit_code == 0
-                    new_status, new_skip = classify_should_fail_result(
-                        success, message, source, name, exit_code=exit_code
+                    new_status, new_skip, credit = (
+                        classify_should_fail_result_with_credit(
+                            success, message, source, name, exit_code=exit_code
+                        )
                     )
                 else:
                     # Pass test_name so name-keyed classifier tables (the
@@ -278,7 +287,7 @@ def reclassify(
                             if backend_reason is not None:
                                 entry["message"] = f"{BACKEND_PASS_PREFIX} {backend_reason}"
                             else:
-                                entry["message"] = "Correctly rejected"
+                                entry["message"] = rejection_pass_message(credit)
                         elif is_no_replay and new_status == "error":
                             entry["message"] = NO_REPLAY_STRICT_ERROR_MESSAGE
 
@@ -329,6 +338,7 @@ def reclassify(
         effective_skip = entry.get("skip_reason")
         new_tier = classify_verification_tier(
             name, effective_status, effective_message, effective_skip, source,
+            trusted_def_paths=entry.get("trusted_def_paths") or None,
         )
         old_tier = entry.get("verification_tier")
         if new_tier != old_tier:
@@ -450,6 +460,7 @@ def _recompute_tier_summary(results: list[dict], summary: dict) -> None:
     """Recompute verification_tiers, tier2_verified, and tier2_rate."""
     tier_counts: dict[str, int] = {
         "tier0": 0, "tier1": 0, "tier2": 0, "tier3": 0, "legacy_unknown": 0,
+        "tier2-source-trusted": 0,
     }
     for entry in results:
         vtier = entry.get("verification_tier")
@@ -457,6 +468,9 @@ def _recompute_tier_summary(results: list[dict], summary: dict) -> None:
             tier_counts[vtier] += 1
     summary["verification_tiers"] = tier_counts
     summary["tier2_verified"] = tier_counts["tier2"]
+    # Reported SEPARATELY, never folded into tier2_verified/tier2_rate: these
+    # passes rest on source-declared #[trusted] axioms (Creusot parity).
+    summary["tier2_source_trusted"] = tier_counts["tier2-source-trusted"]
     tier2_plus_tier3 = tier_counts["tier2"] + tier_counts["tier3"]
     summary["tier2_rate"] = (
         round(tier_counts["tier2"] / tier2_plus_tier3, 4)
@@ -516,6 +530,7 @@ def _recompute_lane_summary(
     # Per-lane tier counts.
     lane_tier_counts: dict[str, int] = {
         "tier0": 0, "tier1": 0, "tier2": 0, "tier3": 0, "legacy_unknown": 0,
+        "tier2-source-trusted": 0,
     }
     for entry in results:
         if lane_segment not in entry.get("name", ""):
@@ -525,6 +540,7 @@ def _recompute_lane_summary(
             lane_tier_counts[vtier] += 1
     lane_summary["verification_tiers"] = lane_tier_counts
     lane_summary["tier2_verified"] = lane_tier_counts["tier2"]
+    lane_summary["tier2_source_trusted"] = lane_tier_counts["tier2-source-trusted"]
     t2_t3 = lane_tier_counts["tier2"] + lane_tier_counts["tier3"]
     lane_summary["tier2_rate"] = (
         round(lane_tier_counts["tier2"] / t2_t3, 4) if t2_t3 > 0 else None

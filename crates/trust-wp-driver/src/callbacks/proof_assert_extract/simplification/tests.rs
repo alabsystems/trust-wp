@@ -386,7 +386,7 @@ fn test_true_implies_reduces_to_consequent() {
 fn test_ok_or_vacuous_implication_reduces_to_true() {
     let antecedent = method_call(logic_fn_call("None", vec![]), "is_some", vec![]);
     let consequent = eq(
-        var("call_3"),
+        var("$call_3"),
         logic_fn_call(
             "Ok",
             vec![PureExpr::Old(Arc::new(method_call(
@@ -407,7 +407,7 @@ fn test_ok_or_vacuous_implication_reduces_to_true() {
 fn test_ok_or_useful_implication_reduces_to_body() {
     let antecedent = method_call(logic_fn_call("None", vec![]), "is_none", vec![]);
     let consequent = eq(
-        var("call_3"),
+        var("$call_3"),
         logic_fn_call("Err", vec![PureExpr::Bool(true)]),
     );
     let expr = implies(antecedent, consequent);
@@ -415,7 +415,7 @@ fn test_ok_or_useful_implication_reduces_to_body() {
     assert_eq!(
         reduced,
         eq(
-            var("call_3"),
+            var("$call_3"),
             logic_fn_call("Err", vec![PureExpr::Bool(true)])
         )
     );
@@ -867,9 +867,9 @@ fn test_synthesize_none_from_tester() {
 #[test]
 fn test_synthesize_err_from_tester_selector() {
     let facts = vec![
-        method_call(var("call_3"), "is_err", vec![]),
+        method_call(var("$call_3"), "is_err", vec![]),
         eq(
-            method_call(var("call_3"), "unwrap_err", vec![]),
+            method_call(var("$call_3"), "unwrap_err", vec![]),
             PureExpr::Bool(true),
         ),
     ];
@@ -878,7 +878,7 @@ fn test_synthesize_err_from_tester_selector() {
     assert_eq!(
         synthesized[0],
         eq(
-            var("call_3"),
+            var("$call_3"),
             logic_fn_call("Err", vec![PureExpr::Bool(true)])
         )
     );
@@ -1135,17 +1135,17 @@ fn test_normalize_old_constructor_equality_fact() {
 fn test_normalize_old_constructor_equality_fact_for_call_alias() {
     let fact = eq(
         logic_fn_call("Ok", vec![int(42)]),
-        PureExpr::Old(Arc::new(var("call_3"))),
+        PureExpr::Old(Arc::new(var("$call_3"))),
     );
     let normalized = normalize_old_constructor_equality_facts(&fact);
     assert!(
-        normalized.contains(&eq(logic_fn_call("Ok", vec![int(42)]), var("call_3"))),
+        normalized.contains(&eq(logic_fn_call("Ok", vec![int(42)]), var("$call_3"))),
         "normalized facts should retain the current-value bridge"
     );
     assert!(
         normalized.contains(&eq(
             logic_fn_call("Ok", vec![int(42)]),
-            var("call_3__upgraded"),
+            var("$call_3__upgraded"),
         )),
         "normalized facts should add an upgraded bridge for call-result aliases"
     );

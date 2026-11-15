@@ -51,7 +51,12 @@ pub(super) fn closure_capture_roots(
             let name = {
                 let var_ident_name = capture.var_ident.as_str().to_string();
                 if !var_ident_name.is_empty() && var_ident_name != "_" {
-                    var_ident_name
+                    // The capture is named as the parent's binding is (D-237).
+                    crate::mir_analysis::binding_identity::hir_binding_debug_name(
+                        tcx,
+                        &var_ident_name,
+                        capture.get_root_variable(),
+                    )
                 } else {
                     let symbol_name = capture.to_symbol().to_string();
                     if !symbol_name.is_empty() && symbol_name != "_" {
@@ -195,9 +200,9 @@ pub(in crate::callbacks) fn find_ghost_closure_def_ids_in_mir(
     let mut closure_def_ids = Vec::new();
     for bb_data in body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
-            if let StatementKind::Assign(box (
+            if let StatementKind::Assign((
                 _,
-                Rvalue::Aggregate(box mir::AggregateKind::Closure(def_id, _), _),
+                Rvalue::Aggregate(mir::AggregateKind::Closure(def_id, _), _),
             )) = stmt.kind
             {
                 let stmt_span = stmt.source_info.span.source_callsite();
@@ -296,7 +301,12 @@ pub(in crate::callbacks) fn closure_capture_names(
         .map(|(idx, capture)| {
             let var_ident_name = capture.var_ident.as_str().to_string();
             if !var_ident_name.is_empty() && var_ident_name != "_" {
-                return var_ident_name;
+                // The capture is named as the parent's binding is (D-237).
+                return crate::mir_analysis::binding_identity::hir_binding_debug_name(
+                    tcx,
+                    &var_ident_name,
+                    capture.get_root_variable(),
+                );
             }
 
             let symbol_name = capture.to_symbol().to_string();

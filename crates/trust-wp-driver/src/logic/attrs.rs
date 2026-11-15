@@ -7,7 +7,7 @@
 //! Extracts `#[requires(...)]`, `#[ensures(...)]`, and `#[variant(...)]` values
 //! from both doc-marker and proc-macro attribute representations.
 
-use rustc_hir::Attribute;
+use rustc_attr_ir::Attribute;
 
 use crate::attr_utils::{get_contract_attrs_from_doc, get_contract_attrs_from_proc_macro};
 

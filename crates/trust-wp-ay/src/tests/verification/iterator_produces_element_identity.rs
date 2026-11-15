@@ -29,9 +29,9 @@ const ITER_PRODUCES_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// Given `vec@.index_logic(0) == 42`, proves `v == 42`.
 ///
-/// With the old length-only produces model, this would be unprovable because
-/// the length-conservation axiom `len(self) == len(visited) + len(o)` does
-/// not constrain element values.
+/// A length-only produces model cannot prove this: the length-conservation
+/// axiom `len(self) == len(visited) + len(o)` does not constrain element
+/// values.
 #[test]
 #[timeout(30000)]
 fn test_verify_into_iter_produces_element_identity() {
@@ -56,10 +56,10 @@ fn test_verify_into_iter_produces_element_identity() {
             .timeout(Some(ITER_PRODUCES_TIMEOUT)),
     )
     .unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result),
         "Vec::IntoIter produces element identity: v should equal first element (42): got {result:?}"
@@ -92,17 +92,17 @@ fn test_verify_into_iter_produces_wrong_element_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "Wrong element value (99 != 42) should fail: got {result:?}"
     );
 }
 
 /// Regression: ext_eq(a@, b@) with two free Seq views must be satisfiable.
 ///
-/// Before the #2246 reverse-axiom suppression for ay#6481, a ay-dpll bug
-/// where asserting a quantified formula Q AND using Q in implies(Q, x)
-/// caused false UNSAT. This test ensures the ext_eq encoding is
-/// satisfiable (not internally contradictory).
+/// Guards the ay-dpll bug (ay#6481, suppressed by the #2246 reverse-axiom
+/// suppression) where asserting a quantified formula Q AND using Q in
+/// implies(Q, x) caused false UNSAT. This test ensures the ext_eq encoding
+/// is satisfiable (not internally contradictory).
 #[test]
 #[timeout(30000)]
 fn test_diag_ext_eq_two_free_views_satisfiable() {
@@ -160,14 +160,14 @@ fn test_diag_ext_eq_concat_singleton_alone_satisfiable() {
 /// is 42, not 0). If this returns Verified, the preconditions themselves
 /// are UNSAT — the ext_eq encoding is overconstrained.
 ///
-/// **Root cause (P1-1210):** ay aae15b56 returns false UNSAT for the
+/// The failure this guards (#2404): a false UNSAT from ay on the
 /// combination of `produces` (ext_eq + concat) with `vec_first`
 /// (index_logic constraint). The individual sub-combinations are
 /// satisfiable — `produces` alone, `produces + len`, `ext_eq(plain) +
 /// first`, `concat_len + first` are all SAT. The false UNSAT only
 /// manifests when ay processes the full combination involving array
 /// theory (select/store) + quantifier instantiation (bridge axiom,
-/// Axiom 16) + uninterpreted functions (Seq projectors). Filed as #2404.
+/// Axiom 16) + uninterpreted functions (Seq projectors).
 #[test]
 #[timeout(30000)]
 fn test_diag_ext_eq_preconditions_not_vacuous() {
@@ -191,7 +191,7 @@ fn test_diag_ext_eq_preconditions_not_vacuous() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "DIAGNOSTIC: v == 0 should fail; if Verified, preconditions are vacuously UNSAT: got {result:?}"
     );
 }
@@ -216,7 +216,7 @@ fn test_diag_ext_eq_produces_alone_not_vacuous() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "produces alone should fail v==0: got {result:?}"
     );
 }
@@ -242,7 +242,7 @@ fn test_diag_ext_eq_produces_plus_len_not_vacuous() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "produces + len should fail v==0: got {result:?}"
     );
 }

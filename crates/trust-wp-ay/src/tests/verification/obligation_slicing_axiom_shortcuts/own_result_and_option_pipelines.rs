@@ -207,8 +207,9 @@ fn test_own_result_as_ref_pipeline_quantified_postcondition() {
 /// }
 /// ```
 ///
-/// This keeps the seam commit-sized while pinning the deref-based shape that
-/// was still reported incomplete in the 2026-03-21 `result/own.rs` rerun.
+/// Pinning the deref-based shape separately from the identity test keeps a
+/// regression in the compat lowering of `result/own.rs` distinguishable from
+/// one in the pure contract.
 #[test]
 #[timeout(30000)]
 fn test_own_result_as_ref_deref_match_identity_quantified_postcondition() {

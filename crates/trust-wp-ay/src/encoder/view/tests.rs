@@ -924,7 +924,10 @@ fn test_opaque_view_final_uses_declared_mapping_return_sort() {
 fn test_opaque_view_return_sort_ignores_untyped_candidates() {
     let mut encoder = AYEncoder::new();
     let t_sort = intern_sort_name("T");
-    let untyped_view_def = LogicFnDef::new(
+    // Two definitions of `view` are two logic functions: each carries its own
+    // unique id (as the driver assigns them), never one shared `logic_view`
+    // symbol whose first-registered axiom would answer for both.
+    let mut untyped_view_def = LogicFnDef::new(
         "view".to_string(),
         "creusot_std::<U as creusot_std::View>::view".to_string(),
         vec!["self".to_string()],
@@ -932,7 +935,10 @@ fn test_opaque_view_return_sort_ignores_untyped_candidates() {
     )
     .with_opaque(true)
     .with_return_sort(Some(ExprSort::Int));
-    let mapping_view_def = LogicFnDef::new(
+    untyped_view_def.assign_unique_id(trust_wp_core::logic::identity::logic_fn_unique_id(
+        "creusot_std::<U as creusot_std::View>::view",
+    ));
+    let mut mapping_view_def = LogicFnDef::new(
         "view".to_string(),
         "creusot_test::<T as creusot_std::View>::view".to_string(),
         vec!["self".to_string()],
@@ -941,6 +947,9 @@ fn test_opaque_view_return_sort_ignores_untyped_candidates() {
     .with_opaque(true)
     .with_param_sorts(vec![Some(ExprSort::Datatype(t_sort))])
     .with_return_sort(Some(ExprSort::Datatype(intern_sort_name("Mapping"))));
+    mapping_view_def.assign_unique_id(trust_wp_core::logic::identity::logic_fn_unique_id(
+        "creusot_test::<T as creusot_std::View>::view",
+    ));
 
     encoder
         .register_logic_fns(&[untyped_view_def, mapping_view_def])
@@ -995,5 +1004,53 @@ fn test_sort_display_key_seq() {
     assert!(
         !key.is_empty(),
         "sort_display_key should produce non-empty string for Seq"
+    );
+}
+
+/// `(^t)@` for `t: &mut T` must use `T`'s registered user view sort: `^t` has
+/// the referent sort, so the registered-view lookup retries through the
+/// dereferenced carrier. Without it the raw `MutRef(T)` annotation never
+/// matches the candidate and the view falls back to the carrier sort `T`
+/// (or a method hint such as `Seq`), a sort conflict with `t@` (mapping_test::f).
+#[test]
+fn view_of_final_mutref_carrier_uses_registered_view_sort() {
+    let mut encoder = AYEncoder::new();
+    let t_id = intern_sort_name("T");
+    let adt = AdtDecl::new(
+        "crate::T".to_string(),
+        "T".to_string(),
+        AdtKind::Struct,
+        vec![AdtConstructorDecl::new(
+            "T".to_string(),
+            "T".to_string(),
+            vec![AdtFieldDecl::new("a".to_string(), ExprSort::Int)],
+        )],
+    );
+    encoder.register_adt_decls(&std::collections::HashMap::from([("T".to_string(), adt)]));
+    let mapping = ExprSort::Datatype(intern_sort_name("Mapping"));
+    let view_def = LogicFnDef::new(
+        "view".to_string(),
+        "crate::<T as creusot_std::View>::view".to_string(),
+        vec!["self".to_string()],
+        var("dead"),
+    )
+    .with_param_sorts(vec![Some(ExprSort::Datatype(t_id))])
+    .with_return_sort(Some(mapping.clone()))
+    .with_opaque(true);
+    encoder
+        .register_logic_fn(&view_def)
+        .expect("opaque view registration should succeed");
+    let carrier_sort = encoder.sort_from_expr_sort(ExprSort::Datatype(t_id));
+    let mapping_sort = encoder.sort_from_expr_sort(mapping);
+    assert_ne!(carrier_sort, mapping_sort, "test premise: distinct sorts");
+
+    let t_ann = ExprSort::MutRef(Box::new(ExprSort::Datatype(t_id)));
+    let term = encoder
+        .encode_pure(&view(final_expr(var_with_sort("t", t_ann))))
+        .expect("(^t)@ should encode");
+    assert_eq!(
+        encoder.solver().get_sort(term),
+        mapping_sort,
+        "(^t)@ must take the registered View sort of the referent"
     );
 }

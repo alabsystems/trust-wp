@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use super::{ContractParser, ParseError};
+use super::{helpers::borrows::dereference, ContractParser, ParseError, WrittenTypeSite};
 use crate::formula::{
     internal::tuple_lowering::{
         tuple_field_logic_fn_name, tuple_logic_fn_name, NAMED_FIELD_LOGIC_FN_PREFIX,
@@ -147,13 +147,15 @@ impl ContractParser<'_> {
         let start = self.position;
         let mut left = self.parse_additive_spanned()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("<<") {
                 let right = self.parse_additive_spanned()?;
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Shl, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::Shl, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else if self.try_consume(">>") {
                 let right = self.parse_additive_spanned()?;
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Shr, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::Shr, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else {
                 break;
@@ -167,13 +169,15 @@ impl ContractParser<'_> {
         let start = self.position;
         let mut left = self.parse_multiplicative_spanned()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("+") {
                 let right = self.parse_multiplicative_spanned()?;
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Add, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::Add, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else if self.try_consume("-") {
                 let right = self.parse_multiplicative_spanned()?;
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Sub, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::Sub, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else {
                 break;
@@ -187,9 +191,11 @@ impl ContractParser<'_> {
         let start = self.position;
         let mut left = self.parse_cast_spanned()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("*") {
                 let right = self.parse_cast_spanned()?;
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Mul, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::Mul, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else if self.try_consume("/") {
                 let right = self.parse_cast_spanned()?;
@@ -197,16 +203,18 @@ impl ContractParser<'_> {
                 // (truncation toward zero), not Euclidean. Lower to
                 // `BinOp::DivTrunc` so contract division agrees with the signed
                 // machine body. See trust-wp-divmod-semantics.
-                let expr =
-                    PureExpr::BinOp(Arc::new(left.expr), BinOp::DivTrunc, Arc::new(right.expr));
+                let expr = self.written_binop(left.expr, BinOp::DivTrunc, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else if self.try_consume("%") {
                 let right = self.parse_cast_spanned()?;
-                // `%` stays Euclidean (`BinOp::Mod`): trust-wp-std's wrapping
-                // arithmetic specs reduce a possibly-negative dividend modulo
-                // `2^n` and rely on the non-negative Euclidean remainder. Only
-                // `/` is reclassified to truncated. See trust-wp-divmod-semantics.
-                let expr = PureExpr::BinOp(Arc::new(left.expr), BinOp::Mod, Arc::new(right.expr));
+                // Creusot's `%` on `Int` is `int.ComputerDivision.mod`
+                // (truncating: the remainder takes the sign of the dividend,
+                // `-3 % 2 == -1`), NOT Euclidean. Lower to `BinOp::RemTrunc`,
+                // matching the machine body `%` and the truncated `/` above.
+                // The Euclidean remainder is spelled `a.rem_euclid(b)`
+                // (creusot-std `Int::rem_euclid`), which is what trust-wp-std's
+                // wrapping specs use. `x % 0` stays unspecified.
+                let expr = self.written_binop(left.expr, BinOp::RemTrunc, right.expr, at)?;
                 left = SpannedExpr::new(expr, self.span(start));
             } else {
                 break;
@@ -216,25 +224,25 @@ impl ContractParser<'_> {
     }
 
     /// Parse cast expressions (`expr as Type`) and type ascriptions
-    /// (`expr : Type`).
-    ///
-    /// Both are treated as transparent in logical expressions: the type is
-    /// parsed and discarded and the inner expression is returned (with its span
-    /// widened to include the ascription). The `: Type` form is only consumed
-    /// on a single `:` (not `::`); see `parse_cast` for why this does not
-    /// collide with binder/struct-field colons.
+    /// (`expr : Type`), exactly as `parse_cast` does, with the span widened
+    /// to include the written type.
     pub(super) fn parse_cast_spanned(&mut self) -> Result<SpannedExpr, ParseError> {
         let start = self.position;
         let mut expr = self.parse_view_spanned()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume_keyword("as") {
                 self.skip_whitespace();
-                self.consume_type_annotation()?;
-                expr = SpannedExpr::new(expr.expr, self.span(start));
+                let (_, text) = self.consume_written_type_text(WrittenTypeSite::Cast)?;
+                let lowered = self.lower_cast(expr.expr, &text, at)?;
+                expr = SpannedExpr::new(lowered, self.span(start));
             } else if self.try_consume_single_colon() {
                 self.skip_whitespace();
-                self.consume_type_annotation()?;
-                expr = SpannedExpr::new(expr.expr, self.span(start));
+                let (sort, text) = self.consume_written_type_text(WrittenTypeSite::Ascription)?;
+                let ascribed =
+                    self.ascribe(expr.expr, sort.as_ref(), &text, "type ascription", at)?;
+                expr = SpannedExpr::new(ascribed, self.span(start));
             } else {
                 break;
             }
@@ -255,7 +263,7 @@ impl ContractParser<'_> {
         let start = self.position;
         if self.try_consume("!") {
             let operand = self.parse_unary_spanned()?;
-            let expr = PureExpr::UnOp(UnOp::Not, Arc::new(operand.expr));
+            let expr = self.written_not(operand.expr, start)?;
             return Ok(SpannedExpr::new(expr, self.span(start)));
         }
         if self.try_consume("~") {
@@ -267,27 +275,28 @@ impl ContractParser<'_> {
         if self.peek() == Some('-') && !self.is_negative_literal() {
             self.advance();
             let operand = self.parse_unary_spanned()?;
-            let expr = PureExpr::UnOp(UnOp::Neg, Arc::new(operand.expr));
+            let expr = self.written_neg(operand.expr, start)?;
             return Ok(SpannedExpr::new(expr, self.span(start)));
         }
-        // Dereference: *v (current value of mutable borrow)
+        // Dereference, final value and borrows, as in `parse_unary`.
         if self.try_consume("*") {
             let operand = self.parse_unary_spanned()?;
-            let expr = PureExpr::Deref(Arc::new(operand.expr));
-            return Ok(SpannedExpr::new(expr, self.span(start)));
+            return Ok(SpannedExpr::new(
+                dereference(operand.expr),
+                self.span(start),
+            ));
         }
-        // Final/prophecy: ^v (value when borrow ends)
         if self.try_consume("^") {
             let operand = self.parse_unary_spanned()?;
-            let expr = PureExpr::Final(Arc::new(operand.expr));
+            let expr = self.final_value(operand.expr, "^")?;
             return Ok(SpannedExpr::new(expr, self.span(start)));
         }
-        // Reference operators: &mut expr / &expr (transparent in contract logic)
         if self.try_consume_single_ampersand() {
             self.skip_whitespace();
             self.try_consume_keyword("mut");
             let operand = self.parse_unary_spanned()?;
-            return Ok(SpannedExpr::new(operand.expr, self.span(start)));
+            let expr = self.borrow(start, operand.expr);
+            return Ok(SpannedExpr::new(expr, self.span(start)));
         }
         self.parse_postfix_spanned()
     }
@@ -523,7 +532,9 @@ impl ContractParser<'_> {
         // (e.g. `<I3<T> as Nat>::VALUE`). Mirrors `unspanned/primary.rs` node-for-
         // node so the AST matches: a trailing `(args)` is a `LogicFnCall`,
         // otherwise a `Var` with the full path string.
+        let path_at = self.position;
         if let Some(qualified) = self.try_parse_qualified_path() {
+            self.refuse_shadowed_path(&qualified, path_at)?;
             self.skip_whitespace();
             if self.try_consume("(") {
                 let args = self.parse_argument_list()?;
@@ -541,17 +552,21 @@ impl ContractParser<'_> {
         }
 
         // Identifier (variable, path like i32::MIN, or logic function call)
+        let path_at = self.position;
         if let Some(ident) = self.try_parse_identifier() {
+            self.refuse_shadowed_path(&ident, path_at)?;
             let turbofish_args = self.try_parse_turbofish_args()?;
             self.skip_whitespace();
-            // Check for logic function call: identifier(args...)
+            // Check for logic function call: identifier(args...). `view(e)`
+            // and `final_value(e)` are the nodes `e@` and `^e` are, as in the
+            // unspanned primary, so both parsers give one AST.
             if self.try_consume("(") {
                 let mut args = turbofish_args.unwrap_or_default();
                 args.extend(self.parse_argument_list()?);
                 if !self.try_consume(")") {
                     return Err(self.error("expected ')' after function arguments"));
                 }
-                let expr = PureExpr::LogicFnCall { name: ident, args };
+                let expr = self.call_or_reference_form(ident, args)?;
                 return Ok(SpannedExpr::new(expr, self.span(start)));
             }
             // Macro-style call: identifier!(...), identifier![...], identifier!{...}

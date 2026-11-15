@@ -317,11 +317,9 @@ fn triggerless_forall_with_logic_fn_predicate_body_encodes() {
     // body `x > 0` is instantiated on demand via the ground pool, and this
     // test has no ground `test_p` application, so no defining instance is
     // asserted. That query is genuinely SATISFIABLE (p := λi. true; z3
-    // agrees). The old pin `!= Sat` (with a comment reading the un-asserted
-    // definition into the query) only held because the pre-2026-07-04 ay was
-    // too incomplete to see the completion and returned Unknown; the
-    // 2026-07-04 ay salvage's UF-completion certificate now correctly
-    // returns Sat. Unsat is the verdict that would be unsound here.
+    // agrees), so reading the un-asserted definition into the query and
+    // pinning `!= Sat` would be wrong. Unsat is the verdict that would be
+    // unsound here; Unknown is acceptable incompleteness.
     encoder.assert_term(term);
     let result = encoder.check_sat();
     assert!(
@@ -332,11 +330,11 @@ fn triggerless_forall_with_logic_fn_predicate_body_encodes() {
     );
 }
 
-/// Verifies ay correctly solves a trivially satisfiable existential.
+/// Verifies ay solves a trivially satisfiable existential.
 ///
 /// `exists<i> test_f(i) > 0` where `f(x) = x + 1` is trivially satisfiable
-/// (witness: `i = 0`, `f(0) = 1 > 0`). ay now returns Sat after E-matching
-/// improvements in the ay pin bump (previously returned Unknown).
+/// (witness: `i = 0`, `f(0) = 1 > 0`); E-matching over the Int domain finds
+/// the witness, so Unknown is not tolerated.
 ///
 /// Re: #1018
 #[test]
@@ -356,8 +354,7 @@ fn triggerless_exists_known_unknown_limitation() {
         .expect("register logic fn");
 
     // exists<i: Int> test_f(i) > 0
-    // Trivially satisfiable (i=0 gives f(0)=1>0). ay now returns Sat
-    // after E-matching improvements in the ay pin bump.
+    // Trivially satisfiable (i=0 gives f(0)=1>0).
     let expr = exists("i", gt(logic_fn_call("test_f", vec![var("i")]), int(0)));
     let term = encoder.encode_pure(&expr).expect("should encode");
     assert_synthesized_triggers(
@@ -369,8 +366,7 @@ fn triggerless_exists_known_unknown_limitation() {
     );
     encoder.assert_term(term);
     let result = encoder.check_sat();
-    // ay E-matching now handles triggerless existentials over Int domain.
-    // Previously returned Unknown; fixed in ay pin bump.
+    // ay's E-matching decides triggerless existentials over the Int domain.
     assert_eq!(
         result,
         SolveResult::Sat,
@@ -448,10 +444,9 @@ fn partial_trigger_blocks_bool_expansion_for_multi_var_bool_quantifier() {
         "forall<b:Bool, i:Int> (audit_p(i) > 0 OR b OR NOT b) is a tautology — \
          Unsat would indicate a soundness bug"
     );
-    // Behavioral pin: mixed-sort Bool expansion now works — the solver
-    // recognizes `b OR NOT b` as a tautology in the Bool component even
-    // when Int variables are present, returning Sat correctly.
-    // (Previously returned Unknown before per-variable Bool expansion landed.)
+    // Behavioral pin: per-variable Bool expansion lets the solver recognize
+    // `b OR NOT b` as a tautology in the Bool component even when Int
+    // variables are present, so the answer is Sat, not Unknown.
     assert_eq!(
         result,
         SolveResult::Sat,
@@ -461,8 +456,7 @@ fn partial_trigger_blocks_bool_expansion_for_multi_var_bool_quantifier() {
 }
 
 /// Verify that nested Bool quantifiers WITHOUT any trigger candidates
-/// correctly use multi-variable Bool expansion (cartesian product).
-/// This is the happy path that #1134 fixed.
+/// correctly use multi-variable Bool expansion (cartesian product). (#1134)
 #[test]
 #[timeout(30000)]
 fn triggerless_multi_var_bool_uses_cartesian_expansion() {
@@ -560,8 +554,8 @@ fn nested_unit_bool_without_triggers_optimizes_each_level_independently() {
 /// covering the outer forall's `i`, the quantifier would get a trigger
 /// referencing a variable it doesn't bind.
 ///
-/// After #985 conservative handling, the closure encodes as a fresh
-/// constant. This test verifies the pipeline doesn't crash and that
+/// Closures in logic context encode conservatively as a fresh constant
+/// (#985). This test verifies the pipeline doesn't crash and that
 /// trigger synthesis correctly avoids the shadowed variable.
 ///
 /// Re: #1018 trigger synthesis edge case audit.
@@ -579,7 +573,7 @@ fn closure_param_shadowing_quantifier_var_reaches_encoder() {
     };
     let expr = forall("i", closure);
 
-    // Closures in logic context now encode conservatively (#985).
+    // Closures in logic context encode conservatively (#985).
     // The closure becomes a fresh constant; the forall body is Bool.
     let result = encoder.encode_pure(&expr);
     assert!(
@@ -698,7 +692,7 @@ fn user_triggered_inner_quantifier_not_collapsed() {
     };
     let expr = exists("a", inner_exists);
 
-    // After #1118, the outer `a` gets synthesis — test_f2(a, b) is found
+    // The outer `a` gets synthesis (#1118) — test_f2(a, b) is found
     // inside the inner exists body (references outer `a`, inner `b` is shadowed).
     // Inner `b` keeps its user trigger.
     let term = encoder.encode_pure(&expr).expect("should encode");
@@ -1008,7 +1002,7 @@ fn de_morgan_nested_exists_inner_triggered_partial_coverage() {
     let q_term = encoder
         .encode_pure(&outer_forall)
         .expect("nested De Morgan with inner triggers should encode");
-    // After #1118, trigger synthesis descends into the inner forall<b> body
+    // Trigger synthesis (#1118) descends into the inner forall<b> body
     // (shadowing b) and finds test_pci(a, b) which references outer `a`.
     assert_synthesized_triggers(
         &encoder,
@@ -1097,7 +1091,7 @@ fn slow_path_or_combination_detects_unsatisfiable_existential() {
     .expect("should not error");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "exists<a:Bool> (a AND NOT a) is always false — slow path OR must detect failure, got {:?}",
         result
     );

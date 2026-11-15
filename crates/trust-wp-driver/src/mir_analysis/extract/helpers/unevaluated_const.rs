@@ -68,7 +68,7 @@ impl Drop for UnevalConstDepthGuard<'_> {
 ///
 /// This keeps variant information available to match-based std specs (such as
 /// `Option::ok_or`) in proof_assert extraction. (#1264, #1277)
-pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
+pub(in crate::mir_analysis) fn translate_rvalue_with_enum_variants<'tcx>(
     tcx: TyCtxt<'tcx>,
     rvalue: &Rvalue<'tcx>,
     locals: &impl ExprLookup,
@@ -76,7 +76,7 @@ pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
     diagnostics: Option<&ExtractionDiagnosticSink>,
     location: Option<Location>,
 ) -> Option<PureExpr> {
-    if let Rvalue::Use(Operand::Constant(box constant), _) = rvalue {
+    if let Rvalue::Use(Operand::Constant(deref!(constant)), _) = rvalue {
         if let rustc_middle::ty::TyKind::Adt(adt_def, _) = constant.ty().kind() {
             if adt_def.is_enum() {
                 if let Some(discr) = constant.const_.try_to_scalar_int() {
@@ -94,7 +94,7 @@ pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
         }
     }
 
-    if let Rvalue::Aggregate(box AggregateKind::Adt(def_id, variant_idx, ..), operands) = rvalue {
+    if let Rvalue::Aggregate(AggregateKind::Adt(def_id, variant_idx, ..), operands) = rvalue {
         let adt_def = tcx.adt_def(*def_id);
         if adt_def.is_enum() {
             let mut args = Vec::with_capacity(operands.len());
@@ -122,7 +122,7 @@ pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
 
     if let Rvalue::Cast(
         rustc_middle::mir::CastKind::IntToInt,
-        Operand::Constant(box constant),
+        Operand::Constant(deref!(constant)),
         cast_ty,
     ) = rvalue
     {
@@ -140,15 +140,12 @@ pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
     // First try CTFE-backed constant translation, then fall back to symbolic/
     // MIR-body expansion for generic constants and associated constants that
     // CTFE cannot monomorphize. (#1588)
-    if let Rvalue::Use(Operand::Constant(box constant), _) = rvalue {
+    if let Rvalue::Use(Operand::Constant(deref!(constant)), _) = rvalue {
         if let rustc_middle::mir::Const::Unevaluated(ref uneval, _) = constant.const_ {
             let def_kind = tcx.def_kind(uneval.def);
             let is_const_item = matches!(
                 def_kind,
-                DefKind::Const { .. }
-                    | DefKind::AssocConst { .. }
-                    | DefKind::AnonConst
-                    | DefKind::InlineConst
+                DefKind::Const { .. } | DefKind::AssocConst { .. } | DefKind::AnonConst
             );
             let has_params = uneval.args.iter().any(|arg| {
                 arg.as_type()
@@ -165,6 +162,11 @@ pub(in super::super) fn translate_rvalue_with_enum_variants<'tcx>(
             let is_promoted = uneval.promoted.is_some();
             if (is_const_item && !has_params) || is_promoted {
                 if let Some(expr) = translate_constant_with_tcx(constant, tcx) {
+                    return Some(expr);
+                }
+            }
+            if is_promoted {
+                if let Some(expr) = translate_promoted_body(tcx, constant, diagnostics) {
                     return Some(expr);
                 }
             }
@@ -306,6 +308,62 @@ fn is_std_option_or_result(path: &str) -> bool {
     )
 }
 
+thread_local! {
+    /// Active capture of obligations owed by expanded inline-const bodies.
+    static CONST_BODY_OBLIGATION_SINK: std::cell::RefCell<Option<Vec<PureExpr>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct ConstBodyObligationCaptureGuard {
+    previous: Option<Option<Vec<PureExpr>>>,
+}
+
+impl Drop for ConstBodyObligationCaptureGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            CONST_BODY_OBLIGATION_SINK.with(|sink| {
+                sink.replace(previous);
+            });
+        }
+    }
+}
+
+/// Run `translate` and return, alongside its result, every proof obligation
+/// owed by an inline `const { .. }` body it expanded symbolically.
+///
+/// An inline const in a generic fn is expanded from its CTFE MIR (keeping
+/// `N + 1` symbolic). That body carries its own arithmetic panic asserts —
+/// Creusot inlines it into the enclosing function's VC (should_fail
+/// `ignore_overflow`: goal `vc_f.0` "Add overflow") — so its obligations must
+/// reach the caller's obligation set instead of being dropped with the
+/// expansion's side effects. Captures nest; obligations recorded outside any
+/// capture are discarded (no consumer states them).
+pub(crate) fn capture_const_body_obligations<R>(
+    translate: impl FnOnce() -> R,
+) -> (R, Vec<PureExpr>) {
+    let previous = CONST_BODY_OBLIGATION_SINK.with(|sink| sink.replace(Some(Vec::new())));
+    let mut guard = ConstBodyObligationCaptureGuard {
+        previous: Some(previous),
+    };
+    let result = translate();
+    let previous = guard.previous.take().unwrap_or(None);
+    let captured = CONST_BODY_OBLIGATION_SINK
+        .with(|sink| sink.replace(previous))
+        .unwrap_or_default();
+    (result, captured)
+}
+
+fn record_const_body_obligations(obligations: &[PureExpr]) {
+    if obligations.is_empty() {
+        return;
+    }
+    CONST_BODY_OBLIGATION_SINK.with(|sink| {
+        if let Some(active) = sink.borrow_mut().as_mut() {
+            active.extend(obligations.iter().cloned());
+        }
+    });
+}
+
 pub(super) fn translate_unevaluated_const_symbolic<'tcx>(
     tcx: TyCtxt<'tcx>,
     constant: &rustc_middle::mir::ConstOperand<'tcx>,
@@ -320,10 +378,7 @@ pub(super) fn translate_unevaluated_const_symbolic<'tcx>(
     let def_kind = tcx.def_kind(def_id);
     if !matches!(
         def_kind,
-        DefKind::Const { .. }
-            | DefKind::AssocConst { .. }
-            | DefKind::AnonConst
-            | DefKind::InlineConst
+        DefKind::Const { .. } | DefKind::AssocConst { .. } | DefKind::AnonConst
     ) {
         return None;
     }
@@ -391,7 +446,7 @@ pub(super) fn translate_unevaluated_const_symbolic_impl<'tcx>(
             cutoff_location: None,
             diagnostics,
         };
-        if let (Some(expr), _effects) = super::super::extract_return_expr_impl(
+        let (extracted, const_effects) = super::super::extract_return_expr_impl(
             tcx,
             body,
             &[],
@@ -399,7 +454,14 @@ pub(super) fn translate_unevaluated_const_symbolic_impl<'tcx>(
             &empty_specs,
             &empty_extern,
             config,
-        ) {
+        );
+        // An inline const is an anon const whose kind says so.
+        if matches!(tcx.def_kind(def_id), DefKind::AnonConst)
+            && tcx.anon_const_kind(def_id) == rustc_middle::ty::AnonConstKind::NonTypeSystemInline
+        {
+            record_const_body_obligations(&const_effects.obligations);
+        }
+        if let Some(expr) = extracted {
             // Reject the trivial `Var("_0")` fallback from the primary
             // extractor's `on_assign_local`. When the const body assigns an
             // unrecognized rvalue (e.g., `const STR: &'static str = "Hello"`
@@ -441,7 +503,7 @@ pub(super) fn translate_unevaluated_const_symbolic_impl<'tcx>(
             tcx.item_name(def_id).as_str().to_string(),
             ty_to_expr_sort_enriched(tcx, constant.ty()),
         )),
-        DefKind::AnonConst | DefKind::InlineConst => symbolic_anon_const_name(constant)
+        DefKind::AnonConst => symbolic_anon_const_name(constant)
             .map(|name| PureExpr::Var(name, ty_to_expr_sort_enriched(tcx, constant.ty()))),
         DefKind::AssocConst { .. } => {
             symbolic_assoc_const_name(tcx, constant, def_id).map(|name| {
@@ -660,10 +722,7 @@ pub(crate) fn collect_generic_assoc_const_definitions<'tcx>(
                 .filter_map(|child_local_def_id| {
                     let child_def_id = child_local_def_id.to_def_id();
                     (tcx.opt_parent(child_def_id) == Some(def_id)
-                        && matches!(
-                            tcx.def_kind(child_def_id),
-                            DefKind::AnonConst | DefKind::InlineConst
-                        ))
+                        && matches!(tcx.def_kind(child_def_id), DefKind::AnonConst))
                     .then_some(child_def_id)
                 })
                 .find_map(|child_def_id| {
@@ -785,7 +844,10 @@ fn source_assoc_const_body_expr<'tcx>(
         .span_to_snippet(body.value.span)
         .ok()?;
     let expr_source = strip_const_block_wrapper(&snippet).unwrap_or(snippet.trim());
-    parse_contract_body(expr_source).ok()
+    // A constant's initializer is program code, not a specification (D-232).
+    trust_wp_core::contract_parser::machine_arith::read_as_program(|| {
+        parse_contract_body(expr_source).ok()
+    })
 }
 
 fn strip_const_block_wrapper(snippet: &str) -> Option<&str> {
@@ -794,6 +856,118 @@ fn strip_const_block_wrapper(snippet: &str) -> Option<&str> {
     let after_open = after_const.strip_prefix('{')?.trim_start();
     let inner = after_open.strip_suffix('}')?.trim_end();
     Some(inner.trim())
+}
+
+/// The value of a promoted constant, read off the promoted's own MIR body.
+///
+/// CTFE-backed `translate_constant_with_tcx` reads only a scalar or a newtype
+/// behind a promoted reference, so `&Some(42)` in `match (&Some(42), ..)` was
+/// left untranslated and its local became an unconstrained placeholder: the
+/// match's panic arm could be neither proved unreachable nor refuted, and a
+/// field read through it (`match &Some(43) { Some(v) => *v, .. }`) was refuted
+/// against a value the program never holds. The promoted body builds the
+/// value with ordinary statements (`_1 = Some(const 42); _0 = &_1`), which the
+/// primary extractor translates exactly as it would the same statements in
+/// the enclosing function.
+///
+/// Read only when CTFE evaluates the promoted: that evaluation ran every
+/// check its body carries, so the body's obligations hold and are not
+/// restated, and a promoted that does not evaluate (a generic one) stays
+/// untranslated.
+///
+/// A promoted is a closed value, so a result is kept only when it is closed
+/// and the extraction modelled every statement (see
+/// [`promoted_value_is_closed`] and [`promoted_extraction_is_exact`]). A
+/// variable in the result is a placeholder the extractor minted for a value
+/// it could not translate, and its spelling (`$_1`, `$havoc_local_1_0_0`) is
+/// derived from the PROMOTED body's local indices: carried into the
+/// enclosing function it would be the same symbol as that function's own
+/// placeholder for its local `_1`, and every fact the enclosing VC states
+/// about that local would silently constrain the promoted's value.
+fn translate_promoted_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    constant: &rustc_middle::mir::ConstOperand<'tcx>,
+    diagnostics: Option<&ExtractionDiagnosticSink>,
+) -> Option<PureExpr> {
+    let rustc_middle::mir::Const::Unevaluated(ref uneval, _) = constant.const_ else {
+        return None;
+    };
+    let promoted = uneval.promoted?;
+    if !uneval.def.is_local() {
+        return None;
+    }
+    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+    tcx.const_eval_resolve(typing_env, *uneval, constant.span)
+        .ok()?;
+    let body = tcx.promoted_mir(uneval.def).get(promoted)?;
+    UNEVAL_CONST_EXPANSION_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current >= MAX_UNEVAL_CONST_EXPANSION_DEPTH {
+            return None;
+        }
+        let _guard = UnevalConstDepthGuard::new(depth, current);
+        let empty_specs: HashMap<DefId, StdSpec> = HashMap::new();
+        let empty_extern: HashMap<String, StdSpec> = HashMap::new();
+        let config = super::super::ExtractionConfig {
+            scope_call_context: false,
+            cutoff_span: None,
+            cutoff_location: None,
+            diagnostics,
+        };
+        let (extracted, effects) = super::super::extract_return_expr_impl(
+            tcx,
+            body,
+            &[],
+            &empty_specs,
+            &empty_specs,
+            &empty_extern,
+            config,
+        );
+        if !promoted_extraction_is_exact(&effects) {
+            return None;
+        }
+        extracted.filter(promoted_value_is_closed)
+    })
+}
+
+/// Whether a promoted's value mentions nothing but literals, operators and
+/// constructor or logic-function applications.
+///
+/// Any variable is refused (see [`translate_promoted_body`]): a closed value
+/// has none, and the binders of a quantifier, `match` or `let` would put one
+/// in the term. `old`, `^` and the assumption / obligation carriers name a
+/// program state or a fact, which a constant has no use for.
+fn promoted_value_is_closed(expr: &PureExpr) -> bool {
+    !expr.any_recursive(|node| {
+        matches!(
+            node,
+            PureExpr::Var(..)
+                | PureExpr::Old(_)
+                | PureExpr::Final(_)
+                | PureExpr::Forall { .. }
+                | PureExpr::Exists { .. }
+                | PureExpr::Match { .. }
+                | PureExpr::Let { .. }
+                | PureExpr::LetAssume { .. }
+                | PureExpr::LetObligation { .. }
+        )
+    })
+}
+
+/// Whether the promoted body's extraction modelled every statement it read.
+///
+/// The extractor marks a construct it could not model with a fail-closed
+/// `false` obligation or a dropped clause, and the value it returns is sound
+/// only together with that marker. The promoted's obligations are not
+/// restated (CTFE discharged them), which would drop the marker and keep the
+/// value: refuse the value instead.
+fn promoted_extraction_is_exact(effects: &crate::mir_analysis::effects::CallEffects) -> bool {
+    effects.dropped_clauses.is_empty()
+        && effects.dropped_spec_clauses == 0
+        && !effects.has_mutating_call_effect
+        && !effects.obligations.iter().any(|obligation| {
+            obligation.any_recursive(|node| matches!(node, PureExpr::Bool(false)))
+        })
 }
 
 fn translate_const_body_return_rvalue<'tcx>(
@@ -807,7 +981,7 @@ fn translate_const_body_return_rvalue<'tcx>(
         .find(|bb_data| matches!(bb_data.terminator().kind, TerminatorKind::Return))
         .and_then(|bb_data| {
             bb_data.statements.iter().rev().find_map(|stmt| {
-                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                let StatementKind::Assign((place, rvalue)) = &stmt.kind else {
                     return None;
                 };
                 (place.local == rustc_middle::mir::RETURN_PLACE).then_some(rvalue)

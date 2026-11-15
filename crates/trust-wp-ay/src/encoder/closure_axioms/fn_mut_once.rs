@@ -190,12 +190,18 @@ impl AYEncoder {
             return;
         };
 
+        // `split_last` says "all but the last, and the last" in one total
+        // operation. The old form indexed `rev_vars.len() - 1` twice, which
+        // underflows and then panics on an empty argument vector; this fails
+        // closed there instead, the same way every other guard in this function
+        // does.
+        let Some((last_var, leading_vars)) = rev_vars.split_last() else {
+            return;
+        };
         let mut mut_args = Vec::with_capacity(mut_arity);
-        for var in &rev_vars[..rev_vars.len() - 1] {
-            mut_args.push(*var);
-        }
+        mut_args.extend_from_slice(leading_vars);
         mut_args.push(witness_term);
-        mut_args.push(rev_vars[rev_vars.len() - 1]);
+        mut_args.push(*last_var);
         // Fail closed when mut_decl diverges from the once_decl domain used to
         // create these variables; never fabricate a differently typed alias.
         // (#2556)

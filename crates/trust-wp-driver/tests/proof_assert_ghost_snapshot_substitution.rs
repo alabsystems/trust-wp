@@ -13,12 +13,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::trust_wp_rustc_path;
+use trust_wp_test_utils::{nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture() -> std::process::Output {
     let unique = SystemTime::now()
@@ -84,14 +83,14 @@ fn main() {
     let target_dir: PathBuf =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ghost_snapshot_subst_tests");
 
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(&fixture_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", "--verify")
-        .args(["check", "--quiet"])
+        .args(["--quiet"])
         .output()
-        .expect("failed to run cargo check for ghost snapshot fixture");
+        .expect("failed to run targo check for ghost snapshot fixture");
     let _ = fs::remove_dir_all(&fixture_dir);
     output
 }

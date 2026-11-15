@@ -3,8 +3,7 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Licensed under the Apache License, Version 2.0
 
-"""Pearlite -> Clean body translator, v1.1 (R4 §1-executor, ratified
-doctrine 2026-07-22).
+"""Pearlite -> Clean body translator, v1.1 (R4 §1-executor).
 
 Scope (the census's quantifier-free, non-recursive Int-relaxed fragment):
 arithmetic (+ - * / %, unary -), comparisons (== != < <= > >=), boolean
@@ -246,8 +245,7 @@ class Parser:
             if tname == "Int":
                 binders.append((name, None))
             elif tname in MACHINE_BINDER_BOUNDS:
-                # Bounded-domain encoding (§2, ratified design + owner
-                # ratification 2026-07-22): pearlite logic bodies read as Int
+                # Bounded-domain encoding (§2): pearlite logic bodies read as Int
                 # arithmetic, so a machine-typed binder MEANS bounded-Int
                 # quantification — the u<w> values inject into Int as exactly
                 # [0, 2^w). Rendered below with the ∀/∃ duality.
@@ -320,7 +318,7 @@ class Parser:
         # binder for a viewed parameter IS its sequence model (the emitter
         # ports `Seq<Int>`-modeled params as `(v : List Int)`), so the view
         # application is the identity at the island level. `@` on anything
-        # other than a bare identifier keeps the historical model_deref_at
+        # other than a bare identifier keeps the model_deref_at
         # refusal — HashMap models, nested views, and machine-element
         # collections (whose bounded-element encoding needs its own battery)
         # all stay attributed.
@@ -330,10 +328,10 @@ class Parser:
             else:
                 raise Refused("model_deref_at")
 
-        # §3 vocabulary (Seq→List mapping, owner-ratified 2026-07-23), entry 1:
+        # §3 vocabulary (Seq→List mapping), entry 1:
         # `.len()` renders the island's `(Int.ofNat (xs.length))` — the exact
         # spelling the generator dialect pin kernel-checks (seq_len_pin). Any
-        # other method or field access keeps the historical refusal.
+        # other method or field access is refused.
         while self.peek() == ("op", "."):
             self.next()
             kind, method = self.next()

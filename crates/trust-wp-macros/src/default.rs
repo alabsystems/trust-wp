@@ -21,11 +21,9 @@ pub fn derive_default(input: proc_macro::TokenStream) -> proc_macro::TokenStream
 
     let body_code = default_body(&name, &input.data);
     let body_spec = default_spec(&name, &input.data);
-    let trusted_attr = trusted_attr_for_default(&input.data);
 
     quote! {
         impl #impl_generics ::core::default::Default for #name #ty_generics #where_clause {
-            #trusted_attr
             #[::trust_wp_std::ensures(#body_spec)]
             fn default() -> Self {
                 #body_code
@@ -106,13 +104,16 @@ fn default_spec(type_name: &Ident, data: &Data) -> TokenStream {
         Data::Struct(data_struct) => struct_default_spec(type_name, &data_struct.fields),
         Data::Enum(data_enum) => match default_variant(data_enum) {
             Ok(default_variant) => {
+                let variant_name = &default_variant.ident;
                 if matches!(default_variant.fields, Fields::Unit) {
-                    let variant_name = &default_variant.ident;
                     quote!(match result { #type_name::#variant_name => true, _ => false })
                 } else {
-                    let variant_name = &default_variant.ident;
-                    let pattern = wildcard_constructor_pattern(&default_variant.fields);
-                    quote!(match result { #type_name::#variant_name #pattern => true, _ => false })
+                    // Creusot's derive states every payload field's default, as
+                    // for a struct; a variant-only claim is weaker than the
+                    // contract callers are owed.
+                    let (pattern, fields_expr) =
+                        constructor_default_pattern_and_expr(&default_variant.fields);
+                    quote!(match result { #type_name::#variant_name #pattern => #fields_expr, _ => false })
                 }
             }
             Err(error) => error.to_compile_error(),
@@ -154,18 +155,6 @@ fn default_variant(data_enum: &DataEnum) -> syn::Result<&Variant> {
     }
 
     Ok(default_variant)
-}
-
-fn trusted_attr_for_default(data: &Data) -> TokenStream {
-    let Data::Enum(data_enum) = data else {
-        return quote!();
-    };
-    match default_variant(data_enum) {
-        Ok(default_variant) if !matches!(default_variant.fields, Fields::Unit) => {
-            quote!(#[::trust_wp_std::trusted])
-        }
-        _ => quote!(),
-    }
 }
 
 fn constructor_default_pattern_and_expr(fields: &Fields) -> (TokenStream, TokenStream) {
@@ -215,30 +204,20 @@ fn constructor_default_pattern_and_expr(fields: &Fields) -> (TokenStream, TokenS
 fn default_field_predicate(ty: &Type, value: TokenStream, span: Span) -> TokenStream {
     match primitive_default_kind(ty) {
         Some(PrimitiveDefault::False) => quote_spanned! { span => #value == false },
-        Some(PrimitiveDefault::Zero) => quote_spanned! { span => #value == 0 },
+        // Typed zero (`0i32`): an unsuffixed pearlite literal is `Int`.
+        Some(PrimitiveDefault::Zero) => {
+            let zero = primitive_type_ident(ty).map_or_else(
+                || quote_spanned! { span => 0 },
+                |ident| {
+                    let lit = syn::LitInt::new(&format!("0{ident}"), span);
+                    quote_spanned! { span => #lit }
+                },
+            );
+            quote_spanned! { span => #value == #zero }
+        }
         None => quote_spanned! { span =>
             core::default::Default::default.postcondition((), #value)
         },
-    }
-}
-
-fn wildcard_constructor_pattern(fields: &Fields) -> TokenStream {
-    match fields {
-        Fields::Named(fields) => {
-            let fields = fields.named.iter().map(|field| {
-                let name = &field.ident;
-                quote_spanned! { field.span() => #name: _ }
-            });
-            quote!({ #(#fields),* })
-        }
-        Fields::Unnamed(fields) => {
-            let fields = fields
-                .unnamed
-                .iter()
-                .map(|field| quote_spanned! { field.span() => _ });
-            quote!(( #(#fields),* ))
-        }
-        Fields::Unit => quote!(),
     }
 }
 
@@ -254,6 +233,16 @@ fn default_expr_for_type(ty: &Type) -> TokenStream {
 enum PrimitiveDefault {
     False,
     Zero,
+}
+
+fn primitive_type_ident(ty: &Type) -> Option<String> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() || type_path.path.segments.len() != 1 {
+        return None;
+    }
+    Some(type_path.path.segments.first()?.ident.to_string())
 }
 
 fn primitive_default_kind(ty: &Type) -> Option<PrimitiveDefault> {

@@ -1,0 +1,70 @@
+    Checking trust-wp-std v0.6.0 (<campaign-root>/s53/trust-wp/crates/trust-wp-std)
+    Checking trust-wp v0.6.0 (<campaign-root>/s53/trust-wp/crates/trust-wp)
+    Checking creusot-std v0.6.0 (<campaign-root>/s53/trust-wp/crates/creusot-std)
+    Checking creusot-contracts v0.6.0 (<campaign-root>/s53/trust-wp/crates/creusot-contracts)
+    Checking creusot_test v0.1.0 (/private/var/folders/w6/hcy0yr1d35qcfjb9x2mr5b340000gn/T/s53probe_mji6gkqy/test_project)
+warning: unused doc comment
+  --> src/lib.rs:16:12
+   |
+16 | #[requires(x > 0i32)]
+   |            ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+  --> src/lib.rs:19:11
+   |
+19 | #[ensures(^x == -5i32)]
+   |           ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:22:11
+   |
+22 | #[ensures(true)]
+   |           ^^^^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:23:88
+   |
+23 | ...x); let mut i: u32 = 0; #[invariant(i <= n)] while i < n { i += 1; } let mut j: u32 = 0; #[invariant(j <= n && x == -5i32)] while...
+   |                                        ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:23:153
+   |
+23 | ...; } let mut j: u32 = 0; #[invariant(j <= n && x == -5i32)] while j < n { j += 1; } }
+   |                                        ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused variable: `x`
+  --> src/lib.rs:17:17
+   |
+17 | pub fn need_pos(x: i32) {}
+   |                 ^ help: if this is intentional, prefix it with an underscore: `_x`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+trust-wp: need_pos verified ✓
+trust-wp: setneg verified ✓
+TRUST_WP_DIAGNOSTIC:v1 def_path=f kind=loop_initialization status=failed reason=counterexample solve_time_ms=13 assertions=3 timeout_ms=14499 ay_result=sat accepted_for_consumer=false model_validated=false unsat_proof_available=false verification_level=Unknown replay_present=true replay_bytes=441 replay_sha256=a7ad21ba2be93e058990ce0b2fd65c1260ca61bbe56734174d6cadccd18c1569 native_replay_present=true native_replay_bytes=4124 native_replay_sha256=53d75498302319f10a207d45969bbc1725ca77d441a309db6780d1fea5389142 native_replay_schema=ay.native-replay.v1 native_replay_path=none native_replay_write_error=none strict_replay=none strict_replay_unbound=0
+TRUST_WP_DIAGNOSTIC:v1 def_path=f kind=loop_preservation status=unknown reason=vacuous%20proof:%20base%20assertions%20are%20UNSAT%20without%20the%20negated%20postcondition solve_time_ms=0 assertions=0 timeout_ms=none ay_result=none accepted_for_consumer=unknown model_validated=unknown unsat_proof_available=unknown verification_level=none replay_present=false replay_bytes=0 replay_sha256=none native_replay_present=false native_replay_bytes=0 native_replay_sha256=none native_replay_schema=none native_replay_path=none native_replay_write_error=none strict_replay=none strict_replay_unbound=0
+TRUST_WP_DIAGNOSTIC:v1 def_path=f kind=loop_postcondition status=unknown reason=vacuous%20proof:%20base%20assertions%20are%20UNSAT%20without%20the%20negated%20postcondition solve_time_ms=0 assertions=0 timeout_ms=none ay_result=none accepted_for_consumer=unknown model_validated=unknown unsat_proof_available=unknown verification_level=none replay_present=false replay_bytes=0 replay_sha256=none native_replay_present=false native_replay_bytes=0 native_replay_sha256=none native_replay_schema=none native_replay_path=none native_replay_write_error=none strict_replay=none strict_replay_unbound=0
+TRUST_WP_DIAGNOSTIC:v1 def_path=f kind=loop_call_obligation status=unknown reason=vacuous%20proof:%20base%20assertions%20are%20UNSAT%20without%20the%20negated%20postcondition solve_time_ms=0 assertions=0 timeout_ms=none ay_result=none accepted_for_consumer=unknown model_validated=unknown unsat_proof_available=unknown verification_level=none replay_present=false replay_bytes=0 replay_sha256=none native_replay_present=false native_replay_bytes=0 native_replay_sha256=none native_replay_schema=none native_replay_path=none native_replay_write_error=none strict_replay=none strict_replay_unbound=0
+trust-wp: f vacuous (loop obligations, contradictory premises)
+  at src/lib.rs:23:1: 23:17
+
+trust-wp: 2 verified, 0 failed, 0 errors, 1 vacuous, 1 warnings
+warning: `creusot_test` (lib) generated 6 warnings (run `cargo fix --lib -p creusot_test` to apply 1 suggestion)
+error: could not compile `creusot_test` (lib); 6 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/var/folders/w6/hcy0yr1d35qcfjb9x2mr5b340000gn/T/trust_wp_harness_bin_p9mkx_3v/trust-wp-rustc <rustup-home>/toolchains/trust-wpcamp/bin/rustc --crate-name creusot_test --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(trust_wp)' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=338dd5d60a93f3f2 -C extra-filename=-9716421c1943ef5c --out-dir <campaign-root>/s53/harness-target/debug/deps -L dependency=<campaign-root>/s53/harness-target/debug/deps --extern creusot_contracts=<campaign-root>/s53/harness-target/debug/deps/libcreusot_contracts-1976c791ef999853.rmeta --extern creusot_std=<campaign-root>/s53/harness-target/debug/deps/libcreusot_std-796fae5de59eddf0.rmeta --extern trust_wp=<campaign-root>/s53/harness-target/debug/deps/libtrust_wp-badd645ccc1cd69f.rmeta --extern trust_wp_std=<campaign-root>/s53/harness-target/debug/deps/libtrust_wp_std-32f054453635ac5b.rmeta` (exit status: 2)
+TRUST_WP_RESULT:v1 base_exit_code=2 verified=2 failed=0 errors=0 warnings=1 assumed=0 trusted=0 skipped=0 verified_with_axiom_deps=0 unverified_axioms=0 vacuous=1 evidence_gaps=0 proof_assert_verified=0 proof_assert_inconclusive=0 verified_native_only=0 proof_assert_failed=0 proof_assert_errors=0 panics=0 demoted=0 parse_errors=0 termination_errors=0 logic_recursion_errors=0 erasure_errors=0

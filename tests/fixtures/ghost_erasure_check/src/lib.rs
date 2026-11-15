@@ -21,7 +21,7 @@
 //! These fixtures are tested via the integration test in trust-wp-driver:
 //!
 //! ```bash
-//! cargo test -p trust-wp-driver --test ghost_erasure_check
+//! targo --unverified test -p trust-wp-driver --test ghost_erasure_check
 //! ```
 //!
 //! The integration test compiles these fixtures through trust-wp-rustc and

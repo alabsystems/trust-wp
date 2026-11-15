@@ -602,7 +602,10 @@ fn test_recorded_reason_cannot_widen_proof_authority() {
         .as_ref()
         .expect("the withheld replay is still observed");
 
-    assert!(withheld.unknown_reason.is_some(), "precondition: a reason was recorded");
+    assert!(
+        withheld.unknown_reason.is_some(),
+        "precondition: a reason was recorded"
+    );
     assert!(
         declined.is_none() && !withheld.authority_accepted,
         "a recorded reason must never become a route to authority"

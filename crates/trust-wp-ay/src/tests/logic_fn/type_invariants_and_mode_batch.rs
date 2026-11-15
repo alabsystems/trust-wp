@@ -68,7 +68,7 @@ fn test_verify_function_with_type_invariant_axiom() {
         VerificationRequest::new(&requires, &ensures).return_expr(Some(&return_expr)),
     );
     assert!(
-        matches!(result_without, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result_without),
         "Without invariant body axiom, should produce Failed (invariant() is \
          uninterpreted UF, solver finds counterexample): {result_without:?}"
     );

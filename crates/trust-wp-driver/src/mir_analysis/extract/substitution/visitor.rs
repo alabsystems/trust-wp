@@ -49,11 +49,23 @@ use super::{
     branch_merge::{
         merge_bool_switchint_substitutions, merge_switchint_substitutions, BoolBranchTargets,
     },
-    call_resolution::{call_result_expr_for_substitutions, resolve_ref_to_named_local},
-    name_bindings::{build_name_substitution_sorts, build_name_substitutions},
+    call_resolution::{
+        call_result_expr_for_substitutions, is_mut_ref_reborrow_place,
+        is_trust_wp_std_snapshot_capture, nonfinal_reborrow_carrier, resolve_ref_to_named_local,
+    },
+    name_bindings::{
+        build_name_substitution_sorts, build_name_substitutions, snapshot_frozen_name_values,
+    },
     state::block_can_reach_substitution_cutoff,
     SubstitutionCutoff, SubstitutionExtractionContext, SubstitutionState,
 };
+use crate::mir_analysis::{deref_store_staleness::CurrentState, governed_place::Governed};
+
+/// Whether two expressions are the same variable, whatever sort each
+/// carries.
+fn same_var(a: &PureExpr, b: &PureExpr) -> bool {
+    matches!((a, b), (PureExpr::Var(x, _), PureExpr::Var(y, _)) if x == y)
+}
 
 /// Visitor for the substitution extraction pipeline (Pipeline 3).
 ///
@@ -94,6 +106,30 @@ pub(super) struct SubstitutionVisitor<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> SubstitutionVisitor<'a, 'tcx> {
+    /// The place a borrow chain ends at: follow `borrow_of` from `local` to
+    /// the first local with no recorded borrow (`local` itself when it has
+    /// none). `None` when any `&mut` link on the way — `local` included —
+    /// escapes by reference somewhere in the body: a link whose own address
+    /// is taken (`let rr = &mut r; *rr = &mut y;`) can be redirected to a
+    /// place this chain never saw, so the chain would speak for the wrong
+    /// place. A cycle is cut rather than trusted.
+    fn unescaped_borrow_chain_root(&self, body: &Body<'tcx>, local: Local) -> Option<Local> {
+        let mut seen = HashSet::new();
+        let mut current = local;
+        loop {
+            if !seen.insert(current) {
+                return None;
+            }
+            let Some(&origin) = self.borrow_of.get(&current) else {
+                return Some(current);
+            };
+            if local_is_mut_ref(body, current) && local_escapes_by_reference(body, current) {
+                return None;
+            }
+            current = origin;
+        }
+    }
+
     /// Build the substitution result at the current cutoff point.
     pub(super) fn build_substitutions(&self, body: &Body<'tcx>) -> NameSubstitutions {
         NameSubstitutions::new(
@@ -210,6 +246,138 @@ impl<'a, 'tcx> SubstitutionVisitor<'a, 'tcx> {
         }
     }
 
+    /// D-140: re-bind every local a hand-off may change to a fresh symbol and
+    /// forget what this walk recorded about its pointee, so no binding read
+    /// before glue that may write is identified with one read after it.
+    fn rebind_handed_off(&mut self, body: &Body<'tcx>, changed: HashSet<Local>) {
+        let mut changed: Vec<Local> = changed.into_iter().collect();
+        changed.sort();
+        for local in changed {
+            let sort = ty_to_expr_sort_enriched(self.tcx, body.local_decls[local].ty);
+            self.local_exprs.insert(
+                local,
+                PureExpr::Var(
+                    super::super::unannotated_loops::fresh_name(&format!(
+                        "handoff{}",
+                        local.as_usize()
+                    )),
+                    sort,
+                ),
+            );
+            self.deref_exprs.remove(&local);
+            if let Some(name) = source_name_for_local(body, local, self.arg_names) {
+                self.name_updates.remove(&format!("*{name}"));
+                self.name_updates.remove(&name);
+            }
+        }
+    }
+
+    /// Whether `local` is a parameter of a function item (not a closure,
+    /// whose arguments are its environment and its tupled parameters).
+    fn is_fn_item_param(&self, local: Local) -> bool {
+        (1..=self.body.arg_count).contains(&local.as_usize())
+            && !self.tcx.is_closure_like(self.body.source.def_id())
+    }
+
+    /// The fresh symbol a parameter is re-bound to by a write at `location`
+    /// whose value this walk cannot represent (D-241).
+    fn fresh_param_write_symbol(&self, local: Local, location: Location) -> PureExpr {
+        PureExpr::Var(
+            format!(
+                "$param_write_{}_{}_{}",
+                local.as_u32(),
+                location.block.as_u32(),
+                location.statement_index
+            ),
+            ty_to_expr_sort_enriched(self.tcx, self.body.local_decls[local].ty),
+        )
+    }
+
+    /// Translate `rvalue` as it reads at `location` (D-185).
+    ///
+    /// A read through a dereference whose memory no write reaches before
+    /// `location` reads the entry value, which is what the plain translation
+    /// spells (`Deref(Var x)`). A read of memory a write may have changed takes
+    /// the value this walk recorded for it -- only a whole-pointee read `*x`
+    /// whose every preceding write is a store `*x = v` through `x` itself, the
+    /// writes [`Self::handle_single_deref_write`] records -- and otherwise a
+    /// fresh symbol: spelling it `Deref(Var x)` named the entry value, so `let
+    /// v = *x` after `*x = 5` bound `v` to the value the write replaced.
+    pub(super) fn translate_current_rvalue(
+        &self,
+        rvalue: &Rvalue<'tcx>,
+        body: &Body<'tcx>,
+        location: Location,
+    ) -> Option<PureExpr> {
+        let entry = translate_rvalue_with_enum_variants(
+            self.tcx,
+            rvalue,
+            &self.local_exprs,
+            Some(body),
+            None,
+            None,
+        );
+        let Some(reads) = self.ctx.written_deref_reads.get(&location) else {
+            return entry;
+        };
+        // The plain translation spells each read `*x` as `Deref(<x's
+        // binding>)`, the entry pointee. A recorded read replaces exactly
+        // that term with the value the stores left.
+        let mut recorded: Vec<(PureExpr, PureExpr)> = Vec::new();
+        for (place, state) in reads {
+            let pointee = (*state == CurrentState::DirectPointeeStores
+                && place.projection.len() == 1)
+                .then(|| self.deref_exprs.get(&place.local))
+                .flatten();
+            let binding = self.local_exprs.get(&place.local);
+            match (pointee, binding) {
+                (Some(pointee), Some(PureExpr::Var(..))) => {
+                    recorded.push((binding.cloned()?, pointee.clone()));
+                }
+                _ => return Some(self.written_read_symbol(rvalue, body, location)),
+            }
+        }
+        // A recorded read the translation does not spell as that term was
+        // spelled some other way, which still names the entry value.
+        let mut replaced = vec![false; recorded.len()];
+        let current = entry.map(|expr| {
+            expr.rewrite_bottom_up(|node| {
+                if let PureExpr::Deref(inner) = &node {
+                    for (at, (binding, pointee)) in recorded.iter().enumerate() {
+                        if same_var(inner, binding) {
+                            replaced[at] = true;
+                            return pointee.clone();
+                        }
+                    }
+                }
+                node
+            })
+        });
+        match current {
+            Some(current) if replaced.iter().all(|done| *done) => Some(current),
+            _ => Some(self.written_read_symbol(rvalue, body, location)),
+        }
+    }
+
+    /// A fresh symbol for a value read from memory whose current value this
+    /// walk does not know (D-185).
+    fn written_read_symbol(
+        &self,
+        rvalue: &Rvalue<'tcx>,
+        body: &Body<'tcx>,
+        location: Location,
+    ) -> PureExpr {
+        let ty = rvalue.ty(&body.local_decls, self.tcx);
+        PureExpr::Var(
+            format!(
+                "$written_read_{}_{}",
+                location.block.as_u32(),
+                location.statement_index
+            ),
+            ty_to_expr_sort_enriched(self.tcx, ty),
+        )
+    }
+
     fn apply_seq_ghost_mutation(
         &mut self,
         body: &Body<'tcx>,
@@ -275,6 +443,69 @@ fn receiver_base_name(expr: &PureExpr) -> Option<String> {
     }
 }
 
+/// The functional update of a parameter's `current` value (of type `ty`) at
+/// the field `path` with `value`, spelled the way this walk spells a value of
+/// that type built whole (D-241): a struct of two or more fields as its
+/// constructor (`P(get_0(cur), value)`, as `translate_rvalue_typed` spells
+/// `P { a, b }`), a tuple of two or more fields as `tupleN(..)`. `None` for any
+/// other step (an enum, a single-field struct, which this walk collapses to its
+/// field, an unreadable field); the caller then binds a fresh symbol.
+fn param_field_update<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    locals: &HashMap<Local, PureExpr>,
+    current: PureExpr,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    path: &[usize],
+    value: PureExpr,
+) -> Option<PureExpr> {
+    use rustc_middle::ty::TyKind;
+
+    let Some((&index, rest)) = path.split_first() else {
+        return Some(value);
+    };
+    let (constructor, field_tys): (String, Vec<rustc_middle::ty::Ty<'tcx>>) = match ty.kind() {
+        TyKind::Tuple(fields) => (
+            trust_wp_core::formula::internal::tuple_lowering::tuple_logic_fn_name(fields.len()),
+            fields.iter().collect(),
+        ),
+        TyKind::Adt(adt_def, args) if adt_def.is_struct() && !adt_def.is_box() => (
+            tcx.item_name(adt_def.did()).to_string(),
+            adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .map(|field| field.ty(tcx, *args).skip_norm_wip())
+                .collect(),
+        ),
+        _ => return None,
+    };
+    if field_tys.len() < 2 || index >= field_tys.len() {
+        return None;
+    }
+    let mut value = Some(value);
+    let mut args = Vec::with_capacity(field_tys.len());
+    for (field, field_ty) in field_tys.iter().enumerate() {
+        let child =
+            super::super::super::translate::project_field_for_read(current.clone(), field, locals)?;
+        if field == index {
+            args.push(param_field_update(
+                tcx,
+                locals,
+                child,
+                *field_ty,
+                rest,
+                value.take()?,
+            )?);
+        } else {
+            args.push(child);
+        }
+    }
+    Some(PureExpr::LogicFnCall {
+        name: constructor,
+        args,
+    })
+}
+
 impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
     type Result = NameSubstitutions;
 
@@ -284,6 +515,33 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
 
     fn on_cycle(&mut self, _block: BasicBlock) {
         self.saw_cycle = true;
+    }
+
+    /// Entering the header of a loop the cutoff lies in: every local the loop
+    /// may change holds the value a back edge carried in, not the value it had
+    /// before the loop, so it is re-bound to its loop-head symbol and what the
+    /// walk recorded about its pointee and its name is forgotten (D-187). The
+    /// loop's invariants and condition are stated about the same symbols.
+    fn on_block_enter(&mut self, block: BasicBlock) {
+        let Some(locals) = self.ctx.loop_head_rebinds.get(&block) else {
+            return;
+        };
+        for &local in locals {
+            let sort = ty_to_expr_sort_enriched(self.tcx, self.body.local_decls[local].ty);
+            self.local_exprs.insert(
+                local,
+                PureExpr::Var(
+                    super::super::loop_merges::loop_head_symbol(block, local),
+                    sort,
+                ),
+            );
+            self.deref_exprs.remove(&local);
+            self.borrow_of.remove(&local);
+            if let Some(name) = source_name_for_local(self.body, local, self.arg_names) {
+                self.name_updates.remove(&format!("*{name}"));
+                self.name_updates.remove(&name);
+            }
+        }
     }
 
     fn on_assign_local(
@@ -299,6 +557,12 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
         if !self.effect_is_in_region(span) {
             return;
         }
+        // A whole-local assignment replaces whatever borrow the local held: an
+        // edge recorded for an earlier value would attribute a later write
+        // through the local to a place it no longer points at. The handlers
+        // below re-record the edge the new value warrants, if any.
+        self.borrow_of.remove(&local);
+        self.retire_recorded_writes_to(local, body);
         // Record whole-local copies for the closure-capture carrier lane
         // (#closure-capture-carriers): a consumed call argument is often a
         // move of the aggregate local (`_5 = move _2`).
@@ -307,11 +571,39 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
                 self.closure_copy_of.insert(local, src.local);
             }
         }
+        // A whole-local move of a `&mut` borrow hands the SAME pointee to the
+        // new local — `let r2 = r;`, or the temporary a borrow-returning call
+        // filled being moved into its `let` — so a write through the new
+        // local is a write to the place the moved borrow governed. Without
+        // this edge the write stays on the new local and the borrowed place
+        // keeps its entry value (a false accept, not an `unknown`). The edge
+        // targets the chain ROOT, resolved now: the moved-from local and the
+        // temporaries between it and the root reach `StorageDead` before the
+        // write and their edges are erased with them. Recorded only for a
+        // local the body assigns exactly once — a borrow local reassigned on
+        // some path governs a different place on each path, and an edge that
+        // speaks for the wrong one would turn the write into a false fact
+        // about an untouched place. (moved-borrow write)
+        if let Rvalue::Use(Operand::Move(src), _) = rvalue {
+            if src.projection.is_empty()
+                && src.local != local
+                && local_is_mut_ref(body, local)
+                && local_assigned_exactly_once(body, local)
+                && !local_escapes_by_reference(body, local)
+            {
+                if let Some(root) = self.unescaped_borrow_chain_root(body, src.local) {
+                    if root != local {
+                        tracing::debug!("moved-borrow edge: {:?} -> {:?}", local, root);
+                        self.borrow_of.insert(local, root);
+                    }
+                }
+            }
+        }
         // Record closure-environment aggregates for the capture carrier lane
         // (#closure-capture-carriers). A REASSIGNED closure local is ambiguous
         // — record an empty field list so the arity check at the call site
         // drops it back to the legacy lane (fail-closed).
-        if let Rvalue::Aggregate(box AggregateKind::Closure(..), operands) = rvalue {
+        if let Rvalue::Aggregate(AggregateKind::Closure(..), operands) = rvalue {
             let fields: Vec<Option<(Local, Local)>> =
                 if self.closure_env_captures.contains_key(&local) {
                     Vec::new()
@@ -335,6 +627,23 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
                 };
             self.closure_env_captures.insert(local, fields);
         }
+        // Reborrow finality (Creusot `NotFinalPlaces`): a `&mut` reborrow
+        // through a `&mut` deref that is NOT final gets a fresh id and no final
+        // link (`borrow_mut`). Identifying it with the reborrowed place's
+        // carrier (below) would credit whole-borrow equalities Creusot cannot
+        // prove (should_fail/final_borrows). Bind a fresh per-site carrier.
+        if let Rvalue::Ref(_, rustc_middle::mir::BorrowKind::Mut { .. }, ref_place) = rvalue {
+            if is_mut_ref_reborrow_place(self.tcx, body, ref_place)
+                && !self.ctx.final_reborrow_sites.contains(&location)
+            {
+                self.local_exprs.insert(
+                    local,
+                    nonfinal_reborrow_carrier(self.tcx, body, local, location),
+                );
+                self.record_borrow_chain(local, rvalue);
+                return;
+            }
+        }
         // Mutable reference identity tracking (#746): when a mutable
         // reference is created to a source-named local, preserve
         // variable identity through reference chains.
@@ -351,14 +660,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
             return;
         }
 
-        if let Some(expr) = translate_rvalue_with_enum_variants(
-            self.tcx,
-            rvalue,
-            &self.local_exprs,
-            Some(body),
-            None,
-            None,
-        ) {
+        if let Some(expr) = self.translate_current_rvalue(rvalue, body, location) {
             // Track reborrow chains: _2 = &mut (*_1) means _2 borrows _1.
             // Only record pure Deref reborrows (projection == [Deref]).
             // Field-through-deref reborrows like `_2 = &mut (*_1).field`
@@ -374,6 +676,12 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
                 }
             }
             self.local_exprs.insert(local, expr);
+        } else if self.is_fn_item_param(local) {
+            // A parameter keeps no binding a write replaced: a stale one
+            // would be read as its value at the assertion, and its own name
+            // is its ENTRY value (D-241).
+            let fresh = self.fresh_param_write_symbol(local, location);
+            self.local_exprs.insert(local, fresh);
         }
     }
 
@@ -390,10 +698,49 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
         if !self.effect_is_in_region(span) {
             return;
         }
+        // A direct write to one field still retires a write-back recorded
+        // for the WHOLE owner: that value states the sibling's pre-write
+        // value too, and the symbolic reset below only reaches `local_exprs`.
+        // Before the translation guard, because a write whose value this
+        // pass cannot translate is still a write.
+        self.retire_recorded_writes_to(place.local, body);
+        // A PARAMETER's own name is its ENTRY value, which its `#[requires]`
+        // and type invariant constrain, so the identity reset below would
+        // read the field just written at its entry value (D-241,
+        // proof_assert_after_param_field_write_keeps_entry_requires.rs). A
+        // parameter the `proof_assert` lane names apart from its entry value
+        // is re-bound to the functional update of its current value, or a
+        // fresh symbol where that cannot be built or the value cannot be
+        // translated: never its own name, and never the stale pre-write
+        // value. Any other parameter keeps the reset: the lane reads a copy of
+        // its entry value taken before the store at its binding at the
+        // assertion, and the update would hand that copy the stored value
+        // (D-140 and D-241 withdraw its entry facts instead). A closure's
+        // arguments are its environment and its tupled parameters, which keep
+        // the reset.
+        if self.is_fn_item_param(place.local) && self.ctx.renamable_params.contains(&place.local) {
+            let value = self.translate_current_rvalue(rvalue, body, location);
+            let ty = body.local_decls[place.local].ty;
+            let path: Option<Vec<usize>> = place
+                .projection
+                .iter()
+                .map(|elem| match elem {
+                    ProjectionElem::Field(field, _) => Some(field.as_usize()),
+                    _ => None,
+                })
+                .collect();
+            let updated = value.and_then(|value| {
+                let path = path?;
+                let current = self.local_exprs.get(&place.local).cloned()?;
+                param_field_update(self.tcx, &self.local_exprs, current, ty, &path, value)
+            });
+            let binding =
+                updated.unwrap_or_else(|| self.fresh_param_write_symbol(place.local, location));
+            self.local_exprs.insert(place.local, binding);
+            return;
+        }
         // Non-deref projected writes (e.g., `_N.field = ...`).
-        // Translation must succeed (matching the original guard), but the
-        // translated expression is not stored — only the symbolic identity
-        // reset below matters for projected writes.
+        // Translation must succeed (matching the original guard).
         if translate_rvalue_with_enum_variants(
             self.tcx,
             rvalue,
@@ -435,7 +782,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
             // `(2 == 4)` instead of staying symbolic. (#2533)
             if !matches!(existing, PureExpr::Var(..)) {
                 let sort = ty_to_expr_sort_enriched(self.tcx, body.local_decls[place.local].ty);
-                let synthetic_name = format!("_local_{}", place.local.as_u32());
+                let synthetic_name = format!("$local_{}", place.local.as_u32());
                 self.local_exprs
                     .insert(place.local, PureExpr::Var(synthetic_name, sort));
             }
@@ -455,16 +802,40 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
         if !self.effect_is_in_region(span) {
             return;
         }
-        let Some(expr) = translate_rvalue_with_enum_variants(
-            self.tcx,
-            rvalue,
-            &self.local_exprs,
-            Some(body),
-            None,
-            None,
-        ) else {
+        let Some(expr) = self.translate_current_rvalue(rvalue, body, location) else {
             return;
         };
+
+        // The generalized write-back. The owner place is resolved from the
+        // MIR, not from the edge map, so a severed chain, a borrow of a field
+        // and a borrow carried inside an aggregate all reach their owner. It
+        // refuses whenever it is not exact, which leaves every shape it
+        // declines to the handlers below exactly as before.
+        let rd = crate::mir_analysis::reaching_defs::for_body(self.tcx, body);
+        let governed = crate::mir_analysis::governed_place::governed_place(
+            self.tcx, body, &rd, place, location,
+        );
+        tracing::debug!("governed write-back for {:?}: {:?}", place, governed);
+        match governed {
+            Governed::Exact(base, path) => {
+                self.apply_governed_deref_write(base, &path, &expr, body, location);
+            }
+            Governed::Candidates(candidates) => {
+                // The write lands on one of these and the body does not say
+                // which. Every one of them loses whatever any lane recorded
+                // for it, and none of them is told what it now holds: picking
+                // one would be the guess this resolver exists to refuse, and
+                // leaving one un-invalidated is the same false accept with a
+                // new mechanism. The legacy handlers are SKIPPED rather than
+                // merely preceded — the edge map's entry for this borrow is
+                // per-branch state that would re-credit whichever target the
+                // walk saw last.
+                self.invalidate_governed_candidates(&candidates, body, location);
+                self.borrow_of.remove(&place.local);
+                return;
+            }
+            Governed::Unknown => {}
+        }
 
         if place.projection.len() == 1 {
             // Single deref write: `(*_N) = expr` (#746 AC1)
@@ -502,6 +873,14 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
 
     fn on_storage_dead(&mut self, local: Local, body: &Body<'tcx>, location: Location) {
         self.handle_storage_dead(local, body, location);
+    }
+
+    fn on_drop_place(&mut self, place: &Place<'tcx>, body: &Body<'tcx>) {
+        if let Some(changed) =
+            super::super::drop_glue_writes::locals_changed_by_drop(self.tcx, body, place)
+        {
+            self.rebind_handed_off(body, changed);
+        }
     }
 
     fn check_cutoff_at_terminator(
@@ -637,6 +1016,31 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
             args,
             destination.local,
         );
+        // A `snapshot!` freezes the value its argument has NOW; the capture
+        // spec reads the argument by name, which every later reader takes for
+        // the name's binding at the assertion (D-241).
+        if extract_call_def_id(func).is_some_and(|def_id| {
+            crate::provenance::is_spec_library_item(self.tcx, def_id)
+                && is_trust_wp_std_snapshot_capture(self.tcx, def_id)
+        }) {
+            let frozen = snapshot_frozen_name_values(body, self.arg_names, &self.local_exprs);
+            if !frozen.is_empty() {
+                call_result = call_result.substitute_no_tuple_beta(&frozen);
+            }
+        }
+        // An argument read through memory a write may have changed (D-185)
+        // was translated as the entry value: the result is not known.
+        let call_location = Location {
+            block: bb,
+            statement_index: body.basic_blocks[bb].statements.len(),
+        };
+        let reads_written_memory = self.ctx.written_deref_reads.contains_key(&call_location);
+        if reads_written_memory {
+            call_result = PureExpr::Var(
+                format!("$written_read_call_{}", bb.as_u32()),
+                ty_to_expr_sort_enriched(self.tcx, destination.ty(&body.local_decls, self.tcx).ty),
+            );
+        }
         // Box::new identity override (#2318): when Box::new has an extern spec
         // (ensures: *result == value), the ExternSpec path creates an opaque
         // result variable (call_N) instead of passing through the argument's
@@ -648,7 +1052,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
         // Fix: override the opaque result with the argument expression for
         // Box::new calls, and propagate the borrow chain so writes through
         // the Box still alias the original mutable reference.
-        if args.len() == 1 {
+        if args.len() == 1 && !reads_written_memory {
             if let Some(def_id) = extract_call_def_id(func) {
                 let path = self.tcx.def_path_str(def_id);
                 if is_box_new_call_path(&path) {
@@ -740,6 +1144,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
                     body,
                     self.arg_names,
                     self_expr,
+                    args.first().map(|arg| &arg.node),
                     Some(&mut self.name_updates),
                 );
             }
@@ -835,12 +1240,59 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
             if path.ends_with("::deref_mut") || path.ends_with("::deref") {
                 if let Some(first_arg) = args.first() {
                     if let Some(arg_local) = mut_ref_local_for_operand(body, &first_arg.node) {
-                        self.borrow_of.insert(destination.local, arg_local);
+                        // A ghost cell IS its payload in the encoding, so the
+                        // borrow `deref_mut` hands back governs the cell's
+                        // whole value: aim the edge at the cell itself, not at
+                        // the `&mut cell` temporary. That temporary reaches
+                        // `StorageDead` right after the call when the result
+                        // is bound by a `let` (`let r = g.deref_mut(); *r = 7`),
+                        // and an edge into a dead local is erased before the
+                        // write — which left `g` at its entry value while `*r`
+                        // was 7. Only for ghost-like receivers: a user
+                        // `DerefMut` may hand back one FIELD, and an edge to
+                        // its whole receiver would rebind the wrong value.
+                        // Durable only for a destination the body assigns
+                        // once and never takes the address of: a result local
+                        // reassigned on another path (`if c { t = h.deref_mut() }`)
+                        // governs a different cell there, and an edge that
+                        // outlives the statement would carry this cell's
+                        // write onto that path as a fact — a false accept.
+                        let receiver_ty = first_arg.node.ty(&body.local_decls, self.tcx);
+                        let target = if crate::ghost::type_helpers::is_ghost_like_type(
+                            self.tcx,
+                            receiver_ty,
+                        ) && local_assigned_exactly_once(body, destination.local)
+                            && !local_escapes_by_reference(body, destination.local)
+                        {
+                            self.unescaped_borrow_chain_root(body, arg_local)
+                                .unwrap_or(arg_local)
+                        } else {
+                            arg_local
+                        };
+                        tracing::debug!(
+                            "deref_mut edge: {:?} -> {:?} (arg {:?}, once={}, escapes={})",
+                            destination.local,
+                            target,
+                            arg_local,
+                            local_assigned_exactly_once(body, destination.local),
+                            local_escapes_by_reference(body, destination.local)
+                        );
+                        self.borrow_of.insert(destination.local, target);
                     }
                 }
             }
         }
         self.local_exprs.insert(destination.local, call_result);
+        if let Some(changed) = super::super::drop_glue_writes::locals_changed_by_call(
+            self.tcx,
+            body,
+            bb,
+            func,
+            args,
+            &destination,
+        ) {
+            self.rebind_handed_off(body, changed);
+        }
         VisitorAction::Continue(next_bb)
     }
 
@@ -859,4 +1311,72 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SubstitutionVisitor<'a, 'tcx> {
     ) {
         self.saw_unsupported = true;
     }
+}
+
+/// Is `local` typed `&mut T`?
+pub(super) fn local_is_mut_ref(body: &Body<'_>, local: Local) -> bool {
+    matches!(
+        body.local_decls[local].ty.kind(),
+        rustc_middle::ty::TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+    )
+}
+
+/// Is the VALUE of `local` written exactly once anywhere in the body — one
+/// whole-local assignment or call destination, or one write to a
+/// sub-place of the local itself? A write behind a deref (`(*local) = v`)
+/// changes the pointee, not the local, and does not count. A local written
+/// more than once may hold a different value on each path through a branch,
+/// so a body-wide count (not the walk's own view of one path) is what makes
+/// a fact recorded about it valid on every path.
+pub(super) fn local_assigned_exactly_once(body: &Body<'_>, local: Local) -> bool {
+    let writes_local = |place: &rustc_middle::mir::Place<'_>| {
+        place.local == local && !matches!(place.projection.first(), Some(ProjectionElem::Deref))
+    };
+    let mut writes = 0usize;
+    for bb_data in body.basic_blocks.iter() {
+        for stmt in &bb_data.statements {
+            match &stmt.kind {
+                rustc_middle::mir::StatementKind::Assign((dst, _)) if writes_local(dst) => {
+                    writes += 1;
+                }
+                rustc_middle::mir::StatementKind::SetDiscriminant { place, .. }
+                    if writes_local(place) =>
+                {
+                    writes += 1;
+                }
+                _ => {}
+            }
+        }
+        if let Some(terminator) = &bb_data.terminator {
+            match &terminator.kind {
+                rustc_middle::mir::TerminatorKind::Call { destination, .. }
+                    if writes_local(destination) =>
+                {
+                    writes += 1;
+                }
+                rustc_middle::mir::TerminatorKind::Yield { resume_arg, .. }
+                    if writes_local(resume_arg) =>
+                {
+                    writes += 1;
+                }
+                rustc_middle::mir::TerminatorKind::InlineAsm { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    writes == 1
+}
+
+/// Does any statement in the body take `local`'s own address (`&mut local`,
+/// `&raw local`) or capture it into a closure by value? Either lets the
+/// borrow the local holds be replaced through a path the walk does not see.
+pub(super) fn local_escapes_by_reference(body: &Body<'_>, local: Local) -> bool {
+    body.basic_blocks.iter().any(|bb_data| {
+        bb_data.statements.iter().any(|stmt| match &stmt.kind {
+            rustc_middle::mir::StatementKind::Assign((_, rvalue)) => {
+                super::super::reborrow_handback::rvalue_lets_local_escape(rvalue, local)
+            }
+            _ => false,
+        })
+    })
 }

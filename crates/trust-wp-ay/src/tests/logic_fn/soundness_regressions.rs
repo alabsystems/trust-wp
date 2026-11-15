@@ -67,7 +67,7 @@ fn test_emit_spec_axioms_dropped_ensures_does_not_falsely_verify() {
     );
 
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "f(1)==42 must fail from the visible body axiom f(x)=x+1: {result:?}"
     );
 }

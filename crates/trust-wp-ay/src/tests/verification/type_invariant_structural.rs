@@ -283,15 +283,32 @@ fn test_sum10_construction_without_precondition_fails() {
     // body: result = x (x is unconstrained)
     let body = var("x");
 
-    let result = verify_function_with_modes(
+    let outcome = crate::verify_function_with_modes_outcome(
         VerificationRequest::new(&[], &[ens])
             .return_expr(Some(&body))
             .type_invariants(Some(&[inv_def])),
     )
     .unwrap();
+    let evidence_gap = crate::refutation_evidence_gap_reason(&outcome);
+    if (!matches!(outcome.result, VerificationResult::Failed(_)) || evidence_gap.is_some())
+        && std::env::var_os("TWP_BR_DBG").is_some()
+    {
+        if let Some(replay) = outcome
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.native_replay_json.as_deref())
+        {
+            eprintln!("SUM10_NATIVE_REPLAY_BEGIN\n{replay}\nSUM10_NATIVE_REPLAY_END");
+        }
+    }
+    let result = outcome.result;
     assert!(
         matches!(result, VerificationResult::Failed(_)),
         "Sum10: unconstrained x cannot satisfy invariant: got {result:?}"
+    );
+    assert!(
+        evidence_gap.is_none(),
+        "Sum10 counterexample needs accepted, validated model evidence: {evidence_gap:?}"
     );
 }
 
@@ -377,7 +394,7 @@ fn test_nonzero_newtype_construction_without_precondition_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "NonZeroU32::new without precondition should fail: got {result:?}"
     );
 }
@@ -538,7 +555,7 @@ fn test_named_field_invariant_not_strictly_positive() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "Point.y >= 0 does not imply result > 0 (y=0 is cex): got {result:?}"
     );
 }

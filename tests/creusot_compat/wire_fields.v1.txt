@@ -2,7 +2,7 @@
 # Source of truth: trust_wp_core::result_protocol::WIRE_FIELDS_V1 (the same
 # slice drives the Rust emitter and decoder). Regenerate and commit together
 # with any manifest change:
-#   TRUST_WP_BLESS_WIRE_FIXTURE=1 cargo test -p trust-wp-core --lib wire_manifest
+#   TRUST_WP_BLESS_WIRE_FIXTURE=1 targo --unverified test -p trust-wp-core --lib wire_manifest
 # Pinned consumers: tests/creusot_compat/harness_model.py and
 # scripts/compare_baselines.py, via tests/creusot_compat/test_harness.py.
 [required]

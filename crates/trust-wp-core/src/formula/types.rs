@@ -9,9 +9,10 @@
 
 use super::PureExpr;
 
+super::listed_enum::listed_enum! {
 /// Binary operators
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -21,8 +22,9 @@ pub enum BinOp {
     ///
     /// SMT encoding: `(mod a b)` - always returns non-negative result when divisor is positive.
     /// Note: SMT-LIB mod semantics differ from Rust's `%` for negative operands.
-    /// This is the EUCLIDEAN remainder, used for mathematical `Int`, unsigned
-    /// machine integers (where Euclidean == truncated), and the contract `%`.
+    /// This is the EUCLIDEAN remainder (`Int::rem_euclid`). The pearlite /
+    /// contract `%` is NOT this: Creusot's `Int` `%` truncates, see
+    /// [`BinOp::RemTrunc`].
     Mod,
     /// Truncated (toward-zero) integer division: Rust's `/` on **signed machine**
     /// integers (`-7 / 2 == -3`, not the Euclidean `-4`).
@@ -35,9 +37,10 @@ pub enum BinOp {
     /// integers — the remainder takes the SIGN OF THE DIVIDEND (`-1 % 5 == -1`,
     /// not the Euclidean `4`).
     ///
-    /// Produced only by MIR/HIR lowering of signed machine `Rem`. Distinct from
-    /// [`BinOp::Mod`] (Euclidean) so the model faithfully matches Rust runtime
-    /// for negative operands.
+    /// Produced by the contract/pearlite `%` (Creusot `int.ComputerDivision.mod`)
+    /// and by MIR/HIR lowering of Rust `Rem`. Distinct from [`BinOp::Mod`]
+    /// (Euclidean) so the model matches Rust and Creusot for negative operands.
+    /// `x % 0` is left unspecified.
     RemTrunc,
     /// Shift-left (`a << b`)
     Shl,
@@ -63,6 +66,7 @@ pub enum BinOp {
     /// Has lowest precedence (below `||`).
     Implies,
 }
+}
 
 impl BinOp {
     /// Return the SMT-LIB UF symbol used for integer bitwise operators.
@@ -79,9 +83,10 @@ impl BinOp {
     }
 }
 
+super::listed_enum::listed_enum! {
 /// Unary operators
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnOp {
     Not,
     Neg,
@@ -91,6 +96,7 @@ pub enum UnOp {
     /// non-boolean operands is bitwise complement; we separate it here so the
     /// encoder can route to BV-NOT instead of boolean NOT. (#2697)
     BitNot,
+}
 }
 
 /// Whether a mutable reborrow is final (source borrow never used afterward).
@@ -108,6 +114,18 @@ pub enum BorrowFinality {
     /// prophecy variable. `deref_pos` is the projection index of the mutable
     /// dereference in the reborrowed place.
     Final { deref_pos: usize },
+}
+
+/// The parameter a reborrow descends from, by its name: a reborrow of `p` is
+/// named `p$rbN`, a reborrow of that `p$rbN$rbM`, and a writeback into any of
+/// them is a write into `p`'s referent. A gate on `p`'s final state (it is
+/// mutation-continued, or advanced past its entry value) is a gate on every
+/// reborrow in its chain: `<parent>_current` of a reborrow parent is its
+/// value when it was taken, pinned to `p`'s entry value by the reborrow's own
+/// writeback, not its value after the child expires (D-107).
+#[must_use]
+pub fn reborrow_root(name: &str) -> &str {
+    name.split_once("$rb").map_or(name, |(root, _)| root)
 }
 
 /// Borrow-id propagation for reborrows of `&mut` values. (#2141)
@@ -261,11 +279,43 @@ pub(crate) const TUPLE_FIELD_LOGIC_FN_PREFIX: &str = "__trust_wp_tuple_get_";
 /// `x.inner` -> `__trust_wp_field_inner(x)`, `p.x` -> `__trust_wp_field_x(p)`.
 pub(crate) const NAMED_FIELD_LOGIC_FN_PREFIX: &str = "__trust_wp_field_";
 
-/// Synthetic logic-function name for the floor primitive (`real_to_int`).
+/// Prefix of a std-spec term that only the call site can resolve: the byte
+/// size or alignment of the callee's generic arguments as that call
+/// instantiates them, or a panic the spec cannot state at all.
 ///
-/// Used by the driver to lower `FloatToInt` casts into a `LogicFnCall` node,
-/// and by the encoder to dispatch to ay's `real_to_int` builtin. (#1802)
-pub(crate) const REAL_TO_INT_FLOOR_LOGIC_FN: &str = "__trust_wp_real_to_int_floor";
+/// The driver rewrites the resolvable ones at each call from the call's own
+/// generic arguments. One that reaches the encoder was not rewritten, so the
+/// encoder refuses it: a spec clause about a type nobody named must never be
+/// read about whatever type happens to share the name in the caller.
+pub(crate) const STD_SITE_MARKER_PREFIX: &str = "__trust_wp_std_site_";
+
+/// Uninterpreted `thin(p)`: a pointer that may carry metadata (a slice
+/// length, a vtable) with the metadata stripped. Creusot's `Opaque.thin`.
+///
+/// Two fat pointers that differ only in their metadata have EQUAL thin
+/// casts, so the cast is not its operand; reading it as one proves them
+/// different. Nothing about it is stated but congruence and that it keeps
+/// the address (`addr_logic`), exactly Creusot's prelude.
+pub(crate) const PTR_THIN_LOGIC_FN: &str = "__trust_wp_ptr_thin";
+
+/// Prefix of a clause's `e as *const T` / `e as *mut T` before the driver
+/// has read the operand's type: the parser has no types, and whether the
+/// cast is the identity or `thin` depends on whether the pointees are
+/// sized. The rest of the name is the written target type. The encoder
+/// refuses any that reaches it.
+pub(crate) const PTR_CAST_PENDING_PREFIX: &str = "__trust_wp_ptr_cast_pending:";
+
+/// Prefix of an uninterpreted function a raw-pointer cast is read as, one
+/// per (cast, source pointee, target pointee); the rest of the name is a hash
+/// of the triple.
+///
+/// Unsizing ADDS metadata (an array's length, a vtable), so it is not its
+/// operand: `p as *const [u8; 4]` and `p as *const [u8; 8]` unsized to
+/// `*const [u8]` differ. A pointer-to-pointer cast that is neither the
+/// identity nor `thin` (a custom unsized pointee) is its pair's function as
+/// well. One function per pair keeps the lengths apart and states nothing but
+/// congruence.
+pub(crate) const PTR_PAIR_LOGIC_FN_PREFIX: &str = "__trust_wp_ptr_pair_";
 
 /// Build the synthetic logic-function name for tuple field access.
 ///
@@ -288,6 +338,17 @@ pub(crate) fn tuple_field_logic_fn_index(name: &str) -> Option<usize> {
 const NAMED_CTOR_FIELD_OPEN: char = '{';
 const NAMED_CTOR_FIELD_CLOSE: char = '}';
 const NAMED_CTOR_FIELD_SEP: char = ',';
+
+/// The pseudo field name that marks a `..` rest pattern in the encoded field
+/// list: `E::C { b: bb, .. }` lowers to the constructor name `"E::C{b,..}"`.
+///
+/// A rest pattern binds an unknown SUBSET of the declared fields, so without
+/// this marker the driver cannot tell `{ b: bb, .. }` (bind the field named
+/// `b`, wherever it is declared) from `{ bb }` (bind field 0). It used to be
+/// told nothing at all — the parser dropped the whole field list when `..` was
+/// present — and positioned the first named field at index 0. `..` is not a
+/// valid Rust identifier, so no real field can collide with this marker.
+pub const NAMED_CTOR_REST_MARKER: &str = "..";
 
 /// Build a synthetic logic-function name for a named struct constructor.
 ///
@@ -319,11 +380,13 @@ pub fn named_struct_ctor_name(type_name: &str, field_names: &[String]) -> String
 #[must_use]
 pub fn parse_named_struct_ctor(name: &str) -> Option<(&str, Vec<&str>)> {
     let open = name.find(NAMED_CTOR_FIELD_OPEN)?;
-    if !name.ends_with(NAMED_CTOR_FIELD_CLOSE) {
-        return None;
-    }
-    let type_name = &name[..open];
-    let fields_str = &name[open + 1..name.len() - 1];
+    // `name[open + 1..name.len() - 1]` underflows on an empty name and is a
+    // byte range the verifier must discharge. Both delimiters are one-byte
+    // ASCII, so strip_suffix/get select exactly the same slice for every input
+    // the old form accepted — and answer None instead of panicking on the rest.
+    let body = name.strip_suffix(NAMED_CTOR_FIELD_CLOSE)?;
+    let type_name = name.get(..open)?;
+    let fields_str = body.get(open.saturating_add(1)..)?;
     if fields_str.is_empty() {
         return Some((type_name, Vec::new()));
     }

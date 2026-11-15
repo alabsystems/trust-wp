@@ -200,8 +200,14 @@ impl<T, E> OwnResult<&T, E> {
 
     let (return_expr, assumptions) = extract_with_std_specs(source, "cloned");
 
+    // The clone runs on the `Ok` arm only, so its postcondition is scoped to
+    // that arm's edge (`edge ==> post`); the post is read under the guard.
     let clone_assumptions: Vec<(&PureExpr, &str)> = assumptions
         .iter()
+        .map(|assumption| match assumption {
+            PureExpr::BinOp(_, trust_wp_core::formula::BinOp::Implies, post) => post.as_ref(),
+            unguarded => unguarded,
+        })
         .filter_map(|assumption| match assumption {
             PureExpr::MethodCall {
                 receiver,
@@ -212,7 +218,7 @@ impl<T, E> OwnResult<&T, E> {
             {
                 match args.as_slice() {
                     [input, PureExpr::Var(result_name, _)]
-                        if clone_receiver_is_self0(input) && result_name.starts_with("call_") =>
+                        if clone_receiver_is_self0(input) && result_name.starts_with("$call_") =>
                     {
                         Some((assumption, result_name.as_str()))
                     }
@@ -252,5 +258,70 @@ impl<T, E> OwnResult<&T, E> {
         expr_contains_ok_result(&return_expr, &clone_results),
         "the lowered return expr should contain `OwnResult::Ok(call_N)` using the same synthesized result \
          named by the clone postcondition assumption, got {return_expr:?}"
+    );
+}
+
+/// s34: a non-deref field write on a by-value local updates the local's whole
+/// value (functional update); the returned value reflects the write.
+#[test]
+fn s34_local_field_write_updates_whole_value() {
+    let (expr, _) = extract_with_std_specs(
+        "pub fn f() -> (u64, u64) { let mut p = (1u64, 2u64); p.0 = 5; p }",
+        "f",
+    );
+    assert_eq!(
+        expr.map(|e| e.to_string()).as_deref(),
+        Some("__trust_wp_tuple2(5, 2)"),
+        "returned tuple must reflect `p.0 = 5`"
+    );
+}
+
+/// s34: a field write on a by-value PARAMETER never returns the entry symbol
+/// and never states a write fact over it.
+#[test]
+fn s34_param_field_write_never_returns_entry_symbol() {
+    let (expr, _) = extract_with_std_specs(
+        "pub fn f(mut t: (u64, u64)) -> (u64, u64) { t.0 = 7; t }",
+        "f",
+    );
+    let rendered = expr.map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        rendered.contains("__trust_wp_tuple2(7, __trust_wp_tuple_get_1(t))"),
+        "expected functional update over the entry value, got `{rendered}`"
+    );
+    assert!(
+        !rendered.contains("__trust_wp_tuple_get_0(t) == 7"),
+        "no write fact over the parameter entry symbol: `{rendered}`"
+    );
+}
+
+/// s34: an arity-1 carrier write cannot be represented exactly: the local is
+/// rebound to a fresh symbol, never the stale entry value `s`.
+#[test]
+fn s34_single_field_write_havocs_local() {
+    let (expr, _) = extract_with_std_specs(
+        "pub struct S(pub u64);\npub fn f(mut s: S) -> S { s.0 = 7; s }",
+        "f",
+    );
+    let rendered = expr.map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        rendered.contains("$havoc_local_"),
+        "expected a fresh havoc symbol, got `{rendered}`"
+    );
+}
+
+/// s34: a mutating call through a field borrow of a by-value arity-1 owner
+/// never leaves the owner at its pre-call value.
+#[test]
+fn s34_field_borrow_call_does_not_keep_owner_pre_state() {
+    let (expr, _) = extract_with_std_specs(
+        "pub struct W(pub Vec<u64>);\npub fn f(mut w: W) -> W { w.0.push(7); w }",
+        "f",
+    );
+    let rendered = expr.map(|e| e.to_string()).unwrap_or_default();
+    assert_ne!(rendered, "w", "owner kept its entry value");
+    assert!(
+        rendered.contains("$havoc_owner_") || rendered.contains("^"),
+        "expected an advanced or havocked owner, got `{rendered}`"
     );
 }

@@ -294,12 +294,12 @@ use trust_wp::*;
 pub fn nested_loop_post_assert(n: i32) {
     let mut i = 0;
 
-    #[invariant(i >= 0)]
+    #[invariant(i@ >= 0)]
     while i < n {
         let mut j = 0;
 
-        #[invariant(j >= 0)]
-        #[invariant(j <= 1)]
+        #[invariant(j@ >= 0)]
+        #[invariant(j@ <= 1)]
         while j < 1 {
             j += 1;
         }
@@ -389,6 +389,7 @@ fn path_matches_name(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
 
 fn install_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(
@@ -417,6 +418,8 @@ struct ProofAssertPipelineSnapshot {
     prepared_ensures: Vec<PureExpr>,
     snapshot_return_expr: Option<PureExpr>,
     prepared_return_expr: Option<PureExpr>,
+    /// `prepare_proof_assert` refused the assertion (D-185's stale read).
+    prepared_refused: bool,
     extractor_diagnostics: Vec<String>,
     ran: bool,
 }
@@ -447,131 +450,138 @@ impl Callbacks for ProofAssertPipelineCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let mut contracts = find_contract_functions(tcx);
-        discover_proof_assert_functions(tcx, &mut contracts);
-        let contract = contracts
-            .iter()
-            .find(|contract| path_matches_name(tcx, contract.def_id, self.target_fn))
-            .expect("target contract function should be discovered");
-        let logic_fn_defs = crate::logic::extract_logic_fn_defs(tcx);
-        let user_specs = build_user_spec_table(&contracts);
-        let (pa_setup, warnings) =
-            build_proof_assert_setup(tcx, &contracts, &logic_fn_defs, &user_specs);
-        assert_eq!(warnings, 0, "fixture should parse without setup warnings");
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let mut contracts = find_contract_functions(tcx);
+            discover_proof_assert_functions(tcx, &mut contracts);
+            let contract = contracts
+                .iter()
+                .find(|contract| path_matches_name(tcx, contract.def_id, self.target_fn))
+                .expect("target contract function should be discovered");
+            let logic_fn_defs = crate::logic::extract_logic_fn_defs(tcx);
+            let user_specs = build_user_spec_table(tcx, &contracts, &[]);
+            let (pa_setup, warnings) =
+                build_proof_assert_setup(tcx, &contracts, &logic_fn_defs, &user_specs);
+            assert_eq!(warnings, 0, "fixture should parse without setup warnings");
 
-        let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
-        let extern_specs = builtin_trust_wp_std_specs();
-        let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
-        let pa_ctx = ProofAssertContext {
-            logic_fn_defs: &logic_fn_defs,
-            type_invariant_defs: &type_invariant_defs,
-            trait_specs: &trait_specs,
-            extern_specs: &extern_specs,
-            verbose: false,
-        };
+            let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
+            let extern_specs = builtin_trust_wp_std_specs();
+            let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
+            let pa_ctx = ProofAssertContext {
+                logic_fn_defs: &logic_fn_defs,
+                type_invariant_defs: &type_invariant_defs,
+                trait_specs: &trait_specs,
+                extern_specs: &extern_specs,
+                verbose: false,
+            };
 
-        let ghost_blocks = find_ghost_blocks(tcx);
-        let body_with_facts = crate::callbacks::try_get_body_with_context(contract.local_def_id)
-            .expect("MIR body should be cached by test query override");
-        let body = get_mir_body(body_with_facts);
-        let assertions = find_proof_asserts_in_mir(tcx, body, contract.local_def_id);
-        assert_eq!(
-            assertions.len(),
-            1,
-            "fixture should expose one proof_assert"
-        );
-        let assertion = &assertions[0];
+            let ghost_blocks = find_ghost_blocks(tcx);
+            let body_with_facts =
+                crate::callbacks::try_get_body_with_context(tcx, contract.local_def_id)
+                    .expect("MIR body should be cached by test query override");
+            let body = get_mir_body(&body_with_facts);
+            let assertions = find_proof_asserts_in_mir(tcx, body, contract.local_def_id);
+            assert_eq!(
+                assertions.len(),
+                1,
+                "fixture should expose one proof_assert"
+            );
+            let assertion = &assertions[0];
 
-        let containing_ghost_block = ghost_blocks
-            .iter()
-            .filter(|block| {
-                block.containing_fn == assertion.containing_fn
-                    && ghost_block_contains_cutoff(block.span, assertion.span)
-            })
-            .max_by_key(|block| block.span.source_callsite().lo());
-        self.snapshot.extractor_diagnostics.push(format!(
-            "assertion_span={}..{}",
-            assertion.span.source_callsite().lo().0,
-            assertion.span.source_callsite().hi().0
-        ));
-        if let Some(mut current) = assertion.closure_def_id {
-            self.snapshot
-                .extractor_diagnostics
-                .push(format!("assertion_closure={}", tcx.def_path_str(current)));
-            while let Some(parent) = tcx.opt_parent(current) {
-                self.snapshot.extractor_diagnostics.push(format!(
-                    "ancestor={} kind={:?}",
-                    tcx.def_path_str(parent),
-                    tcx.def_kind(parent)
-                ));
-                current = parent;
-            }
-        }
-        self.snapshot.extractor_diagnostics.push(format!(
-            "containing_ghost_block={}",
-            containing_ghost_block.is_some()
-        ));
-        if let Some(block) = containing_ghost_block {
-            let ghost_closure_def_ids = find_ghost_closure_def_ids_in_mir(body, block.span);
+            let containing_ghost_block = ghost_blocks
+                .iter()
+                .filter(|block| {
+                    block.containing_fn == assertion.containing_fn
+                        && ghost_block_contains_cutoff(block.span, assertion.span)
+                })
+                .max_by_key(|block| block.span.source_callsite().lo());
             self.snapshot.extractor_diagnostics.push(format!(
-                "ghost_closure_count={}",
-                ghost_closure_def_ids.len()
+                "assertion_span={}..{}",
+                assertion.span.source_callsite().lo().0,
+                assertion.span.source_callsite().hi().0
             ));
-            for closure_def_id in ghost_closure_def_ids {
-                let path = tcx.def_path_str(closure_def_id);
-                let Some(local_def_id) = closure_def_id.as_local() else {
-                    self.snapshot
-                        .extractor_diagnostics
-                        .push(format!("closure={path} local=false"));
-                    continue;
-                };
-                let (flat_invariants, _, _, _, all_loop_spans) =
-                    collect_loop_contract_attrs(tcx, local_def_id);
-                let proof_assert_start = assertion.span.source_callsite().lo().0;
-                let after_all_loops = !all_loop_spans.is_empty()
-                    && all_loop_spans
-                        .iter()
-                        .all(|(_, end)| *end <= proof_assert_start);
-                let loop_analysis = detect_loops(tcx.optimized_mir(closure_def_id));
+            if let Some(mut current) = assertion.closure_def_id {
+                self.snapshot
+                    .extractor_diagnostics
+                    .push(format!("assertion_closure={}", tcx.def_path_str(current)));
+                while let Some(parent) = tcx.opt_parent(current) {
+                    self.snapshot.extractor_diagnostics.push(format!(
+                        "ancestor={} kind={:?}",
+                        tcx.def_path_str(parent),
+                        tcx.def_kind(parent)
+                    ));
+                    current = parent;
+                }
+            }
+            self.snapshot.extractor_diagnostics.push(format!(
+                "containing_ghost_block={}",
+                containing_ghost_block.is_some()
+            ));
+            if let Some(block) = containing_ghost_block {
+                let ghost_closure_def_ids = find_ghost_closure_def_ids_in_mir(body, block.span);
                 self.snapshot.extractor_diagnostics.push(format!(
+                    "ghost_closure_count={}",
+                    ghost_closure_def_ids.len()
+                ));
+                for closure_def_id in ghost_closure_def_ids {
+                    let path = tcx.def_path_str(closure_def_id);
+                    let Some(local_def_id) = closure_def_id.as_local() else {
+                        self.snapshot
+                            .extractor_diagnostics
+                            .push(format!("closure={path} local=false"));
+                        continue;
+                    };
+                    let (flat_invariants, _, _, _, all_loop_spans) =
+                        collect_loop_contract_attrs(tcx, local_def_id);
+                    let proof_assert_start = assertion.span.source_callsite().lo().0;
+                    let after_all_loops = !all_loop_spans.is_empty()
+                        && all_loop_spans
+                            .iter()
+                            .all(|(_, end)| *end <= proof_assert_start);
+                    let loop_analysis = detect_loops(tcx.optimized_mir(closure_def_id));
+                    self.snapshot.extractor_diagnostics.push(format!(
                     "closure={path} invariants={} hir_loops={:?} after_all_loops={} mir_loops={}",
                     flat_invariants.len(),
                     all_loop_spans,
                     after_all_loops,
                     loop_analysis.loops.len()
                 ));
+                }
             }
-        }
 
-        let snapshots = build_assertion_snapshots_for_function(
-            tcx,
-            &assertions,
-            &ghost_blocks,
-            &pa_setup.user_specs,
-            &pa_ctx,
-            TEST_CRATE_NAME,
-        );
-        let snapshot = snapshots
-            .into_iter()
-            .next()
-            .expect("snapshot should be present")
-            .expect("snapshot build should succeed");
-        let prepared = prepare_proof_assert(tcx, &snapshot, &pa_setup, &pa_ctx, TEST_CRATE_NAME)
-            .expect("proof_assert preparation should succeed")
-            .expect("fixture proof_assert should not be trusted");
-        self.snapshot.assumed_facts = snapshot.assumed_facts;
-        self.snapshot.call_assumptions = snapshot.call_assumptions;
-        self.snapshot.call_effect_expr = snapshot.call_effect_expr;
-        self.snapshot.has_mutating_call_effect = prepared.has_mutating_call_effect;
-        self.snapshot.substitution_facts = snapshot.substitution_facts;
-        self.snapshot.post_loop_assumptions = snapshot.post_loop_assumptions;
-        self.snapshot.snapshot_return_expr = snapshot.return_expr;
-        self.snapshot.prepared_preconditions = prepared.preconditions;
-        self.snapshot.prepared_ensures = prepared.ensures;
-        self.snapshot.prepared_return_expr = prepared.return_expr;
-        self.snapshot.ran = true;
-        Compilation::Stop
+            let snapshots = build_assertion_snapshots_for_function(
+                tcx,
+                &assertions,
+                &ghost_blocks,
+                &pa_setup.user_specs,
+                &pa_ctx,
+                TEST_CRATE_NAME,
+            );
+            let snapshot = snapshots
+                .into_iter()
+                .next()
+                .expect("snapshot should be present")
+                .expect("snapshot build should succeed");
+            let prepared =
+                prepare_proof_assert(tcx, &snapshot, &pa_setup, &pa_ctx, TEST_CRATE_NAME);
+            self.snapshot.prepared_refused = prepared.is_err();
+            self.snapshot.assumed_facts = snapshot.assumed_facts;
+            self.snapshot.call_assumptions = snapshot.call_assumptions;
+            self.snapshot.call_effect_expr = snapshot.call_effect_expr;
+            self.snapshot.substitution_facts = snapshot.substitution_facts;
+            self.snapshot.post_loop_assumptions = snapshot.post_loop_assumptions;
+            self.snapshot.snapshot_return_expr = snapshot.return_expr;
+            if let Ok(prepared) = prepared {
+                let prepared = prepared.expect("fixture proof_assert should not be trusted");
+                self.snapshot.has_mutating_call_effect = prepared.has_mutating_call_effect;
+                self.snapshot.prepared_preconditions = prepared.preconditions;
+                self.snapshot.prepared_ensures = prepared.ensures;
+                self.snapshot.prepared_return_expr = prepared.return_expr;
+            }
+            self.snapshot.ran = true;
+            Compilation::Stop
+        })
     }
 }
 
@@ -581,55 +591,56 @@ impl Callbacks for ProofAssertDriverSummaryCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let mut contracts = find_contract_functions(tcx);
-        discover_proof_assert_functions(tcx, &mut contracts);
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let mut contracts = find_contract_functions(tcx);
+            discover_proof_assert_functions(tcx, &mut contracts);
 
-        for contract in &contracts {
-            let path = tcx.def_path_str(contract.def_id);
-            if contract.requires.is_empty()
-                && contract.ensures.is_empty()
-                && contract.invariants.is_empty()
-                && contract.variants.is_empty()
-            {
-                self.snapshot.contractless_paths.push(path);
-            } else {
-                self.snapshot.contracted_paths.push(path);
+            for contract in &contracts {
+                let path = tcx.def_path_str(contract.def_id);
+                if contract.requires.is_empty()
+                    && contract.ensures.is_empty()
+                    && contract.invariants.is_empty()
+                    && contract.variants.is_empty()
+                {
+                    self.snapshot.contractless_paths.push(path);
+                } else {
+                    self.snapshot.contracted_paths.push(path);
+                }
             }
-        }
 
-        let logic_fn_defs = crate::logic::extract_logic_fn_defs(tcx);
-        let ghost_blocks = find_ghost_blocks(tcx);
-        let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
-        let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
-        let trait_contracts = Vec::new();
-        let trait_refinement_overrides = HashSet::new();
-        let recursive_fns = HashSet::new();
-        let extern_specs = builtin_trust_wp_std_specs();
-        let run_config = VerificationRunConfig {
-            all_contracts: &contracts,
-            ghost_blocks: &ghost_blocks,
-            logic_fns: &logic_fn_defs,
-            type_invariant_defs: &type_invariant_defs,
-            trait_specs: &trait_specs,
-            trait_contracts: &trait_contracts,
-            trait_refinement_overrides: &trait_refinement_overrides,
-            recursive_fns: &recursive_fns,
-            extern_specs: &extern_specs,
-            verbose: false,
-            track_level: TrackLevel::Auto,
-            timeout: Some(Duration::from_secs(5)),
-            strict_axioms: false,
-            strict_trust: false,
-        };
+            let logic_fn_defs = crate::logic::extract_logic_fn_defs(tcx);
+            let ghost_blocks = find_ghost_blocks(tcx);
+            let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
+            let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
+            let trait_contracts = Vec::new();
+            let recursive_fns = HashSet::new();
+            let extern_specs = builtin_trust_wp_std_specs();
+            let run_config = VerificationRunConfig {
+                all_contracts: &contracts,
+                ghost_blocks: &ghost_blocks,
+                logic_fns: &logic_fn_defs,
+                type_invariant_defs: &type_invariant_defs,
+                trait_specs: &trait_specs,
+                trait_contracts: &trait_contracts,
+                recursive_fns: &recursive_fns,
+                extern_specs: &extern_specs,
+                verbose: false,
+                track_level: TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+                strict_axioms: false,
+                strict_trust: false,
+            };
 
-        let summary = verify_contracts(tcx, &contracts, &run_config);
-        self.snapshot.proof_assert_verified = summary.proof_assert_verified;
-        self.snapshot.proof_assert_failed = summary.proof_assert_failed;
-        self.snapshot.proof_assert_errors = summary.proof_assert_errors;
-        self.snapshot.exit_code = summary.exit_code();
-        self.snapshot.ran = true;
-        Compilation::Stop
+            let summary = verify_contracts(tcx, &contracts, &run_config);
+            self.snapshot.proof_assert_verified = summary.proof_assert_verified;
+            self.snapshot.proof_assert_failed = summary.proof_assert_failed;
+            self.snapshot.proof_assert_errors = summary.proof_assert_errors;
+            self.snapshot.exit_code = summary.exit_code();
+            self.snapshot.ran = true;
+            Compilation::Stop
+        })
     }
 }
 
@@ -675,7 +686,7 @@ fn collect_proof_assert_driver_summary(source: &str) -> ProofAssertDriverSummary
     callbacks.snapshot
 }
 
-fn assert_complicated_identity_post_loop_specialization(snapshot: &ProofAssertPipelineSnapshot) {
+fn assert_complicated_identity_post_loop_facts(snapshot: &ProofAssertPipelineSnapshot) {
     let post_loop_text: Vec<String> = snapshot
         .post_loop_assumptions
         .iter()
@@ -687,20 +698,24 @@ fn assert_complicated_identity_post_loop_specialization(snapshot: &ProofAssertPi
         .map(ToString::to_string)
         .collect();
 
+    // The loop's invariant names `result`, a local the loop body borrows
+    // `&mut`. Between the loop's head and the assertion the iterator's
+    // `next(&mut iter)` runs, and the write-site analysis cannot follow a
+    // pointer through the borrowed iterator, so it counts that call as a
+    // possible write of every borrowed local: `result` is not known to hold
+    // its head value at the assertion, and no exit fact naming it is stated
+    // (D-189, its price).
     assert!(
-        !snapshot.post_loop_assumptions.is_empty(),
-        "ghost-closure proof_assert snapshot should recover closure-local post-loop assumptions: assumptions={:?} diagnostics={:?}",
+        snapshot.post_loop_assumptions.is_empty(),
+        "an exit fact over a local the loop's `next` call may write is not stated (D-189): \
+         assumptions={:?} diagnostics={:?}",
         snapshot.post_loop_assumptions,
         snapshot.extractor_diagnostics
     );
     assert!(
-        post_loop_text.iter().any(|text| text.contains("fmap_new()")),
-        "post-loop assumptions should specialize exhausted iterator views to fmap_new(): {post_loop_text:?}"
-    );
-    assert!(
         post_loop_text.iter().all(|text| {
             !text.contains("view(iter)")
-                && !text.contains("__trust_wp_for_iter_old")
+                && !text.contains("$for_iter_old")
                 && !text.contains("produced")
         }),
         "post-loop assumptions should not leak loop-local iterator/continuation state: {post_loop_text:?}"
@@ -708,7 +723,7 @@ fn assert_complicated_identity_post_loop_specialization(snapshot: &ProofAssertPi
     assert!(
         prepared_precondition_text.iter().all(|text| {
             !text.contains("view(iter)")
-                && !text.contains("__trust_wp_for_iter_old")
+                && !text.contains("$for_iter_old")
                 && !text.contains("produced")
         }),
         "prepare_proof_assert should not retain loop-local continuation artifacts before later post-loop injection: {prepared_precondition_text:?}"
@@ -738,7 +753,13 @@ fn complicated_identity_proof_assert_pipeline_snapshot_2116() {
         snapshot
             .assumed_facts
             .iter()
-            .any(|expr| format!("{expr}").contains("call_5")),
+            .any(|expr| {
+                // A call-result assumption (`$call_N == fmap_new()` for
+                // `FMap::new()`), pinned by shape: the MIR call index is a
+                // numbering artifact that moves with the lowered body.
+                let text = format!("{expr}");
+                text.contains("$call_") && text.contains("fmap_new()")
+            }),
         "normalized assumed facts should still preserve call assumptions when the synthetic return marker is dropped: {:?}",
         snapshot.assumed_facts
     );
@@ -746,7 +767,7 @@ fn complicated_identity_proof_assert_pipeline_snapshot_2116() {
         !snapshot.substitution_facts.is_empty(),
         "snapshot should own substitution-derived facts for downstream proof_assert hosts"
     );
-    assert_complicated_identity_post_loop_specialization(&snapshot);
+    assert_complicated_identity_post_loop_facts(&snapshot);
 }
 
 #[test]
@@ -763,7 +784,7 @@ fn complicated_identity_view_fn_proof_assert_pipeline_snapshot_2584() {
             .any(|expr| format!("{expr}").contains("result.ext_eq")),
         "prepared proof_assert should preserve the ext_eq goal shape for the view(iter) syntax fixture"
     );
-    assert_complicated_identity_post_loop_specialization(&snapshot);
+    assert_complicated_identity_post_loop_facts(&snapshot);
 }
 
 #[test]
@@ -888,6 +909,13 @@ fn write_inner_borrow_pipeline_preserves_snapshot_reborrow_carrier_2590() {
         write_inner_borrow_fixture_source(),
         "write_inner_borrow",
     );
+    // D-185: `_r` is read after `**x = value` writes through `x`, whose
+    // alias class `_r` is in, so the assertion is refused as a stale read;
+    // the snapshot it is refused over still carries the reborrow carriers.
+    assert!(
+        snapshot.prepared_refused,
+        "write_inner_borrow's read of `_r` after the store through `x` is refused (D-185)"
+    );
     let all_text: Vec<String> = snapshot
         .substitution_facts
         .iter()
@@ -901,11 +929,16 @@ fn write_inner_borrow_pipeline_preserves_snapshot_reborrow_carrier_2590() {
         all_text.iter().any(|text| text.contains("__trust_wp_reborrow_")),
         "proof_assert pipeline should preserve a synthetic reborrow carrier for snapshot!(&mut ...): {all_text:?}"
     );
+    // D-186: `_r` borrows the parameter's memory, which `**x = value`
+    // writes before the assertion, so its current-value binding is no fact
+    // (it would name the written memory by the entry symbol).
     assert!(
-        all_text.iter().any(|text| {
-            text.contains("r == __trust_wp_reborrow_") || text.contains("__trust_wp_reborrow_ == r")
+        all_text.iter().all(|text| {
+            !text.contains("_r == __trust_wp_reborrow_")
+                && !text.contains("__trust_wp_reborrow_ == _r")
         }),
-        "pipeline facts should keep `r` bound to the projected reborrow carrier: {all_text:?}"
+        "the binding of `_r`, a borrow of memory written before the assertion, is no fact: \
+         {all_text:?}"
     );
     assert!(
         all_text.iter().any(|text| {
@@ -1028,13 +1061,13 @@ fn plain_reborrow_pipeline_uses_mut_borrow_child_carrier_2702() {
         .collect();
 
     assert!(
-        all_text.iter().any(|text| text.contains("bor_rb")),
+        all_text.iter().any(|text| text.contains("bor$rb")),
         "plain &mut *bor reborrows should use the MIR mut-borrow child carrier: {all_text:?}"
     );
     assert!(
         ensures_text
             .iter()
-            .any(|text| text.contains("bor_rb") && text.contains("bor")),
+            .any(|text| text.contains("bor$rb") && text.contains("bor")),
         "prepared proof_assert should compare the child reborrow carrier with the parent, not a tautology: {ensures_text:?}"
     );
     assert!(
@@ -1047,7 +1080,7 @@ fn plain_reborrow_pipeline_uses_mut_borrow_child_carrier_2702() {
             .iter()
             .map(ToString::to_string)
             .all(|text| {
-                !(text.contains("bor_rb2")
+                !(text.contains("bor$rb2")
                     && (text.contains("== bor)") || text.ends_with("== bor")))
             }),
         "generated snapshot assumptions must not retain the stale child == parent alias: {:?}",
@@ -1074,8 +1107,8 @@ fn proof_assert_driver_rejects_not_final_plain_reborrow_2702() {
 }
 
 fn is_final_parent_alias_text(text: &str, parent: &str) -> bool {
-    (text.contains("_rb") && text.contains(&format!(" == {parent})")))
-        || (text.contains(&format!("({parent} == ")) && text.contains("_rb"))
+    (text.contains("$rb") && text.contains(&format!(" == {parent})")))
+        || (text.contains(&format!("({parent} == ")) && text.contains("$rb"))
 }
 
 #[test]
@@ -1246,37 +1279,37 @@ fn ghost_seq_push_back_proof_assert_pipeline_snapshot_2616() {
     assert!(
         prepared_ensures
             .iter()
-            .any(|text| text.contains("call_4.push_back(30).index_logic(0) == 30")),
+            .any(|text| text.contains("$call_4.push_back(30).index_logic(0) == 30")),
         "ghost Seq proof_assert should inline the ghost-helper post-state fact into the assertion: {prepared_ensures:?}"
     );
     assert!(
         prepared_ensures
             .iter()
-            .all(|text| !text.contains("^call_4.index_logic(0)")),
+            .all(|text| !text.contains("^$call_4.index_logic(0)")),
         "ghost Seq proof_assert should no longer leave the assertion on the symbolic final carrier once the snapshot fact is available: {prepared_ensures:?}"
     );
     assert!(
         prepared_preconditions
             .iter()
-            .any(|text| text.contains("call_4 == seq_empty()")),
+            .any(|text| text.contains("$call_4 == seq_empty()")),
         "ghost Seq proof_assert should retain the symbolic pre-state carrier: {prepared_preconditions:?}"
     );
     assert!(
         prepared_preconditions
             .iter()
-            .any(|text| text.contains("call_4.len() == 0")),
+            .any(|text| text.contains("$call_4.len() == 0")),
         "ghost Seq proof_assert should retain the empty-seq precondition: {prepared_preconditions:?}"
     );
     assert!(
         prepared_preconditions
             .iter()
-            .any(|text| text.contains("^call_4@ == call_4.push_back(30)")),
+            .any(|text| text.contains("^$call_4@ == $call_4.push_back(30)")),
         "ghost Seq proof_assert should project the ghost-helper post-state fact into Seq view space: {prepared_preconditions:?}"
     );
     assert!(
         prepared_preconditions
             .iter()
-            .all(|text| !text.contains("v == call_4")),
+            .all(|text| !text.contains("v == $call_4")),
         "ghost Seq proof_assert should not fall back to the stale pre-mutation alias: {prepared_preconditions:?}"
     );
 }

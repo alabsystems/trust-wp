@@ -55,9 +55,8 @@ impl AYEncoder {
                 let guarded = self.guard_with_active_path(instance_bool);
                 self.assert_term(guarded);
             }
-            // Ground-then-drop coherence — the second copy of the defect the
-            // 2026-08-20 CE census fixed on the requires path
-            // (`verify/setup.rs`, `is_grounding_exempt_standard_forall`).
+            // Ground-then-drop coherence, the same rule the requires path
+            // applies (`verify/setup.rs`, `is_grounding_exempt_standard_forall`).
             // `instantiate_standard_precondition_foralls_from` EXEMPTS
             // negative-contains foralls (FSet/FMap `EMPTY`'s
             // `forall<k> !s.contains(k)`) from grounding and returns ZERO
@@ -82,10 +81,9 @@ impl AYEncoder {
                         );
                     }
                     Err(e) => {
-                        // Pre-restoration behaviour was an unconditional silent
-                        // drop; falling back to it on an encoding failure is
-                        // never worse than the status quo (a dropped assumption
-                        // only weakens the premises).
+                        // Dropping the exempted universal on an encoding failure
+                        // is safe: a dropped assumption only weakens the
+                        // premises, so nothing unsound is admitted.
                         tracing::debug!(
                             error = %e,
                             "grounding-exempt standard LetAssume forall did not encode — dropped as before"
@@ -165,10 +163,11 @@ impl AYEncoder {
             Err(e) => {
                 unsoundness::increment(unsoundness::UnsoundnessCategory::LetAssumeDropped);
                 // Assumption encoding failed (sort mismatch, unsupported
-                // construct, etc.). Previously dropped the assumption and
-                // continued with the body, leaving the result unconstrained
-                // (#1537). Now propagates as EncodingError per #2663 Phase 2a
-                // — this turns false proofs into Unknown (the safe direction).
+                // construct, etc.). Propagate the EncodingError rather than
+                // dropping the assumption and continuing with the body: an
+                // unconstrained result would let a false proof through, while
+                // the error turns it into Unknown (the safe direction).
+                // (#1537, #2663)
                 tracing::warn!(
                     assumption = ?assumption,
                     error = %e,

@@ -102,10 +102,10 @@ fn test_two_phase_push_len_postcondition() {
         MutBorrowRequest::new(&[], &[ens], &final_values).timeout(Some(Duration::from_secs(5))),
     )
     .unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification. The legacy strict helper stays strict for its other call
-    // sites; the tolerance is opt-in here. See
+    // KNOWN-CLASS PIN (#133): the verdict demotes to `Unknown(ProofTrusted)`
+    // under ay's mandatory strict UNSAT certification; the property this test
+    // guards is unchanged and every other outcome still fails. The tolerance
+    // is opt-in per call site so the strict helper stays strict elsewhere. See
     // `tests::helpers::verified_or_known_proof_trusted`.
     crate::tests::helpers::assert_verified_or_known_proof_trusted(
         &result,
@@ -135,7 +135,7 @@ fn test_two_phase_push_len_wrong_postcondition() {
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &[ens], &final_values))
             .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "two_phase with wrong postcondition should fail: got {result:?}"
     );
 }
@@ -183,7 +183,7 @@ fn test_current_final_alias_is_constrained() {
 /// `v_final_current`. This pattern arises when postconditions dereference
 /// the final value of a mut ref parameter.
 ///
-/// After Phase 3 (#2150), `v_final_current` is no longer eagerly declared.
+/// `v_final_current` is not eagerly declared (#2150).
 /// It may be constrained by `assert_current_chain_alias_constraints` if the
 /// base `v_final` ends with `_current` (it doesn't — base is `v_final`).
 /// This test documents whether the alias system covers this pattern.

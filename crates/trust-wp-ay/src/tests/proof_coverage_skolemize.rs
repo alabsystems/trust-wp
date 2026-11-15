@@ -63,7 +63,7 @@ fn single_forall_skolemizes() {
         PureExpr::UnOp(UnOp::Not, inner) => match inner.as_ref() {
             PureExpr::BinOp(lhs, BinOp::Gt, _) => {
                 assert!(
-                    matches!(lhs.as_ref(), PureExpr::Var(name, _) if name == "sk_x"),
+                    matches!(lhs.as_ref(), PureExpr::Var(name, _) if name == "sk$x"),
                     "Skolem constant should be sk_x, got {lhs:?}"
                 );
             }
@@ -97,11 +97,11 @@ fn nested_forall_skolemizes_both() {
         PureExpr::UnOp(UnOp::Not, inner) => match inner.as_ref() {
             PureExpr::BinOp(lhs, BinOp::Eq, rhs) => {
                 assert!(
-                    matches!(lhs.as_ref(), PureExpr::Var(name, _) if name == "sk_x"),
+                    matches!(lhs.as_ref(), PureExpr::Var(name, _) if name == "sk$x"),
                     "first Skolem should be sk_x, got {lhs:?}"
                 );
                 assert!(
-                    matches!(rhs.as_ref(), PureExpr::Var(name, _) if name == "sk_y"),
+                    matches!(rhs.as_ref(), PureExpr::Var(name, _) if name == "sk$y"),
                     "second Skolem should be sk_y, got {rhs:?}"
                 );
             }
@@ -125,7 +125,7 @@ fn sort_annotations_preserved() {
     match &result {
         PureExpr::UnOp(UnOp::Not, inner) => {
             assert!(
-                matches!(inner.as_ref(), PureExpr::Var(name, Some(ExprSort::Bool)) if name == "sk_x"),
+                matches!(inner.as_ref(), PureExpr::Var(name, Some(ExprSort::Bool)) if name == "sk$x"),
                 "Skolem should preserve Bool sort, got {inner:?}"
             );
         }
@@ -167,12 +167,12 @@ fn triple_nested_forall() {
             PureExpr::BinOp(lhs, BinOp::Eq, rhs) => {
                 match lhs.as_ref() {
                     PureExpr::BinOp(a, BinOp::Add, b) => {
-                        assert!(matches!(a.as_ref(), PureExpr::Var(n, _) if n == "sk_x"));
-                        assert!(matches!(b.as_ref(), PureExpr::Var(n, _) if n == "sk_y"));
+                        assert!(matches!(a.as_ref(), PureExpr::Var(n, _) if n == "sk$x"));
+                        assert!(matches!(b.as_ref(), PureExpr::Var(n, _) if n == "sk$y"));
                     }
                     _ => panic!("expected Add, got {lhs:?}"),
                 }
-                assert!(matches!(rhs.as_ref(), PureExpr::Var(n, _) if n == "sk_z"));
+                assert!(matches!(rhs.as_ref(), PureExpr::Var(n, _) if n == "sk$z"));
             }
             _ => panic!("expected BinOp(Eq), got {inner:?}"),
         },

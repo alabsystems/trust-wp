@@ -18,7 +18,7 @@ use tracing::debug;
 
 /// Extract the `DefId` from a function call operand.
 pub(super) fn extract_call_def_id(func: &Operand<'_>) -> Option<DefId> {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
             return Some(*def_id);
         }
@@ -51,10 +51,10 @@ pub(super) fn resolve_trait_method_def_id(tcx: TyCtxt<'_>, def_id: DefId) -> Opt
 /// Returns `None` for non-closure Self types (e.g., generic `F: Fn(i32)`)
 /// or non-FnDef operands.
 pub(super) fn extract_closure_def_id_from_fn_call(func: &Operand<'_>) -> Option<DefId> {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(_, substs) = constant.const_.ty().kind() {
             // substs[0] is the Self type for trait methods
-            if let Some(self_ty) = substs.first().and_then(|arg| arg.as_type()) {
+            if let Some(self_ty) = substs.skip_binder().first().and_then(|arg| arg.as_type()) {
                 if let TyKind::Closure(closure_def_id, _) = self_ty.kind() {
                     return Some(*closure_def_id);
                 }
@@ -78,9 +78,9 @@ pub(super) fn extract_closure_def_id_from_fn_call(func: &Operand<'_>) -> Option<
 ///
 /// Returns `None` for closures, generic `F: Fn(i32)` bounds, or non-FnDef operands.
 pub(super) fn extract_fn_item_def_id_from_fn_trait_call(func: &Operand<'_>) -> Option<DefId> {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(_, substs) = constant.const_.ty().kind() {
-            if let Some(self_ty) = substs.first().and_then(|arg| arg.as_type()) {
+            if let Some(self_ty) = substs.skip_binder().first().and_then(|arg| arg.as_type()) {
                 if let TyKind::FnDef(fn_def_id, _) = self_ty.kind() {
                     return Some(*fn_def_id);
                 }
@@ -95,21 +95,21 @@ pub(super) fn extract_fn_item_def_id_from_fn_trait_call(func: &Operand<'_>) -> O
 /// For local functions, extracts names from HIR. For cross-crate functions,
 /// falls back to MIR `var_debug_info` which preserves source-level parameter
 /// names for compiled crates. Non-binding patterns fall back to positional
-/// names like `arg0`, `arg1`. (#2215)
+/// names ([`name_unnamed_params`]). (#2215)
 pub(super) fn arg_names_for_def_id(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Vec<String>> {
     // Local functions: use HIR (source-level parameter names).
     if let Some(local_def_id) = def_id.as_local() {
         if let Some(hir_body_id) = tcx.hir_node_by_def_id(local_def_id).body_id() {
             let hir_body = tcx.hir_body(hir_body_id);
-            let mut names = Vec::new();
-            for param in hir_body.params {
-                if let rustc_hir::PatKind::Binding(_, _, ident, _) = param.pat.kind {
-                    names.push(ident.as_str().to_string());
-                } else {
-                    names.push(format!("arg{}", names.len()));
-                }
-            }
-            return Some(names);
+            let names = hir_body
+                .params
+                .iter()
+                .map(|param| match param.pat.kind {
+                    rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            return Some(name_unnamed_params(names));
         }
 
         // Trait method declarations without default bodies have no HIR body.
@@ -119,20 +119,13 @@ pub(super) fn arg_names_for_def_id(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Vec
             if let TraitItemKind::Fn(_, TraitFn::Required(param_names)) = trait_item.kind {
                 let names = param_names
                     .iter()
-                    .enumerate()
-                    .map(|(idx, ident)| match ident {
-                        Some(ident) => {
-                            let name = ident.as_str();
-                            if name.is_empty() || name == "_" {
-                                format!("arg{idx}")
-                            } else {
-                                name.to_string()
-                            }
-                        }
-                        None => format!("arg{idx}"),
+                    .map(|ident| {
+                        ident
+                            .map(|ident| ident.as_str().to_string())
+                            .filter(|name| !name.is_empty() && name != "_")
                     })
                     .collect();
-                return Some(names);
+                return Some(name_unnamed_params(names));
             }
         }
     }
@@ -164,13 +157,92 @@ fn arg_names_from_cross_crate_mir(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Vec<
             }
         }
     }
-    Some(
-        arg_names
-            .into_iter()
-            .enumerate()
-            .map(|(idx, name)| name.unwrap_or_else(|| format!("arg{idx}")))
-            .collect(),
-    )
+    Some(name_unnamed_params(arg_names))
+}
+
+/// Prefix of the positional name a parameter with no usable source name is
+/// registered under (`_`, a destructuring pattern, missing debug info).
+///
+/// It lies in the `__twp` namespace, which no source identifier of a verified
+/// crate may use (`creusot_frontend_checks::validate_reserved_binding_names`
+/// refuses items, bindings, paths and specification identifiers there), so no
+/// module item, static, closure capture or clause name can be spelled like a
+/// positional parameter and be read as one. `arg{idx}` could: a module `const
+/// arg0` was substituted into the projection `(arg0.0)` a pattern binding is
+/// stated as (param_pattern_projection_read_as_module_const), and a closure's
+/// captured `arg0` was read as its destructured parameter
+/// (closure_fallback_param_name_captures_upvar).
+pub(crate) const POSITIONAL_PARAM_PREFIX: &str = "__twp_arg";
+
+/// Reserved prefix of the name given to a parameter with no usable source
+/// name when its positional name is taken by another parameter.
+pub(crate) const ANON_PARAM_PREFIX: &str = "$anon_arg";
+
+/// Prefix of the placeholder variables standing for a call argument the MIR
+/// translator could not express.
+pub(crate) const FALLBACK_ARG_PREFIX: &str = "$fallback_arg";
+
+static FALLBACK_ARG_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A FRESH placeholder variable for an untranslatable call argument at
+/// position `idx`.
+///
+/// The placeholder used to be `Var("arg{idx}")`. That name (a) collides with a
+/// caller variable literally named `arg{idx}`, so a callee contract such as
+/// `result == v` became a fact about the caller's own `arg0`, and (b) is shared
+/// by every call site with the same argument position, so `id(K1)` and
+/// `id(K2)` were both equated with the same symbol. The placeholder is
+/// therefore drawn from the reserved `__trust_wp_` namespace and numbered per
+/// creation, so it denotes an unconstrained value distinct from every other
+/// placeholder and every source variable.
+pub(crate) fn fresh_fallback_arg_var(
+    idx: usize,
+    sort: Option<trust_wp_core::formula::ExprSort>,
+) -> trust_wp_core::formula::PureExpr {
+    let n = FALLBACK_ARG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    trust_wp_core::formula::PureExpr::Var(format!("{FALLBACK_ARG_PREFIX}{idx}_{n}"), sort)
+}
+
+/// True for a placeholder produced by [`fresh_fallback_arg_var`].
+pub(crate) fn is_fallback_arg_placeholder(name: &str) -> bool {
+    name.starts_with(FALLBACK_ARG_PREFIX)
+}
+
+/// Name every parameter, keeping source names and giving each unnamed one
+/// (`_`, a destructuring pattern, missing debug info) the positional name
+/// [`POSITIONAL_PARAM_PREFIX`]`{idx}`, unless another parameter of the same
+/// signature is literally named that (only a crate trust-wp does not check
+/// can spell it). The result is injective: call sites bind clause names to
+/// arguments by these names (later names win), so a fallback that collided
+/// with a real parameter of that spelling would bind the real parameter's
+/// clause occurrences to the wrong argument. A colliding fallback gets a name
+/// in the `$anon_arg` namespace instead, disambiguated further if even that
+/// is taken.
+pub(crate) fn name_unnamed_params(names: Vec<Option<String>>) -> Vec<String> {
+    let real: std::collections::HashSet<String> = names.iter().flatten().cloned().collect();
+    let mut used: std::collections::HashSet<String> = real.clone();
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(idx, name)| match name {
+            Some(name) => name,
+            None => {
+                let mut candidate = format!("{POSITIONAL_PARAM_PREFIX}{idx}");
+                let mut attempt = 0usize;
+                while used.contains(&candidate) {
+                    candidate = if attempt == 0 {
+                        format!("{ANON_PARAM_PREFIX}{idx}")
+                    } else {
+                        format!("{ANON_PARAM_PREFIX}{idx}_{attempt}")
+                    };
+                    attempt += 1;
+                }
+                used.insert(candidate.clone());
+                candidate
+            }
+        })
+        .collect()
 }
 
 /// Resolve argument names with fallback chain and diagnostic.
@@ -261,7 +333,7 @@ pub(crate) fn resolve_spec_or_mir_arg_names(
 /// Returns `None` if the operand is not a trait method call or the Self type
 /// is not an ADT.
 pub(super) fn ufcs_path_for_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<String> {
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     let TyKind::FnDef(def_id, substs) = constant.const_.ty().kind() else {
@@ -282,8 +354,25 @@ pub(super) fn ufcs_path_for_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<
     // Self type (e.g., `&[T]` for `<[T] as Index<usize>>::index`) rather than
     // the bare implementing type. Without peeling, `&[T]` falls through to the
     // default `return None` branch and the call becomes opaque. (#2004)
-    let self_ty = substs.first()?.as_type()?;
+    let self_ty = substs.skip_binder().first()?.as_type()?;
     let self_ty_inner = self_ty.peel_refs();
+    // Provenance (spec-provenance front): a UFCS path is only as trustworthy
+    // as every printed path inside it. A local (or foreign lookalike) Self
+    // type or trait prints like a library one, so refuse to build the path
+    // unless each named item comes from a builtin provider crate. Callers then
+    // fall back to the DefId-gated plain/trait-method lookups.
+    let named_items_are_library = |ty: rustc_middle::ty::Ty<'_>| {
+        ty.walk().all(|arg| match arg.as_type().map(|t| t.kind()) {
+            Some(TyKind::Adt(adt_def, _)) => {
+                crate::provenance::is_builtin_provider(tcx, adt_def.did())
+            }
+            Some(TyKind::Foreign(did)) => crate::provenance::is_builtin_provider(tcx, *did),
+            _ => true,
+        })
+    };
+    if !named_items_are_library(self_ty_inner) {
+        return None;
+    }
     let self_type_name = match self_ty_inner.kind() {
         TyKind::Adt(adt_def, _) => tcx.def_path_str(adt_def.did()),
         // Slice ([T]) and Array ([T; N]) implement Index/IndexMut traits.
@@ -352,6 +441,9 @@ pub(super) fn ufcs_path_for_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<
         let trait_method_id = assoc_item.trait_item_def_id()?;
         tcx.parent(trait_method_id)
     };
+    if !crate::provenance::is_builtin_provider(tcx, trait_def_id) {
+        return None;
+    }
     let trait_path = tcx.def_path_str(trait_def_id);
     // Get the method name
     let method_name = assoc_item.name();

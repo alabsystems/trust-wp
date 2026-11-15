@@ -7,7 +7,6 @@ use ntest::timeout;
 use trust_wp_core::formula::ExprSort;
 
 use super::*;
-use crate::encoder::match_enc::MatchDatatypeKind;
 
 /// FMap len dispatches to fmap_len UF for non-Seq receivers.
 ///
@@ -545,28 +544,6 @@ fn test_view_complex_bool_expr_is_identity() {
     assert!(
         matches!(encoder.check_sat(), SolveResult::Unsat(_)),
         "View(x > 0) AND x == 0 must be UNSAT — view identity preserves x > 0"
-    );
-}
-
-// ── value_constructor_name coverage (#504) ─────────────────────────────
-
-/// `MatchDatatypeKind::value_constructor_name` returns the right constructor.
-#[test]
-#[timeout(30000)]
-fn test_value_constructor_name_option_returns_some() {
-    assert_eq!(
-        MatchDatatypeKind::OptionInt.value_constructor_name(),
-        "Some"
-    );
-}
-
-/// `MatchDatatypeKind::value_constructor_name` returns Ok for Result.
-#[test]
-#[timeout(30000)]
-fn test_value_constructor_name_result_returns_ok() {
-    assert_eq!(
-        MatchDatatypeKind::ResultIntInt.value_constructor_name(),
-        "Ok"
     );
 }
 

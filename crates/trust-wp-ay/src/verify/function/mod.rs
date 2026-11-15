@@ -13,8 +13,7 @@
 //! - [`alias_constraints`]: By-value alias constraints and invariant receiver extraction.
 //!
 //! Shared utilities (`flatten_ghost_implications`, `infer_result_sort`,
-//! `assert_current_chain_alias_constraints`) moved to `verify/shared_constraints.rs`
-//! per #1939.
+//! `assert_current_chain_alias_constraints`) live in `verify::shared_constraints`.
 
 mod alias_constraints;
 pub(crate) mod axiom_detection;
@@ -41,7 +40,6 @@ pub(super) use axiom_detection::expr_contains_embedded_universal;
 pub(super) use axiom_detection::has_open_logic_fns;
 #[cfg(test)]
 pub(super) use axiom_detection::instantiate_embedded_existentials_with_body_witness;
-pub(super) use axiom_detection::is_axiom_only_function;
 #[cfg(test)]
 pub(super) use axiom_detection::is_universal_quantifier;
 #[cfg(test)]
@@ -229,7 +227,18 @@ fn fresh_function_base_recheck(
         super::solver_tail::assert_standard_axioms(&mut encoder, base.requires, &body_assumptions)?;
         encoder.maybe_assert_logic_ground_instances()?;
     }
-    Ok(super::solver_tail::resolve_base_sat_result_with_tight_timeout(&mut encoder))
+    Ok(match mode {
+        // The AxiomLight recheck classifies literal-`false` / unconstrained
+        // closure-capture obligations: its SAT base IS the refutation, so it
+        // must leave a validated model behind (see
+        // `resolve_base_sat_result_with_witness`).
+        FreshFunctionBaseMode::AxiomLight => {
+            super::solver_tail::resolve_base_sat_result_with_witness(&mut encoder)
+        }
+        FreshFunctionBaseMode::Full | FreshFunctionBaseMode::PreconditionsOnly => {
+            super::solver_tail::resolve_base_sat_result_with_tight_timeout(&mut encoder)
+        }
+    })
 }
 
 /// Verify a function contract with optional per-function mode overrides.
@@ -315,6 +324,25 @@ fn legacy_verified_evidence_gap_reason(
 pub fn verify_function_with_modes_outcome(
     request: VerificationRequest<'_>,
 ) -> Result<VerificationOutcome, EncodingError> {
+    let retry = request.clone();
+    let original = verify_function_with_modes_outcome_single(request)?;
+    Ok(super::guard_split::retry_with_guard_split(
+        retry.base.requires,
+        retry.base.ensures,
+        original,
+        |requires, ensures| {
+            let mut sub = retry.clone();
+            sub.base.requires = requires;
+            sub.base.ensures = ensures;
+            verify_function_with_modes_outcome_single(sub)
+        },
+    ))
+}
+
+/// One unsplit function-contract query (see [`super::guard_split`]).
+fn verify_function_with_modes_outcome_single(
+    request: VerificationRequest<'_>,
+) -> Result<VerificationOutcome, EncodingError> {
     // Silently drop mode_overrides when lengths don't match (#2316, #2700).
     // mode_overrides is computed from the full logic_fn_defs set, but
     // logic_fns may be a filtered subset. Rather than aborting verification,
@@ -334,7 +362,22 @@ pub fn verify_function_with_modes_outcome(
         }
     }
 
-    process_isolation::run_outcome_in_child(request.base.timeout, || {
+    // Read BEFORE the request moves into the child: a goal set carrying a
+    // driver-injected fail-closed `false` cannot license a refutation, and the
+    // gate below is where every caller of this entry point passes through.
+    // The goals come along because the gate attributes the refutation to one
+    // of them (D-27).
+    let injected_fail_closed_goal = request.base.injected_fail_closed_goal;
+    let gate_goals: Vec<PureExpr> = request.base.ensures.to_vec();
+    let timeout = request.base.timeout;
+
+    // THE PLACEMENT GATE (D-31). Nothing below this line may run on a
+    // constructor whose named fields were never placed at their declared
+    // indices — `verify_function_with_modes_inner` takes a `Placed<_>` and
+    // `Placed::check` is the only way to make one. See `super::placement_gate`.
+    let request = crate::verify::placement_gate::CheckPlacement::into_placed(request)?;
+
+    process_isolation::run_outcome_in_child(timeout, || {
         // Wrap the entire verification pipeline in catch_unwind to isolate ay
         // sort mismatch panics (#997). Uses shared helper (#1111).
         //
@@ -348,12 +391,25 @@ pub fn verify_function_with_modes_outcome(
             verify_function_with_modes_inner(request)
         }))
     })
-    .map(VerificationOutcome::apply_mandatory_proof_authority)
+    .map(|outcome| {
+        crate::verify::authority_trace(|| {
+            format!(
+                "function boundary pre-authority result={} {}",
+                crate::verify::authority_result_tag(&outcome.result),
+                crate::verify::authority_evidence_tag(outcome.provenance.as_ref())
+            )
+        });
+        outcome
+            .apply_mandatory_proof_authority()
+            .apply_injected_goal_refutation_authority(injected_fail_closed_goal, &gate_goals)
+            .apply_opaque_type_param_goal_refutation_authority(&gate_goals)
+    })
 }
 
 fn verify_function_with_modes_inner(
-    request: VerificationRequest<'_>,
+    request: crate::verify::placement_gate::Placed<VerificationRequest<'_>>,
 ) -> Result<VerificationOutcome, EncodingError> {
+    let request = request.into_inner();
     let base = request.base;
     let requires = base.requires;
     let ensures = base.ensures;
@@ -414,6 +470,9 @@ fn verify_function_with_modes_inner(
         .unsoundness_snapshot
         .clone()
         .unwrap_or_else(unsoundness::snapshot);
+    // A structural precheck that refutes the contract (see
+    // `precheck_short_circuit`); reconciled with the solver's verdict below.
+    let mut precheck_refutation: Option<VerificationResult> = None;
     if requirements_are_obviously_contradictory(requires) {
         return Ok(VerificationOutcome::without_provenance(
             VerificationResult::Unknown(UnknownReason::SolverMessage(
@@ -424,7 +483,11 @@ fn verify_function_with_modes_inner(
     if let Some(result) =
         precheck_recursive_postconditions(requires, ensures, logic_fns, base.mode_overrides)
     {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
@@ -435,30 +498,13 @@ fn verify_function_with_modes_inner(
         logic_fns,
         base.mode_overrides,
     ) {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
-    }
-    if let Some(result) = precheck_recursive_adt_lemma_structural_induction(
-        ensures,
-        return_expr,
-        logic_fns,
-        base.mode_overrides,
-    ) {
-        // The ADT-structural-induction precheck is a hard shortcut: when the
-        // recognised shape applies, the obligation is discharged directly by
-        // the structural-induction argument (see precheck docs) and we skip
-        // the SMT solver entirely. Unlike the integer-recursion preckecks
-        // that merely emit ground instances for the solver, here the
-        // soundness argument lives entirely in the precheck. To keep the
-        // This lane has no AY-checkable certificate yet, so its provisional
-        // structural provenance remains outside mandatory proof authority via
-        // `super::structural_induction_verified_outcome`.
-        let demoted = super::demote_if_unsound(&precheck_demotion_baseline, result.clone());
-        if matches!(demoted, VerificationResult::Verified(_)) {
-            return Ok(super::structural_induction_verified_outcome());
-        }
-        return Ok(VerificationOutcome::without_provenance(demoted));
     }
     if let Some(result) = precheck_ground_disabled_recursive_body(
         base.logic_ground_mode,
@@ -466,16 +512,22 @@ fn verify_function_with_modes_inner(
         return_expr,
         logic_fns,
     ) {
-        return Ok(VerificationOutcome::without_provenance(
+        if let Some(result) = precheck_short_circuit(
             super::demote_if_unsound(&precheck_demotion_baseline, result),
-        ));
+            &mut precheck_refutation,
+        ) {
+            return Ok(VerificationOutcome::without_provenance(result));
+        }
     }
     if let Some(result) =
         precheck_recursive_seq_relation_postconditions(ensures, return_expr, logic_fns)
     {
-        return Ok(VerificationOutcome::without_provenance(
+        if let Some(result) = precheck_short_circuit(
             super::demote_if_unsound(&precheck_demotion_baseline, result),
-        ));
+            &mut precheck_refutation,
+        ) {
+            return Ok(VerificationOutcome::without_provenance(result));
+        }
     }
     if let Some(result) = precheck_type_invariant_postconditions(
         requires,
@@ -484,21 +536,33 @@ fn verify_function_with_modes_inner(
         base.type_invariants,
         logic_fns,
     ) {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
     if let Some(result) =
         precheck_result_match_ite_constructor_postconditions(requires, ensures, return_expr)
     {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
     if let Some(result) =
         precheck_result_constructor_match_postconditions(requires, ensures, return_expr)
     {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
@@ -509,14 +573,22 @@ fn verify_function_with_modes_inner(
         ghost_context,
         logic_fns,
     ) {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
     if let Some(result) =
         precheck_logic_body_postconditions(requires, ensures, return_expr, logic_fns)
     {
-        if let Some(result) = demote_non_verified_precheck(&precheck_demotion_baseline, result) {
+        if let Some(result) = demote_non_verified_precheck(
+            &precheck_demotion_baseline,
+            result,
+            &mut precheck_refutation,
+        ) {
             return Ok(VerificationOutcome::without_provenance(result));
         }
     }
@@ -706,17 +778,132 @@ fn verify_function_with_modes_inner(
         },
         verify_single_obligation_slice,
     )?;
+    let mut provenance = provenance;
+    let result = reconcile_precheck_refutation(
+        result,
+        precheck_refutation,
+        Some(&literal_false_base_recheck),
+        &mut provenance,
+    );
     Ok(VerificationOutcome::new(result, provenance))
 }
 
 fn demote_non_verified_precheck(
     baseline: &unsoundness::Snapshot,
     result: VerificationResult,
+    refutation_hint: &mut Option<VerificationResult>,
 ) -> Option<VerificationResult> {
     if matches!(result, VerificationResult::Verified(_)) {
         return None;
     }
-    Some(super::demote_if_unsound(baseline, result))
+    precheck_short_circuit(super::demote_if_unsound(baseline, result), refutation_hint)
+}
+
+/// Decide whether a non-`Verified` precheck result ends verification here.
+///
+/// A structural precheck that finds the contract FALSE has no solver model
+/// behind it, and `FAILED (counterexample)` may only be published with a
+/// VALIDATED one (`refutation_evidence_gap_reason`). Returning the precheck's
+/// `Failed` therefore only ever reached the user as
+/// `unknown (refutation withheld: missing solver provenance)`. Instead the
+/// precheck is kept as a HINT and verification falls through to the solver,
+/// whose SAT model of `requires ∧ body ∧ ¬ensures` is the counterexample the
+/// verdict needs. `reconcile_precheck_refutation` then checks the solver's
+/// verdict against the hint. Every other non-verified precheck result
+/// (vacuity, demotion, unknown) short-circuits as before.
+fn precheck_short_circuit(
+    result: VerificationResult,
+    refutation_hint: &mut Option<VerificationResult>,
+) -> Option<VerificationResult> {
+    if matches!(result, VerificationResult::Failed(_)) {
+        super::authority_trace(|| {
+            "precheck Failed(structural) kept as hint; falling through to the solver".to_string()
+        });
+        if refutation_hint.is_none() {
+            *refutation_hint = Some(result);
+        }
+        return None;
+    }
+    Some(result)
+}
+
+/// Check the solver's verdict against a structural precheck that refuted the
+/// contract.
+///
+/// * `Failed` from the solver: the validated model is the verdict; the
+///   precheck's clause tag is attached when the solver left none (diagnostic
+///   only — it names the ensures clause in the report).
+/// * `Verified` from the solver: the two disagree. A checked proof outranks a
+///   syntactic precheck, but a disagreement is a bug in one of them, so the
+///   accept is withheld (fail closed; strictly narrowing).
+/// * anything else passes through.
+fn reconcile_precheck_refutation(
+    result: VerificationResult,
+    refutation_hint: Option<VerificationResult>,
+    base_witness: Option<&dyn Fn() -> Result<VerificationResult, EncodingError>>,
+    provenance: &mut Option<super::VerificationProvenance>,
+) -> VerificationResult {
+    let Some(VerificationResult::Failed(hint)) = refutation_hint else {
+        return result;
+    };
+    match result {
+        VerificationResult::Verified(_) => {
+            let clause = hint
+                .violated_postcondition
+                .as_ref()
+                .map_or_else(String::new, |info| {
+                    format!(" ensures #{} (`{}`)", info.clause_idx, info.contract_text)
+                });
+            VerificationResult::Unknown(UnknownReason::SolverMessage(format!(
+                "structural precheck refuted{clause} but the solver proved it; verdict withheld"
+            )))
+        }
+        VerificationResult::Failed(mut counterexample) => {
+            if counterexample.violated_postcondition.is_none() {
+                counterexample.violated_postcondition = hint.violated_postcondition;
+            }
+            VerificationResult::Failed(counterexample)
+        }
+        VerificationResult::Unknown(reason) => {
+            // The solver could not decide what the precheck refuted
+            // syntactically. The precheck proves `requires ⟹ ¬ensures`, so a
+            // VALIDATED model of the base alone is a validated counterexample:
+            // ask the AxiomLight fresh base recheck for one and carry its
+            // witness (evidence + statistics + replay + model) in the
+            // outcome's provenance. Without one, the structural `Failed`
+            // stands and the public boundary withholds it as
+            // `unknown (refutation withheld: ..)` exactly as before the solver
+            // was consulted — nothing is accepted, the exit stays non-zero.
+            super::authority_trace(|| {
+                format!(
+                    "solver inconclusive ({}) after a structural precheck refutation; \
+                     seeking a base witness",
+                    reason.as_str()
+                )
+            });
+            super::solver_tail::clear_refutation_witness();
+            if let Some(base_witness) = base_witness {
+                if matches!(base_witness(), Ok(VerificationResult::Verified(_))) {
+                    if let Some(witness) = super::solver_tail::take_refutation_witness() {
+                        let provenance =
+                            provenance.get_or_insert_with(super::VerificationProvenance::default);
+                        provenance.solve_evidence = Some(witness.evidence);
+                        if let Some(statistics) = witness.statistics {
+                            provenance.solver_statistics = Some(statistics);
+                        }
+                        if witness.native_replay_json.is_some() {
+                            provenance.native_replay_json = witness.native_replay_json;
+                        }
+                        let mut counterexample = witness.counterexample;
+                        counterexample.violated_postcondition = hint.violated_postcondition;
+                        return VerificationResult::Failed(counterexample);
+                    }
+                }
+            }
+            VerificationResult::Failed(hint)
+        }
+        other => other,
+    }
 }
 
 fn assert_ground_tuple_destructor_instances(
@@ -1275,11 +1462,11 @@ fn assert_recursive_logic_fn_symbolic_unfoldings_for_goal_and_assumptions(
         // closing a mathematically false obligation (e.g. the subtraction-based
         // `diff(self) >= 0`). Treat such a corrupted unfolding as a dropped spec
         // axiom (HIGH risk) so `demote_if_unsound` downgrades any resulting
-        // `Verified` to `Unknown`. This is sound and surgical: genuine
-        // non-negative-sum inductions are discharged by
-        // `precheck_recursive_adt_lemma_structural_induction` before reaching
-        // this path, and correctly-typed recursive datatypes need no coercion
-        // here, so their unfolding axioms are left untouched. (#soundness)
+        // `Verified` to `Unknown`. This is sound and surgical: correctly-typed
+        // recursive datatypes need no coercion here, so their unfolding axioms
+        // are left untouched. (Variant-less structural inductions reach the
+        // solver with the driver-injected, tester-guarded structural IH rather
+        // than through a no-solve ADT-lemma shortcut.) (#soundness)
         let coercion_before = unsoundness::snapshot();
         let term = encoder.encode_pure(fact)?;
         let coercion_after = unsoundness::snapshot();
@@ -1584,14 +1771,16 @@ fn precheck_result_match_ite_constructor_postconditions(
         };
         saw_match = true;
 
-        if !postcondition_true_under_context(requires, Some((cond, true)), &then_body) {
-            if postcondition_false_under_context(requires, Some((cond, true)), &then_body) {
-                return Some(precheck_failed_for_clause(clause_idx, ensure));
-            }
-            return None;
-        }
-        if !postcondition_true_under_context(requires, Some((cond, false)), &else_body) {
-            if postcondition_false_under_context(requires, Some((cond, false)), &else_body) {
+        let then_true = postcondition_true_under_context(requires, Some((cond, true)), &then_body);
+        let else_true = postcondition_true_under_context(requires, Some((cond, false)), &else_body);
+        if !then_true || !else_true {
+            // A base witness need not take a branch whose postcondition is
+            // false. Only a contradiction on both branches licenses a
+            // refutation hint for every state satisfying the preconditions.
+            // Leave a potentially unreachable bad branch to the actual query.
+            if simple_false_postcondition(&then_body, ProphecyFold::Opaque)
+                && simple_false_postcondition(&else_body, ProphecyFold::Opaque)
+            {
                 return Some(precheck_failed_for_clause(clause_idx, ensure));
             }
             return None;
@@ -1606,8 +1795,17 @@ fn precheck_result_match_ite_constructor_postconditions(
 /// counterexample carries no bindings (the precheck path bypasses the
 /// solver), but tagging the clause text lets the driver render a precise
 /// "violated ensures #N: <clause>" line instead of the generic
-/// "postcondition(s): ..." dump (Phase 8a).
+/// "postcondition(s): ..." dump.
+#[track_caller]
 fn precheck_failed_for_clause(clause_idx: usize, ensure: &PureExpr) -> VerificationResult {
+    let caller = std::panic::Location::caller();
+    crate::verify::authority_trace(|| {
+        format!(
+            "precheck Failed(structural) clause={clause_idx} at {}:{} ensure={ensure}",
+            caller.file(),
+            caller.line()
+        )
+    });
     VerificationResult::Failed(Counterexample::empty()).tag_violated_postcondition(
         super::PostconditionInfo {
             clause_idx,
@@ -1714,41 +1912,6 @@ fn postcondition_true_under_context(
         PureExpr::BinOp(left, BinOp::Le, right) => {
             requirements_imply_ge(requires, right, left)
                 || branch_context_implies_ge(branch, right, left)
-        }
-        _ => false,
-    }
-}
-
-fn postcondition_false_under_context(
-    requires: &[PureExpr],
-    branch: Option<(&PureExpr, bool)>,
-    expr: &PureExpr,
-) -> bool {
-    // REFUSING path (its only outcome is `precheck_failed_for_clause`), so the
-    // permissive fold is retained for behavioural continuity. (tract19)
-    simple_false_postcondition(expr, ProphecyFold::Collapse)
-        || branch_context_has_strict_boundary_counterexample(requires, branch, expr)
-}
-
-fn branch_context_has_strict_boundary_counterexample(
-    requires: &[PureExpr],
-    branch: Option<(&PureExpr, bool)>,
-    expr: &PureExpr,
-) -> bool {
-    let Some((cond, true)) = branch else {
-        return false;
-    };
-    let PureExpr::BinOp(cond_left, cond_op, cond_right) = cond else {
-        return false;
-    };
-    let PureExpr::BinOp(expr_left, expr_op, expr_right) = expr else {
-        return false;
-    };
-    match (cond_op, expr_op) {
-        (BinOp::Ge, BinOp::Gt) | (BinOp::Le, BinOp::Lt)
-            if same_expr(cond_left, expr_left) && same_expr(cond_right, expr_right) =>
-        {
-            boundary_value_allowed_by_requirements(requires, cond_left, cond_right)
         }
         _ => false,
     }
@@ -2620,6 +2783,11 @@ fn inline_expr_with_visible_logic_fns_for_context(
             method,
             args,
         } => {
+            let resolution = crate::logic::resolve_colliding_call_by_annotation(
+                method,
+                Some(receiver.as_ref()),
+                args.len() + 1,
+            );
             let receiver = inline_expr_with_visible_logic_fns_for_context(receiver, logic_fns);
             let args: Vec<PureExpr> = args
                 .iter()
@@ -2628,13 +2796,26 @@ fn inline_expr_with_visible_logic_fns_for_context(
             let mut logic_args = Vec::with_capacity(args.len() + 1);
             logic_args.push(receiver.clone());
             logic_args.extend(args.iter().cloned());
-            if let Some(logic_fn) = logic_fns.iter().find(|logic_fn| {
-                logic_fn.name() == method
-                    && logic_fn.params().len() == logic_args.len()
+            let visible = |logic_fn: &&LogicFnDef| {
+                logic_fn.params().len() == logic_args.len()
                     && !logic_fn.is_opaque()
                     && logic_fn.mode() != LogicMode::Default
                     && logic_fn.requires().is_empty()
-            }) {
+            };
+            let found = match resolution {
+                Some(Ok(id)) => logic_fns
+                    .iter()
+                    .find(|logic_fn| logic_fn.name() == id)
+                    .filter(visible),
+                Some(Err(_)) => None,
+                // Every local definition carries a unique id: a bare name here can only
+                // be a method/short name no resolution bound, and must bind nothing.
+                None if crate::logic::bare_logic_fn_name_bindable(method) => logic_fns
+                    .iter()
+                    .find(|logic_fn| logic_fn.name() == method && visible(logic_fn)),
+                None => None,
+            };
+            if let Some(logic_fn) = found {
                 let substitutions: HashMap<String, PureExpr> =
                     logic_fn.params().iter().cloned().zip(logic_args).collect();
                 return inline_expr_with_visible_logic_fns_for_context(
@@ -2825,8 +3006,9 @@ fn eval_simple_int_literal(expr: &PureExpr, fold: ProphecyFold) -> Option<i64> {
                 BinOp::Add => left.checked_add(right),
                 BinOp::Sub => left.checked_sub(right),
                 BinOp::Mul => left.checked_mul(right),
-                BinOp::Div => left.checked_div(right),
-                BinOp::Mod => left.checked_rem(right),
+                // `Div`/`Mod` are EUCLIDEAN; only the `*Trunc` ops truncate.
+                BinOp::Div => left.checked_div_euclid(right),
+                BinOp::Mod => left.checked_rem_euclid(right),
                 BinOp::DivTrunc => left.checked_div(right),
                 BinOp::RemTrunc => left.checked_rem(right),
                 _ => None,
@@ -3089,15 +3271,14 @@ fn precheck_recursive_postconditions(
             saw_recursive = true;
             continue;
         }
-        // A postcondition that mentions a visible recursive logic fn but does
-        // not match one of the recognised inductive-proof shapes above used to
-        // trigger an early `Unknown` (without any solver call). That early
-        // `Unknown` was spurious for program fns such as cell/02_fib `fib_memo`
-        // (postcondition `result@ == fib(i@)`), whose body the precheck cannot
-        // recognise but the solver can discharge. Falling through to
-        // `all_prechecked = false` DEFERS the obligation to the solver instead.
-        // SOUND: converting an early `Unknown` into a solver-defer can never
-        // produce a false-accept (a sound solver only proves true goals).
+        // A postcondition that mentions a visible recursive logic fn but
+        // matches none of the recognised inductive-proof shapes above is
+        // DEFERRED to the solver (`all_prechecked = false`), never answered
+        // `Unknown` here without a solve: the precheck cannot recognise every
+        // inductive body (cell/02_fib `fib_memo`, postcondition
+        // `result@ == fib(i@)`) but the solver can discharge it. SOUND: a
+        // solver-defer can never produce a false accept (a sound solver only
+        // proves true goals).
         all_prechecked = false;
     }
     (saw_recursive && all_prechecked).then_some(VerificationResult::Verified(None))
@@ -3496,430 +3677,6 @@ fn is_zero_literal(expr: &PureExpr) -> bool {
     matches!(expr, PureExpr::Int(0))
 }
 
-/// Structural-induction precheck for recursive `#[logic]` lemmas of shape
-/// `f(self) >= 0` (or `f(self) > 0`) where:
-///   * the lemma takes a single ADT-sorted receiver, has one ensures clause, and
-///   * its body is `match self { Variant_i(...) => recurse-or-base, ... }`.
-///
-/// The lemma `lemma_sum_nonneg` from rusthorn `inc_some_list`/`inc_some_tree`
-/// matches exactly this shape:
-///
-/// ```text
-/// #[logic]
-/// #[ensures(self.sum() >= 0)]
-/// fn lemma_sum_nonneg(&self) {
-///     match self {
-///         Cons(_, l) => l.lemma_sum_nonneg(),
-///         Nil => (),
-///     }
-/// }
-/// ```
-///
-/// Soundness sketch (#trust-wp 4B):
-/// Every constructor arm of `f`'s body returns either `0` or a sum of
-/// non-negative components (`view`s of unsigned-int bindings) plus recursive
-/// `f(sub_binding)` calls. The lemma's match arms cover the same constructors
-/// and either base-case (`()`) or recursively invoke the lemma on the same
-/// sub-bindings that `f` recurses on. Because each recursive call's argument
-/// is a constructor sub-binding, it is structurally smaller; the spec axiom
-/// is therefore a valid induction hypothesis, and `f(self) >= 0` follows by
-/// unfolding `f`'s definition arm and adding the IH conclusions.
-///
-/// We accept the proof obligation when:
-///   1. the function under test is recursive,
-///   2. it has a single ADT-typed parameter,
-///   3. its single ensures clause is `f(self) >= 0` for some recursive
-///      one-parameter logic-fn `f` defined over the same scrutinee, and `f`'s
-///      body decomposes the scrutinee with a match whose arms are either `0`
-///      or sums of nonneg-integer terms and recursive `f(sub_binding)` calls,
-///   4. the lemma's own body is `match self { ... }` and every arm body is
-///      either the unit literal `()` or a let-chain of method/logic-fn calls
-///      whose receivers are pattern bindings (i.e., the structural recursion
-///      sites match `f`'s recursion sites).
-fn precheck_recursive_adt_lemma_structural_induction(
-    ensures: &[PureExpr],
-    return_expr: Option<&PureExpr>,
-    logic_fns: Option<&[trust_wp_core::logic::LogicFnDef]>,
-    mode_overrides: Option<&[LogicMode]>,
-) -> Option<VerificationResult> {
-    if ensures.len() != 1 {
-        debug!("adt_lemma_precheck: skip — ensures.len()={}", ensures.len());
-        return None;
-    }
-    let body = return_expr?;
-    let logic_fns = logic_fns?;
-
-    let (self_param, lemma_arms) = match_on_var_arms(body)?;
-    debug!(
-        "adt_lemma_precheck: lemma body matches on `{}` with {} arms",
-        self_param,
-        lemma_arms.len()
-    );
-    let (helper_call_name, helper_arg_name) =
-        recursive_helper_nonneg_ensures_shape(&ensures[0], self_param)?;
-    debug!(
-        "adt_lemma_precheck: ensures uses helper `{}` on `{}`",
-        helper_call_name, helper_arg_name
-    );
-    if helper_arg_name != self_param {
-        return None;
-    }
-    let (helper_index, helper_fn) = logic_fns.iter().enumerate().find(|(_, lf)| {
-        lf.name() == helper_call_name
-            && lf.params().len() == 1
-            && lf.is_recursive()
-            && !lf.is_opaque()
-    })?;
-    debug!(
-        "adt_lemma_precheck: found helper `{}` at index {} (mode={:?})",
-        helper_call_name,
-        helper_index,
-        effective_logic_mode(helper_fn, helper_index, mode_overrides)
-    );
-    // The helper must remain effectively `Open` (visible body) so its match
-    // structure is observable for both the encoder and this precheck.
-    if effective_logic_mode(helper_fn, helper_index, mode_overrides) != LogicMode::Open {
-        debug!("adt_lemma_precheck: helper not Open");
-        return None;
-    }
-    let helper_param = helper_fn.params().first()?.as_str();
-    let helper_arms = match_on_var_arms(helper_fn.body())?;
-    if helper_arms.0 != helper_param {
-        debug!(
-            "adt_lemma_precheck: helper scrutinee `{}` does not match helper param `{}`",
-            helper_arms.0, helper_param
-        );
-        return None;
-    }
-    debug!(
-        "adt_lemma_precheck: helper body has {} arms",
-        helper_arms.1.len()
-    );
-
-    // Every helper arm body must be either a zero literal (base case) or a
-    // sum of nonneg-int terms and recursive helper(sub_binding) calls.
-    let mut helper_arm_recursive_sites: HashMap<String, Vec<String>> = HashMap::new();
-    for arm in helper_arms.1 {
-        let constructor = arm_constructor_name(&arm.pattern)?;
-        let bindings = arm_constructor_bindings(&arm.pattern);
-        let Some(recursive_targets) =
-            helper_arm_nonneg_sum_recursive_targets(&arm.body, helper_call_name, &bindings)
-        else {
-            debug!(
-                "adt_lemma_precheck: helper arm `{}` body is not a nonneg sum: {:?}",
-                constructor, arm.body
-            );
-            return None;
-        };
-        debug!(
-            "adt_lemma_precheck: helper arm `{}` recursion targets: {:?}",
-            constructor, recursive_targets
-        );
-        helper_arm_recursive_sites.insert(constructor, recursive_targets);
-    }
-
-    // For every constructor arm in the lemma, ensure the helper has a
-    // matching arm and the lemma arm body either base-cases (unit) or
-    // recurses on each binding that the helper recurses on. (The precheck
-    // does not require strict alignment — additional lemma calls are OK,
-    // but the structurally recursive sub-bindings used by `f` must be
-    // covered to make the induction sound.)
-    for arm in lemma_arms {
-        let constructor = arm_constructor_name(&arm.pattern)?;
-        let bindings = arm_constructor_bindings(&arm.pattern);
-        let Some(helper_targets) = helper_arm_recursive_sites.get(&constructor) else {
-            debug!(
-                "adt_lemma_precheck: lemma arm `{}` has no matching helper arm",
-                constructor
-            );
-            return None;
-        };
-        let Some(lemma_recursion_targets) = lemma_arm_recursive_call_targets(&arm.body, &bindings)
-        else {
-            debug!(
-                "adt_lemma_precheck: lemma arm `{}` body shape not recognized: {:?}",
-                constructor, arm.body
-            );
-            return None;
-        };
-        debug!(
-            "adt_lemma_precheck: lemma arm `{}` recursion targets: {:?}",
-            constructor, lemma_recursion_targets
-        );
-        for target in helper_targets {
-            if !lemma_recursion_targets.contains(target) {
-                debug!(
-                    "adt_lemma_precheck: lemma arm `{}` missing recursion on `{}`",
-                    constructor, target
-                );
-                return None;
-            }
-        }
-    }
-
-    debug!("adt_lemma_precheck: VERIFIED");
-    Some(VerificationResult::Verified(None))
-}
-
-/// If `body` is `Match { scrutinee: Var(name), arms }`, return `(name, arms)`.
-fn match_on_var_arms(body: &PureExpr) -> Option<(&str, &[trust_wp_core::formula::MatchArm])> {
-    let PureExpr::Match { scrutinee, arms } = body else {
-        return None;
-    };
-    let scrutinee = strip_deref_view(scrutinee);
-    let PureExpr::Var(name, _) = scrutinee else {
-        return None;
-    };
-    Some((name.as_str(), arms.as_slice()))
-}
-
-/// Peel surface `Deref`/`View` nodes so `match *self` and `match self@` both
-/// resolve to the underlying receiver variable.
-fn strip_deref_view(expr: &PureExpr) -> &PureExpr {
-    let mut current = expr;
-    loop {
-        match current {
-            PureExpr::Deref(inner) | PureExpr::View(inner) => current = inner,
-            other => return other,
-        }
-    }
-}
-
-/// Detect a `helper(self) >= 0` or `helper(self) > 0` ensures shape (in both
-/// `LogicFnCall` and `MethodCall` orientations) and return `(helper_name,
-/// receiver_name)`.
-fn recursive_helper_nonneg_ensures_shape<'a>(
-    ensure: &'a PureExpr,
-    expected_receiver: &str,
-) -> Option<(&'a str, &'a str)> {
-    let PureExpr::BinOp(left, op, right) = ensure else {
-        return None;
-    };
-    if !matches!(op, BinOp::Ge | BinOp::Gt) {
-        return None;
-    }
-    if !is_zero_literal(right) {
-        return None;
-    }
-    let call_target = strip_deref_view(left);
-    match call_target {
-        PureExpr::LogicFnCall { name, args } if args.len() == 1 => {
-            let arg = strip_deref_view(&args[0]);
-            let PureExpr::Var(arg_name, _) = arg else {
-                return None;
-            };
-            (arg_name == expected_receiver).then_some((name.as_str(), arg_name.as_str()))
-        }
-        PureExpr::MethodCall {
-            receiver,
-            method,
-            args,
-        } if args.is_empty() => {
-            let receiver_expr = strip_deref_view(receiver);
-            let PureExpr::Var(receiver_name, _) = receiver_expr else {
-                return None;
-            };
-            (receiver_name == expected_receiver)
-                .then_some((method.as_str(), receiver_name.as_str()))
-        }
-        _ => None,
-    }
-}
-
-/// Extract the constructor name of a top-level pattern (`Cons(_, l)` ->
-/// `Cons`, `Nil` -> `Nil`). Returns `None` for wildcard/binding/tuple/literal
-/// patterns.
-fn arm_constructor_name(pattern: &Pattern) -> Option<String> {
-    match pattern {
-        Pattern::Constructor { name, .. } => Some(name.clone()),
-        Pattern::Alias { pattern, .. } => arm_constructor_name(pattern),
-        _ => None,
-    }
-}
-
-/// Collect named bindings exposed by a constructor pattern's inner sub-pattern
-/// (`Cons(_, l)` -> `["l"]`, `Node(tl, _, tr)` -> `["tl", "tr"]`). Wildcards
-/// are silently skipped.
-fn arm_constructor_bindings(pattern: &Pattern) -> Vec<String> {
-    let mut bindings = Vec::new();
-    pattern_bindings_into(pattern, &mut bindings);
-    bindings
-}
-
-fn pattern_bindings_into(pattern: &Pattern, bindings: &mut Vec<String>) {
-    match pattern {
-        Pattern::Binding(name) => bindings.push(name.clone()),
-        Pattern::Tuple(items) => {
-            for item in items {
-                pattern_bindings_into(item, bindings);
-            }
-        }
-        Pattern::Constructor {
-            inner: Some(inner), ..
-        } => pattern_bindings_into(inner, bindings),
-        Pattern::Alias {
-            alias,
-            pattern: inner,
-        } => {
-            bindings.push(alias.clone());
-            pattern_bindings_into(inner, bindings);
-        }
-        Pattern::Constructor { inner: None, .. } | Pattern::Wildcard | Pattern::Literal(_) => {}
-        // `Pattern` is `#[non_exhaustive]`; any future variants are treated as
-        // opaque (no bindings exposed) so the precheck remains conservative.
-        _ => {}
-    }
-}
-
-/// For a helper arm body, detect a non-negative-sum shape and return the
-/// sub-bindings on which `helper` recurses.
-///
-/// Accepted body shapes (recursively flattened over `+`):
-///   * `0`  — base case, no recursive sites.
-///   * `view_of(binding)` — `binding@` for an unsigned-integer pattern field;
-///     contributes 0 recursive sites.
-///   * `helper(binding)` / `binding.helper()` — contributes one recursive site
-///     on `binding`.
-///   * Any nested `Add` of the above.
-///
-/// Returns `None` if any operand is neither a zero literal, a `view` of a
-/// pattern binding, nor a recursive helper call on a pattern binding.
-fn helper_arm_nonneg_sum_recursive_targets(
-    body: &PureExpr,
-    helper_name: &str,
-    bindings: &[String],
-) -> Option<Vec<String>> {
-    let mut targets = Vec::new();
-    if collect_nonneg_sum_operands(body, helper_name, bindings, &mut targets) {
-        Some(targets)
-    } else {
-        None
-    }
-}
-
-fn collect_nonneg_sum_operands(
-    expr: &PureExpr,
-    helper_name: &str,
-    bindings: &[String],
-    targets: &mut Vec<String>,
-) -> bool {
-    match expr {
-        PureExpr::Int(0) => true,
-        PureExpr::BinOp(left, BinOp::Add, right) => {
-            collect_nonneg_sum_operands(left, helper_name, bindings, targets)
-                && collect_nonneg_sum_operands(right, helper_name, bindings, targets)
-        }
-        PureExpr::View(inner) => {
-            // `binding@` — accepted as a nonneg contribution iff the binding
-            // is a pattern variable. (The ADT field's integer type controls
-            // sign; trust-wp's ADT-field range axioms handle u32/u64.)
-            let inner = strip_deref_view(inner);
-            matches!(inner, PureExpr::Var(name, _) if bindings.iter().any(|b| b == name))
-        }
-        PureExpr::LogicFnCall { name, args } if name == helper_name && args.len() == 1 => {
-            let arg = strip_deref_view(&args[0]);
-            if let PureExpr::Var(arg_name, _) = arg {
-                if bindings.iter().any(|b| b == arg_name) {
-                    targets.push(arg_name.clone());
-                    return true;
-                }
-            }
-            false
-        }
-        PureExpr::MethodCall {
-            receiver,
-            method,
-            args,
-        } if method == helper_name && args.is_empty() => {
-            let receiver_expr = strip_deref_view(receiver);
-            if let PureExpr::Var(receiver_name, _) = receiver_expr {
-                if bindings.iter().any(|b| b == receiver_name) {
-                    targets.push(receiver_name.clone());
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// For a lemma arm body, return the set of bindings that the lemma recurses
-/// on via method-call / logic-fn-call statements. Accepted shapes:
-///   * Unit literal `()` — base case (no recursion).
-///   * A `Let { var: __stmtN, value: <call>, body: rest }` chain ending in
-///     unit or another call. Each `value` must be a `MethodCall` or
-///     `LogicFnCall` whose receiver/arg is a pattern binding.
-///   * A trailing `MethodCall { receiver: Var(binding), .. }` /
-///     `LogicFnCall { args: [Var(binding)] }`.
-///
-/// Returns `None` if any encountered node is not one of the above shapes.
-fn lemma_arm_recursive_call_targets(body: &PureExpr, bindings: &[String]) -> Option<Vec<String>> {
-    let mut targets = Vec::new();
-    if collect_lemma_recursive_targets(body, bindings, &mut targets) {
-        Some(targets)
-    } else {
-        None
-    }
-}
-
-fn collect_lemma_recursive_targets(
-    expr: &PureExpr,
-    bindings: &[String],
-    targets: &mut Vec<String>,
-) -> bool {
-    match expr {
-        PureExpr::LogicFnCall { name, args } if is_unit_logic_fn(name) && args.is_empty() => true,
-        PureExpr::Let { value, body, .. } => {
-            statement_call_target(value, bindings, targets)
-                && collect_lemma_recursive_targets(body, bindings, targets)
-        }
-        PureExpr::MethodCall { .. } | PureExpr::LogicFnCall { .. } => {
-            statement_call_target(expr, bindings, targets)
-        }
-        PureExpr::Bool(true) => {
-            // Some lemma bodies use `true` as a terminating trivial value
-            // (e.g., when the recursion is purely in a leading statement).
-            true
-        }
-        _ => false,
-    }
-}
-
-fn statement_call_target(expr: &PureExpr, bindings: &[String], targets: &mut Vec<String>) -> bool {
-    match expr {
-        PureExpr::MethodCall { receiver, args, .. } if args.is_empty() => {
-            let receiver_expr = strip_deref_view(receiver);
-            if let PureExpr::Var(receiver_name, _) = receiver_expr {
-                if bindings.iter().any(|b| b == receiver_name) {
-                    targets.push(receiver_name.clone());
-                    return true;
-                }
-            }
-            false
-        }
-        PureExpr::LogicFnCall { args, .. } if args.len() == 1 => {
-            let arg = strip_deref_view(&args[0]);
-            if let PureExpr::Var(arg_name, _) = arg {
-                if bindings.iter().any(|b| b == arg_name) {
-                    targets.push(arg_name.clone());
-                    return true;
-                }
-            }
-            false
-        }
-        // Calls with no arguments (e.g., a side-effecting proof helper) are
-        // tolerated only if they have no receiver/arg — they contribute no
-        // recursion site but don't disqualify the arm.
-        PureExpr::LogicFnCall { args, .. } if args.is_empty() => true,
-        _ => false,
-    }
-}
-
-fn is_unit_logic_fn(name: &str) -> bool {
-    name == tuple_logic_fn_name(0)
-}
-
 fn precheck_recursive_seq_relation_postconditions(
     ensures: &[PureExpr],
     return_expr: Option<&PureExpr>,
@@ -4165,11 +3922,32 @@ fn inline_open_logic_method_call(
     args: &[PureExpr],
     logic_fns: &[LogicFnDef],
 ) -> Option<PureExpr> {
-    let logic_fn = logic_fns.iter().find(|lf| {
+    // A method name shared by several local definitions denotes the one
+    // resolved on the receiver's type, never the first match. Opaque
+    // definitions carry a transport placeholder body, never their semantics.
+    // A body is only an equation under the definition's `requires` (the
+    // defining axiom is guarded by them), so a guarded definition is never
+    // unfolded here: this expansion carries no requires context.
+    let visible = |lf: &&LogicFnDef| {
         lf.mode() == LogicMode::Open
-            && (lf.name() == method || lf.full_path().ends_with(&format!("::{method}")))
+            && !lf.is_opaque()
+            && lf.requires().is_empty()
             && lf.params().len() == args.len() + 1
-    })?;
+    };
+    let logic_fn = match crate::logic::resolve_colliding_call_by_annotation(
+        method,
+        Some(receiver.as_ref()),
+        args.len() + 1,
+    ) {
+        Some(Ok(id)) => logic_fns.iter().find(|lf| lf.name() == id).filter(visible),
+        Some(Err(_)) => None,
+        // Every local definition carries a unique id: a bare name here can only
+        // be a method/short name no resolution bound, and must bind nothing.
+        None if crate::logic::bare_logic_fn_name_bindable(method) => logic_fns
+            .iter()
+            .find(|lf| lf.name() == method && visible(lf)),
+        None => None,
+    }?;
     let mut substitutions = HashMap::new();
     let params = logic_fn.params();
     substitutions.insert(params[0].clone(), receiver.as_ref().clone());
@@ -4186,11 +3964,17 @@ fn inline_open_logic_fn_call(
     args: &[PureExpr],
     logic_fns: &[LogicFnDef],
 ) -> Option<PureExpr> {
+    // Guarded definitions (non-empty `requires`) are not unfolded: see
+    // `inline_open_logic_method_call`.
     let logic_fn = logic_fns.iter().find(|lf| {
         lf.mode() == LogicMode::Open
+            && !lf.is_opaque()
             && (lf.name() == name || lf.full_path() == name)
             && lf.params().len() == args.len()
     })?;
+    if !logic_fn.requires().is_empty() {
+        return None;
+    }
     let mut substitutions = HashMap::new();
     for (param, arg) in logic_fn.params().iter().zip(args.iter()) {
         substitutions.insert(param.clone(), arg.clone());

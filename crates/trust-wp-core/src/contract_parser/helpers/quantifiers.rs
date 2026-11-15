@@ -7,10 +7,14 @@
 
 use std::sync::Arc;
 
-use super::super::{ContractParser, ParseError};
+use super::super::{ContractParser, ParseError, WrittenTypeSite};
 use crate::formula::{intern_sort_name, BinOp, ExprSort, PureExpr};
 
-fn collection_iterator_sort(type_path: &[String]) -> Option<ExprSort> {
+/// The sort of a collection iterator type the parser reads by its path
+/// (`hash_map::IntoIter<K, V>`), if `type_path` is one.
+pub(in crate::contract_parser) fn collection_iterator_sort(
+    type_path: &[String],
+) -> Option<ExprSort> {
     let canonical_name = match type_path {
         [module, ty]
             if module == "hash_map" && matches!(ty.as_str(), "IntoIter" | "Iter" | "IterMut") =>
@@ -60,6 +64,145 @@ fn collection_iterator_sort(type_path: &[String]) -> Option<ExprSort> {
     Some(ExprSort::Datatype(intern_sort_name(&canonical_name)))
 }
 
+/// A machine integer type, the range of values a binder of it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MachineInt {
+    bits: u32,
+    signed: bool,
+}
+
+impl MachineInt {
+    /// `low <= value && value < high`, the type's values. A bound past `i64`
+    /// is spelled as a product of 32-bit powers (`PureExpr::Int` is an `i64`).
+    /// No bound is computed past `i128`: a 128-bit type's `high` (2^127,
+    /// 2^128) is none, and the shift or negation that computed it overflowed
+    /// (quantifier_binder_128_bit_machine_int_range_overflows.rs).
+    fn range_of(self, value: &PureExpr) -> PureExpr {
+        let (low, high) = if self.signed {
+            (
+                int_constant(i128::MIN >> (128 - self.bits)),
+                power_of_two(self.bits - 1),
+            )
+        } else {
+            (int_constant(0), power_of_two(self.bits))
+        };
+        let value = || Arc::new(value.clone());
+        PureExpr::BinOp(
+            Arc::new(PureExpr::BinOp(Arc::new(low), BinOp::Le, value())),
+            BinOp::And,
+            Arc::new(PureExpr::BinOp(value(), BinOp::Lt, Arc::new(high))),
+        )
+    }
+}
+
+/// `2^exponent` (`exponent <= 128`) as an integer expression.
+fn power_of_two(exponent: u32) -> PureExpr {
+    if exponent < 127 {
+        return int_constant(1_i128 << exponent);
+    }
+    PureExpr::BinOp(
+        Arc::new(int_constant(1_i128 << (exponent - 64))),
+        BinOp::Mul,
+        Arc::new(int_constant(1_i128 << 64)),
+    )
+}
+
+/// `value` as an integer expression: a literal where it fits an `i64`, else
+/// `high * 2^32 + low` with `0 <= low < 2^32`.
+fn int_constant(value: i128) -> PureExpr {
+    if let Ok(small) = i64::try_from(value) {
+        return PureExpr::Int(small);
+    }
+    let two_pow_32 = 1_i128 << 32;
+    let high = value.div_euclid(two_pow_32);
+    let low = value.rem_euclid(two_pow_32);
+    PureExpr::BinOp(
+        Arc::new(PureExpr::BinOp(
+            Arc::new(int_constant(high)),
+            BinOp::Mul,
+            Arc::new(PureExpr::Int(1_i64 << 32)),
+        )),
+        BinOp::Add,
+        Arc::new(int_constant(low)),
+    )
+}
+
+/// The machine integer `name` is, by its spelling (a shadowed spelling is
+/// refused before this reads it, `spelled_types`). `usize`/`isize` are 64
+/// bits wide, as `usize::MAX` is read.
+fn machine_int(name: &str) -> Option<MachineInt> {
+    let (bits, signed) = match name {
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" | "usize" => (64, false),
+        "u128" => (128, false),
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" | "isize" => (64, true),
+        "i128" => (128, true),
+        _ => return None,
+    };
+    Some(MachineInt { bits, signed })
+}
+
+/// What a binder's written type says of the values it ranges over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinderRange {
+    /// A machine integer: its range is stated on the body.
+    MachineInt(MachineInt),
+    /// A reference to a machine integer: the range of the value it points
+    /// at, and of a `&mut`'s final value, is stated on the body.
+    Reference { int: MachineInt, mutable: bool },
+    /// A type that holds a machine integer anywhere else (`Seq<u8>`,
+    /// `(u8, bool)`, `&&u8`): the sort it maps to keeps no range for it, and
+    /// the binder would range over values the type does not have. The
+    /// quantifier is refused.
+    Holds,
+}
+
+impl BinderRange {
+    /// `value` is a value of this type, as a formula; `None` for
+    /// [`BinderRange::Holds`].
+    fn of(self, value: &PureExpr) -> Option<PureExpr> {
+        let shared = || Arc::new(value.clone());
+        match self {
+            Self::MachineInt(int) => Some(int.range_of(value)),
+            Self::Reference { int, mutable } => {
+                let current = int.range_of(&PureExpr::Deref(shared()));
+                Some(if mutable {
+                    let last = int.range_of(&PureExpr::Final(shared()));
+                    PureExpr::BinOp(Arc::new(current), BinOp::And, Arc::new(last))
+                } else {
+                    current
+                })
+            }
+            Self::Holds => None,
+        }
+    }
+}
+
+/// The range a binder's written type states, if any.
+fn binder_range(text: &str) -> Option<BinderRange> {
+    let text = text.trim();
+    if let Some(own) = machine_int(text) {
+        return Some(BinderRange::MachineInt(own));
+    }
+    if let Some(referent) = text.strip_prefix('&').map(str::trim_start) {
+        let (mutable, referent) = match referent.strip_prefix("mut") {
+            Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest.trim()),
+            _ => (false, referent.trim()),
+        };
+        if let Some(int) = machine_int(referent) {
+            return Some(BinderRange::Reference { int, mutable });
+        }
+    }
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .any(|word| machine_int(word).is_some())
+        .then_some(BinderRange::Holds)
+}
+
 fn type_annotation_sort(
     type_path: &[String],
     has_generics: bool,
@@ -93,6 +236,12 @@ fn type_annotation_sort(
         "Seq" => Some(ExprSort::Seq),
         // Vec<T> maps to Seq in SMT (logical view of collections)
         "Vec" if has_generics => Some(ExprSort::Seq),
+        // Creusot `Mapping<K, V>` (Why3 `map.Map.map`) is a total function
+        // value. Annotate it with the canonical Mapping datatype sort (the same
+        // sort the encoder's type-name table and the driver's ADT analysis
+        // use), so `forall<f: Mapping<T, U>> .. f.get(x) ..` binds `f` at the
+        // Mapping carrier instead of the Int fallback. Sort choice only.
+        "Mapping" if has_generics => Some(ExprSort::Datatype(intern_sort_name("Mapping"))),
         _ if is_generic_type_param => Some(ExprSort::TypeParam(intern_sort_name(type_name))),
         _ => None,
     }
@@ -134,7 +283,7 @@ impl ContractParser<'_> {
         //   forall<a, b>          — multiple variables, types elided
         //   exists<s1: F, r: T>   — multiple variables with types
         //   exists<r: &mut T>     — generic reference annotation (Int fallback)
-        let mut vars: Vec<(String, Option<ExprSort>)> = Vec::new();
+        let mut vars: Vec<(String, Option<ExprSort>, Option<BinderRange>)> = Vec::new();
 
         loop {
             self.skip_whitespace();
@@ -145,14 +294,17 @@ impl ContractParser<'_> {
             self.skip_whitespace();
 
             // Optional type annotation: `: Type`
-            let sort = if self.try_consume(":") {
+            let (sort, range) = if self.try_consume(":") {
                 self.skip_whitespace();
-                self.consume_type_annotation()?
+                let (sort, text) =
+                    self.consume_written_type_text(WrittenTypeSite::QuantifierBinder)?;
+                (sort, binder_range(&text))
             } else {
-                None
+                self.note_elided_type(WrittenTypeSite::QuantifierBinder);
+                (None, None)
             };
 
-            vars.push((var, sort));
+            vars.push((var, sort, range));
 
             self.skip_whitespace();
 
@@ -183,7 +335,21 @@ impl ContractParser<'_> {
         // For multi-variable quantifiers, nest them: forall<a, b> body
         // becomes Forall { var: a, body: Forall { var: b, body } }
         let mut result = body;
-        for (var, var_sort) in vars.into_iter().rev() {
+        for (var, var_sort, range) in vars.into_iter().rev() {
+            // The binder's sort has every integer where its type has a
+            // range: the range is a premise of `forall` and a conjunct of
+            // `exists` (quantifier_binder_machine_int_read_unbounded_granted.rs).
+            let bound = PureExpr::Var(var.clone(), None);
+            if let Some(range) = range.and_then(|range| range.of(&bound)) {
+                let op = if is_forall {
+                    BinOp::Implies
+                } else {
+                    BinOp::And
+                };
+                result = PureExpr::BinOp(Arc::new(range), op, Arc::new(result));
+            }
+            let refused = range == Some(BinderRange::Holds);
+            let binder_var = var.clone();
             result = if is_forall {
                 PureExpr::Forall {
                     var,
@@ -199,6 +365,17 @@ impl ContractParser<'_> {
                     triggers: triggers.clone(),
                 }
             };
+            if refused {
+                // Refused where the quantifier is read, not here: the proc
+                // macros parse every clause at compile time, and a parse
+                // error there fails the user's build.
+                result = PureExpr::LogicFnCall {
+                    name: crate::logic::identity::logic_fn_unresolved_marker(&format!(
+                        "{binder_var}_binder_range"
+                    )),
+                    args: vec![result],
+                };
+            }
         }
 
         Ok(result)
@@ -333,7 +510,7 @@ impl ContractParser<'_> {
         while depth > 0 {
             match self.peek() {
                 Some('<') => {
-                    depth += 1;
+                    depth = depth.saturating_add(1);
                     self.advance();
                 }
                 Some('>') => {

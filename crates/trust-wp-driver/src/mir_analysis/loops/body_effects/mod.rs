@@ -18,6 +18,7 @@ use std::{
     sync::Arc,
 };
 
+use call_modeling::CallPremise;
 use rustc_middle::{
     mir::{
         BasicBlock, Body, CastKind, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind,
@@ -47,6 +48,28 @@ pub(super) struct BodyEffects {
     /// `x: &mut &mut i32`, constrains `x_prime_current_current = 0` during
     /// preservation. (#1295)
     pub(super) double_deref_effects: HashMap<String, PureExpr>,
+    /// Callee postconditions stated at the calls' results, each guarded by the
+    /// path condition reaching its call and the callee's own premises.
+    pub(super) call_facts: Vec<PureExpr>,
+    /// Premises the program supplies that the walk could not state.
+    pub(super) dropped_premises: Vec<DroppedPremise>,
+}
+
+/// A premise some path through the loop body supplies that the loop VC does
+/// not state. A model of that VC may violate it, so a model is not a
+/// counterexample to the program while one of these stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DroppedPremise {
+    /// The block whose semantics were left out.
+    pub(crate) block: BasicBlock,
+    /// What was left out, as the withheld verdict's reason.
+    pub(crate) what: String,
+    /// The premise is an `Iterator::next` step, which a for-loop's own
+    /// structural facts state instead of the call's contract.
+    pub(crate) iterator_step: bool,
+    /// The premise speaks only of this variable's post-iteration value; `None`
+    /// when it may constrain any value.
+    pub(crate) only_about: Option<String>,
 }
 
 pub(super) fn extract_body_effects<'a, 'tcx: 'a>(
@@ -71,7 +94,12 @@ pub(super) fn extract_body_effects<'a, 'tcx: 'a>(
         // fact for the opaque marker, so only the sound length / off-index frame
         // is asserted. (gap nested-loop-outer-element-and-indexed-write-frame)
         index_mut_length_only_on_value_failure: true,
+        path_guard: Vec::new(),
+        path_guard_opaque: false,
+        call_facts: Vec::new(),
+        dropped_premises: Vec::new(),
     };
+    let lent_body_locals = lent_body_locals(body, body_blocks, call_spec_ctx.map(|ctx| ctx.tcx));
     let ctx = BodyExtractionCtx {
         body,
         body_blocks,
@@ -79,6 +107,7 @@ pub(super) fn extract_body_effects<'a, 'tcx: 'a>(
         local_to_name,
         inner_loops,
         call_spec_ctx,
+        lent_body_locals,
     };
     let result = ctx.extract_from_block(header, false, initial_state, HashSet::new());
     result.map_or_else(
@@ -86,13 +115,98 @@ pub(super) fn extract_body_effects<'a, 'tcx: 'a>(
             effects: HashMap::new(),
             deref_effects: HashMap::new(),
             double_deref_effects: HashMap::new(),
+            call_facts: Vec::new(),
+            // Every modified variable is havoced, and whatever the body
+            // established about any other value is gone with it.
+            dropped_premises: vec![DroppedPremise {
+                block: header,
+                what: "the loop body walk does not reach the back edge on every path".to_string(),
+                iterator_step: false,
+                only_about: None,
+            }],
         },
         |state| BodyEffects {
             effects: state.effects,
             deref_effects: state.deref_effects,
             double_deref_effects: state.double_deref_effects,
+            call_facts: state.call_facts,
+            dropped_premises: state.dropped_premises,
         },
     )
+}
+
+/// The value a loop condition reads from the call that computes it on the
+/// header path, with the premises the callee's contract supplies about it.
+pub(super) struct ConditionCallValue {
+    /// The destination's value: the modeled `result == e`, or the symbol
+    /// naming the value this evaluation returns. `None` when it has neither.
+    pub(super) value: Option<PureExpr>,
+    /// The postcondition clauses stated at `value`, under the callee's own
+    /// premises at its arguments.
+    pub(super) facts: Vec<PureExpr>,
+    /// What the contract supplies that no premise states.
+    pub(super) dropped: Vec<DroppedPremise>,
+}
+
+/// State the call that ends block `bb` the way the body walk states it, for
+/// the loop condition that reads its result.
+///
+/// The body walk passes the same call on its way from the header, so the
+/// condition and the walk's premises name the same value
+/// (loop_condition_call_postcondition_control). `None` when `bb` does not end
+/// in a call.
+pub(super) fn condition_call_value<'a, 'tcx: 'a>(
+    body: &'a Body<'tcx>,
+    body_blocks: &'a HashSet<BasicBlock>,
+    header: BasicBlock,
+    local_to_name: &'a HashMap<Local, String>,
+    call_spec_ctx: CallSpecContext<'a, 'tcx>,
+    bb: BasicBlock,
+    working_exprs: &HashMap<Local, PureExpr>,
+) -> Option<ConditionCallValue> {
+    let TerminatorKind::Call {
+        func,
+        args,
+        destination,
+        ..
+    } = &body.basic_blocks[bb].terminator().kind
+    else {
+        return None;
+    };
+    // The body walk's own lent set, so the call is stated in its environment.
+    let lent_body_locals = lent_body_locals(body, body_blocks, Some(call_spec_ctx.tcx));
+    let ctx = BodyExtractionCtx {
+        body,
+        body_blocks,
+        header,
+        local_to_name,
+        inner_loops: Vec::new(),
+        call_spec_ctx: Some(call_spec_ctx),
+        lent_body_locals,
+    };
+    let mut state = BodyExtractionState {
+        working_exprs: working_exprs.clone(),
+        effects: HashMap::new(),
+        deref_effects: HashMap::new(),
+        double_deref_effects: HashMap::new(),
+        pending_index_mut: HashMap::new(),
+        index_mut_length_only_on_value_failure: false,
+        path_guard: Vec::new(),
+        path_guard_opaque: false,
+        call_facts: Vec::new(),
+        dropped_premises: Vec::new(),
+    };
+    ctx.apply_call_terminator(bb, func, args, destination, &mut state);
+    ctx.forget_body_locals_written_at_terminator(bb, &mut state);
+    Some(ConditionCallValue {
+        value: destination
+            .projection
+            .is_empty()
+            .then(|| state.working_exprs.get(&destination.local).cloned())
+            .flatten(),
+        facts: state.call_facts,
+        dropped: state.dropped_premises,
+    })
 }
 
 #[derive(Clone)]
@@ -118,6 +232,15 @@ pub(super) struct BodyExtractionState {
     /// asserted, never `index_logic(updated, i) == <opaque>`.
     /// (gap nested-loop-outer-element-and-indexed-write-frame)
     pub(super) index_mut_length_only_on_value_failure: bool,
+    /// Branch conditions taken on the path from the header to this point.
+    pub(super) path_guard: Vec<PureExpr>,
+    /// The path took a branch whose condition does not translate, so no fact
+    /// recorded on it could be guarded.
+    pub(super) path_guard_opaque: bool,
+    /// See [`BodyEffects::call_facts`].
+    pub(super) call_facts: Vec<PureExpr>,
+    /// See [`BodyEffects::dropped_premises`].
+    pub(super) dropped_premises: Vec<DroppedPremise>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +273,77 @@ pub(super) struct BodyExtractionCtx<'a, 'tcx> {
     pub(super) inner_loops: Vec<(BasicBlock, HashSet<BasicBlock>)>,
     /// Optional spec context for modeling call results. (#1463)
     pub(super) call_spec_ctx: Option<CallSpecContext<'a, 'tcx>>,
+    /// Locals declared in this loop's body, and those of them whose own
+    /// memory the body lends out ([`lent_body_locals`]): a value bound to one
+    /// is forgotten wherever it may be written behind the walk.
+    pub(super) lent_body_locals: LentBodyLocals,
+}
+
+/// Locals declared inside a loop body (their `StorageLive` is in it): all of
+/// them, and those whose own memory the body lends out.
+#[derive(Default)]
+pub(super) struct LentBodyLocals {
+    born: HashSet<Local>,
+    lent: HashSet<Local>,
+}
+
+/// The locals DECLARED inside a loop body (their `StorageLive` is in it), and
+/// those of them whose own memory the body borrows `&mut` or raw (not a
+/// reborrow through a `Deref`), or borrows shared while their type is not
+/// `Freeze`.
+///
+/// The walk binds a local at its projection-free assignments. Through such a
+/// loan the local also changes at a `Drop` whose glue writes it
+/// (`{ let _g = G(&mut m); }`, D-140), inside a callee handed the loan
+/// (`set5(&mut m)`), and at a store through a reference; a loop-carried local
+/// copied from it before the back edge (`n = m`) would carry the value from
+/// before (loop_body_local_drop_glue_write_unseen_by_invariant.rs,
+/// loop_body_local_written_by_callee_unseen.rs,
+/// loop_variant_reads_body_local_before_drop_glue_write.rs). Forgetting a
+/// body-local makes a later read its name, a symbol nothing constrains. A
+/// loop-carried local's name is its value at the header, so forgetting it
+/// would read a stale value instead; `WriteSites` havocs those. Without a
+/// `tcx` the interior-mutability clause is not asked.
+fn lent_body_locals<'tcx>(
+    body: &Body<'tcx>,
+    body_blocks: &HashSet<BasicBlock>,
+    tcx: Option<rustc_middle::ty::TyCtxt<'tcx>>,
+) -> LentBodyLocals {
+    use rustc_middle::mir::{BorrowKind, RawPtrKind};
+    let mut born = HashSet::new();
+    let mut lent = HashSet::new();
+    for bb in body_blocks {
+        for stmt in &body.basic_blocks[*bb].statements {
+            match &stmt.kind {
+                StatementKind::StorageLive(local) => {
+                    born.insert(*local);
+                }
+                StatementKind::Assign((_, rvalue)) => {
+                    let (place, may_write) = match rvalue {
+                        Rvalue::Ref(_, kind, place) => {
+                            (place, matches!(kind, BorrowKind::Mut { .. }))
+                        }
+                        Rvalue::RawPtr(kind, place) => (place, !matches!(kind, RawPtrKind::Const)),
+                        _ => continue,
+                    };
+                    if place.is_indirect() {
+                        continue;
+                    }
+                    let interior = !may_write
+                        && tcx.is_some_and(|tcx| {
+                            let ty = body.local_decls[place.local].ty;
+                            !ty.is_freeze(tcx, body.typing_env(tcx))
+                        });
+                    if may_write || interior {
+                        lent.insert(place.local);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    lent.retain(|local| born.contains(local));
+    LentBodyLocals { born, lent }
 }
 
 impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
@@ -187,7 +381,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
 
         let terminator = &self.body.basic_blocks[bb].terminator().kind;
         match terminator {
-            TerminatorKind::Goto { target }
+            TerminatorKind::Goto { target, .. }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::Drop { target, .. } => {
                 self.extract_from_block(*target, entered_header, state, visited)
@@ -253,7 +447,11 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
         rvalue: &Rvalue<'tcx>,
         state: &BodyExtractionState,
     ) -> Option<PureExpr> {
-        let Rvalue::Cast(CastKind::Transmute, operand, target_ty) = rvalue else {
+        // The box-deref elaboration's cast is `BoxDerefTransmute`, a transmute
+        // whose input is a valid `Box` pointer.
+        let Rvalue::Cast(CastKind::Transmute | CastKind::BoxDerefTransmute, operand, target_ty) =
+            rvalue
+        else {
             return None;
         };
         if !matches!(target_ty.kind(), TyKind::RawPtr(..)) {
@@ -601,7 +799,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
             .get(index_local)
             .cloned()
             .or_else(|| self.named_local_expr(*index_local))
-            .unwrap_or_else(|| PureExpr::Var(format!("_{}", index_local.as_u32()), None));
+            .unwrap_or_else(|| PureExpr::Var(format!("$_{}", index_local.as_u32()), None));
         apply_indexed_write_effect(state, &param_name, index, value);
         true
     }
@@ -963,7 +1161,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
         for &block in self.body_blocks {
             let block_data = &self.body.basic_blocks[block];
             for stmt in &block_data.statements {
-                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                let StatementKind::Assign((place, rvalue)) = &stmt.kind else {
                     continue;
                 };
                 if place.local != local || !place.projection.is_empty() {
@@ -1032,6 +1230,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
                 if !matches!(
                     cast_kind,
                     CastKind::Transmute
+                        | CastKind::BoxDerefTransmute
                         | CastKind::PtrToPtr
                         | CastKind::PointerCoercion(..)
                         | CastKind::PointerExposeProvenance
@@ -1092,7 +1291,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
             .fields
             .get(rustc_abi::FieldIdx::from_usize(field_idx))
             .is_some_and(|field| {
-                let field_ty = field.ty(tcx, scrut_substs).skip_norm_wip();
+                let field_ty = field.ty(tcx, *scrut_substs).skip_norm_wip();
                 matches!(field_ty.kind(), TyKind::Adt(box_def, box_substs)
                 if box_def.is_box()
                     && box_substs.types().next().is_some_and(|inner| {
@@ -1105,7 +1304,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
     fn apply_assignments(&self, bb: BasicBlock, state: &mut BodyExtractionState) {
         let bb_data = &self.body.basic_blocks[bb];
         for stmt in &bb_data.statements {
-            if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+            if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
                 if place.projection.is_empty() {
                     // Direct assignment: `local = rvalue`
                     let pending_index_mut_alias =
@@ -1142,6 +1341,9 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
                 {
                     self.apply_deref_assignment(place, rvalue, state);
                 }
+                if place.is_indirect() {
+                    self.forget_lent_body_locals(state);
+                }
             }
         }
 
@@ -1153,62 +1355,167 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
             ..
         } = &bb_data.terminator().kind
         {
-            // Model Seq ghost mutation methods (#1581)
-            self.apply_seq_ghost_mutation(func, args, state);
-            // Model `&mut self` mutators (push/insert/swap/...) by recording the
-            // `(^self)@` post-state of the receiver as a deref body effect, so the
-            // post-state reaches the loop preservation VC instead of being havoced.
-            self.apply_mut_self_post_state(func, args, state);
-            let pending_index_mut = self.record_pending_index_mut(func, args, destination, state);
+            self.apply_call_terminator(bb, func, args, destination, state);
+        }
+        // Every terminator that hands off memory, a `Drop` as much as a call.
+        self.forget_body_locals_written_at_terminator(bb, state);
+    }
 
-            if destination.projection.is_empty() {
-                let modeled = (!pending_index_mut).then(|| {
-                    // Option adapter/unwrap modeling first (#counter-cons-tail):
-                    // `as_mut`/`unwrap` specs are implication-style (no bare
-                    // `result == e` clause), so the generic spec path below
-                    // havocs them, severing call-chain tail advances like
-                    // `l = l.1.as_mut().unwrap()`. Env-gated during rollout.
-                    std::env::var_os("TRUST_WP_OFFLOOP")
-                        .and_then(|_| {
-                            self.try_model_option_adapter_result(func, args, &state.working_exprs)
-                        })
-                        .or_else(|| {
-                            self.try_model_call_result(
-                                func,
-                                args,
-                                destination.local,
-                                &state.working_exprs,
-                            )
-                        })
-                        .or_else(|| {
-                            self.try_model_index_read_result(
-                                func,
-                                args,
-                                destination.local,
-                                &state.working_exprs,
-                            )
-                        })
-                });
-                let modeled = modeled.flatten();
-                if let Some(result_expr) = modeled {
-                    state
-                        .working_exprs
-                        .insert(destination.local, result_expr.clone());
-                    if let Some(var_name) = self.local_to_name.get(&destination.local) {
-                        state.effects.insert(var_name.clone(), result_expr);
+    /// Give a call's destination the value its callee's contract states, and
+    /// record the premises that come with it (or the ones it cannot state).
+    ///
+    /// One definition for the body walk and for the loop condition's own call
+    /// (`condition_call_value`): the condition a VC assumes and the premises
+    /// stated about the value it reads must name the same thing.
+    pub(super) fn apply_call_terminator(
+        &self,
+        bb: BasicBlock,
+        func: &Operand<'tcx>,
+        args: &[rustc_span::Spanned<Operand<'tcx>>],
+        destination: &Place<'tcx>,
+        state: &mut BodyExtractionState,
+    ) {
+        // Model Seq ghost mutation methods (#1581)
+        let seq_ghost_modeled = self.apply_seq_ghost_mutation(func, args, state);
+        // Model `&mut self` mutators (push/insert/swap/...) by recording the
+        // `(^self)@` post-state of the receiver as a deref body effect, so the
+        // post-state reaches the loop preservation VC instead of being havoced.
+        let carried_clause = self.apply_mut_self_post_state(func, args, state);
+        let pending_index_mut = self.record_pending_index_mut(func, args, destination, state);
+
+        // A model is WHOLE when it states everything the callee's contract
+        // says about this call; `try_model_call_result` states one
+        // `result == e` clause and leaves the rest to the premise below.
+        let (modeled, whole_contract_modeled) = if !destination.projection.is_empty() {
+            (None, false)
+        } else if pending_index_mut {
+            (None, true)
+        } else if let Some(adapted) = std::env::var_os("TRUST_WP_OFFLOOP").and_then(|_| {
+            // Option adapter/unwrap modeling first (#counter-cons-tail):
+            // `as_mut`/`unwrap` specs are implication-style (no bare
+            // `result == e` clause), so the generic spec path below
+            // havocs them, severing call-chain tail advances like
+            // `l = l.1.as_mut().unwrap()`. Env-gated during rollout.
+            self.try_model_option_adapter_result(func, args, &state.working_exprs)
+        }) {
+            (Some(adapted), true)
+        } else if let Some(result) =
+            self.try_model_call_result(func, args, destination.local, &state.working_exprs)
+        {
+            (Some(result), false)
+        } else if let Some(read) =
+            self.try_model_index_read_result(func, args, destination.local, &state.working_exprs)
+        {
+            (Some(read), true)
+        } else {
+            (None, false)
+        };
+        let result_expr = if whole_contract_modeled || seq_ghost_modeled {
+            modeled
+        } else {
+            match self.call_postcondition_premise(
+                bb,
+                func,
+                args,
+                destination,
+                modeled.as_ref(),
+                carried_clause,
+                state,
+            ) {
+                CallPremise::Carried { result, facts } => {
+                    for fact in facts {
+                        if !state.call_facts.contains(&fact) {
+                            state.call_facts.push(fact);
+                        }
                     }
-                } else {
-                    state.working_exprs.remove(&destination.local);
-                    if let Some(var_name) = self.local_to_name.get(&destination.local) {
-                        state.effects.remove(var_name);
-                    }
+                    result
                 }
-            } else {
-                // Projected destination: havoc for soundness.
+                CallPremise::Dropped(premise) => {
+                    if !state.dropped_premises.contains(&premise) {
+                        state.dropped_premises.push(premise);
+                    }
+                    modeled
+                }
+            }
+        };
+
+        match result_expr.filter(|_| destination.projection.is_empty()) {
+            Some(result_expr) => {
+                state
+                    .working_exprs
+                    .insert(destination.local, result_expr.clone());
+                if let Some(var_name) = self.local_to_name.get(&destination.local) {
+                    state.effects.insert(var_name.clone(), result_expr);
+                }
+            }
+            None => {
+                // Unmodeled, or a projected destination: havoc for soundness.
                 state.working_exprs.remove(&destination.local);
                 if let Some(var_name) = self.local_to_name.get(&destination.local) {
                     state.effects.remove(var_name);
                 }
+            }
+        }
+    }
+
+    /// Forget the body-locals the terminator of `bb` may write behind the
+    /// walk; the call's own arguments and result were read above. A callee
+    /// handed an argument it may write through (a `&mut`, a raw pointer, a
+    /// value holding one, interior mutability) may write any lent body-local,
+    /// the callee's `^` being bound by no walk here; a `Drop`
+    /// or a call whose drop glue may write changes what
+    /// `locals_changed_by_handoff` names, the substitution walk's own answer
+    /// at the same terminator (D-140).
+    fn forget_body_locals_written_at_terminator(
+        &self,
+        bb: BasicBlock,
+        state: &mut BodyExtractionState,
+    ) {
+        let terminator = self.body.basic_blocks[bb].terminator();
+        if !matches!(
+            terminator.kind,
+            TerminatorKind::Call { .. } | TerminatorKind::Drop { .. }
+        ) {
+            return;
+        }
+        let Some(ctx) = self.call_spec_ctx else {
+            self.forget_lent_body_locals(state);
+            return;
+        };
+        let lends = matches!(&terminator.kind, TerminatorKind::Call { func, args, .. }
+        if crate::mir_analysis::extract::drop_glue_writes::call_may_write_through_args(
+            ctx.tcx, self.body, func, args,
+        ));
+        if lends {
+            self.forget_lent_body_locals(state);
+            return;
+        }
+        let changed = crate::mir_analysis::extract::drop_glue_writes::locals_changed_by_handoff(
+            ctx.tcx, self.body, bb, terminator,
+        );
+        if let Some(changed) = changed {
+            let born: Vec<Local> = changed
+                .into_iter()
+                .filter(|local| self.lent_body_locals.born.contains(local))
+                .collect();
+            self.forget_locals(state, &born);
+        }
+    }
+
+    /// Forget every lent body-local ([`lent_body_locals`]): a store through a
+    /// reference, or a callee handed one, may have written it.
+    fn forget_lent_body_locals(&self, state: &mut BodyExtractionState) {
+        let lent: Vec<Local> = self.lent_body_locals.lent.iter().copied().collect();
+        self.forget_locals(state, &lent);
+    }
+
+    /// A later read of a forgotten body-local is its name, which nothing
+    /// constrains, and its own effect is dropped.
+    fn forget_locals(&self, state: &mut BodyExtractionState, locals: &[Local]) {
+        for local in locals {
+            state.working_exprs.remove(local);
+            if let Some(var_name) = self.local_to_name.get(local) {
+                state.effects.remove(var_name);
             }
         }
     }
@@ -1217,7 +1524,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
 /// Whether a place projection is value-preserving for the cons-tail ADDRESS
 /// during the `try_model_cons_tail_reassignment` def-use walk: a bare local
 /// (no projection), a single `Deref` (box/raw-pointer unwrap), or a pure
-/// `Field`-only chain (the `Box -> Unique -> NonNull` internal field unwrap the
+/// `Field`-only chain (the `Box -> BoxRaw` internal field unwrap the
 /// MIR `Box` lowering emits). These steps all keep the SAME tail pointer; any
 /// other projection (e.g. `Index`, `Downcast` mid-chain, or a mix) could select
 /// a different value, so it is rejected (fail closed).

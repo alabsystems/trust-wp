@@ -35,7 +35,7 @@ fn expr_sort_display(sort: Option<&ExprSort>) -> Cow<'static, str> {
             "TypeParam({})",
             super::sort_intern::resolve_sort_name(*id)
         )),
-        Some(ExprSort::Float) => Cow::Borrowed("Float"),
+        Some(ExprSort::Float(width)) => Cow::Owned(format!("Float({})", width.rust_name())),
         None => Cow::Borrowed("_"),
     }
 }

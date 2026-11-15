@@ -76,6 +76,7 @@ mod logic_emit;
 mod marker_attrs;
 mod pearlite;
 mod snapshot_rewrite;
+mod spec_tc;
 mod transform;
 mod view_syntax;
 
@@ -139,7 +140,7 @@ pub fn variant(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// See `designs/2026-02-01-logic-functions.md` and Issue #153.
+/// See Issue #153.
 #[proc_macro_attribute]
 pub fn logic(attr: TokenStream, item: TokenStream) -> TokenStream {
     logic_emit::process_logic(&attr, item)
@@ -273,7 +274,10 @@ pub fn derive_default(input: TokenStream) -> TokenStream {
 
 /// Marks a block as ghost code (verification only, erased at compile time).
 ///
-/// See `designs/2026-02-01-ghost-code.md` and `designs/2026-02-02-ghost-macro-stable-rust.md`.
+/// The block is validated as ghost code and wrapped in `Ghost::new`. Under
+/// `cfg(trust_wp)` the driver sees the real block; otherwise it sits in an
+/// `if false` arm so it still type-checks on stable Rust while the runtime
+/// value is `Ghost::conjure()` and the block never executes.
 #[proc_macro]
 pub fn ghost(input: TokenStream) -> TokenStream {
     ghost_macros::expand_ghost(input)
@@ -281,7 +285,9 @@ pub fn ghost(input: TokenStream) -> TokenStream {
 
 /// Captures a snapshot of a value for proof purposes.
 ///
-/// See `designs/2026-02-01-snapshot-type.md`.
+/// The argument is normalised to the shape the driver's std specs expect
+/// (closures become `Mapping::from_closure`, unsuffixed integer literals lift
+/// to `Int` as in Creusot pearlite) before `Snapshot::capture` records it.
 #[proc_macro]
 pub fn snapshot(input: TokenStream) -> TokenStream {
     ghost_macros::expand_snapshot(input)
@@ -313,11 +319,11 @@ pub fn proof_assert(input: TokenStream) -> TokenStream {
     ghost_macros::expand_proof_assert(input)
 }
 
-/// The in-source authored-proof surface (design §3 L1): `proof!(by <tactic>)` or
+/// The in-source authored-proof surface: `proof!(by <tactic>)` or
 /// `proof!(assume [<axioms>], by <tactic>)`.
 ///
 /// Desugars to a reserved `trust-wp:proof_by:` marker using the `proof_assert!`
-/// mechanism. The production driver does not currently consume this marker, so
+/// mechanism. The production driver does not consume this marker, so
 /// this macro is an inert proof hint and cannot discharge an obligation.
 #[proc_macro]
 pub fn proof(input: TokenStream) -> TokenStream {
@@ -345,7 +351,9 @@ pub fn __trust_wp_trusted_proof_assert(input: TokenStream) -> TokenStream {
 
 /// Embeds a specification-only expression using pearlite DSL syntax.
 ///
-/// See `designs/2026-02-02-pearlite-dsl.md` and Issue #245.
+/// Pearlite syntax (`x@`, `forall<..>`, `exists<..>`, `==>`) is preprocessed
+/// and then validated by the same path as contract clauses, so `result` and
+/// `old(..)` are rejected here as they are in a `requires`. Issue #245.
 #[proc_macro]
 pub fn pearlite(input: TokenStream) -> TokenStream {
     let expr = match pearlite::validate_pearlite_expr(&input) {
@@ -359,15 +367,12 @@ pub fn pearlite(input: TokenStream) -> TokenStream {
     pearlite::expand_pearlite(&expr).into()
 }
 
-// R1 (two-language spec surface): the `verus!{}` block front-end is
-// deleted — zero consumers; the Verus surface is retired per the ratified
-// two-language spec-surface design (§3.2/R1). The native surface is
-// first-class trustc clauses (R3); the Verus corpus survives as engine
-// test material.
-
 /// Specifies contracts for external (unowned) functions.
 ///
-/// See `designs/2026-02-01-extern-spec.md` and Issue #160.
+/// Generic types take turbofish syntax (`Option::<T>`) so `<` cannot be read
+/// as a comparison; a method body, when given, expands into a separately
+/// verified `_body` function proved against the method's own contract.
+/// Issue #160.
 #[proc_macro]
 pub fn extern_spec(input: TokenStream) -> TokenStream {
     let parsed = match syn::parse(input) {

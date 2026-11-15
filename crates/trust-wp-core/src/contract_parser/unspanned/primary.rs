@@ -130,7 +130,9 @@ impl ContractParser<'_> {
 
         // Fully-qualified associated type/const path: `<Type as Trait>::CONST`
         // e.g., `<I3<T> as Nat>::VALUE`, `<T as ::std::mem::SizedTypeProperties>::IS_ZST`
+        let path_at = self.position;
         if let Some(qualified) = self.try_parse_qualified_path() {
+            self.refuse_shadowed_path(&qualified, path_at)?;
             // After parsing the qualified path, check for a function call `(args...)`.
             // Logic function bodies like `<Self as Foo>::f()` serialize the qualified
             // call via `quote!(...).to_string()`. (#352)
@@ -152,7 +154,9 @@ impl ContractParser<'_> {
         }
 
         // Identifier (variable, path like i32::MIN, or logic function call)
+        let path_at = self.position;
         if let Some(ident) = self.try_parse_identifier() {
+            self.refuse_shadowed_path(&ident, path_at)?;
             let turbofish_args = self.try_parse_turbofish_args()?;
 
             self.skip_whitespace();
@@ -163,24 +167,7 @@ impl ContractParser<'_> {
                 if !self.try_consume(")") {
                     return Err(self.error("expected ')' after function arguments"));
                 }
-                // Recognize `view(expr)` as a structural View node rather than
-                // a LogicFnCall. The `@` postfix operator (e.g., `y@`) is
-                // transformed to `view(y)` by the view-syntax macro, but the
-                // contract parser only produces `PureExpr::View` for the native
-                // `@` syntax. Without this, `view(y)` falls through to the
-                // LogicFnCall catch-all in sort inference, which fires the
-                // demoting `SortFallbackToIntFromLogicFn` counter and causes
-                // invariant/postcondition proofs to be demoted to Unknown.
-                // (#2671)
-                if ident == "view" && args.len() == 1 {
-                    return Ok(PureExpr::View(Arc::new(args.remove(0))));
-                }
-                // Similarly, `final_value(expr)` from `^expr` syntax should
-                // produce a structural Final node. (#2671)
-                if ident == "final_value" && args.len() == 1 {
-                    return Ok(PureExpr::Final(Arc::new(args.remove(0))));
-                }
-                return Ok(PureExpr::LogicFnCall { name: ident, args });
+                return self.call_or_reference_form(ident, args);
             }
             // Macro-style call: identifier!(...), identifier![...], identifier!{...}
             if let Some(open) = self.peek_macro_invocation_delimiter() {

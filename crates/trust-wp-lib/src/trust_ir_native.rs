@@ -15,12 +15,13 @@ use std::{fmt, fmt::Write};
 use serde_json::{Map, Value};
 use trust_wp_core::{
     contract_parser::parse_contract,
-    formula::{BinOp, PureExpr},
+    formula::{BinOp, ExprSort, PureExpr},
     verify_bundle::{
-        BundleNativeOrigin, BundleNativeReplayIdentity, BundleNativeToolIdentity,
-        BundleNativeVerificationMode, BundleProofAtom, BundleProofAtomRole, BundleProofContext,
-        BundleTmirCompilerFactRef, BundleTmirObligationCause, BundleTmirObligationSource,
-        BundleTmirSourceSpan, EvidenceArtifact, EvidenceArtifactKind,
+        native_claim_names, BundleNativeOrigin, BundleNativeReplayIdentity,
+        BundleNativeToolIdentity, BundleNativeVerificationMode, BundleProofAtom,
+        BundleProofAtomRole, BundleProofContext, BundleTmirCompilerFactRef,
+        BundleTmirObligationCause, BundleTmirObligationSource, BundleTmirSourceSpan,
+        EvidenceArtifact, EvidenceArtifactKind, NativeClaimName, NativeNameUse, NativeUseSort,
         TMIR_NATIVE_ORIGIN_SCHEMA_PREFIX, TRUST_FORMULA_CLAIM_SCHEMA_VERSION,
     },
 };
@@ -122,6 +123,47 @@ pub enum TrustIrNativeBundleError {
         source_cause: &'static str,
     },
 
+    /// The obligation kind has no admission rule in this bridge. Refused before
+    /// verification: a verdict must never attach to a kind whose meaning this
+    /// verifier cannot state.
+    #[error(
+        "tMIR trust-wp request {request_id} obligation {obligation_id} has kind `{kind}`, which trust-wp does not admit: {reason}"
+    )]
+    UnsupportedObligationKind {
+        request_id: u32,
+        obligation_id: u32,
+        kind: String,
+        reason: TrustIrUnsupportedObligationKindReason,
+    },
+
+    /// The obligation names a temporal property it discharges. trust-wp has no
+    /// spec-machine or temporal model, so no verdict it produces can be about
+    /// that property; refused whether or not the reference resolves.
+    #[error(
+        "tMIR trust-wp request {request_id} obligation {obligation_id} carries a spec backref to temporal property {temporal:?} of machine {machine:?}; trust-wp has no temporal or spec-machine model, so it discharges no temporal property"
+    )]
+    UnsupportedSpecObligation {
+        request_id: u32,
+        obligation_id: u32,
+        machine: String,
+        temporal: String,
+    },
+
+    /// A clause binding states a meaning for one of the formula's names that
+    /// trust-wp cannot read faithfully. Refused before verification: proving
+    /// the formula under trust-wp's own reading of the name would attach a
+    /// verdict to a claim the binding says is a different one.
+    #[error(
+        "tMIR trust-wp request {request_id} obligation {obligation_id} {carrier} binds `{name}` in a way trust-wp does not admit: {reason}"
+    )]
+    UnsupportedClauseBinding {
+        request_id: u32,
+        obligation_id: u32,
+        carrier: TrustIrClauseCarrier,
+        name: String,
+        reason: TrustIrUnsupportedClauseBindingReason,
+    },
+
     /// The obligation source names a monomorphization without digest-bound fact evidence.
     #[error(
         "tMIR trust-wp request {request_id} obligation {obligation_id} monomorphization {monomorphization_id} is not bound by a matching compiler fact digest"
@@ -216,6 +258,171 @@ impl fmt::Display for TrustIrUnsupportedModeReason {
     }
 }
 
+/// Typed reason why a tMIR obligation kind cannot enter native replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustIrUnsupportedObligationKindReason {
+    /// `ObligationKind::Custom`: its namespace is authority-bearing, to be
+    /// admitted from a pinned list, and this bridge pins none.
+    UnpinnedCustomNamespace,
+    /// A kind this bridge does not name. `ObligationKind` is
+    /// `#[non_exhaustive]`, so the compiler cannot force a decision when
+    /// trust-ir grows one; refusing is the decision until someone makes it.
+    UnknownKind,
+}
+
+impl fmt::Display for TrustIrUnsupportedObligationKindReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnpinnedCustomNamespace => formatter.write_str(
+                "a producer-namespaced kind is admitted only from a pinned namespace list, and trust-wp pins none",
+            ),
+            Self::UnknownKind => {
+                formatter.write_str("the kind is newer than this bridge and has no admission rule")
+            }
+        }
+    }
+}
+
+/// Which formula of an obligation carried a refused clause binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustIrClauseCarrier {
+    /// The obligation's own formula, the one the verdict is about.
+    Obligation,
+    /// A replay-context atom attached to the obligation's proof context.
+    ReplayAtom { atom_id: u32 },
+}
+
+impl fmt::Display for TrustIrClauseCarrier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Obligation => formatter.write_str("formula"),
+            Self::ReplayAtom { atom_id } => write!(formatter, "replay atom {atom_id}"),
+        }
+    }
+}
+
+/// Typed reason why a tMIR clause binding cannot enter native replay.
+///
+/// trust-wp reads every free name of a formula as an unbounded mathematical
+/// integer or a boolean, over the parameters and results of the request's
+/// function. A binding that says a name means anything else is refused rather
+/// than read that way: `x + 1 > x` is valid over `Int` and false at
+/// `u64::MAX`, so dropping a `BitVec(64)` turns a false clause into a proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustIrUnsupportedClauseBindingReason {
+    /// `SpecVar` / `SpecVarNext`: a spec-machine state variable. trust-wp has
+    /// no spec model, and the index must never be read as the parameter that
+    /// shares the number.
+    SpecVariablePlace { place: trust_ir::proof::ClausePlace },
+    /// The place has no IR type on the request's function.
+    UnresolvedPlace {
+        place: trust_ir::proof::ClausePlace,
+        error: trust_ir::proof::clause_typing::ClauseTypingError,
+    },
+    /// The request's function has a signature that records source ABI
+    /// placement (`FuncTy::abi`). Its lowered parameters and results are then
+    /// carriers, not the function's source parameters and results: one may
+    /// hold part of a source value, padding, a hidden result buffer or the
+    /// pointer an indirect argument travels by, and a source argument may
+    /// have none. trust-wp reads a place as the whole value of one source
+    /// parameter or result and models no placement (D-191).
+    PlacedSignature { place: trust_ir::proof::ClausePlace },
+    /// A sort trust-wp does not model; reading the name as `Int` or `Bool`
+    /// would strip the width, format or structure the clause is stated in.
+    UnmodeledSort { sort: trust_ir::proof::ClauseSort },
+    /// trust-ir does not class the sort as a faithful reading of the place's
+    /// IR type.
+    SortDoesNotAdmitPlaceType {
+        sort: trust_ir::proof::ClauseSort,
+        ty: trust_ir::Ty,
+    },
+    /// The formula's goal reads no free name of this spelling: the name is
+    /// bound inside the formula (a `let`, a quantifier), declared by a
+    /// trust-formula payload but never read by its body, or not in the
+    /// formula at all, so the binding would say what something the claim is
+    /// not about means. The same rule holds in both claim formats.
+    NotAFormulaName,
+    /// The formula declares the name itself, at a sort the binding contradicts.
+    FormulaDeclaresOtherSort {
+        sort: trust_ir::proof::ClauseSort,
+        declared: String,
+    },
+    /// The formula's uses read the name at a sort the binding contradicts: an
+    /// operand of arithmetic or of an ordering is an `Int`, an operand of a
+    /// connective a `Bool`, the two sides of an equality one sort, and a name
+    /// no use fixes the `Int` an unsorted name is read as. This is the rule a
+    /// pure-expr payload, which declares no sorts, is held to.
+    FormulaUsesOtherSort {
+        sort: trust_ir::proof::ClauseSort,
+        used: String,
+    },
+    /// The formula's uses read the name at two different sorts, so no one
+    /// sort is its reading and no binding can agree with it.
+    FormulaUsesConflictingSorts { first: String, second: String },
+    /// The name is bound more than once, so it has two readings.
+    DuplicateName,
+    /// The obligation is scoped to a function other than the request's, so
+    /// its places have no one owning signature to resolve against.
+    OwningFunctionMismatch {
+        obligation_function: u32,
+        request_function: u32,
+    },
+}
+
+impl fmt::Display for TrustIrUnsupportedClauseBindingReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SpecVariablePlace { place } => write!(
+                formatter,
+                "{place:?} is a spec-machine state variable, and trust-wp has no temporal or spec-machine model"
+            ),
+            Self::UnresolvedPlace { place, error } => {
+                write!(formatter, "{place:?} does not resolve: {error}")
+            }
+            Self::PlacedSignature { place } => write!(
+                formatter,
+                "{place:?} is a lowered slot of a signature that records source ABI placement, \
+                 which trust-wp does not model: the slot may carry part of a source value, \
+                 padding, a hidden result buffer or an indirect argument's pointer"
+            ),
+            Self::UnmodeledSort { sort } => write!(
+                formatter,
+                "sort {sort:?} is outside trust-wp's model, which reads every name as an unbounded Int or a Bool"
+            ),
+            Self::SortDoesNotAdmitPlaceType { sort, ty } => write!(
+                formatter,
+                "sort {sort:?} is not a faithful reading of the place's IR type {ty}"
+            ),
+            Self::NotAFormulaName => formatter.write_str(
+                "the formula's goal reads no free name of this spelling; a name it binds itself, or declares and never reads, is not one",
+            ),
+            Self::FormulaDeclaresOtherSort { sort, declared } => write!(
+                formatter,
+                "the binding says sort {sort:?} but the formula declares the name at sort `{declared}`"
+            ),
+            Self::FormulaUsesOtherSort { sort, used } => write!(
+                formatter,
+                "the binding says sort {sort:?} but the formula's uses read the name as {used}"
+            ),
+            Self::FormulaUsesConflictingSorts { first, second } => write!(
+                formatter,
+                "the formula's uses read the name as both {first} and {second}"
+            ),
+            Self::DuplicateName => formatter.write_str("the name is bound more than once"),
+            Self::OwningFunctionMismatch {
+                obligation_function,
+                request_function,
+            } => write!(
+                formatter,
+                "the obligation is scoped to function {obligation_function} but requested for function {request_function}"
+            ),
+        }
+    }
+}
+
 /// Convert every typed tMIR trust-wp request into trust-wp verify-bundle requests.
 ///
 /// trust-vc and trust-mc requests are ignored. Each trust-wp request becomes one
@@ -229,7 +436,37 @@ pub fn trust_ir_native_bundle_to_verify_requests(
     bundle: &trust_ir::NativeVerificationBundle,
 ) -> Result<Vec<VerifyBundleRequest>, TrustIrNativeBundleError> {
     validate_tmir_bundle(bundle)?;
+    convert_native_requests(bundle, BindingModel::FormulaOnly)
+}
 
+/// Body interpretation additionally proves the bounded unsigned domain. This
+/// entry is private so formula-only callers cannot discard that obligation.
+pub(crate) fn body_native_requests(
+    bundle: &trust_ir::NativeVerificationBundle,
+) -> Result<Vec<VerifyBundleRequest>, TrustIrNativeBundleError> {
+    validate_tmir_bundle(bundle)?;
+    convert_native_requests(bundle, BindingModel::BodyScalar)
+}
+
+pub(crate) fn body_native_requests_validated(
+    admitted: &trust_ir::ValidatedNativeBundle<'_>,
+) -> Result<Vec<VerifyBundleRequest>, TrustIrNativeBundleError> {
+    let bundle = admitted.bundle();
+    validate_trust_wp_request_provenance(bundle)?;
+    validate_trust_wp_lineage_roots(bundle)?;
+    convert_native_requests(bundle, BindingModel::BodyScalar)
+}
+
+#[derive(Clone, Copy)]
+enum BindingModel {
+    FormulaOnly,
+    BodyScalar,
+}
+
+fn convert_native_requests(
+    bundle: &trust_ir::NativeVerificationBundle,
+    model: BindingModel,
+) -> Result<Vec<VerifyBundleRequest>, TrustIrNativeBundleError> {
     let mut requests = Vec::new();
     for native_request in &bundle.requests {
         if let trust_ir::NativeVerificationRequest::TrustWp(trust_wp_request) = native_request {
@@ -237,6 +474,7 @@ pub fn trust_ir_native_bundle_to_verify_requests(
                 bundle,
                 native_request,
                 trust_wp_request,
+                model,
             )?);
         }
     }
@@ -494,7 +732,7 @@ fn decode_sha256_hex(
     }
 
     let mut bytes = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = decode_hex_nibble(chunk[0]).ok_or_else(|| {
             TrustIrNativeBundleError::InvalidResponseEvidence {
                 request_id: request_id.index(),
@@ -673,6 +911,7 @@ fn tmir_trust_wp_request_to_verify_bundle(
     bundle: &trust_ir::NativeVerificationBundle,
     native_request: &trust_ir::NativeVerificationRequest,
     request: &trust_ir::TrustWpNativeRequest,
+    model: BindingModel,
 ) -> Result<VerifyBundleRequest, TrustIrNativeBundleError> {
     if !is_supported_trust_wp_mode(request.mode) {
         return Err(TrustIrNativeBundleError::UnsupportedTrustWpMode {
@@ -730,15 +969,18 @@ fn tmir_trust_wp_request_to_verify_bundle(
                     request_id: request.id.index(),
                     obligation_id: obligation_id.index(),
                 })?;
-        let claim_format = claim_format_for_tmir_schema(formula.schema.as_str());
-        let claim = BundleClaim::new(claim_format.clone(), formula.payload.clone());
+        let obligation_kind =
+            admitted_obligation_kind(request, obligation, function.name.as_str())?;
+        admit_obligation_clauses(&bundle.module, request, obligation, formula, model)?;
+        let claim = native_claim_for_tmir(formula)?;
+        let claim_format = claim.format.clone();
         let mut bundle_obligation = BundleObligation::new(
             {
                 let request_id = request.id.index();
                 let obligation_id = obligation_id.index();
                 format!("trust-ir-r{request_id}-proof-{obligation_id}")
             },
-            obligation_kind_from_tmir(&obligation.kind, function.name.as_str()),
+            obligation_kind,
             function.name.clone(),
             claim,
         )
@@ -897,15 +1139,26 @@ fn tmir_obligation_source_cause_matches_kind(
         | trust_ir::ObligationKind::BoundsCheck => {
             matches!(source_cause, trust_ir::NativeObligationCause::Panic)
         }
+        // No single source cause is canonical for these kinds, and
+        // trust-wp-core's native gate admits any cause for the core kinds they
+        // map to (`Termination`, `Other(_)`). The producer files
+        // `GiveBackRefinement` under `BorrowCheck` and sends `Termination` and
+        // `Ownership` through its generic fallback, so pinning one cause here
+        // would refuse well-formed bundles without making a verdict sounder.
         trust_ir::ObligationKind::LoopInvariant
         | trust_ir::ObligationKind::TypeInvariant
-        | trust_ir::ObligationKind::RefinementType => true,
+        | trust_ir::ObligationKind::RefinementType
+        | trust_ir::ObligationKind::GiveBackRefinement
+        | trust_ir::ObligationKind::Termination
+        | trust_ir::ObligationKind::Ownership => true,
         trust_ir::ObligationKind::TemporalSafety | trust_ir::ObligationKind::Liveness => {
             matches!(source_cause, trust_ir::NativeObligationCause::Temporal)
         }
-        // `ObligationKind` is `#[non_exhaustive]`; accept an unknown future kind
-        // conservatively (do not reject a well-formed bundle on a new kind).
-        _ => true,
+        // `obligation_kind_from_tmir` refuses both before this check runs; a
+        // kind with no admission rule matches no cause, so neither can pass
+        // here by being reached another way.
+        trust_ir::ObligationKind::Custom { .. } => false,
+        _ => false,
     }
 }
 
@@ -953,6 +1206,26 @@ fn claim_format_for_tmir_schema(schema: &str) -> BundleClaimFormat {
     }
 }
 
+fn native_claim_for_tmir(
+    formula: &trust_ir::ProofFormula,
+) -> Result<BundleClaim, TrustIrNativeBundleError> {
+    if formula.schema == "trust-types.Formula@1" {
+        let predicate = crate::trust_ir_body::decode_shared_boolean_formula(&formula.payload)
+            .map_err(|error| TrustIrNativeBundleError::InvalidNativeBundle {
+                errors: vec![error.to_string()],
+            })?;
+        return crate::trust_ir_body::boolean_claim(&predicate).map_err(|error| {
+            TrustIrNativeBundleError::InvalidNativeBundle {
+                errors: vec![error.to_string()],
+            }
+        });
+    }
+    Ok(BundleClaim::new(
+        claim_format_for_tmir_schema(&formula.schema),
+        formula.payload.clone(),
+    ))
+}
+
 const fn is_supported_trust_wp_mode(mode: trust_ir::TrustWpVerificationMode) -> bool {
     matches!(
         mode,
@@ -985,11 +1258,365 @@ const fn tmir_trust_wp_mode(mode: trust_ir::TrustWpVerificationMode) -> TrustIrT
     }
 }
 
+fn admitted_obligation_kind(
+    request: &trust_ir::TrustWpNativeRequest,
+    obligation: &trust_ir::ProofObligation,
+    function_name: &str,
+) -> Result<BundleObligationKind, TrustIrNativeBundleError> {
+    obligation_kind_from_tmir(&obligation.kind, function_name).map_err(|reason| {
+        TrustIrNativeBundleError::UnsupportedObligationKind {
+            request_id: request.id.index(),
+            obligation_id: obligation.id.index(),
+            kind: obligation.kind.to_string(),
+            reason,
+        }
+    })
+}
+
+/// The spec backref and every clause binding the obligation's verdict would
+/// rest on: its own formula's, and those of the replay atoms that enter its
+/// proof context.
+fn admit_obligation_clauses(
+    module: &trust_ir::Module,
+    request: &trust_ir::TrustWpNativeRequest,
+    obligation: &trust_ir::ProofObligation,
+    formula: &trust_ir::ProofFormula,
+    model: BindingModel,
+) -> Result<(), TrustIrNativeBundleError> {
+    refuse_spec_obligation(request, obligation)?;
+    admit_clause_bindings(
+        module,
+        request,
+        obligation,
+        formula,
+        TrustIrClauseCarrier::Obligation,
+        model,
+    )?;
+    for atom in replay_atoms_for_obligation(request, obligation.id) {
+        admit_clause_bindings(
+            module,
+            request,
+            obligation,
+            &atom.formula,
+            TrustIrClauseCarrier::ReplayAtom {
+                atom_id: atom.id.index(),
+            },
+            BindingModel::FormulaOnly,
+        )?;
+    }
+    Ok(())
+}
+
+fn refuse_spec_obligation(
+    request: &trust_ir::TrustWpNativeRequest,
+    obligation: &trust_ir::ProofObligation,
+) -> Result<(), TrustIrNativeBundleError> {
+    match &obligation.spec {
+        None => Ok(()),
+        Some(spec) => Err(TrustIrNativeBundleError::UnsupportedSpecObligation {
+            request_id: request.id.index(),
+            obligation_id: obligation.id.index(),
+            machine: spec.machine.clone(),
+            temporal: spec.temporal.clone(),
+        }),
+    }
+}
+
+/// The sorts trust-wp reads a formula name in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeledSort {
+    /// An unbounded mathematical integer.
+    Int,
+    Bool,
+}
+
+/// No wildcard: a sort trust-ir adds must be classified here before this
+/// crate builds, never admitted by default.
+fn modeled_sort(sort: &trust_ir::proof::ClauseSort) -> Option<ModeledSort> {
+    use trust_ir::proof::ClauseSort;
+    match sort {
+        ClauseSort::Int => Some(ModeledSort::Int),
+        ClauseSort::Bool => Some(ModeledSort::Bool),
+        // No fixed-width, floating or structured model: each of these would be
+        // read as an unbounded Int or a Bool, which is the width strip.
+        ClauseSort::BitVec(_)
+        | ClauseSort::Float { .. }
+        | ClauseSort::RoundingMode
+        | ClauseSort::Array(..)
+        | ClauseSort::Datatype { .. } => None,
+    }
+}
+
+/// Every binding of `formula` must name a name the formula's goal reads free,
+/// and a place of the request's function that resolves, at a sort trust-wp
+/// models, that trust-ir classes as a faithful reading of the place's IR type,
+/// and that the formula itself does not contradict, by declaration or by use.
+/// An empty `bindings` passes: trust-wp then states only what the formula's
+/// own declarations say.
+fn body_binding_sort(
+    model: BindingModel,
+    sort: &trust_ir::proof::ClauseSort,
+    ty: &trust_ir::Ty,
+    place: trust_ir::proof::ClausePlace,
+) -> Option<ModeledSort> {
+    use trust_ir::proof::ClausePlace;
+
+    match (model, sort, ty, place) {
+        // This is an integer representation of a bounded unsigned body value,
+        // not formula-only bitvector semantics. The body pass supplies
+        // and proves its domain, and admits no wrapping arithmetic.
+        (
+            BindingModel::BodyScalar,
+            trust_ir::proof::ClauseSort::BitVec(8),
+            trust_ir::Ty::U8,
+            ClausePlace::Param { .. } | ClausePlace::ResultSlot { index: 0 },
+        )
+        | (
+            BindingModel::BodyScalar,
+            trust_ir::proof::ClauseSort::BitVec(32),
+            trust_ir::Ty::U32,
+            ClausePlace::Param { .. } | ClausePlace::ResultSlot { index: 0 },
+        )
+        | (
+            BindingModel::BodyScalar,
+            trust_ir::proof::ClauseSort::BitVec(64),
+            trust_ir::Ty::U64,
+            ClausePlace::Param { .. } | ClausePlace::ResultSlot { index: 0 },
+        ) => Some(ModeledSort::Int),
+        _ => modeled_sort(sort),
+    }
+}
+
+fn admit_clause_bindings(
+    module: &trust_ir::Module,
+    request: &trust_ir::TrustWpNativeRequest,
+    obligation: &trust_ir::ProofObligation,
+    formula: &trust_ir::ProofFormula,
+    carrier: TrustIrClauseCarrier,
+    model: BindingModel,
+) -> Result<(), TrustIrNativeBundleError> {
+    use trust_ir::proof::{
+        clause_typing::{clause_sort_admits, resolve_clause_place},
+        ClausePlace,
+    };
+
+    let refuse = |name: &str, reason: TrustIrUnsupportedClauseBindingReason| {
+        TrustIrNativeBundleError::UnsupportedClauseBinding {
+            request_id: request.id.index(),
+            obligation_id: obligation.id.index(),
+            carrier,
+            name: name.to_string(),
+            reason,
+        }
+    };
+    // The names the claim is stated over, read by the decoder core proves it
+    // with.
+    let names = native_claim_names(&native_claim_for_tmir(formula)?);
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, binding) in &formula.bindings {
+        if let Some(obligation_function) = obligation.function {
+            if obligation_function != request.function {
+                return Err(refuse(
+                    name,
+                    TrustIrUnsupportedClauseBindingReason::OwningFunctionMismatch {
+                        obligation_function: obligation_function.index(),
+                        request_function: request.function.index(),
+                    },
+                ));
+            }
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(refuse(
+                name,
+                TrustIrUnsupportedClauseBindingReason::DuplicateName,
+            ));
+        }
+        let claim_name =
+            formula_claim_name(names.as_deref(), name).map_err(|reason| refuse(name, reason))?;
+
+        // No wildcard: a place trust-ir adds must be classified here before
+        // this crate builds. Everything but the spec places goes to trust-ir's
+        // own resolver, which refuses the ambient world (un-epoched or at
+        // either epoch), `Unwind` and `Value` itself. The v62 entry pointee of
+        // a reference parameter (`ParamPointeeEntry`, `*x` at entry) is typed
+        // there against the referent `T`, and refused on a parameter that is
+        // not `&T` / `&mut T`, as `MutParamExit` is for one that is not `&mut`.
+        match binding.place {
+            ClausePlace::SpecVar { .. } | ClausePlace::SpecVarNext { .. } => {
+                return Err(refuse(
+                    name,
+                    TrustIrUnsupportedClauseBindingReason::SpecVariablePlace {
+                        place: binding.place,
+                    },
+                ));
+            }
+            ClausePlace::Param { .. }
+            | ClausePlace::ResultSlot { .. }
+            | ClausePlace::MutParamExit { .. }
+            | ClausePlace::ParamPointeeEntry { .. }
+            | ClausePlace::World
+            | ClausePlace::WorldPre
+            | ClausePlace::WorldPost
+            | ClausePlace::Unwind
+            | ClausePlace::Value(_) => {}
+        }
+        let ty =
+            resolve_clause_place(module, request.function, &binding.place).map_err(|error| {
+                refuse(
+                    name,
+                    TrustIrUnsupportedClauseBindingReason::UnresolvedPlace {
+                        place: binding.place,
+                        error,
+                    },
+                )
+            })?;
+        // The resolver types a place by the lowered signature's slot alone.
+        // That slot is the source parameter or result only while the
+        // signature records no ABI placement (D-191).
+        if owning_signature_records_abi_placement(module, request.function) {
+            return Err(refuse(
+                name,
+                TrustIrUnsupportedClauseBindingReason::PlacedSignature {
+                    place: binding.place,
+                },
+            ));
+        }
+
+        let sort = body_binding_sort(model, &binding.sort, &ty, binding.place);
+        let Some(sort) = sort else {
+            return Err(refuse(
+                name,
+                TrustIrUnsupportedClauseBindingReason::UnmodeledSort {
+                    sort: binding.sort.clone(),
+                },
+            ));
+        };
+        // U8, U32 and U64 have fixed widths independent of the target pointer width.
+        // Pointer-sized and aggregate sorts remain outside this model.
+        if !clause_sort_admits(&binding.sort, &ty, None) {
+            return Err(refuse(
+                name,
+                TrustIrUnsupportedClauseBindingReason::SortDoesNotAdmitPlaceType {
+                    sort: binding.sort.clone(),
+                    ty,
+                },
+            ));
+        }
+        if let Some(claim_name) = claim_name {
+            admit_claim_name_reading(claim_name, &binding.sort, sort)
+                .map_err(|reason| refuse(name, reason))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the signature of `function` records source ABI placement. Asked
+/// only after `resolve_clause_place` resolved a place on `function`, so it is
+/// the one function of that id and its signature resolves; a lookup that
+/// fails anyway answers `true`, which refuses.
+fn owning_signature_records_abi_placement(
+    module: &trust_ir::Module,
+    function: trust_ir::FuncId,
+) -> bool {
+    module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == function)
+        .and_then(|candidate| module.func_type(candidate.ty))
+        .is_none_or(|signature| signature.abi.is_some())
+}
+
+/// The name of the formula's goal that `name` binds; a name the goal does not
+/// read free is refused. With no names to read (`None`) the claim is one core
+/// will not prove, so no binding on it can reach a verdict and every name
+/// passes.
+fn formula_claim_name<'a>(
+    names: Option<&'a [NativeClaimName]>,
+    name: &str,
+) -> Result<Option<&'a NativeClaimName>, TrustIrUnsupportedClauseBindingReason> {
+    let Some(names) = names else {
+        return Ok(None);
+    };
+    names
+        .iter()
+        .find(|claim_name| claim_name.name == name)
+        .map(Some)
+        .ok_or(TrustIrUnsupportedClauseBindingReason::NotAFormulaName)
+}
+
+/// A binding at `sort` must agree with the formula's own reading of the name:
+/// its declaration, when it has one, and every use of it in the goal.
+fn admit_claim_name_reading(
+    claim_name: &NativeClaimName,
+    clause_sort: &trust_ir::proof::ClauseSort,
+    sort: ModeledSort,
+) -> Result<(), TrustIrUnsupportedClauseBindingReason> {
+    if let Some(declared) = &claim_name.declared {
+        if declared_modeled_sort(declared) != Some(sort) {
+            return Err(
+                TrustIrUnsupportedClauseBindingReason::FormulaDeclaresOtherSort {
+                    sort: clause_sort.clone(),
+                    declared: declared.to_string(),
+                },
+            );
+        }
+    }
+    let uses_other_sort =
+        |used: String| TrustIrUnsupportedClauseBindingReason::FormulaUsesOtherSort {
+            sort: clause_sort.clone(),
+            used,
+        };
+    match &claim_name.used {
+        NativeNameUse::Sort(used) => {
+            if used_modeled_sort(used) != Some(sort) {
+                return Err(uses_other_sort(used.to_string()));
+            }
+        }
+        NativeNameUse::Unfixed => {
+            if sort != ModeledSort::Int {
+                return Err(uses_other_sort(
+                    "Int, the reading of a name no use gives a sort".to_string(),
+                ));
+            }
+        }
+        NativeNameUse::Conflicting(first, second) => {
+            return Err(
+                TrustIrUnsupportedClauseBindingReason::FormulaUsesConflictingSorts {
+                    first: first.to_string(),
+                    second: second.to_string(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sort a use reads a name at, as one trust-wp models. No wildcard: a
+/// reading core adds must be classified here before this crate builds.
+fn used_modeled_sort(used: &NativeUseSort) -> Option<ModeledSort> {
+    match used {
+        NativeUseSort::Int => Some(ModeledSort::Int),
+        NativeUseSort::Bool => Some(ModeledSort::Bool),
+        NativeUseSort::Other(_) => None,
+    }
+}
+
+/// The sort a formula declares a name at, as one trust-wp models; any other
+/// declared sort agrees with no binding trust-wp admits.
+fn declared_modeled_sort(declared: &ExprSort) -> Option<ModeledSort> {
+    match declared {
+        ExprSort::Int => Some(ModeledSort::Int),
+        ExprSort::Bool => Some(ModeledSort::Bool),
+        _ => None,
+    }
+}
+
 fn obligation_kind_from_tmir(
     kind: &trust_ir::ObligationKind,
     function_name: &str,
-) -> BundleObligationKind {
-    match kind {
+) -> Result<BundleObligationKind, TrustIrUnsupportedObligationKindReason> {
+    Ok(match kind {
         trust_ir::ObligationKind::Precondition => BundleObligationKind::Precondition {
             callee: function_name.to_string(),
         },
@@ -1023,10 +1650,16 @@ fn obligation_kind_from_tmir(
         trust_ir::ObligationKind::BoundsCheck => {
             BundleObligationKind::Other("bounds_check".to_string())
         }
-        // `ObligationKind` is `#[non_exhaustive]`; an unknown future kind is
-        // labeled generically rather than panicking.
-        _ => BundleObligationKind::Other("unknown".to_string()),
-    }
+        trust_ir::ObligationKind::GiveBackRefinement => {
+            BundleObligationKind::Other("give_back_refinement".to_string())
+        }
+        trust_ir::ObligationKind::Termination => BundleObligationKind::Termination,
+        trust_ir::ObligationKind::Ownership => BundleObligationKind::Other("ownership".to_string()),
+        trust_ir::ObligationKind::Custom { .. } => {
+            return Err(TrustIrUnsupportedObligationKindReason::UnpinnedCustomNamespace);
+        }
+        _ => return Err(TrustIrUnsupportedObligationKindReason::UnknownKind),
+    })
 }
 
 fn tmir_obligation_kind_label(kind: &trust_ir::ObligationKind) -> &'static str {
@@ -1045,7 +1678,11 @@ fn tmir_obligation_kind_label(kind: &trust_ir::ObligationKind) -> &'static str {
         // panic-class kinds.
         trust_ir::ObligationKind::ArithmeticSafety => "arithmetic_safety",
         trust_ir::ObligationKind::BoundsCheck => "bounds_check",
-        // `ObligationKind` is `#[non_exhaustive]`; unknown future kinds.
+        trust_ir::ObligationKind::GiveBackRefinement => "give_back_refinement",
+        trust_ir::ObligationKind::Termination => "termination",
+        trust_ir::ObligationKind::Ownership => "ownership",
+        trust_ir::ObligationKind::Custom { .. } => "custom",
+        // `ObligationKind` is `#[non_exhaustive]`; a diagnostic label only.
         _ => "unknown",
     }
 }
@@ -1074,6 +1711,7 @@ const fn producer_name(producer: trust_ir::NativeBundleProducer) -> &'static str
         trust_ir::NativeBundleProducer::TSwift => "tSwift",
         trust_ir::NativeBundleProducer::TC => "tC",
         trust_ir::NativeBundleProducer::TrustIr => "TrustIr",
+        trust_ir::NativeBundleProducer::Clean => "Clean",
     }
 }
 
@@ -1356,20 +1994,28 @@ fn bundle_tmir_other_compiler_fact_ref(
     BundleTmirCompilerFactRef::other(kind, id)
 }
 
-fn proof_context_from_native_replay_context(
+/// The replay atoms that enter `obligation_id`'s proof context: those bound to
+/// it and those bound to no obligation.
+fn replay_atoms_for_obligation(
     request: &trust_ir::TrustWpNativeRequest,
     obligation_id: trust_ir::ProofId,
-) -> Option<BundleProofContext> {
-    let mut atoms = request
+) -> impl Iterator<Item = &trust_ir::NativeReplayAtom> {
+    request
         .provenance
         .replay_context()
         .atoms
         .iter()
-        .filter(|atom| match atom.obligation {
+        .filter(move |atom| match atom.obligation {
             Some(bound_obligation) => bound_obligation == obligation_id,
             None => true,
         })
-        .collect::<Vec<_>>();
+}
+
+fn proof_context_from_native_replay_context(
+    request: &trust_ir::TrustWpNativeRequest,
+    obligation_id: trust_ir::ProofId,
+) -> Option<BundleProofContext> {
+    let mut atoms = replay_atoms_for_obligation(request, obligation_id).collect::<Vec<_>>();
     if atoms.is_empty() {
         return None;
     }
@@ -1513,12 +2159,10 @@ fn split_trust_formula_body(body: &Value) -> (Vec<Value>, Vec<Value>) {
     if object.get("op").and_then(Value::as_str) == Some("implies") {
         let assumptions = object
             .get("lhs")
-            .map(flatten_trust_formula_conjunction)
-            .unwrap_or_default();
+            .map_or_else(Vec::new, flatten_trust_formula_conjunction);
         let assertions = object
             .get("rhs")
-            .map(flatten_trust_formula_conjunction)
-            .unwrap_or_default();
+            .map_or_else(Vec::new, flatten_trust_formula_conjunction);
         return (assumptions, assertions);
     }
     (Vec::new(), flatten_trust_formula_conjunction(body))

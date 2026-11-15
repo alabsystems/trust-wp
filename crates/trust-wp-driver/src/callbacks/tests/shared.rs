@@ -104,7 +104,8 @@ impl Callbacks for ProofAssertStructuralRewriteCallbacks {
             false,
             &mut assertion,
             &mut preconditions,
-        );
+        )
+        .expect("the test fixture declares no unresolvable named-field pattern");
 
         self.assertion = Some(assertion);
         self.preconditions = preconditions;

@@ -364,9 +364,7 @@ fn test_unsupported_construct_skip_production_path_counter() {
 /// triggers the error path in `pure_encoding/bindings.rs`, incrementing the counter.
 ///
 /// Production path: `encoder/pure_encoding/bindings.rs` line ~71.
-/// The assumption is a Float(NaN) expression which is unencodable, causing the
-/// assumption to be dropped and the body returned directly.
-/// Updated for #985: closures now encode conservatively, so Float(NaN) is used.
+/// The assumption is one the encoder refuses (`unencodable_float_order`).
 #[test]
 #[timeout(30000)]
 fn test_let_assume_dropped_production_path_counter() {
@@ -374,12 +372,9 @@ fn test_let_assume_dropped_production_path_counter() {
         unsoundness::reset();
         let before = unsoundness::snapshot();
 
-        // Build a LetAssume where the assumption is unencodable (Float NaN).
-        // The Float(NaN) expression causes encode_pure_impl(assumption) to fail,
-        // triggering the Err branch that increments LetAssumeDropped.
-        let unencodable_assumption = trust_wp_core::formula::PureExpr::Float(
-            trust_wp_core::formula::FloatBits::from_f64(f64::NAN),
-        );
+        // An unencodable assumption makes encode_pure_impl(assumption)
+        // fail, taking the Err branch that increments LetAssumeDropped.
+        let unencodable_assumption = crate::tests::helpers::unencodable_float_order();
         let body = int(42);
         let expr = let_assume(unencodable_assumption, body);
 
@@ -419,9 +414,8 @@ fn test_let_assume_dropped_production_path_counter() {
 /// clause triggers the error path in `logic_fn/registration.rs`, incrementing the counter.
 ///
 /// Production path: `encoder/logic_fn/registration.rs` line ~380.
-/// The ensures clause contains a Float(NaN) expression which cannot be encoded,
-/// causing the spec axiom to be dropped while other ensures clauses survive.
-/// Updated for #985: closures now encode conservatively, so Float(NaN) is used.
+/// The ensures clause equates an integer with a float, which cannot be encoded,
+/// so its spec axiom is dropped while the other ensures clauses survive.
 #[test]
 #[timeout(30000)]
 fn test_spec_axiom_dropped_production_path_counter() {
@@ -432,8 +426,7 @@ fn test_spec_axiom_dropped_production_path_counter() {
         let mut encoder = AYEncoder::new_with_quantifiers();
 
         // Create a logic function with one encodable and one unencodable ensures.
-        // The Float(NaN) in the ensures clause will fail to encode.
-        // Updated for #985: closures now encode conservatively, so Float(NaN) is used.
+        // `result` is an integer here, and no equality relates it to a float.
         let encodable_ensures = gt(var("result"), var("x"));
         let unencodable_ensures = eq(
             var("result"),
@@ -688,11 +681,10 @@ fn test_sort_fallback_to_int_e2e_demotion() {
 /// instead of silently dropping the assumption.
 ///
 /// Production path: `encoder/pure_encoding/bindings.rs` line ~71.
-/// The return expression contains a LetAssume whose assumption is a Float(NaN)
-/// (unencodable). Per #2663 Phase 2a, the encoder now propagates the encoding
-/// error instead of dropping the assumption and continuing with the body.
-/// This turns false proofs into EncodingError (the safe direction).
-/// Updated for #985: closures now encode conservatively, so Float(NaN) is used.
+/// The return expression contains a LetAssume whose assumption the encoder
+/// refuses. Per #2663 Phase 2a, the encoder propagates the encoding error
+/// instead of dropping the assumption and continuing with the body. This
+/// turns false proofs into EncodingError (the safe direction).
 #[test]
 #[timeout(30000)]
 fn test_let_assume_dropped_e2e_error_propagation_through_pipeline() {
@@ -703,11 +695,9 @@ fn test_let_assume_dropped_e2e_error_propagation_through_pipeline() {
         let driver_snapshot = unsoundness::snapshot();
 
         // 2. Build a return expression with an unencodable LetAssume.
-        //    The Float(NaN) assumption will fail to encode, triggering
-        //    LetAssumeDropped during verify_function_with_modes.
-        let unencodable_assumption = trust_wp_core::formula::PureExpr::Float(
-            trust_wp_core::formula::FloatBits::from_f64(f64::NAN),
-        );
+        //    The assumption fails to encode, triggering LetAssumeDropped
+        //    during verify_function_with_modes.
+        let unencodable_assumption = crate::tests::helpers::unencodable_float_order();
         let body = bool_expr(true);
         let return_expr = let_assume(unencodable_assumption, body);
 

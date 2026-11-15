@@ -1,8 +1,8 @@
-# Simple trust-wp Examples - Phase 6 Completion Criteria
+# Simple trust-wp Examples
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 #
 # This project contains examples that demonstrate trust-wp's core
-# verification features as defined in designs/2026-02-02-simple-creusot-criteria.md
+# verification features.
 #
 # Each example exercises a specific feature:
 # 1. requires/ensures contracts

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-pub use super::float_bits::FloatBits;
+pub use super::float_bits::{FloatBits, FloatWidth};
 use super::{
     sort_intern::resolve_sort_name,
     types::{BinOp, UnOp},
@@ -18,6 +18,7 @@ use super::{
 mod free_vars;
 mod pattern;
 mod rewrite;
+mod sort_shape;
 mod walk;
 
 pub use rewrite::PureExprChildRole;
@@ -33,13 +34,6 @@ pub use rewrite::PureExprChildRole;
 /// - `ExprSort` models expression-level sort annotations, including `Unit`
 /// - `logic::ParamSortHint` stores only non-default overrides (Bool/Seq/Datatype)
 /// - `smt::VarSort` models SMT declaration sorts and therefore excludes `Unit`
-///
-/// Extensible for future Datatype/Uninterpreted sorts when generic ADT encoding
-/// is implemented (#717).
-///
-/// Reference: designs/2026-02-08-encoder-sort-inference.md (Option A)
-/// Extended with Datatype/FMap/Tuple/Ref per designs/2026-03-07-994-solver-unknown-alternative.md
-/// Datatype interned per designs/2026-03-07-expr-sort-interning.md (#2047)
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExprSort {
@@ -55,7 +49,7 @@ pub enum ExprSort {
     /// Algebraic data type, carrying an interned ID for the ADT `def_path_str`.
     /// Use `intern_sort_name` / `resolve_sort_name` to convert. (#994, #2036, #2047)
     Datatype(u32),
-    /// Finite map sort. Previously hinted but not representable in `ExprSort`.
+    /// Finite map sort.
     FMap,
     /// Tuple sort with arity. Prevents Seq/Int confusion for multi-return functions.
     Tuple(u8),
@@ -69,9 +63,10 @@ pub enum ExprSort {
     /// for the parameter name. Distinct from Datatype: this is an opaque
     /// polymorphic sort placeholder, not a declared ADT. (#2062)
     TypeParam(u32),
-    /// Float sort (f32, f64). Maps to SMT `Real` — exact rational arithmetic
-    /// without IEEE 754 semantics (no NaN, infinity, or rounding). (#1802)
-    Float,
+    /// An IEEE-754 float of one format (`f32` or `f64`): the solver's
+    /// floating-point sort of that format, with NaN, the infinities and both
+    /// zeros as values and every operation rounded.
+    Float(FloatWidth),
 }
 
 impl std::fmt::Display for ExprSort {
@@ -87,7 +82,7 @@ impl std::fmt::Display for ExprSort {
             ExprSort::Ref(inner) => write!(f, "&{inner}"),
             ExprSort::MutRef(inner) => write!(f, "&mut {inner}"),
             ExprSort::TypeParam(id) => write!(f, "TypeParam({})", resolve_sort_name(*id)),
-            ExprSort::Float => f.write_str("Float"),
+            ExprSort::Float(width) => write!(f, "Float({})", width.rust_name()),
         }
     }
 }
@@ -100,7 +95,8 @@ pub enum PureExpr {
     Bool(bool),
     /// Integer literal
     Int(i64),
-    /// Float literal, stored as bit pattern. Maps to SMT Real. (#1802)
+    /// Float literal of one IEEE-754 format (or an unsuffixed contract
+    /// literal whose format its context decides), stored as a bit pattern.
     Float(FloatBits),
     /// Variable reference, with optional sort annotation
     Var(String, Option<ExprSort>),

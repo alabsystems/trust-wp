@@ -9,8 +9,8 @@
 //! then the function postcondition is verified separately with loop-exit
 //! state (invariants ∧ ¬condition) injected as preconditions.
 //!
-//! This models what the driver does at `verification.rs:1055-1063` when
-//! `verify_contract_loop_path` returns `ContinueWithAssumptions`.
+//! This models what the driver does when `verify_contract_loop_path` returns
+//! `ContinueWithAssumptions`.
 
 use std::collections::HashMap;
 
@@ -125,10 +125,10 @@ fn test_frame_constraint_preserves_pre_loop_binding() {
             .return_expr(Some(&return_expr)),
     );
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         fn_result.as_ref().is_ok_and(crate::tests::helpers::verified_or_known_proof_trusted),
         "With frame constraint saved == n, postcondition result == n + n should verify. Got: {fn_result:?}"

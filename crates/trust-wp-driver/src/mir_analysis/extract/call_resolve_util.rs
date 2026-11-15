@@ -45,7 +45,7 @@ pub(super) fn is_box_new_call_path(path: &str) -> bool {
 /// (`[T; N]`), returning either `Int(5)` or `Var("N")`.
 fn translate_ty_const_len_expr(len_const: rustc_middle::ty::Const<'_>) -> Option<PureExpr> {
     if let Some(value) = len_const.try_to_value() {
-        // Trust: ValTree::try_to_scalar removed; ty::Value now exposes try_to_scalar directly.
+        // The Trust toolchain exposes `try_to_scalar` on `ty::Value`, not on `ValTree`.
         let scalar = value
             .try_to_scalar()
             .and_then(|s| s.try_to_scalar_int().ok())?;
@@ -73,7 +73,7 @@ pub(super) fn translate_const_generic_arg_expr(c: rustc_middle::ty::Const<'_>) -
     if let Some(value) = c.try_to_value() {
         match value.ty.kind() {
             TyKind::Int(_) => {
-                // Trust: ValTree::try_to_scalar removed; use ty::Value::try_to_scalar.
+                // The Trust toolchain exposes `try_to_scalar` on `ty::Value`, not on `ValTree`.
                 let scalar = value
                     .try_to_scalar()
                     .and_then(|s| s.try_to_scalar_int().ok())?;
@@ -81,7 +81,7 @@ pub(super) fn translate_const_generic_arg_expr(c: rustc_middle::ty::Const<'_>) -
                 return i64::try_from(bits).ok().map(PureExpr::Int);
             }
             TyKind::Uint(_) => {
-                // Trust: ValTree::try_to_scalar removed; use ty::Value::try_to_scalar.
+                // The Trust toolchain exposes `try_to_scalar` on `ty::Value`, not on `ValTree`.
                 let scalar = value
                     .try_to_scalar()
                     .and_then(|s| s.try_to_scalar_int().ok())?;
@@ -89,7 +89,7 @@ pub(super) fn translate_const_generic_arg_expr(c: rustc_middle::ty::Const<'_>) -
                 return i64::try_from(bits).ok().map(PureExpr::Int);
             }
             TyKind::Bool => {
-                // Trust: ValTree::try_to_scalar removed; use ty::Value::try_to_scalar.
+                // The Trust toolchain exposes `try_to_scalar` on `ty::Value`, not on `ValTree`.
                 let scalar = value
                     .try_to_scalar()
                     .and_then(|s| s.try_to_scalar_int().ok())?;
@@ -103,7 +103,7 @@ pub(super) fn translate_const_generic_arg_expr(c: rustc_middle::ty::Const<'_>) -
             // Const generic params are typically integral (Int/Uint) or Bool.
             // Int is correct for the vast majority (array lengths, counts).
             // Bool const generics would need the type from GenericParamDef
-            // to get ExprSort::Bool — accepted as a known limitation. (#2052)
+            // to get ExprSort::Bool — a known limitation.
             Some(PureExpr::Var(
                 param.name.as_str().to_string(),
                 Some(ExprSort::Int),
@@ -121,12 +121,13 @@ pub(super) fn extend_call_with_const_generic_args<'tcx>(
     param_names: &mut Vec<String>,
 ) {
     use rustc_middle::ty::TyKind;
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return;
     };
     let TyKind::FnDef(_, substs) = constant.ty().kind() else {
         return;
     };
+    let substs = substs.skip_binder();
 
     let generics = tcx.generics_of(callee_def_id);
     // Skip parent generic args — `substs` contains ALL args (parent + own),
@@ -183,11 +184,243 @@ fn find_local_assignment_rvalue<'a, 'tcx>(
         .iter()
         .rev()
         .find_map(|stmt| {
-            let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
+            let StatementKind::Assign((lhs, rvalue)) = &stmt.kind else {
                 return None;
             };
             (lhs.local == local && lhs.projection.is_empty()).then_some(rvalue)
         })
+}
+
+// ── Loop-body call-target classification ────────────────────────────
+
+/// Paths of the `Fn*` trait call methods. A call to one of these with a
+/// GENERIC self type is Creusot's `precondition_F f args` goal, which neither
+/// loop lane can state.
+const FN_TRAIT_CALL_PATHS: &[&str] = &[
+    "core::ops::Fn::call",
+    "std::ops::Fn::call",
+    "core::ops::FnMut::call_mut",
+    "std::ops::FnMut::call_mut",
+    "core::ops::FnOnce::call_once",
+    "std::ops::FnOnce::call_once",
+];
+
+/// What a call terminator inside a LOOP BODY resolves to.
+///
+/// Both loop lanes — `loop_body.rs` (a loop carrying `#[invariant]`/
+/// `#[variant]`) and `unannotated_loops.rs` (every other loop, which is the
+/// DEFAULT lane) — must agree about which call sites owe an undischargeable
+/// obligation, so the decision lives here and not in either lane. Two copies
+/// drift: an unannotated lane that drops every non-`FnDef` callee silently
+/// lets a violated precondition behind a fn pointer verify
+/// (`s62_fnptr_unannotated_loop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoopCallTarget {
+    /// The call site can hold exactly one callee, whose contract applies here.
+    Resolved(DefId),
+    /// A call through a generic `Fn*` bound (`F: Fn(..)`, self type is a type
+    /// parameter). The callee's precondition is `precondition_F f args`, a
+    /// goal no lane can state: it is OWED and no proof discharges it.
+    GenericFnTrait,
+    /// No unique callee: a fn-pointer parameter or reassigned local, a `dyn`
+    /// vtable dispatch, an indirect call. Its precondition is unknown, and an
+    /// unknown precondition is owed, never dropped.
+    Unresolved,
+}
+
+/// Classify a loop-body call terminator's target.
+///
+/// A direct `FnDef` constant resolves to itself; a call through a local
+/// resolves only when [`resolve_unique_call_fn_def`] proves the local can hold
+/// nothing else. Anything else is [`LoopCallTarget::Unresolved`].
+///
+/// ONE DECISION, ONE IMPLEMENTATION. `Resolved` is what buys a callee its
+/// credit here — the lane assumes its postcondition — so it is granted only
+/// when the OBLIGATION side ([`resolve_obligation_callee`], which is what
+/// `assertion::call_type_obligation` resolves through) reaches the SAME callee
+/// at the SAME site. Credit and obligation therefore quantify over one set by
+/// construction, and narrowing either side narrows both.
+///
+/// This is not hypothetical bookkeeping: a grant side that searches the whole
+/// body beside an obligation side that scans only `body.basic_blocks[bb]
+/// .statements` credits a fn pointer assigned BEFORE a loop and called inside
+/// it while owing nothing, and `fn evil(n: u32) { let f: fn(D) -> u32 =
+/// make::<D>; while i < n { need7(f(D)) } }` verifies with `D::drop`
+/// panicking on every iteration (`s62v2_preloop_fnptr_credit_no_owe`).
+pub(super) fn classify_loop_call_target<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    bb: BasicBlock,
+    func: &Operand<'tcx>,
+) -> LoopCallTarget {
+    if is_generic_fn_trait_call(tcx, func) {
+        return LoopCallTarget::GenericFnTrait;
+    }
+    let Some(def_id) = extract_call_def_id(func)
+        .or_else(|| resolve_unique_call_fn_def(body, func).map(|(def_id, _)| def_id))
+    else {
+        return LoopCallTarget::Unresolved;
+    };
+    match resolve_obligation_callee(tcx, body, bb, func) {
+        Some((owing_def_id, _)) if owing_def_id == def_id => LoopCallTarget::Resolved(def_id),
+        // The obligation side cannot see this callee (or sees a different
+        // one): crediting here would assume a contract at a site owing
+        // nothing. Fail closed — the caller emits `false`.
+        _ => LoopCallTarget::Unresolved,
+    }
+}
+
+/// The callee the type-driven call OBLIGATIONS resolve through — the UNION of
+/// every chain any lane credits a contract from, so that a credit anywhere
+/// implies the obligation here.
+///
+/// 1. the `FnDef` the operand's own type carries (a direct call, and a call
+///    through a local holding a zero-sized fn ITEM);
+/// 2. the `FnDef` constant the BLOCK-LOCAL backtracker reaches
+///    ([`resolve_call_fn_def`]) — what the primary extractor's `resolve_call`
+///    credits from;
+/// 3. the `FnDef` constant the WHOLE-BODY backtracker reaches
+///    ([`resolve_unique_call_fn_def`]) — what the loop lanes'
+///    [`classify_loop_call_target`] credits from.
+///
+/// (3) never guesses: every local on the way must have exactly one assignment
+/// in the whole body and must never be mutably or raw-borrowed, so widening
+/// the union with it only ever resolves MORE sites, and a resolved site can
+/// only gain a `false` obligation. The widening is monotone in the safe
+/// direction.
+///
+/// `None` means no chain pins the target down (a fn-pointer parameter, a `dyn`
+/// vtable, a reassigned local). Every lane reaches `None` too and credits no
+/// contract there, so no obligation is owed for a credit that is not granted.
+pub(super) fn resolve_obligation_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    bb: BasicBlock,
+    func: &Operand<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgs<'tcx>)> {
+    if let rustc_middle::ty::TyKind::FnDef(def_id, generic_args) =
+        func.ty(&body.local_decls, tcx).kind()
+    {
+        return Some((*def_id, generic_args.skip_binder()));
+    }
+    resolve_call_fn_def(body, bb, func, None).or_else(|| resolve_unique_call_fn_def(body, func))
+}
+
+/// `true` for `<F as Fn*>::call*` where the self type is a type PARAMETER —
+/// the callee is whatever the caller passed, so its precondition is opaque.
+/// A concrete closure or fn item as self type is NOT this case: those resolve
+/// to a `DefId` whose contract can be looked up.
+pub(super) fn is_generic_fn_trait_call<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
+    let Operand::Constant(deref!(constant)) = func else {
+        return false;
+    };
+    let rustc_middle::ty::TyKind::FnDef(callee, generic_args) = constant.const_.ty().kind() else {
+        return false;
+    };
+    FN_TRAIT_CALL_PATHS.contains(&tcx.def_path_str(*callee).as_str())
+        && generic_args
+            .skip_binder()
+            .first()
+            .and_then(|arg| arg.as_type())
+            .is_some_and(|self_ty| {
+                matches!(
+                    self_ty.peel_refs().kind(),
+                    rustc_middle::ty::TyKind::Param(_)
+                )
+            })
+}
+
+/// The `FnDef` (with its generic arguments) a call's `func` operand denotes,
+/// following fn-pointer locals back to the constant they were initialised
+/// from: `let f: fn(u8, u8) -> u8 = <u8 as Add>::add; f(x, 1)`.
+///
+/// Unlike [`resolve_call_def_id`] this never guesses: every local on the way
+/// must have exactly ONE assignment in the whole body and must never be
+/// borrowed mutably or through a raw pointer, so the resolved target is the
+/// only value the operand can hold at the call. `None` means the target is
+/// unknown (a fn-pointer parameter, a reassigned local, a `dyn` vtable, ...).
+pub(super) fn resolve_unique_call_fn_def<'tcx>(
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgs<'tcx>)> {
+    if let Some(def) = func.const_fn_def() {
+        return Some(def);
+    }
+    let base_local = |place: &rustc_middle::mir::Place<'tcx>| match place.projection.as_slice() {
+        [] | [ProjectionElem::Deref] => Some(place.local),
+        _ => None,
+    };
+    let mut current = match func {
+        Operand::Copy(place) | Operand::Move(place) => base_local(place)?,
+        _ => return None,
+    };
+    for _ in 0..MAX_CALL_DEF_BACKTRACK_DEPTH {
+        let mut assignment = None;
+        let mut count = 0usize;
+        for bb_data in body.basic_blocks.iter() {
+            for stmt in &bb_data.statements {
+                match &stmt.kind {
+                    StatementKind::Assign((lhs, rvalue)) => {
+                        if lhs.local == current {
+                            count += 1;
+                            if lhs.projection.is_empty() {
+                                assignment = Some(rvalue);
+                            } else {
+                                return None;
+                            }
+                        }
+                        if let Rvalue::Ref(_, rustc_middle::mir::BorrowKind::Mut { .. }, place)
+                        | Rvalue::RawPtr(_, place) = rvalue
+                        {
+                            if place.local == current {
+                                return None;
+                            }
+                        }
+                    }
+                    StatementKind::SetDiscriminant { place, .. } if place.local == current => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(terminator) = &bb_data.terminator {
+                if let rustc_middle::mir::TerminatorKind::Call { destination, .. } =
+                    &terminator.kind
+                {
+                    if destination.local == current {
+                        return None;
+                    }
+                }
+            }
+        }
+        if count != 1 || current.as_usize() <= body.arg_count {
+            return None;
+        }
+        match assignment? {
+            Rvalue::Use(Operand::Constant(deref!(constant)), _)
+            | Rvalue::Cast(_, Operand::Constant(deref!(constant)), _) => {
+                let ty = constant.const_.ty();
+                let inner = match ty.kind() {
+                    rustc_middle::ty::TyKind::Ref(_, inner, _) => *inner,
+                    _ => ty,
+                };
+                return match inner.kind() {
+                    rustc_middle::ty::TyKind::FnDef(def_id, args) => {
+                        Some((*def_id, args.skip_binder()))
+                    }
+                    _ => None,
+                };
+            }
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
+            | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _)
+            | Rvalue::Ref(_, _, place)
+            | Rvalue::CopyForDeref(place) => {
+                current = base_local(place)?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(super) fn resolve_call_def_id<'tcx>(
@@ -196,8 +429,32 @@ pub(super) fn resolve_call_def_id<'tcx>(
     func: &Operand<'tcx>,
     diagnostics: Option<&ExtractionDiagnosticSink>,
 ) -> Option<DefId> {
-    if let Some(def_id) = extract_call_def_id(func) {
-        return Some(def_id);
+    resolve_call_fn_def(body, bb, func, diagnostics).map(|(def_id, _)| def_id)
+}
+
+/// [`resolve_call_def_id`] carrying the callee's generic arguments.
+///
+/// The `DefId`-only wrapper above is what `resolve_call` uses to look up the
+/// contract it credits at a call site; the type-driven call obligations in
+/// `extract::assertion` need the same callee's INSTANTIATION as well (which
+/// types a generic parameter was substituted with), so both read this one
+/// function. Keeping them on one resolver is what makes the rule hold: if a
+/// callee's postcondition is credited at a call site, every obligation that
+/// callee's instantiation owes is owed at that same site. While the
+/// obligations keyed on `TyKind::FnDef` alone and this chain followed
+/// fn-pointer locals, one `let f: fn(&Cell<u8>) -> bool =
+/// conflate::<Cell<u8>>; f(c)` coercion credited a postcondition and owed
+/// nothing.
+pub(super) fn resolve_call_fn_def<'tcx>(
+    body: &Body<'tcx>,
+    bb: BasicBlock,
+    func: &Operand<'tcx>,
+    diagnostics: Option<&ExtractionDiagnosticSink>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgs<'tcx>)> {
+    if let Operand::Constant(deref!(constant)) = func {
+        if let rustc_middle::ty::TyKind::FnDef(def_id, generic_args) = constant.const_.ty().kind() {
+            return Some((*def_id, generic_args.skip_binder()));
+        }
     }
 
     let mut current_local = match func {
@@ -239,8 +496,8 @@ pub(super) fn resolve_call_def_id<'tcx>(
             return None;
         };
         match rvalue {
-            Rvalue::Use(Operand::Constant(box constant), _)
-            | Rvalue::Cast(_, Operand::Constant(box constant), _) => {
+            Rvalue::Use(Operand::Constant(deref!(constant)), _)
+            | Rvalue::Cast(_, Operand::Constant(deref!(constant)), _) => {
                 // Check for FnDef directly, or peel a reference layer for
                 // promoted constants like `&some_fn`. Promoted `&fn_item`
                 // has type `&fn() {fn_item}` where the inner type is FnDef. (#1636)
@@ -249,7 +506,7 @@ pub(super) fn resolve_call_def_id<'tcx>(
                     rustc_middle::ty::TyKind::Ref(_, inner, _) => *inner,
                     _ => ty,
                 };
-                let rustc_middle::ty::TyKind::FnDef(def_id, _) = inner_ty.kind() else {
+                let rustc_middle::ty::TyKind::FnDef(def_id, generic_args) = inner_ty.kind() else {
                     record_extraction_diag(
                         diagnostics,
                         "extract/call_resolve_util.rs",
@@ -259,7 +516,7 @@ pub(super) fn resolve_call_def_id<'tcx>(
                     );
                     return None;
                 };
-                return Some(*def_id);
+                return Some((*def_id, generic_args.skip_binder()));
             }
             Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
             | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _)
@@ -373,10 +630,11 @@ pub(super) fn call_receiver_array_len_expr<'tcx>(
 /// continuation expression in `LetAssume`/`LetObligation` nodes.
 ///
 /// This scopes call-site postcondition assumptions and precondition obligations
-/// to the branch they were created in, fixing #815 (branch-local assumption leak).
+/// to the branch they were created in; an assumption that outlived its branch
+/// would premise goals on every other path.
 ///
-/// Phase C (#963): requires explicit `&mut CallEffects`. Thread-local fallback
-/// removed — all callers already pass effects explicitly via `session.effects`.
+/// Effects are passed explicitly (`session.effects`); there is no thread-local
+/// fallback.
 pub(super) fn wrap_call_context(
     continuation: Option<PureExpr>,
     enabled: bool,

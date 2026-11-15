@@ -110,10 +110,10 @@ pub(in crate::encoder) fn coerce_ite_sorts(
         (a, solver.declare_const(&fresh(), a_sort))
     }
     // --- Int↔Real coercion (lossless promotion to Real) ---
-    // IntToFloat identity (#1802) passes Int PureExprs to Float locals.
-    // When these appear in equality/Ite with Real-sorted terms, promote
-    // Int→Real via int_to_real rather than losing the value with a fresh
-    // constant. (#2353)
+    // An integer term meeting a `Real`-sorted one in an equality or Ite is
+    // promoted with int_to_real rather than losing the value with a fresh
+    // constant. (#2353) A Rust float is never `Real`: it has its own
+    // floating-point sort, which no branch here bridges.
     else if a_sort == Sort::Int && b_sort == Sort::Real {
         (solver.int_to_real(a), b)
     } else if b_sort == Sort::Int && a_sort == Sort::Real {
@@ -659,7 +659,13 @@ pub(in crate::encoder) fn coerce_to_numeric(
     // When both operands are the same non-numeric term, reuse one fresh
     // numeric constant for both sides to preserve reflexivity. (#2285)
     // Fresh constant is unconstrained — conservative. Reclassified LOW per #2231.
-    if !l_ok && !r_ok && l == r {
+    // Never for a float: the shared constant makes `x <= x` true, and IEEE
+    // `<=` is false of NaN.
+    if !l_ok
+        && !r_ok
+        && l == r
+        && !crate::encoder::pure_encoding::ieee::is_float_value_sort(&l_sort)
+    {
         unsoundness::increment(unsoundness::UnsoundnessCategory::SortCoercionBridge);
         let id = INT_COERCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let shared =

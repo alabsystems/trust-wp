@@ -838,18 +838,15 @@ fn let_obligation_encoding_failure_must_not_verify() {
     // LetObligation { obligation: <unencodable>, body: true }
     // Ensures: result == true
     //
-    // The obligation is a Float(NaN) expression, which the encoder rejects
-    // via try_real_const. When the obligation fails to encode, the error
-    // must propagate — a dropped obligation is unsound because the
-    // precondition goes unchecked.
+    // The obligation is one the encoder refuses. When the obligation fails
+    // to encode, the error must propagate — a dropped obligation is unsound
+    // because the precondition goes unchecked.
     //
     // Fixed in #1029: the error now propagates, producing an encoding error
     // instead of a false Verified result.
-    // Updated for #985: closures now encode conservatively, so we use
-    // Float(NaN) as the unencodable expression instead.
-    use trust_wp_core::formula::FloatBits;
-
-    let unencodable_obligation = PureExpr::Float(FloatBits::from_f64(f64::NAN));
+    // Closures encode conservatively (#985), so the unencodable obligation
+    // is an ordered float comparison spelled as a `BinOp`.
+    let unencodable_obligation = crate::tests::helpers::unencodable_float_order();
 
     let body = let_obligation(unencodable_obligation, bool_expr(true));
     let ensures = eq(var("result"), bool_expr(true));

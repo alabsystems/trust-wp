@@ -9,7 +9,11 @@ use trust_wp::{ensures, requires};
 /// `#[requires]` is the caller's obligation; `#[ensures]` is what trust-wp
 /// proves in return, for **every** input satisfying the precondition. `result`
 /// names the return value.
-#[requires(x > 0)]
+///
+/// The upper bound earns its place: **every** input means `i32::MAX` too, and
+/// there `x + 1` overflows. Drop `x < 1_000_000` and re-run — trust-wp hands
+/// back exactly that input rather than proving the postcondition.
+#[requires(x > 0 && x < 1_000_000)]
 #[ensures(result > x)]
 pub fn increment(x: i32) -> i32 {
     x + 1

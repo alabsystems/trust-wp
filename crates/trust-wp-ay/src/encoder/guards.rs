@@ -29,7 +29,13 @@ impl Drop for DepthGuard {
         // owned by the encoder. The guard's lifetime is limited to the
         // encoding function that created it, and the encoder is borrowed
         // mutably for the entire call, so no aliasing occurs.
-        unsafe { *self.0 -= 1 };
+        // saturating, not `-= 1`. This runs on EVERY exit path including
+        // unwind, and the increment it pairs with is the caller's invariant,
+        // not this impl's: a panic between the increment and the guard's
+        // construction leaves a depth of 0 here, and the wrap would turn a
+        // recursion counter into usize::MAX — a limit check that then passes
+        // forever.
+        unsafe { *self.0 = (*self.0).saturating_sub(1) };
     }
 }
 

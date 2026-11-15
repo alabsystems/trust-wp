@@ -476,3 +476,52 @@ fn remtrunc_symbolic_keystone_and_soundness() {
         "must NOT prove n %trunc m >= 0 for possibly-negative n"
     );
 }
+
+// ── Contract/pearlite `%` is Creusot `int.ComputerDivision.mod` ─────────────
+//
+// Parsed contract text, end to end through the encoder: `%` takes the sign of
+// the dividend; the Euclidean remainder is only reachable as `rem_euclid`.
+
+fn parsed(text: &str) -> PureExpr {
+    trust_wp_core::contract_parser::parse_contract(text).expect("contract parses")
+}
+
+#[test]
+#[timeout(30000)]
+fn contract_percent_is_truncating_ground() {
+    for (text, value) in [
+        ("-3 % 2", -1),
+        ("(-7) % 3", -1),
+        ("7 % -3", 1),
+        ("-7 % -3", -1),
+    ] {
+        assert!(
+            proved_ground_int_eq(&parsed(text), value),
+            "{text} == {value}"
+        );
+    }
+    for (text, wrong) in [("-3 % 2", 1), ("(-7) % 3", 2)] {
+        assert!(
+            !proved_ground_int_eq(&parsed(text), wrong),
+            "{text} == {wrong} is the Euclidean answer and must NOT be proved"
+        );
+    }
+    assert!(proved_ground_int_eq(&parsed("(-3).rem_euclid(2)"), 1));
+    assert!(!proved_ground_int_eq(&parsed("(-3).rem_euclid(2)"), -1));
+}
+
+#[test]
+#[timeout(30000)]
+fn contract_percent_is_truncating_symbolic() {
+    let neg = parsed("x < 0 && x > -100");
+    // False under Creusot semantics (x = -1 gives -1): must not be proved.
+    assert!(!proved_under(
+        std::slice::from_ref(&neg),
+        &parsed("x % 2 >= 0")
+    ));
+    // True: a negative dividend has a non-positive truncated remainder.
+    assert!(proved_under(
+        std::slice::from_ref(&neg),
+        &parsed("x % 2 <= 0")
+    ));
+}

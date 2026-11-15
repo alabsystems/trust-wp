@@ -76,29 +76,6 @@ pub(crate) fn operand_is_bool(operand: &Operand<'_>, body: &Body<'_>) -> bool {
     }
 }
 
-/// True iff the operand's type is a SIGNED machine integer (`i8..i128`/`isize`).
-///
-/// Used to lower Rust's signed `%` (which TRUNCATES toward zero, with the
-/// remainder taking the sign of the dividend) to `BinOp::RemTrunc`. Unsigned
-/// `%` keeps Euclidean `BinOp::Mod` (== truncated for non-negative operands)
-/// and, crucially, matches the contract `%` which remains Euclidean (trust-wp's
-/// wrapping arithmetic specs reduce a possibly-negative dividend modulo `2^n`
-/// and depend on the non-negative Euclidean remainder). Only projection-less
-/// places and constants are inspected; anything else stays Euclidean. See
-/// `trust-wp-divmod-semantics`.
-pub(crate) fn operand_is_signed_int(operand: &Operand<'_>, body: &Body<'_>) -> bool {
-    match operand {
-        Operand::Copy(place) | Operand::Move(place) => {
-            if !place.projection.is_empty() {
-                return false;
-            }
-            matches!(body.local_decls[place.local].ty.kind(), TyKind::Int(_))
-        }
-        Operand::Constant(constant) => matches!(constant.ty().kind(), TyKind::Int(_)),
-        Operand::RuntimeChecks(_) => false,
-    }
-}
-
 /// True iff the operand's type is a machine integer — SIGNED (`i8..i128`/
 /// `isize`) or UNSIGNED (`u8..u128`/`usize`).
 ///

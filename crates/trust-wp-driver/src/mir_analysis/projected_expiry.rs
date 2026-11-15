@@ -180,11 +180,13 @@ pub(crate) fn collect_projected_expiry_pins<'tcx>(
 ) -> ProjectedExpiryReport {
     let mut report = ProjectedExpiryReport::default();
 
-    let assign_counts = assignment_counts(body);
-    let extractions = collect_extractions(tcx, body, &assign_counts);
+    let extractions = collect_extractions(tcx, body);
     if extractions.is_empty() {
         return report;
     }
+    // Whole-local assignment counts, the R0/R1 authority: computed once for
+    // the body and read by `adjudicate` for every candidate.
+    let assign_counts = assignment_counts(body);
 
     // The finality analysis is only built when a candidate exists (R10).
     let analysis = NotFinalPlaces::new(tcx, body);
@@ -197,7 +199,14 @@ pub(crate) fn collect_projected_expiry_pins<'tcx>(
             extraction.root.as_u32(),
             extraction.payload.as_u32()
         );
-        match adjudicate(tcx, body, arg_names, &extraction, &mut cursor) {
+        match adjudicate(
+            tcx,
+            body,
+            arg_names,
+            &assign_counts,
+            &extraction,
+            &mut cursor,
+        ) {
             Ok(pin) => {
                 debug!(
                     "projected_expiry: PROVEN death for {shape} -> {:?} == {:?}",
@@ -206,10 +215,7 @@ pub(crate) fn collect_projected_expiry_pins<'tcx>(
                 report.pins.push(pin);
             }
             Err(reason) => {
-                debug!(
-                    "projected_expiry: DISARMED {shape} ({})",
-                    reason.as_str()
-                );
+                debug!("projected_expiry: DISARMED {shape} ({})", reason.as_str());
                 report.disarms.push(DisarmRecord { shape, reason });
             }
         }
@@ -224,7 +230,7 @@ fn assignment_counts(body: &Body<'_>) -> HashMap<Local, usize> {
     let mut counts: HashMap<Local, usize> = HashMap::new();
     for block in body.basic_blocks.iter() {
         for statement in &block.statements {
-            if let StatementKind::Assign(box (place, _)) = &statement.kind {
+            if let StatementKind::Assign((place, _)) = &statement.kind {
                 if place.projection.is_empty() {
                     *counts.entry(place.local).or_insert(0) += 1;
                 }
@@ -244,11 +250,7 @@ fn assignment_counts(body: &Body<'_>) -> HashMap<Local, usize> {
 /// Find `payload = move ((root as Ctor).f)` / `payload = move (root.f)` where
 /// `root` is a uniquely-assigned CALL destination whose type embeds a `&mut`
 /// behind at least one projection step.
-fn collect_extractions<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    assign_counts: &HashMap<Local, usize>,
-) -> Vec<Extraction> {
+fn collect_extractions<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<Extraction> {
     // Call destinations, so a non-call root (an aggregate the body itself
     // built) never enters this lane — that borrow is locally rooted and belongs
     // to the #124 carrier lane.
@@ -266,7 +268,7 @@ fn collect_extractions<'tcx>(
     let mut out = Vec::new();
     for (block_idx, block) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, statement) in block.statements.iter().enumerate() {
-            let StatementKind::Assign(box (dest, rvalue)) = &statement.kind else {
+            let StatementKind::Assign((dest, rvalue)) = &statement.kind else {
                 continue;
             };
             if !dest.projection.is_empty() {
@@ -299,8 +301,9 @@ fn collect_extractions<'tcx>(
                 continue;
             }
             // Non-unique assignment is NOT filtered here: the candidate is
-            // recorded so `adjudicate` can put it in the disarm table with its
-            // reason, which is what makes the emit/disarm table auditable.
+            // recorded so `adjudicate` (R0/R1, over the body's assignment
+            // counts) can put it in the disarm table with its reason, which
+            // is what makes the emit/disarm table auditable.
             out.push(Extraction {
                 root,
                 payload: dest.local,
@@ -322,9 +325,7 @@ fn collect_extractions<'tcx>(
 fn projection_steps(place: &Place<'_>) -> Option<(Vec<PinStep>, Option<u32>)> {
     let projections: &[_] = place.projection.as_ref();
     match projections {
-        [ProjectionElem::Field(field, _)] => {
-            Some((vec![PinStep::Field(field.as_usize())], None))
-        }
+        [ProjectionElem::Field(field, _)] => Some((vec![PinStep::Field(field.as_usize())], None)),
         [ProjectionElem::Downcast(name, variant), ProjectionElem::Field(field, _)] => {
             let ctor = name.map(|sym| sym.to_string())?;
             Some((
@@ -341,16 +342,13 @@ fn projection_steps(place: &Place<'_>) -> Option<(Vec<PinStep>, Option<u32>)> {
 
 /// Does the type-level pin path describe the same one-step projection the MIR
 /// statement performs?
-fn pin_path_matches(
-    path: &[MutRefPinStep],
-    steps: &[PinStep],
-    variant_idx: Option<u32>,
-) -> bool {
+fn pin_path_matches(path: &[MutRefPinStep], steps: &[PinStep], variant_idx: Option<u32>) -> bool {
     if path.len() != steps.len() {
         return false;
     }
-    path.iter().zip(steps).all(|(type_step, mir_step)| {
-        match (type_step, mir_step) {
+    path.iter()
+        .zip(steps)
+        .all(|(type_step, mir_step)| match (type_step, mir_step) {
             (MutRefPinStep::Field(a), PinStep::Field(b)) => *a as usize == *b,
             (
                 MutRefPinStep::Variant {
@@ -359,12 +357,9 @@ fn pin_path_matches(
                     field: tf,
                 },
                 PinStep::Variant { ctor, field },
-            ) => {
-                Some(*tv) == variant_idx && tc == ctor && *tf as usize == *field
-            }
+            ) => Some(*tv) == variant_idx && tc == ctor && *tf as usize == *field,
             _ => false,
-        }
-    })
+        })
 }
 
 fn is_mut_ref_local(body: &Body<'_>, local: Local) -> bool {
@@ -380,10 +375,10 @@ fn adjudicate<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     arg_names: &[String],
+    assign_counts: &HashMap<Local, usize>,
     extraction: &Extraction,
     cursor: &mut rustc_mir_dataflow::ResultsCursor<'_, 'tcx, NotFinalPlaces<'_, 'tcx>>,
 ) -> Result<ProjectedFinalPin, DisarmReason> {
-    let assign_counts = assignment_counts(body);
     // R0 / R1
     if assign_counts.get(&extraction.root).copied() != Some(1)
         || assign_counts.get(&extraction.payload).copied() != Some(1)
@@ -410,11 +405,8 @@ fn adjudicate<'tcx>(
     if let Some(variant_idx) = extraction.variant_idx {
         prove_variant_guard(tcx, body, extraction, variant_idx)?;
     }
-    let root_name = crate::mir_analysis::extract::source_name_for_local(
-        body,
-        extraction.root,
-        arg_names,
-    );
+    let root_name =
+        crate::mir_analysis::extract::source_name_for_local(body, extraction.root, arg_names);
     if extraction.variant_idx.is_some() && root_name.is_none() {
         return Err(DisarmReason::RootUnnamed);
     }
@@ -424,7 +416,7 @@ fn adjudicate<'tcx>(
     let empty_locals: HashMap<Local, PureExpr> = HashMap::new();
     for statement in &block_data.statements[extraction.stmt_idx + 1..death_idx] {
         match &statement.kind {
-            StatementKind::Assign(box (place, rvalue)) => {
+            StatementKind::Assign((place, rvalue)) => {
                 let touches_payload = place.local == extraction.payload
                     || rvalue_mentions(rvalue, extraction.payload)
                     || rvalue_mentions(rvalue, extraction.root);
@@ -493,11 +485,8 @@ fn adjudicate<'tcx>(
     // Address the pin. A variant-bearing path is always addressed through the
     // named root, so the tester has a receiver; a variant-free path prefers the
     // payload binder's own name (the symbol the rest of the VC already uses).
-    let payload_name = crate::mir_analysis::extract::source_name_for_local(
-        body,
-        extraction.payload,
-        arg_names,
-    );
+    let payload_name =
+        crate::mir_analysis::extract::source_name_for_local(body, extraction.payload, arg_names);
     let target = if extraction.variant_idx.is_some() {
         let root = root_name.ok_or(DisarmReason::RootUnnamed)?;
         FinalPinTarget::Projection {
@@ -591,7 +580,7 @@ fn prove_variant_guard<'tcx>(
                 switch_block = Some(pred);
                 break;
             }
-            TerminatorKind::Goto { target } if *target == entry => {}
+            TerminatorKind::Goto { target, .. } if *target == entry => {}
             TerminatorKind::FalseEdge { real_target, .. } if *real_target == entry => {}
             _ => return Err(DisarmReason::VariantGuardNotProvable),
         }
@@ -618,16 +607,20 @@ fn prove_variant_guard<'tcx>(
         Operand::Move(place) | Operand::Copy(place) if place.projection.is_empty() => place.local,
         _ => return Err(DisarmReason::VariantGuardNotProvable),
     };
-    let reads_root_discriminant = body.basic_blocks[switch_block].statements.iter().any(|statement| {
-        matches!(
-            &statement.kind,
-            StatementKind::Assign(box (place, Rvalue::Discriminant(source)))
-                if place.local == discr_local
-                    && place.projection.is_empty()
-                    && source.local == extraction.root
-                    && source.projection.is_empty()
-        )
-    });
+    let reads_root_discriminant =
+        body.basic_blocks[switch_block]
+            .statements
+            .iter()
+            .any(|statement| {
+                matches!(
+                    &statement.kind,
+                    StatementKind::Assign((place, Rvalue::Discriminant(source)))
+                        if place.local == discr_local
+                            && place.projection.is_empty()
+                            && source.local == extraction.root
+                            && source.projection.is_empty()
+                )
+            });
     if !reads_root_discriminant {
         return Err(DisarmReason::VariantGuardNotProvable);
     }
@@ -677,8 +670,10 @@ fn prove_no_escape(
     extraction: &Extraction,
     death_idx: usize,
 ) -> Result<(), DisarmReason> {
-    use rustc_middle::mir::visit::{PlaceContext, Visitor};
-    use rustc_middle::mir::Location;
+    use rustc_middle::mir::{
+        visit::{PlaceContext, Visitor},
+        Location,
+    };
 
     struct UseCollector {
         payload: Local,
@@ -744,7 +739,7 @@ fn prove_no_escape(
         // Reads that cannot change the pointee: the discriminant feeding the
         // guard's switch, and the borrowck-only markers.
         let harmless = match &statement.kind {
-            StatementKind::Assign(box (place, Rvalue::Discriminant(source))) => {
+            StatementKind::Assign((place, Rvalue::Discriminant(source))) => {
                 place.projection.is_empty() && source.local == extraction.root
             }
             _ => !statement_mentions_local(statement, extraction.root),
@@ -772,7 +767,7 @@ fn rvalue_mentions(rvalue: &Rvalue<'_>, local: Local) -> bool {
                 found = true;
             }
         }
-        Rvalue::BinaryOp(_, box (left, right)) => {
+        Rvalue::BinaryOp(_, (left, right)) => {
             if operand_mentions(left, local) || operand_mentions(right, local) {
                 found = true;
             }
@@ -848,7 +843,10 @@ mod tests {
         );
         assert_eq!(DisarmReason::RootUnnamed.as_str(), "root_unnamed");
         assert_eq!(DisarmReason::NoTrackedWrite.as_str(), "no_tracked_write");
-        assert_eq!(DisarmReason::ReferentNotFinal.as_str(), "referent_not_final");
+        assert_eq!(
+            DisarmReason::ReferentNotFinal.as_str(),
+            "referent_not_final"
+        );
     }
 
     #[test]

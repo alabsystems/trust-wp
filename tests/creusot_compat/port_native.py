@@ -15,7 +15,7 @@ into the native Trust clause grammar:
     #[invariant(i)] #[variant(v)] while c { .. }
         -> while c invariant i decreases v { .. }
 
-The 2026-07-22 emitter extends the tool into the semantic tier: a `#[logic]`
+The logic-fn emitter extends the tool into the semantic tier: a `#[logic]`
 fn whose body the pearlite→Clean translator accepts is ported by ROUTE —
 an all-machine signature drops the attribute and stays a Rust fn (the E6
 lane admits its MIR body as `trust_import_<mangled>`); an all-Int signature
@@ -889,13 +889,13 @@ def census_logic(corpus: str, binder_probe: str | None = None) -> dict:
                         continue
                     # A body that mentions its own fn is self-recursive; the
                     # island kernel REJECTS self-reference structurally (the
-                    # def's name is not in scope during its own elaboration —
-                    # soundness-probed 2026-07-22), so it cannot emit until a
-                    # principled termination encoding exists.
+                    # def's name is not in scope during its own elaboration),
+                    # so it cannot emit until a principled termination
+                    # encoding exists.
                     if re.search(rf"\b{re.escape(head.group(1))}\b", body):
                         refuse("self_recursion_v1_2")
                         continue
-                    # Route classification (2026-07-22 emitter design):
+                    # Route classification:
                     #   island — any pearlite `Int` in the signature: the fn
                     #     cannot compile as Rust; it becomes an island def and
                     #     clauses cite island theorems via `by`.
@@ -1326,8 +1326,9 @@ def self_test_emitter() -> int:
             failures += 1
     # Exercise the real census-to-probe shape: Creusot normally wraps logic
     # bodies in pearlite!, while binder_probe accepts the inner expression.
-    # A regression here previously made every normal untyped binder look
-    # `unparsed` without ever invoking the elaborator.
+    # Probing the wrapped body instead of the inner expression makes every
+    # normal untyped binder look `unparsed` without ever invoking the
+    # elaborator.
     source = """#[logic]
 fn bounded(x: u64) -> bool {
     pearlite! { forall<i> i <= x }

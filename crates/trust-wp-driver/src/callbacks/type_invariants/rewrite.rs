@@ -9,7 +9,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use trust_wp_core::{formula::PureExpr, logic::is_invariant_method_name};
+use trust_wp_core::{
+    formula::PureExpr,
+    logic::{is_invariant_method_name, type_param_invariant_index},
+};
 
 use super::super::{contract_rewrite::receiver_root_var_name, parsing::ParsedContract};
 
@@ -38,7 +41,12 @@ pub(in crate::callbacks) fn rewrite_type_invariant_methods_expr_with_structural(
             method,
             args,
         } => {
-            if args.is_empty() && is_invariant_method_name(&method) {
+            // A type parameter's invariant is already the clause its receiver
+            // owes; retargeting it by root name would state some other type's.
+            if args.is_empty()
+                && is_invariant_method_name(&method)
+                && type_param_invariant_index(&method).is_none()
+            {
                 if let Some(name) = receiver_root_var_name(receiver.as_ref()) {
                     if let Some(rewritten_method) = if name == "result" {
                         result_method.map(ToOwned::to_owned)
@@ -147,12 +155,16 @@ pub(in crate::callbacks) fn discharge_trivial_inv_calls_expr(
         {
             PureExpr::Bool(true)
         }
+        // A type parameter's root is in `known_trivial_roots` (no ADT method
+        // names it), but its invariant is NOT `true`: it is the premise the
+        // generic body discharges its own hand-overs of that parameter with.
         PureExpr::MethodCall {
             receiver,
             method,
             args,
         } if args.is_empty()
             && is_invariant_method_name(&method)
+            && type_param_invariant_index(&method).is_none()
             && root_is_trivial(receiver.as_ref(), known_trivial_roots) =>
         {
             PureExpr::Bool(true)

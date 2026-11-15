@@ -1,0 +1,49 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "reference-level-contracts-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_verify"
+path = "src/should_verify.rs"
+
+[[bin]]
+name = "should_not_verify"
+path = "src/should_not_verify.rs"
+
+[[bin]]
+name = "final_of_bound_borrow"
+path = "src/final_of_bound_borrow.rs"
+
+[[bin]]
+name = "final_of_a_branch_borrow"
+path = "src/final_of_a_branch_borrow.rs"
+
+[[bin]]
+name = "final_of_a_match_borrow"
+path = "src/final_of_a_match_borrow.rs"
+
+[[bin]]
+name = "unplaced_mut_ref_read"
+path = "src/unplaced_mut_ref_read.rs"
+
+[[bin]]
+name = "mut_ref_param_bindings"
+path = "src/mut_ref_param_bindings.rs"
+
+[[bin]]
+name = "closure_and_type_arguments"
+path = "src/closure_and_type_arguments.rs"

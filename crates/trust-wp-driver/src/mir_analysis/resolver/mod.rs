@@ -27,13 +27,14 @@ mod liveness;
 use std::collections::{HashMap, HashSet};
 
 use liveness::{compute_mut_local_liveness, for_each_rvalue_local, is_deref_of_mut_local};
-use rustc_borrowck::consumers::{BodyWithBorrowckFacts, TwoPhaseActivation};
+use rustc_borrowck::consumers::TwoPhaseActivation;
 use rustc_middle::{
     mir::{BasicBlock, Body, Local, Location, Rvalue, StatementKind},
     ty::{TyCtxt, TyKind},
 };
 
 use super::{collect_mut_ref_paths_with_tcx, type_contains_mut_ref_with_tcx};
+use crate::callbacks::thread_locals::RetainedBorrowckBody;
 
 /// A point where a mutable borrow parameter should be resolved.
 ///
@@ -88,7 +89,7 @@ pub(crate) fn compute_resolve_points<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     arg_names: &[String],
-    body_with_facts: Option<&BodyWithBorrowckFacts<'tcx>>,
+    body_with_facts: Option<&RetainedBorrowckBody<'tcx>>,
 ) -> ResolveResults {
     let mut mut_locals: HashSet<Local> = HashSet::new();
     let mut local_to_name: HashMap<Local, String> = HashMap::new();
@@ -162,14 +163,14 @@ fn collect_reborrows<'tcx>(
     body: &Body<'tcx>,
     mut_locals: &mut HashSet<Local>,
     local_to_name: &mut HashMap<Local, String>,
-    body_with_facts: Option<&BodyWithBorrowckFacts<'tcx>>,
+    body_with_facts: Option<&RetainedBorrowckBody<'tcx>>,
 ) -> (HashMap<Local, Local>, Vec<ReborrowWriteback>) {
     let mut reborrow_parents: HashMap<Local, Local> = HashMap::new();
     let mut writebacks = Vec::new();
 
     for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
-            if let StatementKind::Assign(box (
+            if let StatementKind::Assign((
                 dest,
                 Rvalue::Ref(_, rustc_middle::mir::BorrowKind::Mut { .. }, place),
             )) = &stmt.kind
@@ -180,8 +181,8 @@ fn collect_reborrows<'tcx>(
                     let parent_name = local_to_name
                         .get(&place.local)
                         .cloned()
-                        .unwrap_or_else(|| format!("_reborrow_{}", place.local.as_u32()));
-                    let child_name = format!("{parent_name}_rb{}", dest.local.as_u32());
+                        .unwrap_or_else(|| format!("$reborrow_{}", place.local.as_u32()));
+                    let child_name = format!("{parent_name}$rb{}", dest.local.as_u32());
                     local_to_name.insert(dest.local, child_name.clone());
 
                     let reservation = Location {
@@ -226,7 +227,7 @@ enum WritebackTiming {
 }
 
 fn classify_writeback_timing<'tcx>(
-    body_with_facts: Option<&BodyWithBorrowckFacts<'tcx>>,
+    body_with_facts: Option<&RetainedBorrowckBody<'tcx>>,
     reservation: Location,
     assigned_local: Local,
     borrowed_local: Local,
@@ -234,7 +235,19 @@ fn classify_writeback_timing<'tcx>(
     let Some(body_with_facts) = body_with_facts else {
         return WritebackTiming::Immediate;
     };
-    let Some(borrow_data) = body_with_facts.borrow_set.location_map().get(&reservation) else {
+    // Several borrows can share one location (generic reborrows); the
+    // reservation is the one that writes `assigned_local` from `borrowed_local`.
+    let borrow_set = &body_with_facts.borrow_set;
+    let Some(borrow_data) = borrow_set
+        .borrows_at_location(&reservation)
+        .into_iter()
+        .flatten()
+        .map(|&index| &borrow_set[index])
+        .find(|borrow| {
+            borrow.assigned_place().local == assigned_local
+                && borrow.borrowed_place().local == borrowed_local
+        })
+    else {
         return WritebackTiming::Immediate;
     };
     if borrow_data.assigned_place().local != assigned_local
@@ -279,7 +292,7 @@ fn find_resolve_points<'tcx>(
         for stmt in &bb_data.statements {
             let mut newly_dead = Vec::new();
             for &local in &currently_live {
-                if let StatementKind::Assign(box (dest, _)) = &stmt.kind {
+                if let StatementKind::Assign((dest, _)) = &stmt.kind {
                     if dest.projection.is_empty() && dest.local == local {
                         newly_dead.push(local);
                     }
@@ -294,7 +307,7 @@ fn find_resolve_points<'tcx>(
                 currently_live.remove(dead_local);
             }
 
-            if let StatementKind::Assign(box (dest, rvalue)) = &stmt.kind {
+            if let StatementKind::Assign((dest, rvalue)) = &stmt.kind {
                 if is_deref_of_mut_local(dest, mut_locals) {
                     currently_live.insert(dest.local);
                 }
@@ -419,7 +432,7 @@ fn find_kill_location(body: &Body<'_>, bb: BasicBlock, local: Local) -> Option<L
     let bb_data = &body.basic_blocks[bb];
     for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
         match &stmt.kind {
-            StatementKind::Assign(box (dest, _))
+            StatementKind::Assign((dest, _))
                 if dest.projection.is_empty() && dest.local == local =>
             {
                 return Some(Location {

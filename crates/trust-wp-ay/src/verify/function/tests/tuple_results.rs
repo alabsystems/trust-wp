@@ -44,7 +44,11 @@ fn user_defined_tuple_result_wraps_multi_field_constructor() {
 #[test]
 #[timeout(30000)]
 fn user_defined_named_result_wraps_multi_field_constructor() {
-    let ctor = named_struct_ctor_name("Named", &["x".to_string(), "y".to_string()]);
+    // The placed spelling of `Named { x, y }`: the driver's placement pass
+    // drops the field-name metadata once the fields are at their declared
+    // indices, and the encoder's one door refuses it otherwise
+    // (verify::placement_gate).
+    let ctor = "Named".to_string();
     let ensures = vec![PureExpr::Match {
         scrutinee: Arc::new(var("result")),
         arms: vec![
@@ -215,7 +219,11 @@ fn named_default_postconditions_flow_through_tuple_lowered_result() {
     let call_1 = PureExpr::Var("call_1".to_string(), Some(ExprSort::Int));
     let call_2 = PureExpr::Var("call_2".to_string(), None);
     let default_fn = PureExpr::Var("core::default::Default::default".to_string(), None);
-    let ctor = named_struct_ctor_name("Named", &["x".to_string(), "y".to_string()]);
+    // The placed spelling of `Named { x, y }`: the driver's placement pass
+    // drops the field-name metadata once the fields are at their declared
+    // indices, and the encoder's one door refuses it otherwise
+    // (verify::placement_gate).
+    let ctor = "Named".to_string();
     let requires = vec![
         method_call_with_args(
             default_fn.clone(),

@@ -133,16 +133,14 @@ fn test_ite_branch_error_does_not_corrupt_path_conditions() {
     let mut encoder = AYEncoder::new();
 
     // Build an Ite where the then-branch returns an encoding error.
-    // Float(NaN) is unencodable because try_real_const rejects NaN.
-    // Updated for #985: closures now encode conservatively, so Float(NaN) is used.
-    let unencodable = PureExpr::Float(trust_wp_core::formula::FloatBits::from_f64(f64::NAN));
+    let unencodable = crate::tests::helpers::unencodable_float_order();
     let error_ite = ite(gt(var("a"), int(0)), unencodable, int(0));
 
     // The Ite encoding should fail because the then-branch is unsupported.
     let result = encoder.encode_pure(&error_ite);
     assert!(
         result.is_err(),
-        "expected encoding error from Float(NaN) in Ite branch: {result:?}"
+        "expected encoding error from the refused branch: {result:?}"
     );
 
     // Encode a NEW Ite with a LetAssume in the then-branch. This exercises

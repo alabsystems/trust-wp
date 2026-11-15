@@ -253,24 +253,51 @@ impl IntOffsetUnionFind {
     fn union_difference(&mut self, lhs: Term, rhs: Term, difference: i64) -> bool {
         let (lhs_root, lhs_offset) = self.find_term(lhs);
         let (rhs_root, rhs_offset) = self.find_term(rhs);
+        // Every arithmetic step below is on i64 offsets that come from user
+        // terms, so a large constant can overflow. Wrapping is not merely a
+        // panic risk here: a wrapped offset makes this union-find AGREE about a
+        // difference that does not hold, and the encoder would then carry an
+        // equality nothing justifies. Overflow therefore refuses to conclude.
         if lhs_root == rhs_root {
-            return lhs_offset - rhs_offset == difference;
+            return lhs_offset
+                .checked_sub(rhs_offset)
+                .is_some_and(|d| d == difference);
         }
 
-        let lhs_root_to_rhs_root = difference - lhs_offset + rhs_offset;
+        let Some(lhs_root_to_rhs_root) = difference
+            .checked_sub(lhs_offset)
+            .and_then(|d| d.checked_add(rhs_offset))
+        else {
+            return false;
+        };
         let lhs_root_value = self.root_value[lhs_root];
         let rhs_root_value = self.root_value[rhs_root];
 
-        if let (Some(lhs_value), Some(rhs_value)) = (lhs_root_value, rhs_root_value) {
-            if lhs_value != rhs_value + lhs_root_to_rhs_root {
-                return false;
+        // Resolve everything that can fail BEFORE touching `self`, so a refusal
+        // cannot leave the structure half-linked (parent rewritten, value not).
+        let new_rhs_root_value = match (lhs_root_value, rhs_root_value) {
+            (Some(lhs_value), Some(rhs_value)) => {
+                let Some(expected) = rhs_value.checked_add(lhs_root_to_rhs_root) else {
+                    return false;
+                };
+                if lhs_value != expected {
+                    return false;
+                }
+                None
             }
-        }
+            (Some(lhs_value), None) => {
+                let Some(value) = lhs_value.checked_sub(lhs_root_to_rhs_root) else {
+                    return false;
+                };
+                Some(value)
+            }
+            _ => None,
+        };
 
         self.parent[lhs_root] = rhs_root;
         self.offset_to_parent[lhs_root] = lhs_root_to_rhs_root;
-        if let (Some(lhs_value), None) = (lhs_root_value, rhs_root_value) {
-            self.root_value[rhs_root] = Some(lhs_value - lhs_root_to_rhs_root);
+        if let Some(value) = new_rhs_root_value {
+            self.root_value[rhs_root] = Some(value);
         }
         true
     }
@@ -279,7 +306,13 @@ impl IntOffsetUnionFind {
         match side.atom {
             Some(atom) => {
                 let (root, offset) = self.find_term(atom);
-                self.root_value[root].map(|value| value + offset + side.offset)
+                // `None` already means "no constant value known", so an
+                // overflowing sum answers with that rather than a wrapped one.
+                self.root_value[root].and_then(|value| {
+                    value
+                        .checked_add(offset)
+                        .and_then(|v| v.checked_add(side.offset))
+                })
             }
             None => Some(side.offset),
         }
@@ -443,15 +476,15 @@ impl AYEncoder {
     /// disjunction is not, so such a premise is discounted and the whole solve
     /// degrades to `unknown`. We emit that shape a great deal: every quantified
     /// call postcondition assumed inside a branch arrives as
-    /// `G ⇒ ∀k. frame(k)`. On `ghost/ghost_map.rs` it is 28 of 31 foralls in a
-    /// single query.
+    /// `G ⇒ ∀k. frame(k)`. On `ghost/ghost_map.rs` nearly every forall in a
+    /// query has this shape.
     ///
     /// This runs at the assertion boundary rather than at any one producer
     /// because that is where the shape actually matters — `assert_term_conjuncts`
     /// builds exactly the assertion list ay classifies, so every producer is
-    /// covered by one seam. (An earlier attempt at the `guard_with_active_path`
-    /// producer was MEASURED INERT: the ghost_map non-conjunctive census did not
-    /// move, so the guarded foralls reach the solver by some other route.)
+    /// covered by one seam. Rewriting at the `guard_with_active_path` producer
+    /// alone is inert: guarded foralls reach the solver by other routes too, so
+    /// the non-conjunctive count does not move.
     ///
     /// SOUNDNESS. `A ∨ ∀x. B(x)` and `∀x. (A ∨ B(x))` are EQUIVALENT in
     /// first-order logic whenever `x` is not free in `A` (SMT sorts are
@@ -792,6 +825,14 @@ impl AYEncoder {
             return self
                 .finish_shortcut_solve(SolveResult::Sat, "shortcut:cached-sat-no-new-assertions");
         }
+        // An empty stack is trivially SAT. Kept unconditional: a goal-labelled
+        // base/vacuity probe over an empty stack (the loop lane) must not run
+        // the real solver here, or it replaces the goal's retained UNSAT proof
+        // artifact and the proof is lost. When this SAT DECIDES an obligation
+        // (a closure body whose negated postcondition simplified away,
+        // `1u8 >> 8` under `ensures(true)`), the refuting lane confirms it
+        // with a real solve before publishing — see
+        // `confirm_shortcut_sat_with_solver`.
         if self.solver.assertions().is_empty() {
             return self.finish_shortcut_solve(SolveResult::Sat, "shortcut:empty-assertions");
         }
@@ -910,16 +951,61 @@ impl AYEncoder {
         }
     }
 
+    /// Syntactic shortcut decisions are off for a query that DECIDES an
+    /// obligation.
+    ///
+    /// A query carrying a negated-goal label is an obligation's verdict: SAT
+    /// refutes it, UNSAT proves it. Both directions must come from the solver,
+    /// for symmetric reasons.
+    ///
+    /// * UNSAT: a shortcut UNSAT on a goal query
+    ///   is an ACCEPT nothing proved.
+    /// * SAT: a shortcut SAT on a goal query is a REFUTATION nothing validated.
+    ///   `finish_shortcut_solve` records `model_validated=false,
+    ///   accepted_for_consumer=false, consumer_rejection="shortcut SAT result
+    ///   (..) did not run ay model validation"` — accurate, and downstream the
+    ///   refutation-authority gate then withholds the verdict, so the shortcut
+    ///   bought nothing but an inconclusive. Running the real solve buys a
+    ///   VALIDATED model and a publishable counterexample.
+    ///
+    /// Non-goal queries — base-satisfiability probes, vacuity rechecks, the
+    /// entry-may-execute probe — keep every shortcut: their SAT answer is a
+    /// reachability fact, not a verdict about a contract.
+    ///
+    /// MEASURED COST, and it is a real one: the negated-goal LABEL's scope is
+    /// wider than the goal query. One `with_negated_goal_label_prefix` region
+    /// also covers the base/vacuity/axiom-consistency probes the pipeline runs
+    /// inside it, so those lose their shortcut too. On
+    /// `loops_logic_fn::result_axioms_and_modes::
+    /// test_loop_preservation_two_logic_fns_on_unmodified_vars` the
+    /// `shortcut:simple-int-bounds-sat` answers under
+    /// `__trust_wp_loop_negated_goal` / `__trust_wp_axiom_free_negated_goal`
+    /// disappear — none of them the obligation's verdict, since the obligation
+    /// VERIFIES — and the proof goes with them (`Unknown(ProofTrusted)`): the
+    /// real solver cannot decide what that shortcut decided.
+    ///
+    /// Narrowing the guard to "a goal-side assertion is on the current stack"
+    /// does NOT separate the two: `note_assertion_provenance` marks every
+    /// assertion made while the label is set as goal-side, so the refined
+    /// predicate is the label test again and the same shortcuts stay gone.
+    /// Separating them needs a set populated only in
+    /// `AssertionPhase::NegatedPostcondition`, which this guard does not have.
+    ///
+    /// Kept despite the cost: without this guard the driver `--bin` tests
+    /// that assert genuine refutations, and `should_fail/const_default`, lose
+    /// their validated counterexample and fall back to a withheld
+    /// inconclusive. That trade is measured in both directions; the
+    /// completeness loss above is the price, not an oversight.
     fn shortcut_solve_enabled(&self) -> bool {
         self.solver.timeout() != Some(Duration::ZERO)
-    }
-
-    fn shortcut_unsat_enabled(&self) -> bool {
-        self.shortcut_solve_enabled()
             && self
                 .assertion_pipeline
                 .negated_goal_label_prefix()
                 .is_none()
+    }
+
+    fn shortcut_unsat_enabled(&self) -> bool {
+        self.shortcut_solve_enabled()
     }
 
     fn finish_shortcut_solve(&mut self, result: SolveResult, detail: &'static str) -> SolveResult {
@@ -973,6 +1059,127 @@ impl AYEncoder {
             verification_level: SolveVerificationLevelSnapshot::Unknown,
             resource_usage: SolveResourceSnapshot::default(),
         }
+    }
+
+    /// Confirm a syntactic-shortcut SAT with a real solve before it is
+    /// published as a refutation.
+    ///
+    /// The SAT shortcuts (`shortcut:empty-assertions`, the int-bounds and
+    /// cached-SAT shortcuts) answer without ay and record
+    /// `model_validated=false, accepted_for_consumer=false`. As a base or
+    /// vacuity probe that is the right, cheap answer. As the verdict of an
+    /// obligation — a closure whose negated postcondition simplified away,
+    /// `1u8 >> 8` under `ensures(true)` — it is a REFUTATION nothing
+    /// validated, and the refutation-authority boundary withholds it. So the
+    /// refuting lane calls this: when the last solve evidence is a SAT that ay
+    /// did not validate, run `check_sat_with_details` on the same stack and
+    /// cache ITS statistics, evidence and replay, exactly as
+    /// `solve_and_cache_details` does. Returns whether the cached evidence is
+    /// now a validated, consumer-accepted SAT.
+    ///
+    /// Only the refuting path calls it, so the retained UNSAT proof artifact
+    /// of a proved goal is never displaced by a probe (the reason the
+    /// empty-stack shortcut itself stays unconditional).
+    pub(crate) fn confirm_shortcut_sat_with_solver(&mut self) -> bool {
+        let needs_confirmation = self
+            .encoding_cache
+            .solve_evidence()
+            .is_some_and(|evidence| {
+                evidence.result.eq_ignore_ascii_case("sat")
+                    && !(evidence.model_validated && evidence.accepted_for_consumer)
+            });
+        if !needs_confirmation {
+            return self
+                .encoding_cache
+                .solve_evidence()
+                .is_some_and(|evidence| {
+                    evidence.result.eq_ignore_ascii_case("sat")
+                        && evidence.model_validated
+                        && evidence.accepted_for_consumer
+                });
+        }
+        self.replay_recorder.record_check_sat("check_sat");
+        let details = match catch_solver_panic_with_reason("confirm_shortcut_sat", || {
+            self.solver.check_sat_with_details()
+        }) {
+            Ok(details) => details,
+            Err(err) => {
+                self.assertion_pipeline
+                    .record_solver_panic(err.into_reason());
+                return false;
+            }
+        };
+        self.cache_native_replay_json(Some(&details));
+        let stats = SolveStatisticsSnapshot::from(&details.statistics);
+        let evidence = self.consumer_solve_evidence(&details);
+        let confirmed =
+            details.result.is_sat() && evidence.model_validated && evidence.accepted_for_consumer;
+        crate::verify::authority_trace(|| {
+            format!(
+                "confirm shortcut SAT with solver: result={} validated={} accepted={}",
+                evidence.result, evidence.model_validated, evidence.accepted_for_consumer
+            )
+        });
+        self.encoding_cache.set_solve_statistics(stats);
+        self.encoding_cache.set_solve_evidence(evidence);
+        if let Some(reason) = details.unknown_reason.as_ref() {
+            self.encoding_cache
+                .set_solve_unknown_reason(crate::UnknownReason::from_ay_unknown_reason(reason));
+        }
+        confirmed
+    }
+
+    /// The evidence a consumer may act on for the solve just run on the
+    /// current stack.
+    ///
+    /// A model of a query in which a phantom sort upgrade split a name, after
+    /// some assertion still on the stack read the constant it abandoned, is
+    /// not a counterexample: that assertion and every later read of the name
+    /// constrain two constants nothing relates, so the model may describe no
+    /// execution. Its evidence is refused, and the refutation it would back
+    /// is withheld at the authority boundary (D-218). The two constants are
+    /// not linked instead: on a path where the earlier read is a stale fact,
+    /// the link would let it prove what the split kept it from.
+    fn consumer_solve_evidence(
+        &self,
+        details: &ay_dpll::api::SolveDetails,
+    ) -> SolveEvidenceSnapshot {
+        let mut evidence = SolveEvidenceSnapshot::from_solve_details(details);
+        if evidence.accepted_for_consumer && details.result.is_sat() {
+            if let Some(name) = self.split_source_read_by_assertions() {
+                evidence.accepted_for_consumer = false;
+                evidence.consumer_rejection = Some(format!(
+                    "a phantom sort upgrade split `{name}` after an assertion read it, so the \
+                     model need not be an execution"
+                ));
+            }
+        }
+        evidence
+    }
+
+    /// The source name of a constant a phantom sort upgrade abandoned
+    /// (`VarEnv::split_sources`) that an assertion on the stack reads.
+    pub(in crate::encoder) fn split_source_read_by_assertions(&self) -> Option<String> {
+        let split = self.var_env.split_sources();
+        if split.is_empty() {
+            return None;
+        }
+        let abandoned: HashMap<Term, &str> = split
+            .iter()
+            .map(|(name, term)| (*term, name.as_str()))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut pending = self.solver.assertions();
+        while let Some(term) = pending.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if let Some(name) = abandoned.get(&term) {
+                return Some((*name).to_string());
+            }
+            pending.extend(self.solver.term_children(term));
+        }
+        None
     }
 
     pub(crate) fn ensure_structural_provenance(&mut self, detail: &'static str) {
@@ -1675,11 +1882,7 @@ impl AYEncoder {
             return true;
         }
 
-        if self.assertions_have_seq_pushback_component_poststate_assignment(&assertions) {
-            return true;
-        }
-
-        false
+        self.assertions_have_seq_pushback_component_poststate_assignment(&assertions)
     }
 
     fn assertions_have_seq_pushback_component_poststate_assignment(
@@ -2903,12 +3106,26 @@ impl AYEncoder {
         lhs: IntAffineAtom,
         rhs: IntAffineAtom,
     ) -> bool {
+        // The differences below become the offsets the union-find reasons with,
+        // so a wrapped one asserts an equality that does not hold. Overflow
+        // answers `false`, which the caller already treats as "no conflict
+        // claimed" — the conservative direction.
         match (lhs.atom, rhs.atom) {
             (None, None) => lhs.offset == rhs.offset,
-            (Some(atom), None) => union_find.set_constant(atom, rhs.offset - lhs.offset),
-            (None, Some(atom)) => union_find.set_constant(atom, lhs.offset - rhs.offset),
+            (Some(atom), None) => rhs
+                .offset
+                .checked_sub(lhs.offset)
+                .is_some_and(|difference| union_find.set_constant(atom, difference)),
+            (None, Some(atom)) => lhs
+                .offset
+                .checked_sub(rhs.offset)
+                .is_some_and(|difference| union_find.set_constant(atom, difference)),
             (Some(lhs_atom), Some(rhs_atom)) => {
-                union_find.union_difference(lhs_atom, rhs_atom, rhs.offset - lhs.offset)
+                rhs.offset
+                    .checked_sub(lhs.offset)
+                    .is_some_and(|difference| {
+                        union_find.union_difference(lhs_atom, rhs_atom, difference)
+                    })
             }
         }
     }
@@ -3300,6 +3517,33 @@ impl AYEncoder {
         self.encoding_cache.begin_obligation_slice();
     }
 
+    /// Take the strict-replay observation bound to the CURRENT scope, and hand
+    /// it out only when ay REFUSED it (`authority_accepted == false`).
+    ///
+    /// For attributing a slice's own refusal to a verdict that this slice left
+    /// uncertified. An accepted observation is consumed and dropped rather than
+    /// returned: a certificate must never be reported beside a verdict it did
+    /// not certify. A mismatched scope is refused and tallied exactly as
+    /// `capture_provenance` would.
+    /// Test hook: record an observation in the CURRENT scope.
+    #[cfg(test)]
+    pub(crate) fn set_strict_proof_replay_observation_for_test(
+        &mut self,
+        observation: crate::shared_types::StrictProofReplayObservation,
+    ) {
+        self.encoding_cache
+            .set_strict_proof_replay_observation(observation);
+    }
+
+    pub(crate) fn take_refused_strict_replay_observation_for_current_scope(
+        &mut self,
+    ) -> Option<crate::shared_types::StrictProofReplayObservation> {
+        let scope = self.encoding_cache.strict_replay_scope();
+        self.encoding_cache
+            .take_strict_proof_replay_observation_bound_to(scope)
+            .filter(|observation| !observation.authority_accepted)
+    }
+
     /// Get counterexample model (if SAT).
     ///
     /// If the underlying ay solver panics while fetching the model, the panic
@@ -3401,6 +3645,7 @@ impl AYEncoder {
                     if record_bridge_forall {
                         self.enum_payload_bridge_forall_terms.push(term);
                     }
+                    self.note_assertion_provenance(term);
                     self.replay_recorder.record_assert(label, term_text);
                     return true;
                 }
@@ -3421,6 +3666,7 @@ impl AYEncoder {
                     if record_bridge_forall {
                         self.enum_payload_bridge_forall_terms.push(term);
                     }
+                    self.note_assertion_provenance(term);
                     self.replay_recorder.record_assert(operation, term_text);
                 }
                 asserted
@@ -3495,7 +3741,8 @@ impl AYEncoder {
     ///
     /// Returns `Ok(false)` when:
     /// - The negated goal IS in the core (genuine proof)
-    /// - No negated-goal label was set (legacy path, assume non-vacuous)
+    /// - No negated-goal label was set (nothing to test the core against;
+    ///   assume non-vacuous)
     ///
     /// Returns `Err` when unsat-core retrieval itself fails so callers can
     /// fail closed to `Unknown`. (#903, #2414)
@@ -3728,7 +3975,6 @@ impl AYEncoder {
         // through to `coerce_ite_sorts`, which mints a fresh unconstrained
         // constant that discards the iterator value — the fabricated-premise
         // shape behind ghost/seq_iter reverse_ghost loop_initialization.
-        // (ce-census 2026-08-20)
         {
             let a_is_iter = super::seq::sort_is_seq_iterator_carrier(&a_sort);
             let b_is_iter = super::seq::sort_is_seq_iterator_carrier(&b_sort);
@@ -3776,6 +4022,26 @@ impl AYEncoder {
         coerce_ite_sorts(&mut self.solver, a, a_sort, b, b_sort)
     }
 
+    /// `term` read at `anchor_sort` when the two sorts encode one enum (a single
+    /// structural family) and an equality `anchor == term` is harmonized to the
+    /// anchor's side: exactly the bridge [`Self::harmonize_eq_or_ite_terms`]
+    /// applies there, so a binding made through this and an obligation that
+    /// compares the same value elsewhere read one bridge UF. `None` for every
+    /// other pair, including a scalar `term`: which value a scalar stands for
+    /// is not a question sort repair can answer.
+    pub(crate) fn same_family_view_at(&mut self, term: Term, anchor_sort: &Sort) -> Option<Term> {
+        let term_sort = self.solver.get_sort(term);
+        if term_sort == *anchor_sort {
+            return Some(term);
+        }
+        super::sort_context::same_structural_family(anchor_sort, &term_sort)?;
+        let target = super::sort_context::select_structural_sort_target(anchor_sort, &term_sort)?;
+        if target != *anchor_sort {
+            return None;
+        }
+        Some(self.bridge_structural_sort(term, &term_sort, anchor_sort))
+    }
+
     /// Bridge a term from one structural sort to another using an injective UF.
     ///
     /// When two sorts are in the same structural family (e.g., `Datatype(Adt_Some_None)`
@@ -3783,11 +4049,11 @@ impl AYEncoder {
     /// `__trust_wp_struct_bridge_<from>_to_<to>: from_sort -> to_sort` and applies it.
     /// Injectivity is enforced lazily as a set of *ground* implications
     /// `bridge(t_i) == bridge(t_j) => t_i == t_j` for every pair of distinct
-    /// ground terms bridged through the same UF. This avoids arming a universal
-    /// `forall x,y. bridge(x)==bridge(y) => x==y` axiom that previously
-    /// interacted with the datatype-depth quantifier and produced
-    /// `quantifier-ematching-exists-incomplete` for loop preservation queries
-    /// (`lang/while_let.rs`).
+    /// ground terms bridged through the same UF. A universal
+    /// `forall x,y. bridge(x)==bridge(y) => x==y` axiom would interact with the
+    /// datatype-depth quantifier and produce
+    /// `quantifier-ematching-exists-incomplete` on loop preservation queries
+    /// (`lang/while_let.rs`), so none is armed.
     ///
     /// This is strictly better than the `coerce_ite_sorts` fallback which creates
     /// a fresh unconstrained constant that discards the value entirely. With a UF
@@ -3969,20 +4235,18 @@ impl AYEncoder {
 
     /// Create a solver equality term with sort repair and panic isolation.
     ///
-    /// The current ay pin includes the Bool/Bool equality fix for #1179, so
-    /// this now uses native `solver.eq()` for all operand sorts. The remaining
-    /// wrapper logic is only for cross-sort coercion and panic recovery until
-    /// the `try_*` migration lands (#2131).
+    /// Uses native `solver.eq()` for all operand sorts, Bool included (#1179);
+    /// the wrapper exists for cross-sort coercion and panic recovery (#2131).
     ///
     /// On ay panic (sort mismatch), increments the `PanicRecoveryFalse`
     /// unsoundness counter and returns a FRESH UNCONSTRAINED Bool constant so
     /// `demote_if_unsound` can catch it. The fresh constant is polarity-neutral
     /// and thus safe in BOTH contexts: as a proof OBLIGATION it is unprovable
-    /// (exactly as conservative as the old `bool_const(false)`), and as an
-    /// ASSUMED FACT it constrains nothing. The old literal-`false` fallback was
+    /// (exactly as conservative as a literal `false`), and as an ASSUMED FACT
+    /// it constrains nothing. A literal-`false` fallback would be
     /// anti-conservative in assumption position — a fact whose equality cannot
     /// be encoded (e.g. Bool-sorted placeholder lookup vs Int literal in
-    /// ghost/ghost_map) became `(assert false)` and manufactured an UNSAT
+    /// ghost/ghost_map) becomes `(assert false)` and manufactures an UNSAT
     /// premise set, tripping the vacuity guard on a satisfiable path. (#1663,
     /// ghost/ghost_map)
     pub(crate) fn eq_term(&mut self, a: Term, b: Term) -> Term {
@@ -4101,12 +4365,12 @@ impl AYEncoder {
 
     /// Compatibility wrapper for user-facing equality surfaces.
     ///
-    /// Native `solver.eq()` is sound for Bool terms on the current ay pin, but
-    /// higher-level verification queries still lose completeness on complex
-    /// Bool formulas such as short-circuit bodies encoded as nested ITEs. Keep
-    /// the iff expansion here so postconditions and result/body bindings retain
-    /// the pre-cutover proof behavior while lower-level call sites can opt into
-    /// `eq_term()` directly. (#1179, #2508)
+    /// Native `solver.eq()` is sound for Bool terms, but higher-level
+    /// verification queries lose completeness on complex Bool formulas such as
+    /// short-circuit bodies encoded as nested ITEs. Keep the iff expansion here
+    /// so postconditions and result/body bindings keep proving those shapes
+    /// while lower-level call sites can opt into `eq_term()` directly.
+    /// (#1179, #2508)
     pub(crate) fn eq_or_iff(&mut self, a: Term, b: Term, _sort: &Sort) -> Term {
         let a_sort = self.solver.get_sort(a);
         let b_sort = self.solver.get_sort(b);
@@ -4170,7 +4434,7 @@ impl AYEncoder {
     /// Set the per-query timeout on the underlying solver.
     ///
     /// When set, each `check_sat()` call is limited to this duration.
-    /// `None` clears any previously set timeout.
+    /// `None` clears the timeout.
     pub(crate) fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
         self.solver.set_timeout(timeout);
     }
@@ -4208,6 +4472,32 @@ mod tests {
 
     use super::{is_proof_related_panic, is_retryable_proof_unknown, AYEncoder};
     use crate::shared_types::UnknownReason;
+
+    /// A wrapped offset in the affine union-find does not merely panic: it makes
+    /// the structure AGREE about a difference that does not hold, and the
+    /// encoder then carries an equality nothing justifies. Composing a offset of
+    /// `i64::MAX` with a further `+1` is the smallest case that shows it —
+    /// with unchecked arithmetic it wraps to `i64::MIN` and returns true.
+    #[test]
+    fn union_difference_refuses_to_conclude_when_the_offset_overflows() {
+        let mut encoder = AYEncoder::new();
+        let a = encoder.solver.int_const(1);
+        let b = encoder.solver.int_const(2);
+        let c = encoder.solver.int_const(3);
+
+        let mut union_find = super::IntOffsetUnionFind::default();
+        assert!(
+            union_find.union_difference(a, b, i64::MAX),
+            "the first link is representable"
+        );
+
+        // `c` against `a`, whose offset to its root is already i64::MAX:
+        // 1 - 0 + i64::MAX overflows, so this must refuse rather than wrap.
+        assert!(
+            !union_find.union_difference(c, a, 1),
+            "an overflowing composed offset must not be reported as a consistent union"
+        );
+    }
 
     /// A Bool-sorted term compared against an Int literal outside {0, 1} must
     /// NOT constant-fold to literal `false`: as an ASSUMED FACT that would

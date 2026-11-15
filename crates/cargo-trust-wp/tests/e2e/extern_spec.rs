@@ -34,3 +34,28 @@ fn test_extern_spec_get_known_value() {
     let stderr = stderr_string(&output);
     assert_function_status(&stderr, "get_known_value", "verified");
 }
+
+/// An `extern_spec!` method body is proved against the spec's own ensures
+/// (Creusot goal `vc_extern_spec_<..>_body`).
+#[test]
+#[timeout(180_000)]
+fn test_extern_spec_body_is_verified() {
+    let output = run_cargo_trust_wp("extern_spec_project", "is_one_body");
+    let stderr = stderr_string(&output);
+    assert!(
+        stderr.contains("is_one_body verified ✓"),
+        "extern_spec body must be verified:\n{stderr}"
+    );
+}
+
+/// A body that violates the extern spec's ensures is rejected.
+#[test]
+#[timeout(180_000)]
+fn test_extern_spec_wrong_body_fails() {
+    let output = run_cargo_trust_wp("extern_spec_project", "is_one_wrong_body");
+    let stderr = stderr_string(&output);
+    assert!(
+        stderr.contains("is_one_wrong_body FAILED ✗"),
+        "wrong extern_spec body must fail:\n{stderr}"
+    );
+}

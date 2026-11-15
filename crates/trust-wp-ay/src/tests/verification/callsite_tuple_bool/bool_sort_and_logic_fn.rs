@@ -211,7 +211,7 @@ fn test_verify_logic_fn_postcondition_negative() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "is_positive(-1) should produce counterexample: {result:?}"
     );
 }
@@ -380,7 +380,7 @@ fn test_verify_bool_logic_fn_method_syntax_negative() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "result.is_valid() with body=-1 should fail: {result:?} (#1820)"
     );
 }
@@ -553,7 +553,7 @@ fn test_verify_mixed_type_invariant_selective_injection() {
         .type_invariants(Some(std::slice::from_ref(&with_inv_def))),
     );
     assert!(
-        matches!(result_b, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result_b),
         "PlainType b has no invariant — returning b should produce Failed (invariant() is \
          uninterpreted UF, solver finds counterexample): {result_b:?}"
     );

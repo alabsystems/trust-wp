@@ -52,6 +52,16 @@ fn snapshot_loc_budget() {
 }
 
 #[test]
+fn snapshot_expr_kind_loc_budget() {
+    let source = include_str!("../snapshot_expr_kind.rs");
+    let lines = count_lines(source);
+    assert!(
+        lines <= 120,
+        "ghost_macros/snapshot_expr_kind.rs has {lines} lines, exceeding budget of 120"
+    );
+}
+
+#[test]
 fn ghost_block_loc_budget() {
     let source = include_str!("../ghost_block.rs");
     let lines = count_lines(source);

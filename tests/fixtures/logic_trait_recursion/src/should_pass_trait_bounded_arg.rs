@@ -17,7 +17,7 @@ pub trait Cost {
 impl Cost for i32 {
     #[logic]
     fn cost(&self) -> i32 {
-        1
+        1i32
     }
 }
 

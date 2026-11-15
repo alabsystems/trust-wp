@@ -2,8 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Integration tests for logic trait-recursion validation (the ledgered
-//! impl_arg + terminates-trio false-accepts, fixed 2026-07-24).
+//! Integration tests for logic trait-recursion validation (the Creusot
+//! impl_arg and terminates-trio cases, each a false accept without it).
 //!
 //! Two lanes close the four holes:
 //! - the illegal-recursive-trait bound check (Creusot
@@ -22,12 +22,11 @@
 use std::{
     fs,
     path::Path,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let unique = SystemTime::now()
@@ -37,13 +36,13 @@ fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/logic_trait_recursion_tests")
         .join(format!("{bin}-{}-{unique}", std::process::id()));
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(fixture_dir("logic_trait_recursion"))
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for logic trait recursion fixture");
+        .expect("failed to run targo check for logic trait recursion fixture");
     let _ = fs::remove_dir_all(&target_dir);
     output
 }

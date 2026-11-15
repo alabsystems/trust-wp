@@ -196,7 +196,7 @@ fn test_default_mode_verification_fails() {
             .logic_fns(Some(std::slice::from_ref(&logic_fn))),
     );
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Default-mode function body should be invisible — cannot prove answer() == 42: {result:?}"
     );
 }
@@ -264,7 +264,7 @@ fn test_law_axiom_constrains_opaque_function() {
             .logic_fns(Some(std::slice::from_ref(&double_default))),
     );
     assert!(
-        matches!(result_no_law, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result_no_law),
         "Without law (Default mode), double(5) == 10 should NOT be provable: {result_no_law:?}"
     );
 
@@ -408,12 +408,15 @@ fn test_prophetic_deref_minus_final_collapses_to_zero() {
 
 /// Prophetic logic function in a verification context.
 ///
-/// Confirms Prophetic mode is visible (like Open) in the full verification
-/// pipeline: `prophetic_id(5) == 5` is provable because the defining axiom
-/// is emitted.
+/// Its body reads a final value (`^x`), which a logic parameter cannot carry:
+/// the defining axiom collapses `^x` onto `x`, so `prophetic_id(5) == 5`
+/// would be proved of a value that has no final value at all. The encoder's
+/// door reads the definitions a request carries to a fixed point and refuses
+/// every goal that may name one reading a final value, whether or not a
+/// producer withdrew it (D-108, D-109).
 #[test]
 #[timeout(30000)]
-fn test_prophetic_verification_with_final_body() {
+fn test_prophetic_verification_with_final_body_is_refused() {
     use crate::{verify_function_with_modes, VerificationRequest, VerificationResult};
 
     let logic_fn = LogicFnDef::new(
@@ -435,9 +438,13 @@ fn test_prophetic_verification_with_final_body() {
             .logic_fns(Some(std::slice::from_ref(&logic_fn))),
     );
     assert!(
-        matches!(result, Ok(VerificationResult::Verified(_))),
-        "Prophetic function should be visible (like Open) — prophetic_id(5) == 5 provable: {result:?}"
+        !matches!(result, Ok(VerificationResult::Verified(_))),
+        "a goal naming a logic function that reads a final value is refused: {result:?}"
     );
+    let Err(err) = result else {
+        panic!("the door refuses the goal before any verdict: {result:?}");
+    };
+    assert!(err.to_string().contains("reads a final value"), "{err}");
 }
 
 /// Non-prophetic (Default mode) function with Final body should be opaque.

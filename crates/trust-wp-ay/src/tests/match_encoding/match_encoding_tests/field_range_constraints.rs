@@ -329,9 +329,9 @@ fn test_adt_field_range_lookup_with_synthesized_name() {
 
     let mut encoder = AYEncoder::new_all();
 
-    // Simulate what the driver produces AFTER the name-mismatch fix:
-    // range constraints indexed under the synthesized "Adt_Cons_Nil" name
-    // (in addition to "List", but we only test the synthesized path here).
+    // Simulate what the driver produces: range constraints indexed under the
+    // synthesized "Adt_Cons_Nil" name (in addition to "List", but we only
+    // test the synthesized path here).
     let mut ranges = HashMap::new();
     ranges.insert(
         "Adt_Cons_Nil".to_string(),
@@ -461,7 +461,7 @@ fn test_verification_request_adt_field_ranges_threaded() {
             .adt_field_ranges(Some(ranges)),
     )
     .unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
+    // KNOWN-CLASS PIN (upstream proof-trusted certification gap): the verdict
     // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.

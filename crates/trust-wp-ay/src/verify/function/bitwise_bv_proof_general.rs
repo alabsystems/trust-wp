@@ -96,7 +96,7 @@ use ay_dpll::api::{Logic, Solver, Term};
 use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
 
 use super::{
-    super::{solver_tail::ObligationSliceContext, Counterexample, VerificationResult},
+    super::{solver_tail::ObligationSliceContext, VerificationResult},
     bitwise_bv_proof::{inline_visible_logic_fns, width_from_unsigned_max},
 };
 
@@ -346,8 +346,18 @@ pub(super) fn try_prove_general_bitwise_obligation(
         proof.dropped_hypothesis
     );
     if verdict.result.is_unsat() {
-        let summary = crate::verify::extract_proof_summary(&proof.solver)?;
+        let Some(summary) = crate::verify::extract_proof_summary(&proof.solver) else {
+            crate::verify::authority_trace(|| {
+                "bitwise BV UNSAT: no proof summary extracted".to_string()
+            });
+            return None;
+        };
         if !summary.is_fully_verified() {
+            crate::verify::authority_trace(|| {
+                crate::verify::authority_result_tag(&VerificationResult::Verified(Some(
+                    summary.clone(),
+                )))
+            });
             return None;
         }
         let replay = proof
@@ -368,7 +378,23 @@ pub(super) fn try_prove_general_bitwise_obligation(
         && verdict.accept_for_consumer().is_ok()
         && !proof.dropped_hypothesis
     {
-        Some(VerificationResult::Failed(Counterexample::empty()))
+        // The isolated BV solver validated this SAT model: carry it (with the
+        // solve envelope) as the refutation witness so the `Failed` is backed
+        // by a validated counterexample rather than withheld.
+        let model = proof.solver.model().map(ay_dpll::VerifiedModel::into_inner);
+        let replay = proof
+            .solver
+            .export_native_replay_artifact(
+                ay_dpll::api::NativeReplayMetadata::default(),
+                Some(&verdict),
+            )
+            .to_pretty_json();
+        crate::verify::solver_tail::record_isolated_refutation_witness(
+            &verdict,
+            model,
+            Some(replay),
+        )
+        .map(VerificationResult::Failed)
     } else {
         None
     }
@@ -856,6 +882,16 @@ impl BvProof {
             // width) and conjoined into the goal — so an over-wide shift
             // still FAILS in this lane, with no Int-sort round-trip and no
             // uninterpreted conversion aux.
+            // A machine bit operation at its type (D-242).
+            PureExpr::LogicFnCall { name, args }
+                if crate::encoder::parse_int_bitop_name(name).is_some() =>
+            {
+                let (bits, signed) = crate::encoder::parse_int_bitop_name(name)?;
+                let [inner] = args.as_slice() else {
+                    return None;
+                };
+                self.machine_bitop_value(inner, bits, signed)
+            }
             PureExpr::LogicFnCall { name, args } => {
                 let bits = crate::encoder::parse_shift_amount_in_range_name(name)?;
                 let [amount] = args.as_slice() else {
@@ -920,6 +956,118 @@ impl BvProof {
         }
     }
 
+    /// The machine bit operation `inner` AT ITS TYPE (`bits` wide,
+    /// `signed`; the `__trust_wp_int_bitop_*` marker, D-242).
+    ///
+    /// The Rust value is the operation's mathematical value (the walker's
+    /// reading of the bare operator) reduced into the type, so it is
+    /// congruent to it modulo `2^bits` and therefore modulo `M = 2^W`
+    /// whenever `W <= bits`. When the mathematical interval lies in the
+    /// type's range nothing is reduced and the bare reading's interval
+    /// stands; otherwise the value lies in the type's range (for `!` of an
+    /// unsigned operand in `[lo, hi] ⊆ [0, 2^bits)`, in
+    /// `[2^bits-1-hi, 2^bits-1-lo]`). Exactness then follows from that
+    /// interval and the window as for every congruent node.
+    ///
+    /// A window WIDER than the type (`W > bits`, e.g. an `i8` beside a
+    /// `u32` shift amount) is read by
+    /// [`Self::machine_bitop_value_in_wider_window`].
+    fn machine_bitop_value(
+        &mut self,
+        inner: &PureExpr,
+        bits: u32,
+        signed: bool,
+    ) -> Option<(Term, ValueInfo)> {
+        // The type's range, clamped inside the saturation sentinel so a
+        // saturated bound never reads as contained (and a 128-bit range
+        // never overflows).
+        let limit = INTERVAL_SAT - 1;
+        let (type_lo, type_hi) = if bits >= 124 {
+            (if signed { -limit } else { 0 }, limit)
+        } else if signed {
+            let half = 1i128 << (bits - 1);
+            (-half, half - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        if self.width > bits {
+            return self.machine_bitop_value_in_wider_window(inner, signed, type_lo, type_hi);
+        }
+        let (term, info) = match inner {
+            PureExpr::BinOp(l, op, r)
+                if matches!(
+                    op,
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+                ) =>
+            {
+                self.value_binop(l, *op, r)?
+            }
+            PureExpr::UnOp(UnOp::BitNot, operand) => {
+                let (t, i) = self.value(operand)?;
+                let term = self.solver.bvnot(t);
+                let (lo, hi) = if !signed && i.lo >= 0 && i.hi <= type_hi && bits < 124 {
+                    (type_hi - i.hi, type_hi - i.lo)
+                } else {
+                    (sat_sub(sat_neg(i.hi), 1), sat_sub(sat_neg(i.lo), 1))
+                };
+                let exact = self.in_window(lo, hi);
+                (term, ValueInfo { lo, hi, exact })
+            }
+            _ => return None,
+        };
+        if info.lo >= type_lo && info.hi <= type_hi {
+            return Some((term, info));
+        }
+        let (lo, hi) = if bits >= 124 {
+            (-INTERVAL_SAT, INTERVAL_SAT)
+        } else {
+            (type_lo, type_hi)
+        };
+        let exact = self.in_window(lo, hi);
+        Some((term, ValueInfo { lo, hi, exact }))
+    }
+
+    /// [`Self::machine_bitop_value`] in a window wider than the type
+    /// (`W > bits`), whose bits above the type are not reduced. An operation
+    /// reads there only where its Rust value is exactly what the window
+    /// holds: `&`, `|`, `^` and `>>` of values of the type never leave it
+    /// and a signed `!a` is `-a - 1`, each the bare (infinite
+    /// two's-complement) reading; a `<<` only when its mathematical interval
+    /// lies in the type's range (it then wraps nowhere); an unsigned `!a` as
+    /// the exact `(2^bits - 1) - a` of an exact operand of the type.
+    fn machine_bitop_value_in_wider_window(
+        &mut self,
+        inner: &PureExpr,
+        signed: bool,
+        type_lo: i128,
+        type_hi: i128,
+    ) -> Option<(Term, ValueInfo)> {
+        match inner {
+            PureExpr::BinOp(
+                l,
+                op @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shr),
+                r,
+            ) => self.value_binop(l, *op, r),
+            PureExpr::BinOp(l, BinOp::Shl, r) => {
+                let (term, info) = self.value_binop(l, BinOp::Shl, r)?;
+                (info.lo >= type_lo && info.hi <= type_hi).then_some((term, info))
+            }
+            PureExpr::UnOp(UnOp::BitNot, _) if signed => self.value(inner),
+            PureExpr::UnOp(UnOp::BitNot, operand) => {
+                let (t, i) = self.value(operand)?;
+                if !i.exact || i.lo < 0 || i.hi > type_hi || !self.in_window(0, type_hi) {
+                    return None;
+                }
+                let (mask, _) = self.literal(type_hi);
+                let term = self.solver.bvsub(mask, t);
+                let (lo, hi) = (type_hi - i.hi, type_hi - i.lo);
+                let exact = self.in_window(lo, hi);
+                Some((term, ValueInfo { lo, hi, exact }))
+            }
+            _ => None,
+        }
+    }
+
     fn value_binop(&mut self, l: &PureExpr, op: BinOp, r: &PureExpr) -> Option<(Term, ValueInfo)> {
         let (lt, li) = self.value(l)?;
         let (rt, ri) = self.value(r)?;
@@ -930,12 +1078,20 @@ impl BvProof {
                 sat_add(li.hi, ri.hi),
                 true,
             ),
-            BinOp::Sub => (
-                self.solver.bvsub(lt, rt),
-                sat_sub(li.lo, ri.hi),
-                sat_sub(li.hi, ri.lo),
-                true,
-            ),
+            BinOp::Sub => {
+                let (mut lo, mut hi) = (sat_sub(li.lo, ri.hi), sat_sub(li.hi, ri.lo));
+                // Interval arithmetic forgets that both operands read the
+                // same value: the SWAR step `x - ((x >> 1) & 0x55)` gets
+                // `[-0x55, x.hi]`, which is inexact, so the next `>>` bails.
+                // When `r` is `l` narrowed only by right shifts and
+                // non-negative masks and `l >= 0`, `0 <= r <= l` in every
+                // valuation, so `l - r` lies in `[0, l.hi]`.
+                if li.lo >= 0 && narrowed_from(r, l) {
+                    lo = lo.max(0);
+                    hi = hi.min(li.hi);
+                }
+                (self.solver.bvsub(lt, rt), lo, hi, true)
+            }
             BinOp::Mul => {
                 let corners = [
                     sat_mul(li.lo, ri.lo),
@@ -1375,6 +1531,43 @@ fn restore<V>(map: &mut HashMap<String, V>, key: &str, old: Option<V>) {
     }
 }
 
+/// Whether `narrowed` is `base` itself, or `base` passed through right
+/// shifts by non-negative constants and ANDs with non-negative constant
+/// masks. For a non-negative `a`, `0 <= a >> k <= a` and `0 <= a & m <= a`
+/// (`k, m >= 0`), so by induction `0 <= narrowed <= base` whenever
+/// `base >= 0`. `@` and `old` are the value itself here (see `value`); any
+/// other node answers `false`.
+fn narrowed_from(narrowed: &PureExpr, base: &PureExpr) -> bool {
+    fn strip(expr: &PureExpr) -> &PureExpr {
+        match expr {
+            PureExpr::View(inner) | PureExpr::Old(inner) => strip(inner),
+            other => other,
+        }
+    }
+    let non_negative_const = |e: &PureExpr| fold_const(e).is_some_and(|c| c >= 0);
+    let narrowed = strip(narrowed);
+    if narrowed == strip(base) {
+        return true;
+    }
+    match narrowed {
+        PureExpr::BinOp(a, BinOp::Shr, k) if non_negative_const(k) => narrowed_from(a, base),
+        PureExpr::BinOp(a, BinOp::BitAnd, m) if non_negative_const(m) => narrowed_from(a, base),
+        PureExpr::BinOp(m, BinOp::BitAnd, a) if non_negative_const(m) => narrowed_from(a, base),
+        // A `>>` or `&` at its machine type (D-242) of a non-negative value
+        // is the bare operation: neither leaves the type.
+        PureExpr::LogicFnCall { name, args }
+            if crate::encoder::parse_int_bitop_name(name).is_some() =>
+        {
+            matches!(
+                args.as_slice(),
+                [inner @ PureExpr::BinOp(_, BinOp::Shr | BinOp::BitAnd, _)]
+                    if narrowed_from(inner, base)
+            )
+        }
+        _ => false,
+    }
+}
+
 // ── Saturating interval arithmetic ─────────────────────────────────────
 //
 // Saturation is fail-closed: saturated bounds are far outside any window or
@@ -1418,16 +1611,19 @@ fn sat_shl(a: i128, k: i128) -> i128 {
 }
 
 /// Smallest `2^k - 1` covering a non-negative `value` (shared shape with
-/// tier 1's helper; duplicated to keep tier 1 untouched).
+/// tier 1's helper; duplicated to keep tier 1 untouched). Saturates to
+/// `INTERVAL_SAT` instead of stopping below `value`: the earlier loop
+/// stopped at `2^101 - 1`, an UNDER-approximation of a larger `value`.
 fn all_ones_cover(value: i128) -> i128 {
     if value <= 0 {
         return 0;
     }
-    let mut cover: i128 = 1;
-    while cover < value && cover < (1i128 << 100) {
-        cover = (cover << 1) | 1;
-    }
-    cover
+    let bits = 128 - value.leading_zeros();
+    1i128
+        .checked_shl(bits)
+        .and_then(|m| m.checked_sub(1))
+        .filter(|cover| *cover >= value)
+        .map_or(INTERVAL_SAT, clamp)
 }
 
 #[cfg(test)]
@@ -1523,6 +1719,7 @@ mod tests {
             mutation_continued_params: None,
             body_div_obligations: &[],
             fresh_base_recheck: None,
+            literal_false_base_recheck: None,
             slice_length_stable_vars: None,
             base_recheck_pathology: std::cell::Cell::new(false),
         };
@@ -1873,6 +2070,321 @@ mod tests {
             matches!(result, Some(VerificationResult::Verified(_))),
             "a branch-guarded marker must not fail outside its branch, got {result:?}"
         );
+    }
+
+    /// The u8 SWAR popcount body over `n`, as the driver lowers `count8`.
+    fn count8_swar_u8() -> PureExpr {
+        let n = || var("n");
+        let x1 = bin(
+            n(),
+            BinOp::Sub,
+            bin(bin(n(), BinOp::Shr, int(1)), BinOp::BitAnd, int(0x55)),
+        );
+        let x2 = bin(
+            bin(x1.clone(), BinOp::BitAnd, int(0x33)),
+            BinOp::Add,
+            bin(bin(x1, BinOp::Shr, int(2)), BinOp::BitAnd, int(0x33)),
+        );
+        bin(
+            bin(x2.clone(), BinOp::Add, bin(x2, BinOp::Shr, int(4))),
+            BinOp::BitAnd,
+            int(0x0F),
+        )
+    }
+
+    /// Unsigned count8_log over u8: one ITE per bit.
+    fn count8_log_u8_def() -> LogicFnDef {
+        let bit = |mask: i64| {
+            ite(
+                bin(bin(var("n"), BinOp::BitAnd, int(mask)), BinOp::Eq, int(0)),
+                int(0),
+                int(1),
+            )
+        };
+        let mut sum = bit(1);
+        for mask in [2i64, 4, 8, 0x10, 0x20, 0x40, 0x80] {
+            sum = bin(sum, BinOp::Add, bit(mask));
+        }
+        LogicFnDef::new(
+            "count8_log".to_string(),
+            "count8_log".to_string(),
+            vec!["n".to_string()],
+            sum,
+        )
+        .with_mode(LogicMode::Open)
+    }
+
+    /// The u8 range premises of `n` alone: a premise over a variable the
+    /// goal never mentions does not encode, is dropped, and would taint the
+    /// `Failed` direction.
+    fn n_u8_requires() -> Vec<PureExpr> {
+        vec![
+            bin(view(var("n")), BinOp::Ge, int(0)),
+            bin(view(var("n")), BinOp::Le, int(255)),
+        ]
+    }
+
+    fn count8_log_call() -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: "count8_log".to_string(),
+            args: vec![var("n")],
+        }
+    }
+
+    /// `x - ((x >> 1) & 0x55)` subtracts a value the same `x` bounds, so it
+    /// stays in the u8 window and the SWAR chain after it is exact: both
+    /// popcount ensures verify natively. Before the narrowing rule the first
+    /// `>>` on that difference bailed and the goal went to the mixed Int/BV
+    /// encoder, which timed out.
+    #[test]
+    fn swar_popcount_u8_verifies() {
+        let fns = [count8_log_u8_def()];
+        let requires = n_u8_requires();
+        let equal = bin(view(var("result")), BinOp::Eq, count8_log_call());
+        let result = prove(&equal, &requires, &count8_swar_u8(), Some(&fns));
+        assert!(
+            matches!(result, Some(VerificationResult::Verified(_))),
+            "result@ == count8_log(n) should verify natively, got {result:?}"
+        );
+        let bound = bin(view(var("result")), BinOp::Le, int(8));
+        let result = prove(&bound, &requires, &count8_swar_u8(), Some(&fns));
+        assert!(
+            matches!(result, Some(VerificationResult::Verified(_))),
+            "result@ <= 8 should verify natively, got {result:?}"
+        );
+    }
+
+    /// The false twins: an off-by-one count and a bound one too small are
+    /// exactly encoded and refuted, never verified.
+    #[test]
+    fn swar_popcount_u8_false_specs_are_refuted() {
+        let fns = [count8_log_u8_def()];
+        let requires = n_u8_requires();
+        let off_by_one = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(count8_log_call(), BinOp::Add, int(1)),
+        );
+        let result = prove(&off_by_one, &requires, &count8_swar_u8(), Some(&fns));
+        assert!(
+            matches!(result, Some(VerificationResult::Failed(_))),
+            "result@ == count8_log(n) + 1 must be refuted, got {result:?}"
+        );
+        let too_small = bin(view(var("result")), BinOp::Le, int(7));
+        let result = prove(&too_small, &requires, &count8_swar_u8(), Some(&fns));
+        assert!(
+            matches!(result, Some(VerificationResult::Failed(_))),
+            "result@ <= 7 is false at n == 255 and must be refuted, got {result:?}"
+        );
+    }
+
+    /// The narrowing rule reads the SAME operand on both sides. With a
+    /// different variable the difference can go negative (`x = 0, n = 2`),
+    /// its interval stays inexact, and a claim that it is non-negative must
+    /// not verify.
+    #[test]
+    fn narrowing_needs_the_same_operand() {
+        let return_expr = bin(
+            var("x"),
+            BinOp::Sub,
+            bin(bin(var("n"), BinOp::Shr, int(1)), BinOp::BitAnd, int(0x55)),
+        );
+        let ensure = bin(view(var("result")), BinOp::Ge, int(0));
+        let result = prove(&ensure, &u8_requires(255), &return_expr, None);
+        assert!(
+            !matches!(result, Some(VerificationResult::Verified(_))),
+            "x - ((n >> 1) & 0x55) >= 0 is false at x = 0, n = 2, got {result:?}"
+        );
+        // An OR can raise the value above its operand: `x | 1 > x` at even
+        // `x`, so `x - (x | 1)` is negative there and is not narrowed.
+        let or_return = bin(var("x"), BinOp::Sub, bin(var("x"), BinOp::BitOr, int(1)));
+        let result = prove(&ensure, &u8_requires(255), &or_return, None);
+        assert!(
+            !matches!(result, Some(VerificationResult::Verified(_))),
+            "x - (x | 1) >= 0 is false at x = 0, got {result:?}"
+        );
+    }
+
+    fn machine_bitop(signed: bool, bits: u32, inner: PureExpr) -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: trust_wp_core::formula::internal::machine_bitop::name(signed, bits),
+            args: vec![inner],
+        }
+    }
+
+    fn is_verified(result: &Option<VerificationResult>) -> bool {
+        matches!(result, Some(VerificationResult::Verified(_)))
+    }
+
+    /// The rightmost_bit_8 body as the driver now lowers it (D-242): the
+    /// signed `&` at its type. Every proof the bare body had still goes
+    /// through at the i8 window.
+    #[test]
+    fn rightmost_bit_at_its_type_still_verifies() {
+        let marked = machine_bitop(true, 8, rmb8_return_expr());
+        let ensure = bin(
+            bin(var("x"), BinOp::Eq, var("i8::MIN")),
+            BinOp::Eq,
+            bin(var("result"), BinOp::Eq, var("i8::MIN")),
+        );
+        assert!(is_verified(&prove(
+            &ensure,
+            &rmb8_requires(),
+            &marked,
+            None
+        )));
+        let ensure = bin(
+            bin(var("x"), BinOp::Ge, int(0)),
+            BinOp::Implies,
+            bin(
+                bin(int(0), BinOp::Le, var("result")),
+                BinOp::And,
+                bin(var("result"), BinOp::Le, var("x")),
+            ),
+        );
+        assert!(is_verified(&prove(
+            &ensure,
+            &rmb8_requires(),
+            &marked,
+            None
+        )));
+    }
+
+    fn u8_u16_requires() -> Vec<PureExpr> {
+        vec![
+            bin(view(var("x")), BinOp::Ge, int(0)),
+            bin(view(var("x")), BinOp::Le, int(255)),
+            bin(view(var("y")), BinOp::Ge, int(0)),
+            bin(view(var("y")), BinOp::Le, int(65535)),
+        ]
+    }
+
+    /// Regression (r35): with a `u8` and a `u16` operand the window is 16
+    /// bits, and the bare `x << 4` read `x * 16` there although Rust drops
+    /// the bits above the `u8` (`16u8 << 4 == 0`): `result@ == x@ * 16` over
+    /// `((x << 4) as u16) | (y & 0)` was proved. At its type a `<<` that may
+    /// wrap at the `u8` bails in a wider window, and a `!x` there is
+    /// `255 - x`, not `65535 - x`.
+    #[test]
+    fn machine_op_narrower_than_the_window_bails() {
+        let shl = machine_bitop(false, 8, bin(var("x"), BinOp::Shl, int(4)));
+        let ret = bin(shl, BinOp::BitOr, bin(var("y"), BinOp::BitAnd, int(0)));
+        let ensure = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(view(var("x")), BinOp::Mul, int(16)),
+        );
+        let result = prove(&ensure, &u8_u16_requires(), &ret, None);
+        assert!(!is_verified(&result), "16u8 << 4 is 0: {result:?}");
+        let not = machine_bitop(false, 8, PureExpr::UnOp(UnOp::BitNot, Arc::new(var("x"))));
+        let ret = bin(not, BinOp::BitOr, bin(var("y"), BinOp::BitAnd, int(0)));
+        let ensure = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(int(65535), BinOp::Sub, view(var("x"))),
+        );
+        let result = prove(&ensure, &u8_u16_requires(), &ret, None);
+        assert!(!is_verified(&result), "!0u8 is 255: {result:?}");
+    }
+
+    /// An `i8` `>>` beside a `u16` operand (a 17-bit signed window) never
+    /// reduces, so it reads as the bare arithmetic shift there: the true
+    /// `x >= 0 ==> x >> 1 <= x` verifies and the false `x >> 1 >= 0` does
+    /// not (`-128 >> 1 == -64`). A signed `<<` in that window, which wraps at
+    /// the `i8`, still bails.
+    #[test]
+    fn machine_shr_reads_in_a_window_wider_than_its_type() {
+        let requires = vec![
+            bin(view(var("x")), BinOp::Ge, int(-128)),
+            bin(view(var("x")), BinOp::Le, int(127)),
+            bin(view(var("y")), BinOp::Ge, int(0)),
+            bin(view(var("y")), BinOp::Le, int(65535)),
+        ];
+        let y_and_0 = bin(view(var("y")), BinOp::BitAnd, int(0));
+        let shr = machine_bitop(true, 8, bin(var("x"), BinOp::Shr, int(1)));
+        let shrinks = bin(
+            bin(view(var("x")), BinOp::Ge, int(0)),
+            BinOp::Implies,
+            bin(
+                view(var("result")),
+                BinOp::Le,
+                bin(view(var("x")), BinOp::Add, y_and_0.clone()),
+            ),
+        );
+        assert!(is_verified(&prove(&shrinks, &requires, &shr, None)));
+        let nonneg = bin(view(var("result")), BinOp::Ge, y_and_0.clone());
+        assert!(!is_verified(&prove(&nonneg, &requires, &shr, None)));
+        let shl = machine_bitop(true, 8, bin(var("x"), BinOp::Shl, int(1)));
+        let doubles = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(bin(view(var("x")), BinOp::Mul, int(2)), BinOp::Add, y_and_0),
+        );
+        assert!(!is_verified(&prove(&doubles, &requires, &shl, None)));
+    }
+
+    /// In a window wider than a `u8` (a `u16` operand beside it), a `<<`
+    /// that cannot wrap at the `u8` (`x <= 15`) is the exact product, and a
+    /// `!` is the exact `255 - x`: both true contracts verify, and the
+    /// `!` read as `65535 - x` does not.
+    #[test]
+    fn machine_op_that_does_not_wrap_reads_in_a_wider_window() {
+        let mut requires = u8_u16_requires();
+        requires.push(bin(view(var("x")), BinOp::Le, int(15)));
+        let y_and_0 = bin(var("y"), BinOp::BitAnd, int(0));
+        let shl = machine_bitop(false, 8, bin(var("x"), BinOp::Shl, int(4)));
+        let ret = bin(shl, BinOp::BitOr, y_and_0.clone());
+        let times16 = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(view(var("x")), BinOp::Mul, int(16)),
+        );
+        assert!(is_verified(&prove(&times16, &requires, &ret, None)));
+        let not = machine_bitop(false, 8, PureExpr::UnOp(UnOp::BitNot, Arc::new(var("x"))));
+        let ret = bin(not, BinOp::BitOr, y_and_0);
+        let complement = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(int(255), BinOp::Sub, view(var("x"))),
+        );
+        assert!(is_verified(&prove(
+            &complement,
+            &u8_u16_requires(),
+            &ret,
+            None
+        )));
+        let wide = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(int(65535), BinOp::Sub, view(var("x"))),
+        );
+        assert!(!is_verified(&prove(&wide, &u8_u16_requires(), &ret, None)));
+    }
+
+    /// At the type's own window a `u8` `<<` and `!` are exact: the true
+    /// `x << 4 <= 240` and `!x == 255 - x` verify, `x << 4 == x * 16` does not.
+    #[test]
+    fn machine_op_at_its_own_window_is_exact() {
+        let requires = vec![
+            bin(view(var("x")), BinOp::Ge, int(0)),
+            bin(view(var("x")), BinOp::Le, int(255)),
+        ];
+        let shl = machine_bitop(false, 8, bin(var("x"), BinOp::Shl, int(4)));
+        let le240 = bin(view(var("result")), BinOp::Le, int(240));
+        assert!(is_verified(&prove(&le240, &requires, &shl, None)));
+        let times16 = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(view(var("x")), BinOp::Mul, int(16)),
+        );
+        assert!(!is_verified(&prove(&times16, &requires, &shl, None)));
+        let not = machine_bitop(false, 8, PureExpr::UnOp(UnOp::BitNot, Arc::new(var("x"))));
+        let complement = bin(
+            view(var("result")),
+            BinOp::Eq,
+            bin(int(255), BinOp::Sub, view(var("x"))),
+        );
+        assert!(is_verified(&prove(&complement, &requires, &not, None)));
     }
 
     #[test]

@@ -177,12 +177,12 @@ fn test_loop_invariant_pre_loop_call_obligation_fails() {
 
 /// Regression test for #638 (dimension 2): in-loop call obligations are collected and checked.
 ///
-/// `loop_with_in_loop_call` has `f(i)` inside the loop body. The Fn trait
-/// contract generates a call-site obligation `(*self).precondition(arg)`.
-/// For a generic `F: Fn(i32) -> i32` without a concrete closure, this
-/// precondition is an unconstrained predicate the solver can falsify.
-/// The test confirms obligations are collected and checked (not silently
-/// dropped) — the expected outcome is FAILED, matching the pre-loop test.
+/// `loop_with_in_loop_call` has `f(i)` inside the loop body. The loop lane
+/// cannot state a generic `Fn` bound's `precondition_F f args` (s62), so it
+/// owes a fail-closed `false` for the call under the loop's path guard. A
+/// model of that guard only shows the call is reached, so the refutation is
+/// withheld (D-141): the function is `unknown` with the reason named, and never
+/// credited. The test confirms the in-loop call is refused, not dropped.
 #[test]
 #[timeout(180_000)]
 fn test_loop_invariant_in_loop_call_obligation_checked() {
@@ -200,7 +200,11 @@ fn test_loop_invariant_in_loop_call_obligation_checked() {
         !output.status.success(),
         "loop_with_in_loop_call should fail: {output:?}"
     );
-    assert_function_status(&stderr, "loop_with_in_loop_call", "FAILED");
+    assert_function_status(
+        &stderr,
+        "loop_with_in_loop_call",
+        "unknown (loop call obligations: refutation withheld",
+    );
 }
 
 /// Regression test for c44fdc46: multi-loop functions must not use one loop's
@@ -208,8 +212,9 @@ fn test_loop_invariant_in_loop_call_obligation_checked() {
 ///
 /// `multi_loop_with_in_loop_calls` has TWO while loops, each calling `f(...)`.
 /// The driver should detect both loops' in-loop call obligations and keep them
-/// separate. This case still FAILS because the generic `Fn` precondition is
-/// unconstrained even when the correct loop condition is available.
+/// separate. The function is still not credited: each loop refuses its generic
+/// `Fn` call with a fail-closed `false`, and a model of a loop's guard is no
+/// refutation (D-141), so it is `unknown` with the reason named.
 #[test]
 #[timeout(180_000)]
 fn test_multi_loop_in_loop_call_obligations_still_fail_for_unconstrained_fn() {
@@ -227,7 +232,11 @@ fn test_multi_loop_in_loop_call_obligations_still_fail_for_unconstrained_fn() {
         !output.status.success(),
         "multi_loop_with_in_loop_calls should fail: {output:?}"
     );
-    assert_function_status(&stderr, "multi_loop_with_in_loop_calls", "FAILED");
+    assert_function_status(
+        &stderr,
+        "multi_loop_with_in_loop_calls",
+        "unknown (loop call obligations: refutation withheld",
+    );
 }
 
 /// Regression for #752: multi-loop call obligations must keep each loop's

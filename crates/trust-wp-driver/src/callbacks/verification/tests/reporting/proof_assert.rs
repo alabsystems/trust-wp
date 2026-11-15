@@ -2,12 +2,28 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-use trust_wp_ay::{UnknownReason, VerificationResult};
+use trust_wp_ay::{UnknownReason, VerificationOutcome, VerificationResult};
 
 use crate::callbacks::{
     proof_assert_verify::PreparedAssertion,
-    reporting::{report_proof_assert_result, ProofAssertCounters},
+    reporting::{
+        report_proof_assert_outcome_result, report_proof_assert_result, ProofAssertCounters,
+    },
 };
+
+/// A SAT snapshot ay validated and accepted: the only evidence on which
+/// trust-wp may publish a proof_assert as refuted.
+fn validated_sat_provenance() -> trust_wp_ay::VerificationProvenance {
+    let mut evidence = trust_wp_ay::SolveEvidenceSnapshot::default();
+    evidence.result = "sat".to_string();
+    evidence.model_validated = true;
+    evidence.accepted_for_consumer = true;
+    evidence.verification.sat_model_validated = true;
+    evidence.verification_level = trust_wp_ay::SolveVerificationLevelSnapshot::FullyVerified;
+    trust_wp_ay::VerificationProvenance::with_solve_time(std::time::Duration::from_millis(7))
+        .with_assertion_count(3)
+        .with_solve_evidence(Some(evidence))
+}
 
 /// Verify that proof_assert Assumed results are counted as errors, not verified (#1891).
 ///
@@ -104,11 +120,14 @@ fn report_proof_assert_failed_counts_as_failed() {
     };
     let mut pa_counters = ProofAssertCounters::default();
 
-    report_proof_assert_result(
-        Ok(VerificationResult::Failed(trust_wp_ay::Counterexample {
-            values: vec![],
-            violated_postcondition: None,
-        })),
+    report_proof_assert_outcome_result(
+        Ok(VerificationOutcome::new(
+            VerificationResult::Failed(trust_wp_ay::Counterexample {
+                values: vec![],
+                violated_postcondition: None,
+            }),
+            Some(validated_sat_provenance()),
+        )),
         &prepared,
         &mut pa_counters,
     );
@@ -118,6 +137,50 @@ fn report_proof_assert_failed_counts_as_failed() {
         pa_counters.verified, 0,
         "Failed should not count as verified"
     );
+    assert_eq!(
+        pa_counters.refutations_withheld, 0,
+        "a validated refutation is not withheld"
+    );
+}
+
+/// The same refuted proof_assert WITHOUT a validated model is an inconclusive,
+/// not a refutation: it counts as an error and NEVER as verified.
+#[test]
+fn report_proof_assert_failed_without_validated_model_counts_as_error() {
+    let prepared = PreparedAssertion {
+        preconditions: vec![],
+        ensures: vec![],
+        return_expr: None,
+        mode_overrides: None,
+        closure_capture_infos: vec![],
+        has_mutating_call_effect: false,
+        is_contractless: false,
+        containing_requires_false: false,
+        fn_path: "test::proof_assert_fn".to_string(),
+        loc: "test.rs:1:1".to_string(),
+        expr_text: "x > 0".to_string(),
+    };
+    let mut pa_counters = ProofAssertCounters::default();
+
+    report_proof_assert_result(
+        Ok(VerificationResult::Failed(trust_wp_ay::Counterexample {
+            values: vec![],
+            violated_postcondition: None,
+        })),
+        &prepared,
+        &mut pa_counters,
+    );
+
+    assert_eq!(
+        pa_counters.failed, 0,
+        "an unvalidated refutation must NOT count as failed"
+    );
+    assert_eq!(pa_counters.errors, 1, "it is an inconclusive: count it");
+    assert_eq!(
+        pa_counters.verified, 0,
+        "and it must never count as verified"
+    );
+    assert_eq!(pa_counters.refutations_withheld, 1);
 }
 
 /// Verify that proof_assert Unknown results are counted as errors.
@@ -205,11 +268,14 @@ fn report_proof_assert_contractless_failed_still_counts_as_failed() {
     };
     let mut pa_counters = ProofAssertCounters::default();
 
-    report_proof_assert_result(
-        Ok(VerificationResult::Failed(trust_wp_ay::Counterexample {
-            values: vec![],
-            violated_postcondition: None,
-        })),
+    report_proof_assert_outcome_result(
+        Ok(VerificationOutcome::new(
+            VerificationResult::Failed(trust_wp_ay::Counterexample {
+                values: vec![],
+                violated_postcondition: None,
+            }),
+            Some(validated_sat_provenance()),
+        )),
         &prepared,
         &mut pa_counters,
     );

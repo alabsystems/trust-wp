@@ -6,7 +6,7 @@ use ay_dpll::api::Sort;
 use tracing::debug;
 use trust_wp_core::formula::{
     internal::{
-        builtins::REAL_TO_INT_FLOOR_LOGIC_FN,
+        builtins::{PTR_PAIR_LOGIC_FN_PREFIX, PTR_THIN_LOGIC_FN},
         tuple_lowering::{
             tuple_logic_fn_arity, NAMED_FIELD_LOGIC_FN_PREFIX, TUPLE_FIELD_LOGIC_FN_PREFIX,
         },
@@ -18,7 +18,7 @@ use super::{fmap_sort, unit_sort};
 use crate::encoder::{
     match_enc::{stdlib_constructor_target, stdlib_option_datatype_for_payload, SwitchTarget},
     pure_encoding::{
-        parse_int_truncate_name, parse_shift_amount_in_range_name,
+        parse_int_bitop_name, parse_int_truncate_name, parse_shift_amount_in_range_name,
         parse_unsigned_to_signed_same_width_cast_name,
     },
     unsoundness,
@@ -29,6 +29,12 @@ pub(super) fn infer_logic_fn_sort(
     args: &[PureExpr],
     infer_expr_sort: &mut impl FnMut(&PureExpr) -> Sort,
 ) -> Sort {
+    if let Some(f) = trust_wp_core::formula::ieee::IeeeFn::parse(name) {
+        return crate::encoder::sort_context::expr_sort_to_ay_sort(&f.result_sort());
+    }
+    if let Some(f) = trust_wp_core::formula::ieee::OpaqueFloatFn::parse(name) {
+        return crate::encoder::sort_context::expr_sort_to_ay_sort(&f.result_sort());
+    }
     if matches!(name, "seq" | "Seq::singleton" | "seq_empty" | "Seq::empty") {
         return Sort::seq(Sort::Int);
     }
@@ -37,6 +43,19 @@ pub(super) fn infer_logic_fn_sort(
         "fmap_insert" | "fmap_merge" | "fmap_empty" | "FMap::empty" | "__trust_wp_fmap_iter_view"
     ) {
         return fmap_sort();
+    }
+    // An FSet is carried as an `Int` handle, and `FSet::empty()` is encoded as
+    // the `Int`-sorted constant `fset_empty` its axioms are stated over
+    // (`call_encoding::dispatch`). Int is its definite sort, not a fallback.
+    if matches!(name, "fset_empty" | "FSet::empty") && args.is_empty() {
+        return Sort::Int;
+    }
+    // `thin(p)` and a raw-pointer cast's pair function are declared at their
+    // operand's sort (`call_encoding::dispatch`).
+    if name == PTR_THIN_LOGIC_FN || name.starts_with(PTR_PAIR_LOGIC_FN_PREFIX) {
+        if let [operand] = args {
+            return infer_expr_sort(operand);
+        }
     }
     // IterMut view projector returns Seq (analogous to fmap_iter_view returning FMap).
     if name == "__trust_wp_iter_mut_view" {
@@ -122,6 +141,11 @@ pub(super) fn infer_logic_fn_sort(
     if name == "mapping_get" {
         return Sort::Int;
     }
+    // `FSet::interval(l, r)` (Why3 `set.FsetInt.interval`) is encoded by the
+    // `fset_interval` built-in on the Int FSet carrier.
+    if matches!(name, "fset_interval" | "FSet::interval") {
+        return Sort::Int;
+    }
     if name == "mapping_contains" {
         return Sort::Bool;
     }
@@ -169,15 +193,13 @@ pub(super) fn infer_logic_fn_sort(
     if name == "final_value" {
         return args.first().map_or(Sort::Int, infer_expr_sort);
     }
-    if name == REAL_TO_INT_FLOOR_LOGIC_FN {
-        return Sort::Int;
-    }
     // Synthetic Int cast/truncation functions emitted by the driver are
     // intercepted by pure encoding and encoded with exact BV semantics. Their
     // return sort is always Int, so AST-level sort probes should not count
     // them as unknown logic functions.
     if parse_int_truncate_name(name).is_some()
         || parse_unsigned_to_signed_same_width_cast_name(name).is_some()
+        || parse_int_bitop_name(name).is_some()
     {
         return Sort::Int;
     }

@@ -77,6 +77,7 @@ struct RecursiveVariantSummaryCallbacks {
 
 fn install_recursive_variant_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(
@@ -95,32 +96,35 @@ fn install_recursive_variant_mir_borrowck_cache(config: &mut Config) {
 
 impl Callbacks for RecursiveCloneCallCallbacks {
     #[allow(clippy::elidable_lifetime_names)] // Matches rustc_driver::Callbacks trait signature
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        for local_def_id in tcx.hir_body_owners() {
-            let def_id = local_def_id.to_def_id();
-            let def_path = tcx.def_path_str(def_id);
-            if !def_path.ends_with("::clone") || !def_path.contains("List") {
-                continue;
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                let def_path = tcx.def_path_str(def_id);
+                if !def_path.ends_with("::clone") || !def_path.contains("List") {
+                    continue;
+                }
+
+                let arg_names = vec!["self".to_string()];
+                let body = tcx.optimized_mir(def_id);
+                let sites = extract_recursive_call_args(body, &arg_names, def_id, Some(tcx));
+                self.call_arg = sites
+                    .first()
+                    .and_then(|site| site.call_args.first())
+                    .cloned();
+                self.variant_kind = Some(classify_variant_type(
+                    tcx,
+                    def_id,
+                    &PureExpr::Var("self".to_string(), None),
+                    &arg_names,
+                ));
+                self.ran = true;
+                break;
             }
 
-            let arg_names = vec!["self".to_string()];
-            let body = tcx.optimized_mir(def_id);
-            let sites = extract_recursive_call_args(body, &arg_names, def_id, Some(tcx));
-            self.call_arg = sites
-                .first()
-                .and_then(|site| site.call_args.first())
-                .cloned();
-            self.variant_kind = Some(classify_variant_type(
-                tcx,
-                def_id,
-                &PureExpr::Var("self".to_string(), None),
-                &arg_names,
-            ));
-            self.ran = true;
-            break;
-        }
-
-        Compilation::Stop
+            Compilation::Stop
+        })
     }
 }
 
@@ -130,44 +134,45 @@ impl Callbacks for RecursiveVariantSummaryCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)] // Matches rustc_driver::Callbacks trait signature
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let contracts = find_contract_functions(tcx);
-        let call_graph = callgraph::build_call_graph(tcx, &contracts);
-        let recursive_fns = callgraph::detect_recursive_nodes(&call_graph);
-        let logic_fn_defs = extract_logic_fn_defs(tcx);
-        let ghost_blocks = find_ghost_blocks(tcx);
-        let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
-        let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
-        let trait_contracts = Vec::new();
-        let trait_refinement_overrides = HashSet::new();
-        let extern_specs = builtin_trust_wp_std_specs();
-        let run_config = VerificationRunConfig {
-            all_contracts: &contracts,
-            ghost_blocks: &ghost_blocks,
-            logic_fns: &logic_fn_defs,
-            type_invariant_defs: &type_invariant_defs,
-            trait_specs: &trait_specs,
-            trait_contracts: &trait_contracts,
-            trait_refinement_overrides: &trait_refinement_overrides,
-            recursive_fns: &recursive_fns,
-            extern_specs: &extern_specs,
-            verbose: false,
-            track_level: TrackLevel::Auto,
-            timeout: Some(Duration::from_secs(5)),
-            strict_axioms: false,
-            strict_trust: false,
-        };
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let contracts = find_contract_functions(tcx);
+            let call_graph = callgraph::build_call_graph(tcx, &contracts);
+            let recursive_fns = callgraph::detect_recursive_nodes(&call_graph);
+            let logic_fn_defs = extract_logic_fn_defs(tcx);
+            let ghost_blocks = find_ghost_blocks(tcx);
+            let type_invariant_defs: Vec<TypeInvariantDef> = Vec::new();
+            let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
+            let trait_contracts = Vec::new();
+            let extern_specs = builtin_trust_wp_std_specs();
+            let run_config = VerificationRunConfig {
+                all_contracts: &contracts,
+                ghost_blocks: &ghost_blocks,
+                logic_fns: &logic_fn_defs,
+                type_invariant_defs: &type_invariant_defs,
+                trait_specs: &trait_specs,
+                trait_contracts: &trait_contracts,
+                recursive_fns: &recursive_fns,
+                extern_specs: &extern_specs,
+                verbose: false,
+                track_level: TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+                strict_axioms: false,
+                strict_trust: false,
+            };
 
-        let summary = verify_contracts(tcx, &contracts, &run_config);
-        self.snapshot.verified = summary.verified;
-        self.snapshot.failed = summary.failed;
-        self.snapshot.errors = summary.errors;
-        self.snapshot.warnings = summary.warnings;
-        self.snapshot.evidence_gaps = summary.evidence_gaps;
-        self.snapshot.exit_code = summary.exit_code();
-        self.snapshot.rustc_exit_code = summary.rustc_process_exit_code();
-        self.snapshot.ran = true;
-        Compilation::Stop
+            let summary = verify_contracts(tcx, &contracts, &run_config);
+            self.snapshot.verified = summary.verified;
+            self.snapshot.failed = summary.failed;
+            self.snapshot.errors = summary.errors;
+            self.snapshot.warnings = summary.warnings;
+            self.snapshot.evidence_gaps = summary.evidence_gaps;
+            self.snapshot.exit_code = summary.exit_code();
+            self.snapshot.rustc_exit_code = summary.rustc_process_exit_code();
+            self.snapshot.ran = true;
+            Compilation::Stop
+        })
     }
 }
 
@@ -204,35 +209,38 @@ fn collect_recursive_variant_test_invariants<'tcx>(
 
 impl Callbacks for RecursiveVariantRequiresCallbacks {
     #[allow(clippy::elidable_lifetime_names)] // Matches rustc_driver::Callbacks trait signature
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let suffix = format!("::{}", self.fn_name);
-        for local_def_id in tcx.hir_body_owners() {
-            let def_id = local_def_id.to_def_id();
-            let def_path = tcx.def_path_str(def_id);
-            if def_path != self.fn_name && !def_path.ends_with(&suffix) {
-                continue;
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let suffix = format!("::{}", self.fn_name);
+            for local_def_id in tcx.hir_body_owners() {
+                let def_id = local_def_id.to_def_id();
+                let def_path = tcx.def_path_str(def_id);
+                if def_path != self.fn_name && !def_path.ends_with(&suffix) {
+                    continue;
+                }
+
+                let sig = tcx.fn_sig(def_id).instantiate_identity();
+                let type_invariants = collect_recursive_variant_test_invariants(
+                    tcx,
+                    sig.skip_binder().inputs().iter().copied(),
+                );
+
+                self.variant_requires = Some(build_recursive_variant_requires(
+                    tcx,
+                    def_id,
+                    &self.arg_names,
+                    &self.base_requires,
+                    &[], // no call_assumptions in unit tests
+                    &self.path_conditions,
+                    Some(&type_invariants),
+                ));
+                self.ran = true;
+                break;
             }
 
-            let sig = tcx.fn_sig(def_id).instantiate_identity();
-            let type_invariants = collect_recursive_variant_test_invariants(
-                tcx,
-                sig.skip_binder().inputs().iter().copied(),
-            );
-
-            self.variant_requires = Some(build_recursive_variant_requires(
-                tcx,
-                def_id,
-                &self.arg_names,
-                &self.base_requires,
-                &[], // no call_assumptions in unit tests
-                &self.path_conditions,
-                Some(&type_invariants),
-            ));
-            self.ran = true;
-            break;
-        }
-
-        Compilation::Stop
+            Compilation::Stop
+        })
     }
 }
 
@@ -467,13 +475,29 @@ fn recursive_structural_variant_decrease_counts_structural_gap_not_verified() {
 }
 
 #[test]
-fn variant_only_structural_recursion_exits_2_not_0() {
+fn variant_only_structural_recursion_is_refuted_never_credited() {
+    // Creusot types `#[variant(xs)]` as `&List: WellFounded`, which needs a
+    // user `WellFounded` impl for `List` (Creusot has none for user ADTs);
+    // trust-wp-std's `&T` impl additionally needs `T: Clone`. The driver
+    // still classifies the enum variant structurally, never by this relation.
     let source = r#"
-use trust_wp::{check, variant};
+#![feature(stmt_expr_attributes)]
+#![feature(proc_macro_hygiene)]
 
+use trust_wp::{check, variant};
+use trust_wp_std::logic::WellFounded;
+
+#[derive(Clone)]
 pub enum List {
     Nil,
     Cons(u32, Box<List>),
+}
+
+impl WellFounded for List {
+    #[trust_wp::logic(opaque)]
+    fn well_founded_relation(self, other: Self) -> bool {
+        false
+    }
 }
 
 #[check(terminates)]
@@ -492,12 +516,111 @@ pub fn structural_len(xs: &List) -> u32 {
         summary.verified, 0,
         "structural-only variant evidence must not count as clean verified"
     );
-    assert_eq!(summary.failed, 0);
+    // The termination lane does not own the whole verdict of a variant-only
+    // function (D-38): `structural_len`'s body carries a call obligation, so
+    // the function-level VC is built as well.
+    //
+    // That self-call resolves against the function's own (empty) self-spec
+    // instead of falling to Step 9 Opaque (D-26), so the VC carries no
+    // fabricated `requires(false)` and reports no `unknown (refutation
+    // withheld: missing solver provenance)`. What it reports is the obligation
+    // the body REALLY has: `1 + structural_len(&**tail)` can overflow `u32`,
+    // because an empty contract says nothing about the magnitude of the
+    // recursive result. Creusot poses the same goal for the same reason, and
+    // it is equally unprovable there without an `#[ensures]` bounding the
+    // result:
+    //
+    //   trust-wp: structural_len FAILED ✗ (postcondition)
+    //     violated obligation #0:
+    //       (((0 <= $call_6) && ($call_6 <= 4294967295))
+    //         ==> ((1 + $call_6) <= 4294967295))
+    //
+    // So the verdict is a refutation (`failed` 1, `errors` 0) and the run
+    // exits 1 (counterexample) rather than 2 (nothing conclusive).
+    // THE CLAIM THIS TEST EXISTS FOR IS ASSERTED FIRST: structural-only
+    // variant evidence is never credited, and the run never exits 0.
+    assert_ne!(
+        summary.exit_code, 0,
+        "a variant-only structural recursion must never exit 0"
+    );
+    assert_ne!(
+        summary.rustc_exit_code, 0,
+        "a variant-only structural recursion must never exit 0"
+    );
+    assert_eq!(summary.failed, 1);
     assert_eq!(summary.errors, 0);
     assert_eq!(summary.evidence_gaps, 1);
     assert_eq!(summary.warnings, 1);
-    assert_eq!(summary.exit_code, 2);
-    assert_eq!(summary.rustc_exit_code, 2);
+    assert_eq!(summary.exit_code, 1);
+    assert_eq!(summary.rustc_exit_code, 1);
+}
+
+#[test]
+fn mathematical_recursive_variant_refuses_a_negative_caller_measure() {
+    let source = r#"
+#![feature(stmt_expr_attributes)]
+#![feature(proc_macro_hygiene)]
+
+use trust_wp::{check, variant};
+
+#[check(terminates)]
+#[variant(n@)]
+pub fn countdown(n: i32) -> i32 {
+    if n >= -1 { countdown(n - 1) } else { 0 }
+}
+"#;
+
+    let summary = collect_recursive_variant_summary(source);
+    assert!(
+        summary.failed > 0,
+        "negative caller measure must fail its well-founded relation"
+    );
+    assert_ne!(summary.exit_code, 0);
+}
+
+#[test]
+fn mathematical_recursive_variant_allows_the_final_negative_base_case() {
+    let source = r#"
+#![feature(stmt_expr_attributes)]
+#![feature(proc_macro_hygiene)]
+
+use trust_wp::{check, variant};
+
+#[check(terminates)]
+#[variant(n@)]
+pub fn countdown(n: i32) -> i32 {
+    if n >= 0 { countdown(n - 1) } else { 0 }
+}
+"#;
+
+    let summary = collect_recursive_variant_summary(source);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.exit_code, 0, "n=0 may call the n=-1 base case");
+}
+
+#[test]
+fn signed_machine_recursive_variant_preserves_negative_descent() {
+    let source = r#"
+#![feature(stmt_expr_attributes)]
+#![feature(proc_macro_hygiene)]
+
+use trust_wp::{check, variant};
+
+#[check(terminates)]
+#[variant(n)]
+pub fn countdown(n: i32) -> i32 {
+    if n >= -1 { countdown(n - 1) } else { 0 }
+}
+"#;
+
+    let summary = collect_recursive_variant_summary(source);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(
+        summary.exit_code, 0,
+        "signed machine variant uses its type minimum"
+    );
 }
 
 #[test]

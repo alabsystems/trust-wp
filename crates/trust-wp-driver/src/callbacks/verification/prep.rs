@@ -4,7 +4,10 @@
 
 //! Shared verification preparation state and helpers extracted from `verification.rs`.
 
+mod logic_body_callees;
 mod logic_fn_catalog;
+mod logic_impl_discharge;
+mod program_callees;
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,9 +16,11 @@ use logic_fn_catalog::{
     substitute_const_items_into_logic_fns,
 };
 pub(in crate::callbacks) use logic_fn_catalog::{
-    downgrade_unverified_logic_specs, filter_downstream_logic_fns,
+    downgrade_unverified_logic_specs, filter_downstream_logic_fns, neutralized,
+    neutralized_axiom_reached,
 };
-use rustc_hir::{def::DefKind, def_id::DefId};
+use program_callees::program_fns_with_requires;
+use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 use trust_wp_core::{
     formula::PureExpr,
@@ -36,9 +41,7 @@ use super::{
         reporting::VerificationCounters,
         verification_context::VerificationRunConfig,
     },
-    logic_fn_verify::{
-        assumes_concrete_law_postcondition, verify_logic_fn_postconditions, VerifyConfig,
-    },
+    logic_fn_verify::{verify_logic_fn_postconditions, VerifyConfig},
 };
 
 /// Shared state computed once during verification preparation (#1526 Phase 5).
@@ -66,6 +69,11 @@ pub(in crate::callbacks) struct PreparedVerification<'a> {
     /// Builtin names shadowed by local USER #[logic] trait impls, by ADT sort.
     pub(super) user_shadowed_builtins: UserShadowedBuiltins,
     pub(super) const_item_substitutions: HashMap<String, PureExpr>,
+    /// Local logic impls checked against the postcondition of the trait
+    /// logic method they implement that did not establish it
+    /// (`logic_impl_discharge`). The contract loop settles such an impl's
+    /// trait contract from this, never by silence.
+    pub(super) undischarged_logic_impls: HashSet<DefId>,
 }
 
 impl<'a> PreparedVerification<'a> {
@@ -120,6 +128,7 @@ impl<'a> PreparedVerification<'a> {
             logic_method_names: HashSet::new(),
             user_shadowed_builtins: UserShadowedBuiltins::default(),
             const_item_substitutions,
+            undischarged_logic_impls: HashSet::new(),
         }
     }
 }
@@ -134,7 +143,8 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
 ) -> PreparedVerification<'a> {
     let logic_fns = config.logic_fns;
     let type_invariant_defs = config.type_invariant_defs;
-    let mut user_specs = build_user_spec_table(config.all_contracts);
+    let mut user_specs = build_user_spec_table(tcx, config.all_contracts, type_invariant_defs);
+    crate::logic::identity::resolve_spec_table_texts(tcx, &mut user_specs);
     // trusted_proof_assert_assumptions is built AFTER logic-function verification
     // so the downgraded user_specs is used (#1878 leak path 3).
     let mut trait_contract_map: HashMap<DefId, HashMap<String, &TraitMethodContract>> =
@@ -198,20 +208,14 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
     let mut logic_fn_has_ensures = HashSet::new();
     for logic_fn in effective_logic_fns {
         insert_logic_fn_path_aliases(&mut logic_fn_paths, logic_fn.full_path());
-        if !logic_fn.ensures().is_empty()
-            && !assumes_concrete_law_postcondition(
-                logic_fn,
-                Some(&trait_logic_fn_groups),
-                config.strict_axioms,
-            )
-        {
+        if !logic_fn.ensures().is_empty() {
             insert_logic_fn_path_aliases(&mut logic_fn_has_ensures, logic_fn.full_path());
         }
     }
     let logic_method_names: HashSet<String> = effective_logic_fns
         .iter()
         .filter(|lf| lf.params().first().is_some_and(|param| param == "self"))
-        .map(|lf| lf.name().to_string())
+        .map(|lf| lf.short_name().to_string())
         .collect();
     let user_shadowed_builtins = build_user_shadowed_builtins(tcx);
     if !logic_method_names.is_empty() || !user_shadowed_builtins.is_empty() {
@@ -224,6 +228,20 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
             &logic_method_names,
             &user_shadowed_builtins,
         );
+    }
+    // The logic pass and its consumers read one table (D-111). Its values
+    // reach logic functions only after the pass (below); its refusals must
+    // reach them before it, or a bare constant name the crate gives two
+    // meanings is one free symbol standing for both while postconditions are
+    // checked (const_short_name_logic_pass_free_symbol_granted.rs).
+    let const_item_substitutions = super::super::const_items::const_item_substitutions(tcx);
+    let constant_refusals = super::super::const_items::refusals_only(&const_item_substitutions);
+    if !constant_refusals.is_empty() {
+        if !has_simplified {
+            simplified_logic_fns = logic_fns.to_vec();
+            has_simplified = true;
+        }
+        substitute_const_items_into_logic_fns(&mut simplified_logic_fns, &constant_refusals);
     }
     let effective_logic_fns: &[LogicFnDef] = if has_simplified {
         &simplified_logic_fns
@@ -269,6 +287,16 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
             Some(combined)
         }
     };
+    let impl_owed_postconditions =
+        logic_impl_discharge::impl_owed_trait_logic_decls(tcx, effective_logic_fns);
+    let (program_fns_with_requires, program_fn_def_ids) = program_fns_with_requires(
+        tcx,
+        config.all_contracts,
+        config.trait_contracts,
+        &logic_fn_paths,
+    );
+    let logic_body_callees =
+        logic_body_callees::logic_body_callees(tcx, effective_logic_fns, &program_fn_def_ids);
     let verify_cfg = VerifyConfig {
         logic_fns: effective_logic_fns,
         type_invariants_opt,
@@ -276,10 +304,25 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
         timeout: config.timeout,
         strict_axioms: config.strict_axioms,
         trait_logic_fn_groups: Some(&trait_logic_fn_groups),
+        impl_owed_postconditions: Some(&impl_owed_postconditions),
         adt_field_ranges: crate_adt_field_ranges,
         adt_decls: crate_adt_decls,
+        program_fns_with_requires: Some(&program_fns_with_requires),
+        logic_body_callees: &logic_body_callees,
     };
-    verify_logic_fn_postconditions(&verify_cfg, counters, unverified_axioms);
+    let mut logic_credits =
+        verify_logic_fn_postconditions(&verify_cfg, counters, unverified_axioms);
+    // Before any consumer reads a trait logic method's axiom: every local
+    // impl owes it, or it is withdrawn, and so is every logic credit that
+    // leaned on an axiom withdrawn after its proof.
+    let undischarged_logic_impls =
+        logic_impl_discharge::verify_logic_impls_discharge_trait_postconditions(
+            tcx,
+            &verify_cfg,
+            counters,
+            unverified_axioms,
+            &mut logic_credits,
+        );
 
     let (mut downstream_logic_fns, has_downstream_filter) = if unverified_axioms.is_empty() {
         (Vec::new(), false)
@@ -322,43 +365,18 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
             &user_specs,
             trusted_proof_assert_logic_fns,
         );
-    counters.warnings += trusted_pa_warnings;
+    counters.warnings = counters.warnings.saturating_add(trusted_pa_warnings);
     let trusted_pa_assumption_count = trusted_proof_assert_assumptions
         .values()
         .map(Vec::len)
         .sum::<usize>();
     if trusted_pa_assumption_count > 0 {
-        counters.assumed += trusted_pa_assumption_count;
+        counters.assumed = counters.assumed.saturating_add(trusted_pa_assumption_count);
         eprintln!(
             "trust-wp: {trusted_pa_assumption_count} proof_assert assumption(s) injected without proof"
         );
     }
 
-    let const_item_substitutions: HashMap<String, PureExpr> = {
-        let mut map = HashMap::new();
-        for local_def_id in tcx.hir_body_owners() {
-            let def_id = local_def_id.to_def_id();
-            if !matches!(
-                tcx.def_kind(def_id),
-                DefKind::Const { .. } | DefKind::AssocConst { .. }
-            ) {
-                continue;
-            }
-            if let Some(expr) =
-                crate::mir_analysis::translate::resolve_const_item_value(tcx, def_id)
-            {
-                let full_path = tcx.def_path_str(def_id);
-                if let Some(short_name) = full_path.rsplit("::").next() {
-                    map.insert(short_name.to_string(), expr);
-                }
-            }
-        }
-        // Generic associated constant definitions: <SelfType as Trait>::CONST (#2550)
-        let generic_assoc_consts =
-            crate::mir_analysis::extract::collect_generic_assoc_const_definitions(tcx);
-        map.extend(generic_assoc_consts);
-        map
-    };
     // Const-item values must be visible THROUGH logic-fn defining axioms too
     // (ledger int-shift-full, bits.rs `empty`): specs get the substitution
     // per contract in `apply_const_item_substitutions`, but a logic-fn body
@@ -414,5 +432,6 @@ pub(in crate::callbacks) fn prepare_verification<'a>(
         logic_method_names,
         user_shadowed_builtins,
         const_item_substitutions,
+        undischarged_logic_impls,
     }
 }

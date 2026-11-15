@@ -5,9 +5,6 @@
 //! Closure-struct sort registration, constructor/selector declaration, and
 //! capture-projection assertions.
 //!
-//! Extracted from `sort_context.rs` as Slice B of the encoder orchestration
-//! decomposition (Part of #1669, design: `2026-02-15-encoder-orchestration-decomposition.md`).
-//!
 //! This subsystem models concrete closure environments as ay algebraic datatypes
 //! with built-in constructor/selector semantics. It supports:
 //!
@@ -18,11 +15,11 @@
 //!
 //! # Design (#2151)
 //!
-//! Prior to #2151, closure environments were modeled as uninterpreted sorts with
-//! UF constructor/accessor declarations and quantified round-trip axioms. This
-//! created O(N) quantifiers per closure (one per capture field) that dominated
-//! solver time. By switching to ay native algebraic datatypes (`Sort::Datatype`),
-//! round-trip semantics are built into the sort definition — no axioms needed.
+//! Closure environments are ay native algebraic datatypes (`Sort::Datatype`)
+//! rather than uninterpreted sorts with UF constructor/accessor declarations:
+//! the datatype definition carries the round-trip semantics itself, where the
+//! UF encoding needs one quantified round-trip axiom per capture field — O(N)
+//! quantifiers per closure that dominate solver time.
 
 use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort, Term};
 use trust_wp_core::closure::CaptureField;
@@ -79,8 +76,8 @@ pub(crate) fn closure_symbol_suffix(def_id: &str) -> String {
 /// Extract the `ClosureEnv_*` name from a sort, handling both `Sort::Datatype`
 /// and `Sort::Uninterpreted` representations (#2151).
 ///
-/// After the migration to native datatypes, closure sorts are `Sort::Datatype`
-/// at registration time but may appear as `Sort::Uninterpreted` in axiom code
+/// Closure sorts are `Sort::Datatype` at registration time but may appear as
+/// `Sort::Uninterpreted` in axiom code
 /// (e.g., tag-based `"c..."` decoding in the UF fallback path). This helper
 /// normalizes both representations to the underlying name.
 pub(crate) fn closure_env_sort_name(sort: &Sort) -> Option<&str> {

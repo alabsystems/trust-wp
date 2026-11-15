@@ -144,7 +144,7 @@ about it* is what's frozen).
 
 ## 7. Build topology note (the one known sharp edge)
 
-The reference crate builds on **stable** with a path dep on the first-party `clean`
+The reference crate builds with the Trust toolchain with a path dep on the first-party `clean`
 CIC kernel crate. Inside the trust fork's workspace the same package resolves through
 the fork's own copy — consumers there must `[patch]` the clean-kernel path or depend
 through the fork's copy. This crate-graph conflict is a known sharp edge.

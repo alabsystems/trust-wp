@@ -24,7 +24,6 @@
 //! create a false verification.
 //!
 //! References:
-//! - Design: `designs/2026-03-19-1609-slice-index-spec-mvp.md`
 //! - Trait: `crates/trust-wp-std/src/std/slice.rs` (`SliceIndexSpec`)
 //! - Spec strings: `crates/trust-wp-std/src/std/builtin_registry.rs`
 
@@ -400,7 +399,7 @@ impl AYEncoder {
         }
         let sources = self.seq_state.all_seq_index_sources();
         let seq_funcs = self.ensure_seq_theory();
-        let mut emitted = 0;
+        let mut emitted = 0usize;
         let mut seen = std::collections::HashSet::new();
 
         for frame in frames {
@@ -464,7 +463,7 @@ impl AYEncoder {
 
                 if !self.solver.assertions().contains(&guarded) {
                     self.assert_solver_term("ground/resolve_elsewhere", guarded);
-                    emitted += 1;
+                    emitted = emitted.saturating_add(1);
                 }
             }
         }

@@ -15,7 +15,7 @@ mod obligation;
 
 // Re-export all public items at the original `loop_contract::` path so
 // existing imports in verification.rs and tests continue to work unchanged.
-pub(crate) use dispatch::{check_trait_refinement, verify_contract_loop_path, LoopPathOutcome};
+pub(crate) use dispatch::{verify_contract_loop_path, LoopPathOutcome};
 #[cfg(test)]
 pub(crate) use exit_assumptions::{
     build_loop_exit_assumptions, should_continue_with_loop_exit_assumptions,

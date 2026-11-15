@@ -487,7 +487,13 @@ fn display_expr_sort_simple_variants() {
     assert_eq!(format!("{}", ExprSort::Seq), "Seq");
     assert_eq!(format!("{}", ExprSort::Unit), "()");
     assert_eq!(format!("{}", ExprSort::FMap), "FMap");
-    assert_eq!(format!("{}", ExprSort::Float), "Float");
+    assert_eq!(
+        format!(
+            "{}",
+            ExprSort::Float(trust_wp_core::formula::FloatWidth::F64)
+        ),
+        "Float(f64)"
+    );
 }
 
 #[test]

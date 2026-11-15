@@ -203,6 +203,8 @@ mod tests {
 
     fn spec(ensures: &[&str], requires: &[&str]) -> StdSpec {
         StdSpec {
+            inv_requires: Vec::new(),
+            capture_inv_requires: Vec::new(),
             requires: requires.iter().map(|s| (*s).to_string()).collect(),
             ensures: ensures.iter().map(|s| (*s).to_string()).collect(),
             param_names: None,

@@ -2,13 +2,16 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+//! Logic-surface gaps the DRIVER diagnoses (`callbacks::purity_validation`)
+//! on a crate that type-checks. The gaps that are type errors of the
+//! specification — machine-integer `/` and `%`, indexing a type without an
+//! `IndexLogic` impl — are in `should_fail_logic_surface_types.rs`: rustc
+//! stops at a type error before the driver runs, so they cannot share a
+//! build with these.
+
 #![allow(dead_code, unexpected_cfgs)]
 
 use trust_wp::logic::{dead, Int};
-
-pub struct Bag {
-    value: i32,
-}
 
 #[trust_wp::opaque]
 pub struct Secret {
@@ -25,26 +28,11 @@ fn non_opaque_dead(flag: bool) -> Int {
 }
 
 #[trust_wp::logic]
-fn primitive_div(x: i32, y: i32) -> i32 {
-    x / y
-}
-
-#[trust_wp::logic]
-fn primitive_rem(x: i32, y: i32) -> i32 {
-    x % y
-}
-
-#[trust_wp::logic]
 fn int_literal_or_match(x: Int) -> Int {
     match x {
         1 | 2 => Int(0),
         _ => Int(1),
     }
-}
-
-#[trust_wp::logic]
-fn unsupported_index(bag: Bag, idx: usize) -> i32 {
-    bag[idx]
 }
 
 #[trust_wp::logic]

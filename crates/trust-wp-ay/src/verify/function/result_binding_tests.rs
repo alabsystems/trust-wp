@@ -23,7 +23,7 @@ use crate::{
     encoder::{unsoundness, AYEncoder},
     tests::helpers::{
         bool_expr, deref, eq, forall, gt, implies, int, ite, logic_fn_call, match_expr,
-        method_call, var, var_with_sort, view,
+        method_call, ne, var, var_with_sort, view,
     },
     verify::{encode_and_assert_negated_postconditions, VerificationRequest, VerificationResult},
 };
@@ -156,9 +156,9 @@ fn result_match_binds_synthetic_option_call_alias_without_wrapping() {
         )
     }
 
-    let requires = vec![option_is_none(var("call_3"))];
+    let requires = vec![option_is_none(var("$call_3"))];
     let ensures = vec![option_is_none(var("result"))];
-    let body = var("call_3");
+    let body = var("$call_3");
 
     let result = super::verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures).return_expr(Some(&body)),
@@ -437,10 +437,10 @@ fn datatype_ite_body_verifies_through_constructor_tester() {
     )
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result),
         "datatype ITE body with c=true should verify result.is_some(): got {result:?}"
@@ -583,10 +583,13 @@ fn datatype_ite_result_constructor_selects_matching_branch_guard() {
     );
 }
 
-#[test]
-#[timeout(30000)]
-fn datatype_ite_composes_nullary_constructor_precondition_to_result() {
-    let call = var("call_2");
+fn verify_nullary_constructor_precondition_ite(reverse_branches: bool) -> VerificationResult {
+    // MIR supplies the call result's type. A bare `None` does not determine
+    // its polymorphic payload, so the fixture must retain that type evidence.
+    let call = var_with_sort(
+        "call_2",
+        ExprSort::Datatype(trust_wp_core::formula::intern_sort_name("OptionInt")),
+    );
     let empty = eq(var("empty"), bool_expr(true));
     let disc_is_none = eq(method_call(call.clone(), "discriminant", vec![]), int(0));
     let requires = vec![implies(empty.clone(), eq(call, var("None"))), empty.clone()];
@@ -609,26 +612,40 @@ fn datatype_ite_composes_nullary_constructor_precondition_to_result() {
             ),
         ],
     )];
-    let body = ite(
-        disc_is_none,
-        logic_fn_call("None", vec![]),
-        logic_fn_call("Some", vec![int(1)]),
-    );
+    let none = logic_fn_call("None", vec![]);
+    let some = logic_fn_call("Some", vec![int(1)]);
+    let body = if reverse_branches {
+        ite(disc_is_none, some, none)
+    } else {
+        ite(disc_is_none, none, some)
+    };
 
-    let result = super::verify_function_with_modes(
-        VerificationRequest::new(&requires, &ensures).return_expr(Some(&body)),
+    super::verify_function_with_modes(
+        VerificationRequest::new(&requires, &ensures)
+            .return_expr(Some(&body))
+            .timeout(Some(std::time::Duration::from_secs(3))),
     )
-    .expect("encoding should succeed");
+    .expect("typed nullary-constructor case should encode")
+}
 
-    match result {
-        VerificationResult::Failed(cex) => assert!(
-            cex.values.is_empty(),
-            "constructor precondition call_2 == None should currently fail with an empty counterexample, got {cex:?}"
-        ),
-        other => panic!(
-            "constructor precondition call_2 == None should currently return Failed, got {other:?}"
-        ),
-    }
+#[test]
+#[timeout(30000)]
+fn datatype_ite_composes_nullary_constructor_precondition_to_result() {
+    let result = verify_nullary_constructor_precondition_ite(false);
+    assert!(
+        matches!(&result, VerificationResult::Verified(Some(proof)) if proof.is_fully_verified()),
+        "the typed None precondition selects the None result and needs a checked proof: {result:?}"
+    );
+}
+
+#[test]
+#[timeout(30000)]
+fn datatype_ite_reversed_nullary_constructor_branch_is_refuted() {
+    let result = verify_nullary_constructor_precondition_ite(true);
+    assert!(
+        matches!(result, VerificationResult::Failed(_)),
+        "reversing the selected constructor returns Some and needs a validated refutation: {result:?}"
+    );
 }
 
 #[test]
@@ -809,8 +826,9 @@ fn precondition_referencing_result_triggers_binding() {
 /// `if c { Some(1) } else { None }` with `match result { Some(v) => v == 1, None => !c }`.
 /// When `c` is true, result should be `Some(1)`.
 ///
-/// Before #2675, the fallback path wrapped the entire ITE in `Some(ite(...))`,
-/// making result always `Some(...)` — the `None` branch was unreachable.
+/// Without per-branch datatype encoding (#2675) the fallback path wraps the
+/// entire ITE in `Some(ite(...))`, making result always `Some(...)` — the
+/// `None` branch is unreachable.
 #[test]
 #[timeout(30000)]
 fn datatype_ite_body_some_none_branches() {
@@ -959,5 +977,156 @@ fn datatype_ite_body_unconstrained_condition() {
     assert!(
         matches!(result, VerificationResult::Verified(_)),
         "ITE body with unconstrained c should verify both match branches: got {result:?}"
+    );
+}
+
+// ── Datatype result binding reads the body's own value ────────────
+
+/// `return o` for an `Option` parameter with `ensures(result != None)`: the
+/// body already has the datatype, so `result` is `o`, never `Some(o)`, and the
+/// negated goal `o == None` is satisfiable.
+#[test]
+#[timeout(30000)]
+fn datatype_result_param_body_is_not_wrapped_in_some() {
+    let ensures = vec![ne(var("result"), var("None"))];
+    let body = var("o");
+
+    let result = super::verify_function_with_modes(
+        VerificationRequest::new(&[], &ensures).return_expr(Some(&body)),
+    )
+    .expect("encoding should succeed");
+
+    assert!(
+        !matches!(result, VerificationResult::Verified(_)),
+        "`return o` must not be read as `Some(o)`: got {result:?}"
+    );
+}
+
+/// The same body under `requires(o != None)` proves: `result` is bound to `o`.
+#[test]
+#[timeout(30000)]
+fn datatype_result_param_body_binds_result_to_the_param() {
+    let mut encoder = AYEncoder::new_all();
+    // A program parameter arrives declared at its datatype sort.
+    let option_int = crate::encoder::match_enc::MatchDatatypeKind::OptionInt.datatype();
+    encoder.ensure_datatype_declared(&option_int);
+    encoder
+        .get_or_declare_var("o", Sort::Datatype(option_int))
+        .expect("o should declare");
+    let requires = vec![ne(var("o"), var("None"))];
+    let ensures = vec![ne(var("result"), var("None"))];
+    let body = var("o");
+
+    for require in &requires {
+        let term = encoder
+            .encode_pure(require)
+            .expect("requires should encode");
+        encoder.assert_term(term);
+    }
+    assert_result_body_binding(&mut encoder, Some(&body), &ensures, &requires)
+        .expect("datatype binding should encode");
+    let ensure_term = encoder
+        .encode_pure(&ensures[0])
+        .expect("ensures should encode");
+    let negated = encoder.solver.not(ensure_term);
+    encoder.assert_term(negated);
+
+    assert!(
+        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
+        "`result` bound to `o` must carry `o != None`"
+    );
+}
+
+/// An unannotated variable body nothing has declared (a logic parameter) is
+/// declared at the result's datatype sort, the sort `result` itself has.
+#[test]
+#[timeout(30000)]
+fn datatype_result_undeclared_var_body_takes_the_result_sort() {
+    let mut encoder = AYEncoder::new_all();
+    let ensures = vec![ne(var("result"), var("None"))];
+    let body = var("o");
+
+    assert_result_body_binding(&mut encoder, Some(&body), &ensures, &[])
+        .expect("datatype binding should encode");
+
+    assert_eq!(
+        encoder.var_sort("o"),
+        encoder.var_sort("result"),
+        "the body variable must be declared at the result's sort"
+    );
+    assert!(matches!(encoder.var_sort("o"), Some(Sort::Datatype(_))));
+}
+
+/// A scalar body under a datatype result is a payload whose constructor is
+/// unknown here. It is never wrapped in a default `Some`: the binding is
+/// withheld (which withholds a counterexample verdict too), so the false
+/// `result != None` does not verify.
+#[test]
+#[timeout(30000)]
+fn datatype_result_scalar_body_is_withheld_not_wrapped() {
+    let ensures = vec![ne(var("result"), var("None"))];
+    let body = var_with_sort("i", ExprSort::Int);
+
+    let result = super::verify_function_with_modes(
+        VerificationRequest::new(&[], &ensures).return_expr(Some(&body)),
+    )
+    .expect("encoding should succeed");
+    assert!(
+        !matches!(
+            result,
+            VerificationResult::Verified(_) | VerificationResult::Failed(_)
+        ),
+        "a scalar body must neither prove nor refute a datatype postcondition: got {result:?}"
+    );
+
+    let mut encoder = AYEncoder::new_all();
+    let snap_before = unsoundness::snapshot();
+    assert_result_body_binding(&mut encoder, Some(&body), &ensures, &[])
+        .expect("a withheld binding still encodes");
+    let snap_after = unsoundness::snapshot();
+    let d = unsoundness::delta(&snap_before, &snap_after);
+    assert!(
+        d.get(&unsoundness::UnsoundnessCategory::PremiseNeutralizedEq)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "the withheld binding must count as a neutralized premise"
+    );
+}
+
+/// `Err(x)` stays `Err(x)`: a constructor body is built as the constructor it
+/// names, so `ensures(result is Ok)` of it is refuted.
+#[test]
+#[timeout(30000)]
+fn datatype_result_err_constructor_body_is_not_read_as_ok() {
+    let ensures = vec![match_expr(
+        var("result"),
+        vec![
+            (
+                Pattern::Constructor {
+                    name: "Ok".to_string(),
+                    inner: Some(Box::new(Pattern::Wildcard)),
+                },
+                bool_expr(true),
+            ),
+            (
+                Pattern::Constructor {
+                    name: "Err".to_string(),
+                    inner: Some(Box::new(Pattern::Wildcard)),
+                },
+                bool_expr(false),
+            ),
+        ],
+    )];
+    let body = logic_fn_call("Err", vec![var_with_sort("x", ExprSort::Int)]);
+
+    let result = super::verify_function_with_modes(
+        VerificationRequest::new(&[], &ensures).return_expr(Some(&body)),
+    )
+    .expect("encoding should succeed");
+
+    assert!(
+        matches!(result, VerificationResult::Failed(_)),
+        "`Err(x)` claimed to be `Ok` must be refuted: got {result:?}"
     );
 }

@@ -14,7 +14,11 @@ fn test_lookup_mutex_new() {
 #[test]
 fn test_lookup_mutex_lock() {
     let spec = lookup_std_spec("std::sync::Mutex::lock").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "__trust_wp_std_site_unmodelled_panic()",
+        "Mutex::lock",
+    );
     assert_ensures_contains(&spec, "self.inv().inv(*result)", "Mutex::lock");
 }
 
@@ -124,16 +128,16 @@ fn test_lookup_arc_ptr_eq() {
     let spec =
         lookup_std_spec("std::sync::Arc::ptr_eq").expect("Arc::ptr_eq spec must be registered");
     assert!(spec.requires.is_empty());
-    // Biconditional on inner-value equality for clone+ptr_eq reasoning
-    assert_ensures_contains(&spec, "result == (*self == *rhs)", "Arc::ptr_eq");
+    // One direction only: no allocation identity (D-190).
+    assert_ensures_contains(&spec, "result ==> self == rhs", "Arc::ptr_eq");
 }
 
 #[test]
 fn test_lookup_rc_ptr_eq() {
     let spec = lookup_std_spec("std::rc::Rc::ptr_eq").expect("Rc::ptr_eq spec must be registered");
     assert!(spec.requires.is_empty());
-    // Biconditional on inner-value equality for clone+ptr_eq reasoning
-    assert_ensures_contains(&spec, "result == (*self == *rhs)", "Rc::ptr_eq");
+    // One direction only: no allocation identity (D-190).
+    assert_ensures_contains(&spec, "result ==> self == rhs", "Rc::ptr_eq");
 }
 
 #[test]
@@ -167,14 +171,22 @@ fn test_lookup_refcell_new() {
 #[test]
 fn test_lookup_refcell_borrow() {
     let spec = lookup_std_spec("core::cell::RefCell::borrow").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "__trust_wp_std_site_unmodelled_panic()",
+        "RefCell::borrow",
+    );
     assert_ensures_contains(&spec, "*result == self.inner()", "RefCell::borrow");
 }
 
 #[test]
 fn test_lookup_refcell_borrow_mut() {
     let spec = lookup_std_spec("std::cell::RefCell::borrow_mut").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "__trust_wp_std_site_unmodelled_panic()",
+        "RefCell::borrow_mut",
+    );
     assert_eq!(spec.ensures.len(), 2); // two postconditions
     assert_ensures_contains(&spec, "*result == self.inner()", "RefCell::borrow_mut");
     assert_ensures_contains(&spec, "(^self).inner() == ^result", "RefCell::borrow_mut");

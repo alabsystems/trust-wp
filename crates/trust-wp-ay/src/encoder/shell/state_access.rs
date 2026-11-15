@@ -61,6 +61,15 @@ impl AYEncoder {
         self.quantifier_state.is_match_binder(name)
     }
 
+    /// The innermost written `forall`/`exists` binding of `name`, with the
+    /// sort the text wrote for it.
+    pub(crate) fn written_binder_sort(
+        &self,
+        name: &str,
+    ) -> Option<crate::encoder::state::WrittenBinderSort<'_>> {
+        self.quantifier_state.written_binder(name)
+    }
+
     /// Record synthesized trigger patterns used for one quantifier.
     pub(crate) fn record_synthesized_triggers(
         &mut self,

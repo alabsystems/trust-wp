@@ -8,10 +8,8 @@
 //! ExprSort variants but is intentionally lossy for:
 //! - `ExprSort::Int` → `Sort::Int` → `None` (Int is the default, represented as None)
 //! - `ExprSort::Ref(inner)` → peels Ref, loses wrapper
-//! - `ExprSort::MutRef(inner)` now preserves its wrapper via a dedicated carrier
+//! - `ExprSort::MutRef(inner)` is NOT lossy: a dedicated carrier keeps the wrapper (#2141)
 //! - `ExprSort::Datatype("..Snapshot")` → `Sort::Int` → `None` (#2075)
-//!
-//! Requested in W4 commit 04543f3 handoff.
 
 use ay_dpll::api::Sort;
 use ntest::timeout;

@@ -24,12 +24,8 @@ pub(in crate::callbacks) fn derive_final_deref_ghost_substitutions(
     substitutions: &mut HashMap<String, PureExpr>,
 ) {
     fn is_simple_ident(name: &str) -> bool {
-        let mut chars = name.chars();
-        let Some(first) = chars.next() else {
-            return false;
-        };
-        (first == '_' || first.is_ascii_alphabetic())
-            && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        // A renamed shadowed binding names a source binding too (D-237).
+        crate::mir_analysis::binding_identity::is_binding_ident(name)
     }
 
     let mut derived = Vec::new();

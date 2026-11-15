@@ -653,7 +653,7 @@ fn test_sort_annotation_bool_propagation() {
 /// Registered user ADTs that collide with a collection-model bare name (for
 /// example `List`) must keep their declared datatype sort in mut-borrow
 /// bindings instead of collapsing to the Seq carrier. This mirrors compat
-/// `bug/1562`, where `call_*_current` was previously declared as Seq.
+/// `bug/1562`, where `call_*_current` would otherwise be declared as Seq.
 #[test]
 #[timeout(30000)]
 fn test_sort_annotation_registered_list_prefers_datatype_in_bindings() {
@@ -1128,8 +1128,8 @@ fn test_indexed_write_entry_pinned_slice_view_not_vacuous() {
     ))
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
+    // KNOWN-CLASS PIN (strict UNSAT certification gap): the verdict may demote
+    // to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
@@ -1182,4 +1182,65 @@ fn test_indexed_write_entry_pinned_slice_view_wrong_value_fails() {
         matches!(result, VerificationResult::Failed(_)),
         "wrong post-write value must be rejected, not accepted or demoted: got {result:?}"
     );
+}
+
+// ── view alias at the registered user View sort (mapping_test::incr) ─────
+
+/// A user `impl View for T { type ViewTy = Mapping<Int, Int> }` is not an
+/// identity view. `bind_view_aliases` must declare `t_current_view` at the
+/// registered `Mapping` view sort, not at the carrier sort `T`; otherwise the
+/// later `View(Var(t_current))` encode resolves `Mapping` and dies with a sort
+/// conflict.
+#[test]
+#[timeout(30000)]
+fn test_view_alias_declared_at_registered_view_sort_not_carrier_sort() {
+    use trust_wp_core::{
+        formula::intern_sort_name,
+        logic::{AdtConstructorDecl, AdtDecl, AdtFieldDecl, AdtKind, LogicFnDef},
+    };
+
+    let mut encoder = AYEncoder::new();
+    let t_id = intern_sort_name("T");
+    let adt = AdtDecl::new(
+        "crate::T".to_string(),
+        "T".to_string(),
+        AdtKind::Struct,
+        vec![AdtConstructorDecl::new(
+            "T".to_string(),
+            "T".to_string(),
+            vec![AdtFieldDecl::new("a".to_string(), ExprSort::Int)],
+        )],
+    );
+    encoder.register_adt_decls(&HashMap::from([("T".to_string(), adt)]));
+    let mapping = ExprSort::Datatype(intern_sort_name("Mapping"));
+    let view_def = LogicFnDef::new(
+        "view".to_string(),
+        "crate::<T as creusot_std::View>::view".to_string(),
+        vec!["self".to_string()],
+        var("dead"),
+    )
+    .with_param_sorts(vec![Some(ExprSort::Datatype(t_id))])
+    .with_return_sort(Some(mapping.clone()))
+    .with_opaque(true);
+    encoder
+        .register_logic_fn(&view_def)
+        .expect("opaque view registration should succeed");
+
+    let carrier_sort = encoder.sort_from_expr_sort(ExprSort::Datatype(t_id));
+    let mapping_sort = encoder.sort_from_expr_sort(mapping);
+    assert_ne!(carrier_sort, mapping_sort, "test premise: distinct sorts");
+
+    let t_ann = ExprSort::MutRef(Box::new(ExprSort::Datatype(t_id)));
+    let final_values = HashMap::from([("t".to_string(), deref(var_with_sort("t", t_ann)))]);
+    super::bindings::bind_final_values(&mut encoder, &final_values, None)
+        .expect("binding final values should succeed");
+
+    assert_eq!(
+        encoder.var_sort("t_current_view"),
+        Some(&mapping_sort),
+        "t_current_view must be declared at the registered View sort, not the carrier sort"
+    );
+    encoder
+        .encode_pure(&view(var_with_sort("t_current", ExprSort::Datatype(t_id))))
+        .expect("t_current@ must encode without a sort conflict");
 }

@@ -179,14 +179,21 @@ impl AYEncoder {
         for (_name, postcond_decl) in &postcond_decls {
             let domain = postcond_decl.domain();
 
+            // The arity()==3 filter above guarantees these two positions, but
+            // that is the filter's invariant, not this loop's — `get` proves it
+            // here and skips the declaration the same way a sort mismatch does.
+            let (Some(receiver_sort), Some(unit_arg_sort)) = (domain.first(), domain.get(1)) else {
+                continue;
+            };
+
             // Check if receiver sort matches the default_fn term's sort.
             let default_fn_sort = self.solver.get_sort(default_fn_term);
-            if domain[0] != default_fn_sort {
+            if *receiver_sort != default_fn_sort {
                 continue;
             }
 
             // Check if the second arg is Unit-sorted (represents the `()` input).
-            if domain[1] != unit_sort {
+            if *unit_arg_sort != unit_sort {
                 continue;
             }
 

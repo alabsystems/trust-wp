@@ -229,7 +229,7 @@ impl super::super::AYEncoder {
     /// Ground instances for FMap axioms.
     #[allow(clippy::too_many_lines)]
     pub(super) fn assert_fmap_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         // FMap keeps its historical per-family cap of 80, but the effective
         // budget is now the smaller of that cap and the caller's remaining
         // shared cross-product budget. (#2707)
@@ -309,7 +309,7 @@ impl super::super::AYEncoder {
                 let contains_decl = self.fmap_contains_decl_for_terms(insert_app, k);
                 let contains_ins_k = self.solver.apply(&contains_decl, &[insert_app, k]);
                 self.assert_solver_term("ground/fmap_insert_contains", contains_ins_k);
-                count += 1;
+                count = count.saturating_add(1);
 
                 // insert-lookup: lookup(insert(m, k, v), k) = v
                 budget_guard!();
@@ -321,7 +321,7 @@ impl super::super::AYEncoder {
                     lookup_ins_k,
                     v,
                 );
-                count += 1;
+                count = count.saturating_add(1);
 
                 for (lookup_projection, inserted_projection) in self
                     .fmap_payload_projection_pairs_including_constructor_aliases(lookup_ins_k, v)
@@ -332,7 +332,7 @@ impl super::super::AYEncoder {
                         lookup_projection,
                         inserted_projection,
                     );
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
 
                 // insert-len: len(insert(m, k, v)) = ite(contains(m, k), len(m), len(m) + 1)
@@ -355,7 +355,7 @@ impl super::super::AYEncoder {
                     let ite_len = self.solver.ite(contains_m_k, len_m, len_plus_1);
                     let eq = self.eq_term(len_ins, ite_len);
                     self.assert_solver_term("ground/fmap_insert_len", eq);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
 
                 // Eager per-query insert semantics for observed contains/lookup
@@ -369,7 +369,7 @@ impl super::super::AYEncoder {
                 // Per-sub-loop budget for insert-contains cross-product (#2707):
                 // prevents I×C from consuming the entire family budget.
                 if count < budget {
-                    let mut insert_contains_count = 0;
+                    let mut insert_contains_count = 0usize;
                     for (contains_app, c_args) in &contains_entries {
                         if count >= budget
                             || insert_contains_count >= TRUST_WP_FMAP_INSERT_CROSS_BUDGET
@@ -410,22 +410,22 @@ impl super::super::AYEncoder {
                             self.solver.implies(same_entry, contains_ins_k2)
                         };
                         self.assert_solver_term("ground/fmap_insert_contains_same_key", same_key);
-                        count += 1;
-                        insert_contains_count += 1;
+                        count = count.saturating_add(1);
+                        insert_contains_count = insert_contains_count.saturating_add(1);
 
                         budget_guard!();
                         let frame_eq = self.eq_term(contains_ins_k2, contains_m_k2);
                         let frame = self.solver.implies(same_receiver_distinct_key, frame_eq);
                         self.assert_solver_term("ground/fmap_insert_contains_frame", frame);
-                        count += 1;
-                        insert_contains_count += 1;
+                        count = count.saturating_add(1);
+                        insert_contains_count = insert_contains_count.saturating_add(1);
                     }
                 }
 
                 // Per-sub-loop budget for insert-lookup cross-product (#2707):
                 // prevents I×L from consuming the entire family budget.
                 if count < budget {
-                    let mut insert_lookup_count = 0;
+                    let mut insert_lookup_count = 0usize;
                     for (lookup_app, l_args) in &lookup_entries {
                         if count >= budget
                             || insert_lookup_count >= TRUST_WP_FMAP_INSERT_CROSS_BUDGET
@@ -473,8 +473,8 @@ impl super::super::AYEncoder {
                             let same_key = self.solver.implies(same_entry, same_key_eq);
                             self.assert_solver_term("ground/fmap_insert_lookup_same_key", same_key);
                         }
-                        count += 1;
-                        insert_lookup_count += 1;
+                        count = count.saturating_add(1);
+                        insert_lookup_count = insert_lookup_count.saturating_add(1);
 
                         for (lookup_projection, inserted_projection) in self
                             .fmap_payload_projection_pairs_including_constructor_aliases(
@@ -505,16 +505,16 @@ impl super::super::AYEncoder {
                                     projection_same_key,
                                 );
                             }
-                            count += 1;
-                            insert_lookup_count += 1;
+                            count = count.saturating_add(1);
+                            insert_lookup_count = insert_lookup_count.saturating_add(1);
                         }
 
                         budget_guard!();
                         let frame_eq = self.eq_term(lookup_ins_k2, lookup_m_k2);
                         let frame = self.solver.implies(same_receiver_distinct_key, frame_eq);
                         self.assert_solver_term("ground/fmap_insert_lookup_frame", frame);
-                        count += 1;
-                        insert_lookup_count += 1;
+                        count = count.saturating_add(1);
+                        insert_lookup_count = insert_lookup_count.saturating_add(1);
                     }
                 }
             }
@@ -565,7 +565,7 @@ impl super::super::AYEncoder {
                         };
                         let ge_zero = self.solver.ge(len_app, zero);
                         self.assert_solver_term("ground/fmap_len_nonneg", ge_zero);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
             }
@@ -607,7 +607,7 @@ impl super::super::AYEncoder {
                 // For each key k observed in a contains(_, k) call, assert
                 // merge-related ground instances when the receiver matches merge_term.
                 // Per-sub-loop budget prevents O(M×C) blowup. (#2707)
-                let mut merge_contains_count = 0;
+                let mut merge_contains_count = 0usize;
                 for c_args in &contains_entries {
                     if count >= budget || merge_contains_count >= TRUST_WP_FMAP_MERGE_CROSS_BUDGET {
                         break;
@@ -630,24 +630,24 @@ impl super::super::AYEncoder {
                     let fwd_left = self.solver.implies(c_m1_k, c_merge_k);
                     budget_guard!();
                     self.assert_solver_term("ground/fmap_merge_contains_left", fwd_left);
-                    count += 1;
-                    merge_contains_count += 1;
+                    count = count.saturating_add(1);
+                    merge_contains_count = merge_contains_count.saturating_add(1);
 
                     // contains(m2, k) => contains(merge(m1, m2), k)
                     let c_m2_k = self.solver.apply(&contains_decl, &[m2, k]);
                     let fwd_right = self.solver.implies(c_m2_k, c_merge_k);
                     budget_guard!();
                     self.assert_solver_term("ground/fmap_merge_contains_right", fwd_right);
-                    count += 1;
-                    merge_contains_count += 1;
+                    count = count.saturating_add(1);
+                    merge_contains_count = merge_contains_count.saturating_add(1);
 
                     // contains(merge(m1, m2), k) => contains(m1, k) || contains(m2, k)
                     let m1_or_m2 = self.solver.or(c_m1_k, c_m2_k);
                     let bwd = self.solver.implies(c_merge_k, m1_or_m2);
                     budget_guard!();
                     self.assert_solver_term("ground/fmap_merge_contains_bwd", bwd);
-                    count += 1;
-                    merge_contains_count += 1;
+                    count = count.saturating_add(1);
+                    merge_contains_count = merge_contains_count.saturating_add(1);
 
                     // Left-bias lookup: contains(m1, k) => lookup(merge, k) = lookup(m1, k)
                     let lookup_value_sort = self
@@ -661,8 +661,8 @@ impl super::super::AYEncoder {
                     let lookup_left = self.solver.implies(c_m1_k, eq);
                     budget_guard!();
                     self.assert_solver_term("ground/fmap_merge_lookup_left", lookup_left);
-                    count += 1;
-                    merge_contains_count += 1;
+                    count = count.saturating_add(1);
+                    merge_contains_count = merge_contains_count.saturating_add(1);
 
                     // Right-only lookup: !contains(m1, k) && contains(m2, k) =>
                     //   lookup(merge, k) = lookup(m2, k)
@@ -674,8 +674,8 @@ impl super::super::AYEncoder {
                     let lookup_right = self.solver.implies(premise, eq_right);
                     budget_guard!();
                     self.assert_solver_term("ground/fmap_merge_lookup_right", lookup_right);
-                    count += 1;
-                    merge_contains_count += 1;
+                    count = count.saturating_add(1);
+                    merge_contains_count = merge_contains_count.saturating_add(1);
                 }
             }
         }

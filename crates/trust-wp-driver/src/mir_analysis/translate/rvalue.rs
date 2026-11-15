@@ -10,15 +10,23 @@ use rustc_middle::{
     mir::{AggregateKind, Body, CastKind, Operand, Rvalue, UnOp as MirUnOp, WithRetag},
     ty::{adjustment::PointerCoercion, TyCtxt, TyKind},
 };
-use trust_wp_core::formula::{internal::tuple_lowering::tuple_logic_fn_name, BinOp, PureExpr};
+use trust_wp_core::formula::{
+    internal::{machine_bitop, tuple_lowering::tuple_logic_fn_name},
+    BinOp, PureExpr, UnOp,
+};
 
 use super::{
-    binop::{int_ty_bits, lower_float_to_int, translate_binop, translate_unop, uint_ty_bits},
+    binop::{int_ty_bits, translate_binop, translate_unop, uint_ty_bits},
     constant::translate_constant_with_tcx,
     discriminant::{operand_int_ty, translate_ty_const_to_expr},
-    float::{fold_concrete_float_binop, fold_concrete_float_unop},
+    float::{
+        expr_is_syntactically_float, float_class, operand_float_class, operand_ty,
+        translate_float_binop, translate_float_neg, translate_float_to_float,
+        translate_float_to_int, translate_int_to_float, translate_opaque_binop,
+        translate_opaque_cast, translate_opaque_neg, FloatClass,
+    },
     operand::{
-        operand_array_len_expr, operand_is_bool, operand_is_machine_int, operand_is_signed_int,
+        operand_array_len_expr, operand_is_bool, operand_is_machine_int,
         operand_is_slice_ptr_metadata, translate_operand_detailed,
     },
     place::{translate_place_detailed, translate_ref_rvalue_place, translate_typed_field_place},
@@ -104,6 +112,47 @@ fn wrap_shift_amount_in_range_marker<'tcx>(
     }
 }
 
+/// Wrap a machine-integer bit operation in the type marker
+/// `__trust_wp_int_bitop_{s|u}{bits}` when the unannotated operator would be
+/// read with the wrong width or signedness (`machine_bitop::needed`).
+///
+/// The plain `PureExpr` operator names no width, and the encoder reads it at
+/// 64 bits with an unsigned `bv2int`: `x << 1` on a `u8` kept the bit shifted
+/// out of the type (`200 << 1` read as `400`, not `144`), `!x` on a `u8` was
+/// complemented at 64 bits, a `u128` operand was cut to its low 64 bits, and a
+/// signed result came back as its unsigned pattern. `operand` is the
+/// operation's (left) operand: Rust's `<<`/`>>` result has the SHIFTED
+/// operand's type, and `&`/`|`/`^`/`!` take and return one type. Without a
+/// body (unit-test shims) no type is known and the operator stays bare; with a
+/// body an untyped operand was already refused above.
+fn wrap_machine_bitop_marker<'tcx>(
+    expr: PureExpr,
+    operand: &Operand<'tcx>,
+    body: Option<&Body<'tcx>>,
+) -> PureExpr {
+    let (complement, shift_left) = match &expr {
+        PureExpr::BinOp(_, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shr, _) => {
+            (false, false)
+        }
+        PureExpr::BinOp(_, BinOp::Shl, _) => (false, true),
+        PureExpr::UnOp(UnOp::BitNot, _) => (true, false),
+        _ => return expr,
+    };
+    let Some((signed, bits)) = body
+        .and_then(|b| operand_ty(operand, b))
+        .and_then(|ty| int_ty_kind_signed_bits(ty.kind()))
+    else {
+        return expr;
+    };
+    if !machine_bitop::needed(signed, bits, complement, shift_left) {
+        return expr;
+    }
+    PureExpr::LogicFnCall {
+        name: machine_bitop::name(signed, bits),
+        args: vec![expr],
+    }
+}
+
 /// Translate a MIR Rvalue to a PureExpr (compatibility shim).
 ///
 /// Calls `translate_rvalue_detailed` without a diagnostic context.
@@ -127,7 +176,7 @@ pub(crate) fn translate_rvalue_typed<'tcx>(
     locals: &impl ExprLookup,
     body: Option<&Body<'tcx>>,
 ) -> Option<PureExpr> {
-    if let Rvalue::Aggregate(box AggregateKind::Adt(def_id, variant_idx, ..), operands) = rvalue {
+    if let Rvalue::Aggregate(AggregateKind::Adt(def_id, variant_idx, ..), operands) = rvalue {
         let adt_def = tcx.adt_def(*def_id);
         if adt_def.is_struct() && operands.len() >= 2 {
             let mut args = Vec::with_capacity(operands.len());
@@ -185,7 +234,11 @@ pub(crate) fn translate_rvalue_typed<'tcx>(
         // to the underlying mutref instead of dropping into the typed-field
         // path which would add a spurious `Deref` layer per projection.
         // (#7 box_borrow_resolve)
-        Rvalue::Ref(_, _, place) => body
+        // The bounds check's `&raw const (fake) *p` denotes what `&*p` does
+        // (see `translate_rvalue_detailed`), through the same translator, so
+        // its `PtrMetadata` and a `p.len()` guard read one term.
+        Rvalue::Ref(_, _, place)
+        | Rvalue::RawPtr(rustc_middle::mir::RawPtrKind::FakeForPtrMetadata, place) => body
             .and_then(|body| translate_ref_rvalue_place(body, place, locals))
             .or_else(|| body.and_then(|body| translate_typed_field_place(tcx, body, place, locals)))
             .or_else(|| translate_rvalue_detailed(rvalue, locals, body, None)),
@@ -349,9 +402,47 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
             translate_use_operand(operand, *with_retag, locals, diag)
         }
 
-        Rvalue::BinaryOp(op, box (left, right)) => {
+        Rvalue::BinaryOp(op, (left, right)) => {
             let left_expr = translate_operand_detailed(left, locals, diag)?;
             let right_expr = translate_operand_detailed(right, locals, diag)?;
+            // A float operator is its IEEE-754 operation (over `f16`/`f128`,
+            // the uninterpreted function of its operands) or nothing: the
+            // generic `BinOp` below would read it as integer arithmetic or,
+            // for `==`, as logical equality (true of NaN).
+            match body.map(|b| operand_float_class(left, b)) {
+                Some(Some(FloatClass::Float(width))) => {
+                    let translated = translate_float_binop(*op, width, left_expr, right_expr);
+                    if translated.is_none() {
+                        record_translation_gap(
+                            diag,
+                            format!("float operator without an IEEE model: {op:?}"),
+                        );
+                    }
+                    return translated;
+                }
+                Some(Some(FloatClass::Opaque(format))) => {
+                    let translated = translate_opaque_binop(*op, format, left_expr, right_expr);
+                    if translated.is_none() {
+                        record_translation_gap(
+                            diag,
+                            format!("float operator without a model: {op:?}"),
+                        );
+                    }
+                    return translated;
+                }
+                Some(Some(FloatClass::NotFloat)) => {}
+                // No body, or an operand whose type is unknown: refuse any
+                // operand that may be a float.
+                Some(None) | None => {
+                    if expr_is_syntactically_float(&left_expr)
+                        || expr_is_syntactically_float(&right_expr)
+                        || body.is_some()
+                    {
+                        record_translation_gap(diag, "binary operator over an untyped operand");
+                        return None;
+                    }
+                }
+            }
             let bool_ops = body.is_none_or(|b| operand_is_bool(left, b));
             let Some(bin_op) = translate_binop(*op, bool_ops) else {
                 record_translation_gap(diag, format!("unsupported binary operator: {op:?}"));
@@ -366,36 +457,28 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
             // operands truncate identically to Euclidean (non-negative), so the
             // value is unchanged.
             //
-            // Rust's signed `%` likewise truncates (`-1 % 5 == -1`), lowered to
-            // `BinOp::RemTrunc`. Unsigned `%` stays Euclidean `BinOp::Mod`,
-            // matching the contract `%` which also stays Euclidean (wrapping
-            // arithmetic specs depend on the non-negative remainder).
+            // Rust's `%` truncates for EVERY primitive operand type
+            // (`-1 % 5 == -1`; unsigned operands are non-negative, where the
+            // two agree), matching Creusot's `Int` `%`
+            // (`int.ComputerDivision.mod`) and the parsed contract `%`. Lower it
+            // to `BinOp::RemTrunc` unconditionally so no path (projected places,
+            // no body, logic `Int` operands) silently keeps Euclidean `Mod`.
             //
-            // Floats and the no-body / projected-place path keep exact/Euclidean
-            // `Div`/`Mod`. Mathematical `Int` never reaches MIR lowering (it
-            // comes from parsed contracts). See trust-wp-divmod-semantics.
+            // Floats and the no-body / projected-place path keep exact `Div`.
             let bin_op = match bin_op {
                 BinOp::Div if body.is_some_and(|b| operand_is_machine_int(left, b)) => {
                     BinOp::DivTrunc
                 }
-                BinOp::Mod if body.is_some_and(|b| operand_is_signed_int(left, b)) => {
-                    BinOp::RemTrunc
-                }
+                BinOp::Mod => BinOp::RemTrunc,
                 other => other,
             };
-            if let Some(folded) = fold_concrete_float_binop(&left_expr, bin_op, &right_expr) {
-                return Some(folded);
-            }
             // Machine-int shifts carry the shift-amount-in-range side
             // obligation via the internal marker; every other operator keeps
             // the amount/right operand untouched. (ledger int-shift-full)
             let right_expr =
                 wrap_shift_amount_in_range_marker(bin_op, left, right_expr, body, diag);
-            Some(PureExpr::BinOp(
-                Arc::new(left_expr),
-                bin_op,
-                Arc::new(right_expr),
-            ))
+            let expr = PureExpr::BinOp(Arc::new(left_expr), bin_op, Arc::new(right_expr));
+            Some(wrap_machine_bitop_marker(expr, left, body))
         }
 
         Rvalue::UnaryOp(op, operand) => {
@@ -444,15 +527,32 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
                 });
             }
             let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+            match body.map(|b| operand_float_class(operand, b)) {
+                Some(Some(FloatClass::Float(width))) if matches!(op, MirUnOp::Neg) => {
+                    return Some(translate_float_neg(width, operand_expr));
+                }
+                Some(Some(FloatClass::Opaque(format))) if matches!(op, MirUnOp::Neg) => {
+                    return Some(translate_opaque_neg(format, operand_expr));
+                }
+                Some(Some(FloatClass::Float(_) | FloatClass::Opaque(_))) => {
+                    record_translation_gap(diag, format!("float unary operator {op:?}"));
+                    return None;
+                }
+                Some(Some(FloatClass::NotFloat)) => {}
+                Some(None) | None => {
+                    if expr_is_syntactically_float(&operand_expr) || body.is_some() {
+                        record_translation_gap(diag, "unary operator over an untyped operand");
+                        return None;
+                    }
+                }
+            }
             let bool_op = body.is_none_or(|b| operand_is_bool(operand, b));
             let Some(unary_op) = translate_unop(*op, bool_op) else {
                 record_translation_gap(diag, format!("unsupported unary operator: {op:?}"));
                 return None;
             };
-            if let Some(folded) = fold_concrete_float_unop(unary_op, &operand_expr) {
-                return Some(folded);
-            }
-            Some(PureExpr::UnOp(unary_op, Arc::new(operand_expr)))
+            let expr = PureExpr::UnOp(unary_op, Arc::new(operand_expr));
+            Some(wrap_machine_bitop_marker(expr, operand, body))
         }
 
         // Cast operations — type-aware dispatch following Creusot's cast handling.
@@ -506,27 +606,103 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
                 })
             }
 
-            // Int→Float: identity. Every integer is exactly representable as a
-            // Real in the SMT model. Sort coercion (Int→Real) is handled by the
-            // encoding layer. (#1802)
-            CastKind::IntToFloat => translate_operand_detailed(operand, locals, diag),
+            // `as` into a float rounds (`u64` and `i64` above 2^53 are not all
+            // `f64` values), and between float formats it rounds or widens;
+            // between `f32`/`f64` and integers each is its IEEE conversion,
+            // and with an `f16`/`f128` side the uninterpreted function of its
+            // operand. The source and target types come from the body, and
+            // without them the cast is refused.
+            CastKind::IntToFloat => {
+                let Some((b, target @ (FloatClass::Float(_) | FloatClass::Opaque(_)))) =
+                    body.map(|b| (b, float_class(*cast_ty)))
+                else {
+                    record_translation_gap(diag, "int-to-float cast without a typed body");
+                    return None;
+                };
+                let Some((signed, bits)) =
+                    operand_ty(operand, b).and_then(|ty| int_ty_kind_signed_bits(ty.kind()))
+                else {
+                    record_translation_gap(diag, "int-to-float cast from an untyped operand");
+                    return None;
+                };
+                let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+                match target {
+                    FloatClass::Float(target) => {
+                        Some(translate_int_to_float(signed, bits, target, operand_expr))
+                    }
+                    _ => translate_opaque_cast(
+                        FloatClass::NotFloat,
+                        target,
+                        Some((signed, bits)),
+                        operand_expr,
+                    ),
+                }
+            }
+            CastKind::FloatToFloat => {
+                let classes =
+                    body.map(|b| (operand_float_class(operand, b), float_class(*cast_ty)));
+                let Some((Some(source), target)) = classes else {
+                    record_translation_gap(diag, "float-to-float cast without a typed body");
+                    return None;
+                };
+                let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+                let translated = match (source, target) {
+                    (FloatClass::Float(source), FloatClass::Float(target)) => {
+                        Some(translate_float_to_float(source, target, operand_expr))
+                    }
+                    _ => translate_opaque_cast(source, target, None, operand_expr),
+                };
+                if translated.is_none() {
+                    record_translation_gap(diag, "float-to-float cast between non-float types");
+                }
+                translated
+            }
 
-            // Float→Float (e.g., f32→f64): identity. trust-wp models all floats as
-            // unbounded Reals, so precision changes are invisible at the logical
-            // level. (#1802)
-            CastKind::FloatToFloat => translate_operand_detailed(operand, locals, diag),
-
-            // Pointer-to-pointer reinterpretation: identity at the logical level.
-            CastKind::PtrToPtr => translate_operand_detailed(operand, locals, diag),
+            // Pointer-to-pointer: the identity only while it keeps the
+            // metadata; dropping it is `thin`, and a cast of neither kind is
+            // its pair's function (`super::ptr_cast`).
+            CastKind::PtrToPtr => {
+                let cast = body.and_then(|b| super::ptr_cast::mir_ptr_cast(b, operand, *cast_ty));
+                let Some(cast) = cast else {
+                    record_translation_gap(
+                        diag,
+                        format!("raw pointer cast to `{cast_ty}` read without a compiler session"),
+                    );
+                    return None;
+                };
+                let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+                Some(cast.apply(operand_expr))
+            }
 
             // Subtype coercion (e.g., lifetime variance): value-preserving.
             CastKind::Subtype => translate_operand_detailed(operand, locals, diag),
 
             // Unsize coercion: &[T; N] → &[T] is value-preserving identity.
             // For dyn coercions the logical value is also preserved (vtable is
-            // invisible at the specification level).
+            // invisible at the specification level). A raw pointer is not its
+            // pointee's value: unsizing one ADDS a length or a vtable, so it
+            // is the uninterpreted function of its type pair
+            // (`super::ptr_cast::mir_raw_unsize_fn`).
             CastKind::PointerCoercion(PointerCoercion::Unsize, _) => {
-                translate_operand_detailed(operand, locals, diag)
+                if !matches!(cast_ty.kind(), TyKind::RawPtr(..)) {
+                    return translate_operand_detailed(operand, locals, diag);
+                }
+                let name =
+                    body.and_then(|b| super::ptr_cast::mir_raw_unsize_fn(b, operand, *cast_ty));
+                let Some(name) = name else {
+                    record_translation_gap(
+                        diag,
+                        format!(
+                            "raw pointer unsizing to `{cast_ty}` read without a compiler session"
+                        ),
+                    );
+                    return None;
+                };
+                let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+                Some(PureExpr::LogicFnCall {
+                    name,
+                    args: vec![operand_expr],
+                })
             }
 
             // &mut T → &T (or *mut T → *const T): mutability is erased
@@ -543,12 +719,33 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
                 _,
             ) => translate_operand_detailed(operand, locals, diag),
 
-            // Float→Int: truncate toward zero + clamp to target range.
-            // Rust: `x as i32` rounds toward zero, saturates on overflow.
-            // Lowering: let t = trunc_zero(x) in clamp(t, bounds...) (#1802)
+            // Float→Int: Rust truncates toward zero, saturates at the target's
+            // bounds and maps NaN to 0 — the IEEE conversion's definition.
             CastKind::FloatToInt => {
-                let arg = translate_operand_detailed(operand, locals, diag)?;
-                lower_float_to_int(arg, cast_ty.kind())
+                let source = body.and_then(|b| operand_float_class(operand, b));
+                let (
+                    Some(source @ (FloatClass::Float(_) | FloatClass::Opaque(_))),
+                    Some((signed, bits)),
+                ) = (source, int_ty_kind_signed_bits(cast_ty.kind()))
+                else {
+                    record_translation_gap(
+                        diag,
+                        "float-to-int cast without a float source and an integer target",
+                    );
+                    return None;
+                };
+                let operand_expr = translate_operand_detailed(operand, locals, diag)?;
+                match source {
+                    FloatClass::Float(source) => {
+                        Some(translate_float_to_int(source, signed, bits, operand_expr))
+                    }
+                    _ => translate_opaque_cast(
+                        source,
+                        FloatClass::NotFloat,
+                        Some((signed, bits)),
+                        operand_expr,
+                    ),
+                }
             }
 
             // Unsupported cast kinds — return None so the caller can handle
@@ -557,6 +754,7 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
             | CastKind::PointerExposeProvenance
             | CastKind::PointerWithExposedProvenance
             | CastKind::Transmute
+            | CastKind::BoxDerefTransmute
             | CastKind::PointerCoercion(
                 PointerCoercion::UnsafeFnPointer | PointerCoercion::ArrayToPointer,
                 _,
@@ -575,13 +773,23 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
             .and_then(|b| translate_ref_rvalue_place(b, place, locals))
             .or_else(|| translate_place_detailed(place, locals, diag)),
 
+        // `&raw const (fake) *p`: the pointer rustc builds for a bounds check
+        // ONLY to read the pointee's length with `PtrMetadata` — it is never
+        // dereferenced, so it denotes exactly what `&*p` denotes and the
+        // check's length is the same `p@.len()` a `p.len()` guard reads. A
+        // real raw pointer (`&raw const` / `&raw mut` in source) stays
+        // untranslated.
+        Rvalue::RawPtr(rustc_middle::mir::RawPtrKind::FakeForPtrMetadata, place) => body
+            .and_then(|b| translate_ref_rvalue_place(b, place, locals))
+            .or_else(|| translate_place_detailed(place, locals, diag)),
+
         Rvalue::Reborrow(_, mutability, _) => translate_generic_reborrow(*mutability, diag),
 
         // Tuple construction (for Fn/FnMut call lowering and checked-op helpers).
         // `()` lowers to `__trust_wp_tuple0()` so zero-arg closure call specs keep
         // their unit argument, `(x,)` is modeled as `x`, and wider tuples lower
         // to synthetic tuple constructor calls.
-        Rvalue::Aggregate(box rustc_middle::mir::AggregateKind::Tuple, operands) => {
+        Rvalue::Aggregate(rustc_middle::mir::AggregateKind::Tuple, operands) => {
             let mut translated: Vec<PureExpr> = Vec::with_capacity(operands.len());
             for operand in operands {
                 translated.push(translate_operand_detailed(operand, locals, diag)?);
@@ -605,7 +813,7 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
         // `tuple1(capture)` (do not collapse to the inner value). This keeps
         // capture-field projections (`self.0`, `self.1`, ...) representable at
         // call sites and proof_assert extraction.
-        Rvalue::Aggregate(box rustc_middle::mir::AggregateKind::Closure(..), operands) => {
+        Rvalue::Aggregate(rustc_middle::mir::AggregateKind::Closure(..), operands) => {
             let mut translated: Vec<PureExpr> = Vec::with_capacity(operands.len());
             for operand in operands {
                 translated.push(translate_operand_detailed(operand, locals, diag)?);
@@ -633,7 +841,7 @@ pub(crate) fn translate_rvalue_detailed<'tcx>(
         // value (identity, like single-element tuples). Multi-field structs
         // lower to synthetic tuple constructors, matching the field-projection
         // logic in `project_tuple_field`. (#359)
-        Rvalue::Aggregate(box rustc_middle::mir::AggregateKind::Adt(..), operands) => {
+        Rvalue::Aggregate(rustc_middle::mir::AggregateKind::Adt(..), operands) => {
             let mut translated: Vec<PureExpr> = Vec::with_capacity(operands.len());
             for operand in operands {
                 translated.push(translate_operand_detailed(operand, locals, diag)?);

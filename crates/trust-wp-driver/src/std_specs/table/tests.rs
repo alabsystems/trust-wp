@@ -544,7 +544,7 @@ fn lookup_ghost_perm_resource_specs() {
     }
 }
 
-/// ★ SOUNDNESS PIN (#quantifier-frontier, 2026-08-27). `Resource::join_shared`
+/// ★ SOUNDNESS PIN (#quantifier-frontier). `Resource::join_shared`
 /// must NOT carry a committed, RA-generic `self@ == other@` postcondition.
 ///
 /// Creusot's contract is `requires(self.id() == other.id())`,
@@ -732,7 +732,9 @@ fn lookup_hashset_from_iter_spec() {
     }
 }
 
-/// Iterator::collect spec closes the into_iter/collect roundtrip. (#2116)
+/// Iterator::collect resolves to the generic entry, which carries NO result
+/// clause: the roundtrip is appended only by the driver's type gate
+/// (`mir_analysis/extract/collect_gate.rs`) for whitelisted `(Self, B)` pairs.
 ///
 /// Post-borrowck MIR does NOT inline collect() to FromIterator::from_iter,
 /// so the trait default method path is what appears at call sites.
@@ -747,8 +749,8 @@ fn lookup_iterator_collect_spec() {
         let spec =
             lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve to a spec"));
         assert!(
-            spec.ensures.iter().any(|e| e.contains("from_iter_post")),
-            "{path} collect spec should use from_iter_post; got {:?}",
+            spec.ensures.is_empty(),
+            "{path} ungated collect spec must state nothing about the result; got {:?}",
             spec.ensures
         );
     }
@@ -879,7 +881,7 @@ fn no_duplicate_aliases_across_tables() {
     }
 }
 
-// ── #2524: shared registry migration regression tests ─────────────────────
+// ── #2524: canonical and alias paths resolve through the shared registry ──
 
 /// Verify mem_clone_default canonical AND alias paths resolve through
 /// the imported shared registry. (#2524)
@@ -1290,7 +1292,8 @@ fn lookup_nonzero_new_with_generics_normalized() {
 #[test]
 fn audit_spec_table_entry_count_regression_guard() {
     let total: usize = super::STD_SPEC_TABLES.iter().map(|table| table.len()).sum();
-    // As of 2026-04-18 completeness audit: 700+ entries across 16 sub-tables.
+    // The floor sits below the table's real size so ordinary churn never trips
+    // it; a drop past it means a sub-table was emptied or removed.
     assert!(
         total >= 700,
         "Spec table entry count regressed: {total} < 700 (expected 700+). \
@@ -2323,14 +2326,12 @@ fn lookup_atomic_operation_specs() {
     }
 }
 
-/// Master spec table coverage count — documents the current size of
-/// the spec table and serves as a regression test against accidental
+/// Spec table coverage floor — a regression test against accidental
 /// entry removal. (#2689)
 ///
-/// As of 2026-04-18 completeness audit: 700+ spec entries covering 3000+
-/// path aliases across 16 sub-tables. The thresholds below are set ~10%
-/// below actual counts to catch accidental table removal while allowing
-/// minor refactoring.
+/// The thresholds sit roughly a tenth below the table's actual entry and
+/// alias counts: far enough to survive minor refactoring, close enough
+/// that an emptied sub-table or a stripped alias list trips them.
 #[test]
 fn spec_table_entry_count_is_sufficient() {
     let total_entries: usize = super::STD_SPEC_TABLES.iter().map(|table| table.len()).sum();
@@ -2339,8 +2340,7 @@ fn spec_table_entry_count_is_sufficient() {
         .flat_map(|table| table.iter())
         .map(|(paths, _)| paths.len())
         .sum();
-    // Thresholds set at ~90% of actual counts (2026-04-18).
-    // Adjust upward when entries are added, never decrease.
+    // Adjust the floors upward when entries are added, never decrease them.
     assert!(
         total_entries >= 630,
         "Spec table should have at least 630 entries, found {total_entries}. \
@@ -2371,7 +2371,7 @@ fn all_subtables_loaded() {
 /// by compat tests, ensuring creusot_std paths don't require explicit
 /// table entries. (#2689)
 ///
-/// This test documents that the 177 trust_wp_std paths without explicit
+/// This test documents that trust_wp_std paths without explicit
 /// creusot_std counterparts in the table are still reachable, because
 /// `normalize_crate_aliases` rewrites `creusot_std::` -> `trust_wp_std::`
 /// before lookup.
@@ -2399,6 +2399,157 @@ fn normalization_covers_all_creusot_std_paths() {
         assert!(
             lookup_std_spec(&creusot_path).is_some(),
             "creusot_std alias should resolve via normalization: {creusot_path}"
+        );
+    }
+}
+
+/// Primitive `Div::div` / `Rem::rem` specs bind ONLY primitive-integer Self
+/// types. The bare trait path is what call resolution's trait-method
+/// fallback looks up for every impl, so it must not carry the integer spec:
+/// a user `impl Div for S` returning `S(0)` otherwise verified
+/// `S(8).div(S(2))@ == 4`.
+#[test]
+fn primitive_div_rem_specs_are_integer_self_typed_only() {
+    for path in [
+        "core::ops::Div::div",
+        "core::ops::arith::Div::div",
+        "std::ops::Div::div",
+    ] {
+        assert!(
+            lookup_std_spec(path).is_none(),
+            "bare Div trait path must not resolve to the integer spec: {path}"
+        );
+    }
+    for path in [
+        "<i32 as core::ops::Div>::div",
+        "<u64 as std::ops::Div>::div",
+        "<isize as core::ops::arith::Div>::div",
+        "i128::div",
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(
+            spec.ensures.iter().any(|e| e.contains("self@ / rhs@")),
+            "{path} should carry the integer division spec: {:?}",
+            spec.ensures
+        );
+    }
+    for path in [
+        "<i32 as core::ops::Rem>::rem",
+        "<i64 as std::ops::Rem>::rem",
+        "<u8 as core::ops::arith::Rem>::rem",
+        "usize::rem",
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(
+            spec.ensures.iter().any(|e| e.contains("self@ % rhs@")),
+            "{path} should carry the truncating integer remainder spec: {:?}",
+            spec.ensures
+        );
+        assert!(
+            spec.requires.iter().any(|r| r.contains("rhs@ != 0")),
+            "{path} must keep the nonzero-divisor precondition"
+        );
+    }
+    // The bare Rem trait path keeps the generic opaque fallback.
+    let generic = lookup_std_spec("core::ops::Rem::rem").expect("generic Rem fallback");
+    assert!(
+        generic
+            .ensures
+            .iter()
+            .any(|e| e.contains("T::rem.postcondition")),
+        "bare Rem path must stay the generic fallback: {:?}",
+        generic.ensures
+    );
+}
+
+/// Primitive `rem_euclid` / `div_euclid` resolve to their Euclidean specs.
+#[test]
+fn primitive_euclid_specs_resolve() {
+    for path in [
+        "core::num::rem_euclid",
+        "i32::rem_euclid",
+        "core::num::u8::rem_euclid",
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(spec
+            .ensures
+            .iter()
+            .any(|e| e.contains("self@.rem_euclid(rhs@)")));
+    }
+    for path in ["core::num::div_euclid", "i64::div_euclid"] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(spec
+            .ensures
+            .iter()
+            .any(|e| e.contains("rem_euclid(rhs@)) / rhs@")));
+    }
+}
+
+/// Signed `MIN / -1` overflow: every panicking primitive div/rem spec carries
+/// creusot-std's `!(self@ == MIN@ && rhs@ == -1)` precondition, resolved to the
+/// concrete integer type.
+#[test]
+fn primitive_div_rem_specs_require_no_signed_overflow() {
+    for (path, ty) in [
+        ("<i8 as core::ops::Div>::div", "i8"),
+        ("core::num::<impl i8>::div", "i8"),
+        ("<i32 as core::ops::Rem>::rem", "i32"),
+        ("core::num::<impl i32>::rem", "i32"),
+        ("core::num::<impl i64>::rem_euclid", "i64"),
+        ("core::num::<impl i8>::div_euclid", "i8"),
+        ("u32::rem_euclid", "u32"),
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        let want = format!("!(self@ == {ty}::MIN@ && rhs@ == -1)");
+        assert!(
+            spec.requires.iter().any(|r| r.contains(&want)),
+            "{path} must require {want}: {:?}",
+            spec.requires
+        );
+    }
+    for path in ["i8::checked_div", "i8::checked_rem"] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(
+            spec.ensures
+                .iter()
+                .any(|e| e.contains("result.is_none()") && e.contains("i8::MIN@ && rhs@ == -1")),
+            "{path} must return None on MIN / -1: {:?}",
+            spec.ensures
+        );
+    }
+    let sat = lookup_std_spec("i8::saturating_div").expect("saturating_div");
+    assert!(sat
+        .ensures
+        .iter()
+        .any(|e| e.contains("result@ == i8::MAX@")));
+    let wrap = lookup_std_spec("i8::wrapping_div").expect("wrapping_div");
+    assert!(wrap
+        .ensures
+        .iter()
+        .any(|e| e.contains("result@ == i8::MIN@")));
+}
+
+/// The generic `Rem`/`RemAssign`/`DivAssign` fallbacks cannot know the
+/// callee's precondition, so they carry an undischargeable obligation instead
+/// of assuming the call is panic-free.
+#[test]
+fn generic_rem_div_fallbacks_carry_precondition_obligation() {
+    for (path, pre) in [
+        ("core::ops::Rem::rem", "T::rem.precondition"),
+        (
+            "core::ops::RemAssign::rem_assign",
+            "T::rem_assign.precondition",
+        ),
+        (
+            "core::ops::DivAssign::div_assign",
+            "T::div_assign.precondition",
+        ),
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should resolve"));
+        assert!(
+            spec.requires.iter().any(|r| r.contains(pre)),
+            "{path} must require {pre}: {:?}",
+            spec.requires
         );
     }
 }

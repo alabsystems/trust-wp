@@ -116,7 +116,7 @@ fn test_verify_mut_borrow_type_invariant_violation() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "set_zero should violate type invariant through mut borrow: got {result:?}"
     );
 }
@@ -153,7 +153,7 @@ fn test_verify_mut_borrow_type_invariant_no_axiom_fails() {
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[req], &[ens], &final_values))
             .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "Without body axiom, invariant preservation should produce Failed (invariant() is \
          uninterpreted UF, solver finds counterexample): got {result:?}"
     );
@@ -355,7 +355,7 @@ fn test_verify_mut_borrow_nonzero_sub_breaks_invariant() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "NonZero sub without sufficient precondition should fail (counterexample: b >= *a): got {result:?}"
     );
 }
@@ -489,7 +489,7 @@ fn test_verify_mut_borrow_swap_nonzero_partial_precondition_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "swap with partial precondition should fail (^a = *b, but *b unconstrained): got {result:?}"
     );
 }

@@ -125,7 +125,7 @@ fn example_writes_a_contracted_file_to_stdout_and_to_a_path() {
     assert_eq!(code(&piped), EXIT_OK);
     let source = stdout(&piped);
     assert!(source.contains("use trust_wp::{ensures, requires};"));
-    assert!(source.contains("#[requires(x > 0)]"));
+    assert!(source.contains("#[requires(x > 0 && x < 1_000_000)]"));
     assert!(source.contains("#[ensures(result > x)]"));
 
     let dir = scratch("example");

@@ -156,6 +156,10 @@ def _print_baseline_freshness_report(
         lane_status = info.get("status", "?")
         age_str = f"{age} commits behind HEAD" if age is not None else "unknown"
         print(f"  {lane_name}: {lane_status} — {info.get('path')} @ {commit} ({age_str})")
+        if info.get("source_equivalent_to_head") is True:
+            print("    source unchanged across the direct canonical-baseline publication commit")
+        if info.get("reason"):
+            print(f"    {info['reason']}")
 
 
 def _maybe_check_baseline_freshness(

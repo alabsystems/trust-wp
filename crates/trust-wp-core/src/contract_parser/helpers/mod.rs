@@ -8,9 +8,11 @@
 //! `contract_parser` module sees them via the `pub(in crate::contract_parser)`
 //! visibility qualifier.
 
+pub(in crate::contract_parser) mod borrows;
+mod casts;
 mod expressions;
 mod identifiers;
 mod literals;
 mod patterns;
-mod quantifiers;
+pub(in crate::contract_parser) mod quantifiers;
 mod tokenizer;

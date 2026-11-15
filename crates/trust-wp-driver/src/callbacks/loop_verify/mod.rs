@@ -20,6 +20,7 @@ mod for_loop_facts;
 pub(in crate::callbacks) mod ghost_rewrite;
 mod inference;
 mod old_rewrite;
+pub(in crate::callbacks) mod pre_loop_store;
 mod reporting;
 mod single_loop;
 mod span_matching;
@@ -54,8 +55,11 @@ pub(super) use types::{LoopVerificationOutput, LoopWithInvariantRequest};
 use types::{PerLoopConditions, PreExtractedLoopBodies};
 
 use super::{
-    super::mir_analysis::{extract_loop_body, get_mir_body, CallSpecContext},
-    try_get_body_with_context, MIR_BODIES,
+    super::mir_analysis::{
+        every_return_passes_through, extract_loop_body, get_mir_body,
+        names_rewritten_after_exit_before_later_loop, CallSpecContext,
+    },
+    try_get_body_with_context,
 };
 
 /// Verify a function with loop invariants using inductive proof.
@@ -94,6 +98,31 @@ pub(super) fn verify_loop_with_invariant(
         );
     }
 
+    // A loop invariant's `^x[0]`, `^x.m`, `^(^x).m` reads the final value of
+    // a borrow the value holds, which its holder decides after the call; the
+    // encoder reads it as the place the outer borrow is left with, as it did
+    // in a `proof_assert!` (D-129). Refused here as there.
+    for invariant in parsed.loop_fields.invariants.iter().chain(
+        parsed
+            .loop_fields
+            .per_loop_invariants
+            .iter()
+            .flat_map(|(_, _, invariants)| invariants.iter()),
+    ) {
+        if let Some(why) =
+            trust_wp_core::formula::elaborate::first_final_of_a_value_not_named_as_a_borrow(
+                invariant,
+                &trust_wp_core::logic::final_reads::FinalReaders::default(),
+            )
+        {
+            return Err(EncodingError::Unsupported {
+                message: format!("loop invariant final value refused (fail-closed): {why}"),
+                span: None,
+                contract_text: None,
+            });
+        }
+    }
+
     // Handle empty loops case
     if loop_analysis.loops.is_empty() {
         let empty_effect_map = std::collections::HashMap::new();
@@ -112,32 +141,27 @@ pub(super) fn verify_loop_with_invariant(
         emit_loop_verification_diagnostics(def_path, &outcome);
         let evidence_gap_reasons = loop_verification_evidence_gap_reasons(&outcome);
         return Ok(LoopVerificationOutput {
+            exit_condition_holds_at_return: false,
             result: outcome.as_result(),
             frame_constraints: Vec::new(),
             continuation_assumptions: Vec::new(),
             return_expr: None,
             post_loop_final_values: std::collections::HashMap::new(),
-            effective_invariants: parsed.loop_fields.invariants.clone(),
+            // No loops: no loop's invariants to hand to any group.
+            per_loop_effective_invariants: Vec::new(),
             evidence_gap_reasons,
         });
     }
 
-    let inferred_unsigned_invariants = MIR_BODIES.with(|state| {
-        let map = state.borrow();
-        map.get(&contract.local_def_id)
-            .map(|body_with_facts| {
-                infer_unsigned_nonneg_invariants(get_mir_body(body_with_facts), &parsed.arg_names)
-            })
-            .unwrap_or_default()
-    });
-    let inferred_unsigned_requires = MIR_BODIES.with(|state| {
-        let map = state.borrow();
-        map.get(&contract.local_def_id)
-            .map(|body_with_facts| {
-                infer_unsigned_nonneg_requires(get_mir_body(body_with_facts), &parsed.arg_names)
-            })
-            .unwrap_or_default()
-    });
+    let retained_body = try_get_body_with_context(tcx, contract.local_def_id);
+    let inferred_unsigned_invariants = retained_body
+        .as_deref()
+        .map(|body| infer_unsigned_nonneg_invariants(get_mir_body(body), &parsed.arg_names))
+        .unwrap_or_default();
+    let inferred_unsigned_requires = retained_body
+        .as_deref()
+        .map(|body| infer_unsigned_nonneg_requires(get_mir_body(body), &parsed.arg_names))
+        .unwrap_or_default();
     let returns_ghost = function_returns_ghost(tcx, contract.def_id);
 
     // Pre-compute per-loop invariants so nested loops can inherit outer
@@ -146,29 +170,45 @@ pub(super) fn verify_loop_with_invariant(
         .loops
         .iter()
         .map(|li| {
-            let header_byte_pos = MIR_BODIES.with(|state| {
-                let map = state.borrow();
-                map.get(&contract.local_def_id).map(|body_with_facts| {
-                    let mir_body = get_mir_body(body_with_facts);
-                    mir_body.basic_blocks[li.header]
-                        .terminator()
-                        .source_info
-                        .span
-                        .lo()
-                        .0
-                })
+            let header_byte_pos = retained_body.as_deref().map(|body_with_facts| {
+                get_mir_body(body_with_facts).basic_blocks[li.header]
+                    .terminator()
+                    .source_info
+                    .span
+                    .lo()
+                    .0
             });
             let mut invs = if let (false, Some(pos)) = (
                 parsed.loop_fields.per_loop_invariants.is_empty(),
                 header_byte_pos,
             ) {
-                find_loop_invariants(
+                let invs = find_loop_invariants(
                     &parsed.loop_fields.per_loop_invariants,
                     &parsed.loop_fields.all_loop_spans,
                     pos,
-                )
+                );
+                // An invariant names the bindings visible at its loop (D-237).
+                match try_get_body_with_context(tcx, contract.local_def_id) {
+                    Some(body_with_facts) => {
+                        crate::mir_analysis::binding_identity::resolve_loop_clauses(
+                            get_mir_body(&body_with_facts),
+                            li.header,
+                            invs,
+                        )
+                    }
+                    None => invs,
+                }
             } else {
-                parsed.loop_fields.invariants.clone()
+                match try_get_body_with_context(tcx, contract.local_def_id) {
+                    Some(body_with_facts) => {
+                        crate::mir_analysis::binding_identity::resolve_loop_clauses(
+                            get_mir_body(&body_with_facts),
+                            li.header,
+                            parsed.loop_fields.invariants.clone(),
+                        )
+                    }
+                    None => parsed.loop_fields.invariants.clone(),
+                }
             };
             for inv in &inferred_unsigned_invariants {
                 if !invs.contains(inv) {
@@ -178,10 +218,10 @@ pub(super) fn verify_loop_with_invariant(
             invs
         })
         .collect();
-    // Pre-extract ALL loop bodies once with full call_spec_ctx, eliminating the
-    // redundant second extraction inside the per-loop for-loop. (#2278 F7)
-    // Previously, conditions were extracted in a separate pass (with None call_spec_ctx)
-    // and then full bodies were re-extracted per-loop (with Some(call_spec_ctx)).
+    // Extract every loop body once, with the full call_spec_ctx, and take each
+    // loop's condition from that same extraction; a separate condition pass
+    // (with no call_spec_ctx) followed by a per-loop re-extraction would walk
+    // every body twice. (#2278)
     let call_spec_ctx = CallSpecContext {
         tcx,
         user_specs: req.user_specs,
@@ -192,8 +232,8 @@ pub(super) fn verify_loop_with_invariant(
     let (mut pre_extracted_bodies, per_loop_conditions): (
         PreExtractedLoopBodies,
         PerLoopConditions,
-    ) = if let Some(body_with_facts) = try_get_body_with_context(contract.local_def_id) {
-        let mir_body = get_mir_body(body_with_facts);
+    ) = if let Some(body_with_facts) = try_get_body_with_context(tcx, contract.local_def_id) {
+        let mir_body = get_mir_body(&body_with_facts);
         loop_analysis
             .loops
             .iter()
@@ -204,7 +244,6 @@ pub(super) fn verify_loop_with_invariant(
                     li,
                     Some(&loop_analysis.loops),
                     Some(&call_spec_ctx),
-                    returns_ghost,
                 );
                 let header_byte_pos = mir_body.basic_blocks[li.header]
                     .terminator()
@@ -281,8 +320,80 @@ pub(super) fn verify_loop_with_invariant(
     let mut last_return_expr: Option<PureExpr> = None;
     let mut accumulated_post_loop_final_values: std::collections::HashMap<String, PureExpr> =
         std::collections::HashMap::new();
-    let mut accumulated_effective_invariants: Vec<PureExpr> = Vec::new();
+    let mut per_loop_output_invariants: Vec<Vec<PureExpr>> = Vec::with_capacity(loop_count);
     let mut evidence_gap_reasons = Vec::new();
+
+    // Exit facts of a loop that another loop follows must not mention a name
+    // rewritten between that loop's exit and the later loop: the fact describes
+    // the value at that exit, not the one the later loop's checks read.
+    // `None` keeps every fact; `Some(names)` drops facts mentioning `names`.
+    // Without MIR the order is unknown: drop every multi-loop exit fact.
+    let per_loop_exit_rewrites: Vec<Option<Option<std::collections::HashSet<String>>>> =
+        match try_get_body_with_context(tcx, contract.local_def_id) {
+            Some(body_with_facts) => {
+                let mir_body = get_mir_body(&body_with_facts);
+                loop_analysis
+                    .loops
+                    .iter()
+                    .map(|li| {
+                        names_rewritten_after_exit_before_later_loop(
+                            mir_body,
+                            li,
+                            &loop_analysis.loops,
+                            &parsed.arg_names,
+                        )
+                        .map(Some)
+                    })
+                    .collect()
+            }
+            None => (0..loop_count)
+                .map(|_| (loop_count > 1).then_some(None))
+                .collect(),
+        };
+    // A loop's exit facts and the value a walk from its exit states are the
+    // function's only if every return passes through the loop (D-224).
+    // Without MIR no loop is known to.
+    let on_every_return: Vec<bool> = match try_get_body_with_context(tcx, contract.local_def_id) {
+        Some(body_with_facts) => {
+            let mir_body = get_mir_body(&body_with_facts);
+            loop_analysis
+                .loops
+                .iter()
+                .map(|li| every_return_passes_through(mir_body, li))
+                .collect()
+        }
+        None => vec![false; loop_count],
+    };
+    // What a loop's exit tells about its condition: its negation, when the
+    // condition is tested at the header and reads nothing the VC leaves
+    // free. A body-break condition is tested after part of the body ran, and
+    // a loop's exit test says nothing on a path that leaves another way.
+    let exit_conditions: Vec<Option<PureExpr>> = pre_extracted_bodies
+        .iter()
+        .map(|body_opt| {
+            let (body_expr, _) = body_opt.as_ref()?;
+            if body_expr.condition_is_body_break || body_expr.condition_unstated.is_some() {
+                return None;
+            }
+            body_expr.condition.as_ref().map(|cond| {
+                PureExpr::UnOp(
+                    trust_wp_core::formula::UnOp::Not,
+                    std::sync::Arc::new(cond.clone()),
+                )
+            })
+        })
+        .collect();
+    // `Some(None)` means "rewrites unknown": every fact is stale.
+    let exit_fact_is_stale = |loop_idx: usize, name: Option<&str>, expr: &PureExpr| -> bool {
+        match &per_loop_exit_rewrites[loop_idx] {
+            None => false,
+            Some(None) => true,
+            Some(Some(names)) => {
+                name.is_some_and(|name| names.contains(name))
+                    || expr.free_vars().iter().any(|var| names.contains(var))
+            }
+        }
+    };
 
     let orch = LoopOrchestrationData {
         per_loop_effective_invariants: &per_loop_effective_invariants,
@@ -307,31 +418,57 @@ pub(super) fn verify_loop_with_invariant(
             evidence_gap_reasons.push(format!("loop[{loop_idx}] {reason}"));
         }
 
+        let returns_through_this_loop = on_every_return[loop_idx];
         for (name, expr) in single.frame_contributions {
+            if !returns_through_this_loop || exit_fact_is_stale(loop_idx, Some(&name), &expr) {
+                continue;
+            }
             frame_constraint_map.insert(name, expr);
         }
         for assumption in single.continuation_assumptions {
+            if !returns_through_this_loop || exit_fact_is_stale(loop_idx, None, &assumption) {
+                continue;
+            }
             if !continuation_assumptions.contains(&assumption) {
                 continuation_assumptions.push(assumption);
             }
         }
-        // Accumulate effective invariants from each loop, deduplicating.
-        // The call obligation checker needs the union of invariants from all
-        // loops to prove call-site preconditions. (#1709)
+        // One loop's negated condition is added by the dispatcher
+        // (`single_loop_condition`); with several, each loop every return
+        // passes through contributes its own, unless a later write made it
+        // stale (loop_post_return_crosses_later_loop_control.rs).
+        if loop_count > 1 && returns_through_this_loop {
+            if let Some(exit) = exit_conditions[loop_idx].as_ref() {
+                if !exit_fact_is_stale(loop_idx, None, exit)
+                    && !continuation_assumptions.contains(exit)
+                {
+                    continuation_assumptions.push(exit.clone());
+                }
+            }
+        }
+        // Keep effective invariants PER LOOP (#1709). The call obligation
+        // checker gives each loop's groups that loop's own list; a union across
+        // loops would make loop 1's stable pre-loop bindings premises of loop
+        // 0's exit-tail checks (s40v5_crossloop_user_invariant_pooled.rs).
+        let mut loop_invariants: Vec<PureExpr> = Vec::new();
         for inv in single.effective_invariants {
-            if !accumulated_effective_invariants.contains(&inv) {
-                accumulated_effective_invariants.push(inv);
+            if !loop_invariants.contains(&inv) {
+                loop_invariants.push(inv);
             }
         }
         // Range loop elements are only bounded on active loop iterations.
         // Thread condition-guarded bounds to the output used by loop call
         // obligation checking without strengthening raw loop invariants.
         for fact in &per_loop_call_obligation_facts[loop_idx] {
-            if !accumulated_effective_invariants.contains(fact) {
-                accumulated_effective_invariants.push(fact.clone());
+            if !loop_invariants.contains(fact) {
+                loop_invariants.push(fact.clone());
             }
         }
-        last_return_expr = single.return_expr.or(last_return_expr);
+        debug_assert_eq!(per_loop_output_invariants.len(), loop_idx);
+        per_loop_output_invariants.push(loop_invariants);
+        if returns_through_this_loop {
+            last_return_expr = single.return_expr.or(last_return_expr);
+        }
         accumulated_post_loop_final_values.extend(single.post_loop_final_values);
         combined_result = Some(match combined_result {
             None => single.result,
@@ -340,6 +477,7 @@ pub(super) fn verify_loop_with_invariant(
     }
 
     Ok(LoopVerificationOutput {
+        exit_condition_holds_at_return: loop_count == 1 && on_every_return[0],
         result: combined_result.unwrap_or(LoopVerificationResult {
             initialization: VerificationResult::Verified(None),
             preservation: VerificationResult::Verified(None),
@@ -359,7 +497,7 @@ pub(super) fn verify_loop_with_invariant(
         continuation_assumptions,
         return_expr: last_return_expr,
         post_loop_final_values: accumulated_post_loop_final_values,
-        effective_invariants: accumulated_effective_invariants,
+        per_loop_effective_invariants: per_loop_output_invariants,
         evidence_gap_reasons,
     })
 }

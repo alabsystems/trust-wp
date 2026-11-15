@@ -74,7 +74,7 @@ fn test_parse_method_call_no_args() {
     {
         assert!(matches!(*receiver, PureExpr::View(_)));
         assert_eq!(method, "len");
-        assert!(args.is_empty());
+        assert_eq!(args.as_slice(), []);
     } else {
         panic!("Expected MethodCall, got {expr:?}");
     }
@@ -185,7 +185,7 @@ fn test_parse_chained_method_calls() {
     } = expr
     {
         assert_eq!(method, "len");
-        assert!(args.is_empty());
+        assert_eq!(args.as_slice(), []);
         // receiver should be the push_back call
         assert!(matches!(*receiver, PureExpr::MethodCall { .. }));
     } else {

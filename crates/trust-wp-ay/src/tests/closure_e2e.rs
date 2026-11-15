@@ -175,7 +175,7 @@ fn test_fnmut_mixed_captures_wrong_postcondition_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, crate::VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "FnMut mixed-capture ^y == y + 2 should fail (precondition gives +1): {result:?}"
     );
 }

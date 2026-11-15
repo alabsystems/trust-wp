@@ -4,23 +4,23 @@
 
 //! Integration tests for trusted contract reference validation.
 
-use std::{path::Path, process::Command};
+use std::path::Path;
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../target/trusted_contract_validation_tests_verify_{bin}"
     ));
-    Command::new("cargo")
+    nested_cargo("check")
         .current_dir(fixture_dir("trusted_contract_validation"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", "--verify")
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for trusted contract validation fixture")
+        .expect("failed to run targo check for trusted contract validation fixture")
 }
 
 #[test]

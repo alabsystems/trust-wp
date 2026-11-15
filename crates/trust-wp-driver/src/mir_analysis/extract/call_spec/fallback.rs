@@ -32,10 +32,10 @@ pub(super) fn handle_opaque_call<'tcx>(
     // Creusot approach: inject `requires(false)` so calling an opaque function
     // makes the caller's postcondition unprovable. This is fail-closed: if we
     // don't know what the function does, we can't prove anything about its caller.
-    effects.obligations.push(PureExpr::Bool(false));
+    effects.record_injected_fail_closed_obligation("opaque-call");
     let dest_ty = body.local_decls[destination.local].ty;
     let opaque = PureExpr::Var(
-        format!("_call_{}", destination.local.as_u32()),
+        format!("$_call_{}", destination.local.as_u32()),
         ty_to_expr_sort_enriched(tcx, dest_ty),
     );
     let pointer_bits = u32::try_from(tcx.data_layout.pointer_size().bits()).unwrap_or(64);
@@ -45,6 +45,11 @@ pub(super) fn handle_opaque_call<'tcx>(
         pointer_bits,
     );
     effects.assumptions.extend(range_constraints);
+    let nested_capabilities =
+        super::super::closure::nested_interior_capability_arg_positions(tcx, body, args);
+    let interior_capability_roots = (!nested_capabilities.is_empty()).then(|| {
+        super::super::closure::interior_capability_roots(&local_exprs, args, &nested_capabilities)
+    });
     local_exprs.insert(destination.local, opaque);
     propagate_mutating_ref_arg_states(
         &mut local_exprs,
@@ -54,6 +59,30 @@ pub(super) fn handle_opaque_call<'tcx>(
         Some(effects),
         None,
     );
+    // A shared reference to interior-mutable memory is a write capability.
+    let mut interior_mutable_positions = Vec::new();
+    super::super::closure::union_interior_mutable_write_positions(
+        tcx,
+        body,
+        args,
+        &mut interior_mutable_positions,
+    );
+    super::super::closure::propagate_mutating_ref_arg_states_for_positions(
+        &mut local_exprs,
+        body,
+        ctx.arg_names,
+        args,
+        &interior_mutable_positions,
+        Some(effects),
+        None,
+    );
+    if let Some(roots) = interior_capability_roots {
+        super::super::closure::havoc_interior_capability_roots(
+            &mut local_exprs,
+            roots,
+            &mut effects.obligations,
+        );
+    }
     wrap_projected_facts(
         projected_write_facts.to_vec(),
         super::extract_from_block_with_context(

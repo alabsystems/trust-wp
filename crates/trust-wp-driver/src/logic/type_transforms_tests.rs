@@ -19,6 +19,7 @@ fn make_logic_fn(name: &str, full_path: &str, body: &str) -> LogicFunction {
         full_path: full_path.to_string(),
         params: vec!["self".to_string()],
         requires: Vec::new(),
+        written_requires: 0,
         ensures: Vec::new(),
         variants: Vec::new(),
         is_opaque: false,
@@ -26,10 +27,13 @@ fn make_logic_fn(name: &str, full_path: &str, body: &str) -> LogicFunction {
         is_law: false,
         mode: LogicMode::Default,
         is_trait_method: false,
+        is_associated_fn: false,
         param_sort_hints: vec![None],
+        param_int_widths: Vec::new(),
         return_sort_hint: None,
         body_text: Some(body.to_string()),
         deep_model_dispatch_targets: None,
+        param_bindings: Default::default(),
     }
 }
 

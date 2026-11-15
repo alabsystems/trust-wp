@@ -112,7 +112,7 @@ pub(in super::super) fn translate_projected_write_lhs<'tcx>(
         // value (e.g., `tuple_get_0(tuple2(2,3))` → `2`). (#2533)
         if !matches!(existing, PureExpr::Var(..)) {
             let sort = ty_to_expr_sort_enriched(tcx, body.local_decls[place.local].ty);
-            let synthetic_name = format!("_local_{}", place.local.as_u32());
+            let synthetic_name = format!("$local_{}", place.local.as_u32());
             symbolic_locals.insert(place.local, PureExpr::Var(synthetic_name, sort));
         }
     }

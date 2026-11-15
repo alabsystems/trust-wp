@@ -31,6 +31,21 @@ use super::super::{
     BinOp, ExprSort, Formula, Location, MatchArm, Pattern, Permission, PureExpr, UnOp, Value,
 };
 
+/// A boolean expression every encoder refuses: an ordered comparison of two
+/// floats spelled as a `BinOp`. Rust's float comparisons reach the encoder
+/// only as IEEE calls, so this spelling has no meaning to give it.
+pub(crate) fn unencodable_float_order() -> PureExpr {
+    PureExpr::BinOp(
+        Arc::new(PureExpr::Float(
+            trust_wp_core::formula::FloatBits::from_f64(1.0),
+        )),
+        BinOp::Lt,
+        Arc::new(PureExpr::Float(
+            trust_wp_core::formula::FloatBits::from_f64(2.0),
+        )),
+    )
+}
+
 // ── PureExpr leaf constructors ──────────────────────────────────────
 
 pub(crate) fn var(name: &str) -> PureExpr {
@@ -259,6 +274,17 @@ pub(crate) fn resolve_call(arg: PureExpr) -> PureExpr {
     }
 }
 
+/// A closure state annotated at a sort holding no borrow (a closure that
+/// captures nothing by `&mut`), whose `resolve` is the by-value `true`. An
+/// unannotated state is not known to hold none: its `resolve` is refused
+/// where the lane names no final value of it (D-126).
+pub(crate) fn value_state(name: &str) -> PureExpr {
+    PureExpr::Var(
+        name.to_string(),
+        Some(trust_wp_core::formula::ExprSort::Int),
+    )
+}
+
 pub(crate) fn let_assume(assumption: PureExpr, body: PureExpr) -> PureExpr {
     PureExpr::LetAssume {
         assumption: Arc::new(assumption),
@@ -376,7 +402,7 @@ pub(crate) fn build_sep_conj_chain(n: usize) -> Formula {
 ///
 /// Only `ClosureEnv_`-prefixed uninterpreted sorts get per-sort
 /// hex-encoded `"c…"` tags; all other uninterpreted sorts map to `"u"`.
-/// (#1997, cb2f4e70)
+/// (#1997)
 pub(crate) fn closure_sort_tag(sort: &ay_dpll::api::Sort) -> String {
     use ay_dpll::api::Sort;
     match sort {
@@ -396,7 +422,7 @@ pub(crate) fn closure_sort_tag(sort: &ay_dpll::api::Sort) -> String {
 
 /// Joins `closure_sort_tag` results for a slice of sorts with `"_"`.
 ///
-/// Used to build the signature portion of closure UF symbol names
+/// Builds the signature portion of closure UF symbol names
 /// (e.g. `postcondition_once_b_i_u`).
 pub(crate) fn closure_sort_signature(sorts: &[ay_dpll::api::Sort]) -> String {
     sorts
@@ -406,13 +432,12 @@ pub(crate) fn closure_sort_signature(sorts: &[ay_dpll::api::Sort]) -> String {
         .join("_")
 }
 
-// Degraded assertions (assert_verified_or_unknown, assert_failed_or_unknown) removed
-// in #1992 — ay now returns definitive results for all former call sites.
-// All tests use strict `assert!(matches!(...))` assertions directly.
+// Every assertion in this section is strict: `Unknown` never passes. The
+// tolerant predicates live under "Known-class pins" below.
 
 // ── Verification result assertions ────────────────────────────────────
 
-/// Legacy-named helper kept for existing call sites.
+/// The name is wider than the check: only `Verified` passes.
 ///
 /// The bypass audit requires verification tests to fail closed: Unknown is not
 /// accepted as a passing outcome here.
@@ -427,7 +452,7 @@ pub(crate) fn assert_verified_or_demoted_sort_fallback(
     }
 }
 
-/// Legacy-named helper kept for existing call sites.
+/// The name is wider than the check: only `Verified` passes.
 ///
 /// The bypass audit requires verification tests to fail closed: Unknown is not
 /// accepted as a passing outcome here.
@@ -442,7 +467,7 @@ pub(crate) fn assert_verified_or_vacuous(
     }
 }
 
-/// Legacy-named helper kept for existing call sites.
+/// The name is wider than the check: only `Verified` passes.
 ///
 /// The bypass audit requires verification tests to fail closed: Unknown is not
 /// accepted as a passing outcome here.
@@ -462,25 +487,19 @@ pub(crate) fn assert_verified_or_vacuous_or_sort_fallback(
 /// KNOWN-CLASS PIN predicate: `Verified`, or the one named upstream
 /// certification demotion `Unknown(UnknownReason::ProofTrusted)`.
 ///
-/// ADJUDICATION (2026-08-27, mass unit-suite adjudication; the four-test
-/// template landed in `375718e` and a third instance already exists in
-/// `verify::tests::structural_induction_m0`). Since ay made strict UNSAT
-/// certification mandatory (the 0.7 line), a verdict that the solver reaches
-/// but cannot hand back a fully checked certificate for is demoted by
+/// ay makes strict UNSAT certification mandatory, so a verdict that the solver
+/// reaches but cannot hand back a fully checked certificate for is demoted by
 /// [`VerificationResult::apply_strict_trust`], which is the *only* producer of
 /// this variant on the accept path: `Verified(None)` (no certificate at all)
 /// or `Verified(Some(s))` with `!s.is_fully_verified()`.
 ///
-/// Measured at this pin with a temporary probe on eight representative
-/// members of the class: every one demotes through the `Verified(None)` arm —
-/// ay reached the refutation and published no certificate to attach. `588ceb5`
-/// documents the mechanism for the mut-borrow half (`unproved_steps=1
-/// trust_free=no`; under `:check-proofs-strict` ay itself answers
-/// `unknown (:reason-unknown (incomplete proof-trusted))`) and closed the two
-/// routes where trust-wp was discarding a certificate it had actually earned.
-/// What remains is upstream certificate *coverage*, not a trust-wp defect: the
-/// demotion direction is sound (an uncertified UNSAT must never be reported as
-/// Verified), and what is stale is the tests' `Verified`-only expectation.
+/// Members of this class demote through the `Verified(None)` arm: ay reaches
+/// the refutation and publishes no certificate to attach (under
+/// `:check-proofs-strict` ay itself answers
+/// `unknown (:reason-unknown (incomplete proof-trusted))`). The gap is
+/// upstream certificate *coverage*, not a trust-wp defect: the demotion
+/// direction is sound (an uncertified UNSAT must never be reported as
+/// Verified), and only the tests' `Verified`-only expectation is too strict.
 ///
 /// This predicate is DELIBERATELY narrow. `Failed`/counterexample, `Assumed`,
 /// and every other `Unknown` reason still fail the call site, so a pinned test
@@ -489,7 +508,11 @@ pub(crate) fn assert_verified_or_vacuous_or_sort_fallback(
 /// `Verified` arm is the only reachable one and the tolerance can be deleted).
 ///
 /// RETIRE when upstream certificate coverage closes: restore the strict
-/// `matches!(.., Verified(_))` at every call site and delete this helper.
+/// `matches!(.., Verified(_))` at every call site and delete this helper. The
+/// same tolerance is also written inline in `verify::tests::structural_induction_m0`
+/// (a `Verified(_) | Unknown(UnknownReason::ProofTrusted)` match arm that a grep
+/// for this helper's name will not find; grep for the `ProofTrusted` arm to catch
+/// every inline copy) — retire it with this helper.
 pub(crate) fn verified_or_known_proof_trusted(
     result: &super::super::verify::VerificationResult,
 ) -> bool {
@@ -502,9 +525,8 @@ pub(crate) fn verified_or_known_proof_trusted(
 
 /// [`verified_or_known_proof_trusted`] as an assertion with context.
 ///
-/// Used by the call sites that previously went through the legacy
-/// `assert_verified_or_*` helpers; those helpers stay strict for their other
-/// call sites, so the tolerance is opt-in per test.
+/// `assert_verified_or_vacuous` and its siblings stay strict — only `Verified`
+/// passes there — so this tolerance is opt-in per test.
 pub(crate) fn assert_verified_or_known_proof_trusted(
     result: &super::super::verify::VerificationResult,
     context: &str,
@@ -519,15 +541,14 @@ pub(crate) fn assert_verified_or_known_proof_trusted(
 /// KNOWN-CLASS PIN predicate: `Verified`, or the mut-borrow path's fail-closed
 /// vacuity refusal when the base re-solve comes back `Incomplete`.
 ///
-/// ADJUDICATION (2026-08-27, mass unit-suite adjudication). After a mut-borrow
-/// consequence is materialized, the pipeline re-solves the base to prove the
-/// proof is not vacuous. When ay answers `Unknown(Incomplete)` on that fresh
-/// base, trust-wp refuses the verdict with
+/// After a mut-borrow consequence is materialized, the pipeline re-solves the
+/// base to prove the proof is not vacuous. When ay answers `Unknown(Incomplete)`
+/// on that fresh base, trust-wp refuses the verdict with
 /// `materialized mut-borrow consequence has no validated SAT base; proof may be
 /// vacuous (fresh base: Some(Ok(Unknown(Incomplete))))`. That refusal is the
 /// SOUND direction — nothing is accepted — and the trigger is upstream: it is
 /// ay declining to decide the base, not trust-wp mis-encoding it. One member of
-/// this class (`unnest_three_postconditions_verify`) passes 3/3 solo and only
+/// this class (`unnest_three_postconditions_verify`) passes solo and only
 /// refuses under full-suite load, which is itself evidence that the base
 /// re-solve is deadline-bound rather than wrong.
 ///
@@ -553,9 +574,6 @@ pub(crate) fn verified_or_unvalidated_sat_base(
 // ── Solver result assertions ──────────────────────────────────────────
 
 /// Assert that the solver returns UNSAT with a contextual message.
-///
-/// Consolidates the 7 identical `assert_unsat` definitions that were
-/// scattered across `memory_model_*.rs` and `memory_model/base/tests.rs`.
 pub(crate) fn assert_unsat(solver: &mut super::super::Solver, context: &str) {
     let result = solver.check_sat().into_inner();
     assert!(
@@ -565,10 +583,6 @@ pub(crate) fn assert_unsat(solver: &mut super::super::Solver, context: &str) {
 }
 
 /// Assert that the solver returns SAT with a contextual message.
-///
-/// Consolidates the 3 identical `assert_sat` definitions (plus 3 inline
-/// `matches!` call sites) scattered across `memory_model_*.rs` and
-/// `memory_model/base/tests.rs`.
 pub(crate) fn assert_sat(solver: &mut super::super::Solver, context: &str) {
     let result = solver.check_sat().into_inner();
     assert!(
@@ -587,9 +601,6 @@ use super::super::memory_model::{BaseMemoryModel, MemState};
 ///
 /// Returns `(model, solver, state)` where `state` has empty domain and
 /// zero permissions — the standard starting point for most memory model tests.
-///
-/// Consolidates the 4-line boilerplate that appears ~120 times across
-/// `memory_model/base/tests.rs` and `tests/memory_model_*.rs`.
 pub(crate) fn mem_test_setup() -> (BaseMemoryModel, super::super::Solver, MemState) {
     let model = BaseMemoryModel::new();
     let mut solver = super::super::Solver::try_new(Logic::QfAuflia).unwrap();

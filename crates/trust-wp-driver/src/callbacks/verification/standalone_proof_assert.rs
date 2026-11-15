@@ -34,9 +34,10 @@ use super::super::{
         mir_analysis::{extract_mut_borrow_body, get_mir_body},
         proof_assert::find_proof_asserts_in_mir,
     },
+    function_credit::{withdraw_on_late_assertions, AssertionTally, OwnAssertions},
     proof_assert_extract::get_arg_names_for_proof_assert_body,
     proof_assert_snapshot::build_assertion_snapshots_for_function,
-    reporting::ProofAssertCounters,
+    reporting::{ProofAssertCounters, VerificationCounters},
     try_get_body_with_context,
 };
 
@@ -67,7 +68,9 @@ pub(in crate::callbacks) fn verify_standalone_proof_asserts(
     contracts: &[FunctionContract],
     logic_fn_paths: &HashSet<String>,
     env: &StandaloneProofAssertEnv<'_>,
+    counters: &mut VerificationCounters,
     pa_counters: &mut ProofAssertCounters,
+    trait_join: &mut super::trait_credit_join::TraitCreditJoin,
 ) {
     for contract in contracts {
         // Only process proof_assert-only functions (no explicit clauses)
@@ -83,10 +86,58 @@ pub(in crate::callbacks) fn verify_standalone_proof_asserts(
         if contract.trusted {
             continue;
         }
+
+        // A clause-free function can still reach the main contract loop (it is
+        // admitted as a verification target for its body obligations), and
+        // that loop already ran the in-function assertion pass over the same
+        // MIR. Re-running here gives every source `proof_assert!` a second,
+        // identical verdict — one obligation counted twice.
+        if pa_counters
+            .assertions_adjudicated
+            .contains(&contract.def_id)
+        {
+            continue;
+        }
         let def_path = tcx.def_path_str(contract.def_id);
         if logic_fn_paths.contains(&def_path)
             || super::super::super::logic::has_logic_marker(tcx.get_all_attrs(contract.def_id))
         {
+            continue;
+        }
+
+        // A coroutine body's assertions are refused, one error each, rather
+        // than examined by a pass that does not model `Yield` or resumption.
+        // The contract loop has already refused the body itself, so a body
+        // with no assertion of its own (one admitted for its arithmetic, say)
+        // is not reported as holding a refused assertion.
+        if super::skip_decision::is_coroutine_body(tcx, contract.def_id) {
+            let refused = count_own_proof_asserts(tcx, contract);
+            if refused > 0 {
+                eprintln!(
+                    "trust-wp: proof_assert in {def_path} error: {}",
+                    super::skip_decision::COROUTINE_REFUSAL
+                );
+                pa_counters.errors += refused;
+            }
+            continue;
+        }
+
+        // Crate-level wall-clock budget (#2674), extended to this pass.
+        //
+        // Every function reaching this point owns at least one proof_assert
+        // obligation that will be solved at the full per-obligation budget.
+        // Nothing used to bound their sum: a crate whose obligations all live
+        // in `ghost!` blocks kept solving until the HARNESS killed it, and a
+        // killed process reports nothing at all — no per-item verdict, no goal
+        // coverage, not even the assertions it had already discharged. Stop on
+        // the crate's own budget instead, and say so per function: a function
+        // skipped here is counted as an error, never as a pass.
+        if super::timeout_budget::crate_budget_exhausted() {
+            eprintln!(
+                "trust-wp: {def_path} proof_assert skipped (crate wall-clock \
+                 budget exhausted) (#2674)"
+            );
+            pa_counters.errors += 1;
             continue;
         }
 
@@ -95,9 +146,32 @@ pub(in crate::callbacks) fn verify_standalone_proof_asserts(
         // Mirrors the main verification loop pattern (#1975). Wraps MIR body
         // access, snapshot building, and verification so that a panic in one
         // proof_assert-only function does not halt remaining assertions.
+        //
+        // The trait-contract credit ledger is reset and read here too: a
+        // proof_assert-only function takes call-site grants exactly like a
+        // contracted one, and this pass runs AFTER the main loop, so a
+        // guardrail that only covered `verify_single_contract` would leave
+        // these admissions silent.
+        crate::trait_credit::reset_grants();
+        let prior_pa_verified = pa_counters.verified;
+        let assertions_before = AssertionTally::take(pa_counters);
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
             verify_single_standalone_contract(tcx, contract, &def_path, env, pa_counters);
         }));
+        let grants = crate::trait_credit::take_grants();
+        if pa_counters.verified > prior_pa_verified {
+            trait_join
+                .credited_mut()
+                .push(crate::trait_credit::CreditedItem {
+                    def_id: contract.def_id,
+                    def_path: def_path.clone(),
+                    grants,
+                    fn_credits: 0,
+                    native_only_credits: 0,
+                    axiom_dep_credits: 0,
+                    pa_credits: pa_counters.verified - prior_pa_verified,
+                });
+        }
 
         if let Err(panic_payload) = panic_result {
             let reason = ay_core::panic_payload_to_string(panic_payload.as_ref());
@@ -113,7 +187,40 @@ pub(in crate::callbacks) fn verify_standalone_proof_asserts(
             }
             eprintln!("  (continuing with remaining proof_assert functions)");
         }
+
+        // These assertions are the function's own goals too. A function the
+        // contract loop already credited is settled there, so this reaches a
+        // credit only if that pass left an assertion for this one to answer.
+        let own = AssertionTally::take(pa_counters).since(assertions_before);
+        if own != OwnAssertions::AllProved {
+            let loc = tcx
+                .sess
+                .source_map()
+                .span_to_diagnostic_string(tcx.def_span(contract.def_id));
+            let withdrew =
+                !withdraw_on_late_assertions(counters, contract.def_id, &def_path, &loc, own)
+                    .is_empty();
+            // The same ledger as every other withdrawal: an implementation
+            // whose credit this took back did not discharge the trait
+            // contract it owes, and the joins must not take the credit back
+            // a second time.
+            if withdrew {
+                trait_join.withdrawn_later(
+                    tcx,
+                    env.pa_ctx.trait_specs,
+                    contract.def_id,
+                    super::trait_credit_join::LateWithdrawal::OwnAssertion,
+                );
+            }
+        }
     }
+}
+
+/// How many `proof_assert!`s this function's own MIR holds.
+fn count_own_proof_asserts(tcx: TyCtxt<'_>, contract: &FunctionContract) -> usize {
+    try_get_body_with_context(tcx, contract.local_def_id).map_or(0, |body_with_facts| {
+        find_proof_asserts_in_mir(tcx, get_mir_body(&body_with_facts), contract.local_def_id).len()
+    })
 }
 
 /// Verify a single proof_assert-only contract.
@@ -127,10 +234,10 @@ fn verify_single_standalone_contract(
     env: &StandaloneProofAssertEnv<'_>,
     pa_counters: &mut ProofAssertCounters,
 ) {
-    let Some(body_with_facts) = try_get_body_with_context(contract.local_def_id) else {
+    let Some(body_with_facts) = try_get_body_with_context(tcx, contract.local_def_id) else {
         return;
     };
-    let mir_body = get_mir_body(body_with_facts);
+    let mir_body = get_mir_body(&body_with_facts);
     let fn_proof_asserts = find_proof_asserts_in_mir(tcx, mir_body, contract.local_def_id);
     if fn_proof_asserts.is_empty() {
         return;
@@ -139,7 +246,7 @@ fn verify_single_standalone_contract(
     let mut_borrow_body = extract_mut_borrow_body(
         tcx,
         mir_body,
-        Some(body_with_facts),
+        Some(&body_with_facts),
         &arg_names,
         env.user_specs,
         env.pa_ctx.trait_specs,

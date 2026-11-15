@@ -13,10 +13,11 @@ use trust_wp_core::verify_bundle::{
     VerifyBundleOptions, VerifyBundleStatus,
 };
 
-const SNAPSHOT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../reports/2026-04-29-trust-tmir-verify-bundle-performance-gate.json"
-));
+// The snapshot lives beside this test because this test is the only thing that
+// reads it: it pins the adapter's structural shape (obligation, binding, node
+// and byte counts), not wall-clock time, so a drift here is a real change in
+// what the bundle carries.
+const SNAPSHOT: &str = include_str!("fixtures/trust-tmir-verify-bundle-gate.json");
 const SCHEMA: &str = "trust-wp.trust-tmir.verify-bundle-perf-gate.v1";
 const FIXTURE_NAME: &str = "compiler-adjacent-linear-vc-bundle";
 const ISSUE: u64 = 2749;

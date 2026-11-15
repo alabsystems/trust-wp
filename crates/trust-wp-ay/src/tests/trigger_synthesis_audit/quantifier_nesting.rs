@@ -133,7 +133,7 @@ fn mixed_forall_exists_trigger_synthesis_encodes() {
         .expect("register logic fn");
 
     // forall<i> exists<j> test_f(i) > j
-    // After #1118, trigger synthesis descends into the exists<j> body and
+    // Trigger synthesis (#1118) descends into the exists<j> body and
     // finds test_f(i) as a trigger for the outer forall (it references outer
     // var `i` and the inner var `j` is shadowed).
     let inner = exists("j", gt(logic_fn_call("test_f", vec![var("i")]), var("j")));
@@ -165,7 +165,7 @@ fn mixed_forall_exists_trigger_synthesis_encodes() {
 
 /// Triggerless forall with nested quantifier uses only outer-var candidates.
 ///
-/// After #1118, trigger synthesis descends into nested quantifier bodies but
+/// Trigger synthesis (#1118) descends into nested quantifier bodies but
 /// shadows inner vars, so only candidates referencing outer vars are collected.
 /// Here `test_g(j)` only references inner `j`, so only `test_f(i)` is the
 /// outer trigger.
@@ -294,12 +294,10 @@ fn three_var_partial_coverage_fallback() {
     );
     // Asserting the formula is genuinely UNSAT: it requires `k > 0` (and
     // `test_f(i) = i + 1 > 0`) to hold for ALL integers, which is false
-    // (k = -1, i = -1). The pre-2026-07-04 ay could not derive this
-    // (single-round E-matching never refuted the universal), so this test
-    // used to pin `!= Unsat`. The 2026-07-04 ay salvage's deeper
-    // quantifier instantiation now correctly refutes it — Unsat is the
-    // RIGHT verdict (z3 agrees). Sat would be unsound; Unknown is
-    // acceptable incompleteness.
+    // (k = -1, i = -1). Unsat is the RIGHT verdict (z3 agrees); pinning
+    // `!= Unsat` would enshrine single-round E-matching's failure to refute
+    // the universal. Sat would be unsound; Unknown is acceptable
+    // incompleteness.
     encoder.assert_term(term);
     let result = encoder.check_sat();
     assert!(
@@ -529,7 +527,7 @@ fn exists_forall_exists_alternation_trigger_synthesis() {
 }
 
 /// Closure body containing a method call that references the quantifier-bound
-/// variable. After #985 conservative handling, the closure encodes as a
+/// variable. Under conservative closure handling (#985) the closure encodes as a
 /// fresh constant and the quantifier body becomes Bool-sorted.
 ///
 /// `exists<i> (|x| seq.index_logic(i) > x)`
@@ -559,7 +557,7 @@ fn triggerless_exists_with_closure_method_call_unsupported() {
 ///
 /// `forall<i> exists<j> forall<k> test_f(i) > k AND test_g(k) > j`
 ///
-/// After #1118, the outer forall descends through exists<j> (shadow j) and
+/// The outer forall's synthesis (#1118) descends through exists<j> (shadow j) and
 /// forall<k> (shadow k) to find test_f(i) referencing outer `i`.
 /// Inner forall finds test_g(k) for `k`.
 #[test]
@@ -616,11 +614,9 @@ fn forall_exists_forall_alternation_trigger_synthesis() {
     let result = encoder.check_sat();
     // forall<i> exists<j> forall<k> (i+1 > k AND k+2 > j) is genuinely UNSAT:
     // the inner `forall<k>. i+1 > k` must hold for ALL integers k, but k = i+1
-    // falsifies it for every i (the old comment's "may hold for small k" is
-    // not "holds for all k"). The pre-2026-07-04 ay could not refute the
-    // alternation and this test pinned `!= Unsat`; the 2026-07-04 ay
-    // salvage's deeper instantiation now correctly returns Unsat (z3 agrees).
-    // Sat would be unsound; Unknown is acceptable incompleteness.
+    // falsifies it for every i ("may hold for small k" is not "holds for all
+    // k"). Unsat is the right verdict (z3 agrees), so `!= Unsat` must not be
+    // pinned. Sat would be unsound; Unknown is acceptable incompleteness.
     assert!(
         result != SolveResult::Sat,
         "forall-exists-forall alternation is UNSAT (forall k. i+1 > k is false); \
@@ -679,13 +675,13 @@ fn cross_kind_var_shadowing_forall_exists_same_name() {
     );
 }
 
-/// After #1118, the outer quantifier is no longer trigger-starved when the
-/// valid candidate is inside a nested quantifier body.
+/// The outer quantifier is not trigger-starved when the valid candidate is
+/// inside a nested quantifier body.
 ///
 /// Pattern: `forall<i> exists<j> f(i) > j`
 /// - `f(i)` references outer var `i` and lives inside `exists<j>` body.
-/// - After #1118, `collect_trigger_candidates` descends into nested
-///   quantifier bodies (shadowing inner vars), so `f(i)` IS found.
+/// - `collect_trigger_candidates` descends into nested quantifier bodies
+///   (shadowing inner vars), so `f(i)` IS found. (#1118)
 ///
 /// Re: #1018 (trigger boundary gap), #1118, #1245
 #[test]
@@ -714,7 +710,7 @@ fn trigger_found_inside_nested_quantifier_for_outer_var() {
     encoder.assert_term(g);
 
     // forall<i> exists<j> test_starved_f(i) > j
-    // After #1118, test_starved_f(i) is found inside exists<j> because
+    // test_starved_f(i) is found inside exists<j> (#1118) because
     // it references outer var `i` (inner var `j` is shadowed).
     let body = exists(
         "j",

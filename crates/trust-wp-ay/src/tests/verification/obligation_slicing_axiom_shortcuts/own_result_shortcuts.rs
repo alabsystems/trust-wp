@@ -140,10 +140,10 @@ fn test_own_result_unwrap_or_full_pipeline() {
         "unwrap_or pattern should not produce encoding error: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "OwnResult::unwrap_or should verify — forall/exists constructor elimination: {vr:?}"
@@ -325,10 +325,10 @@ fn test_driver_shaped_own_result_payload_projection_respects_constructor() {
         "driver-shaped enum payload read should encode without semantic drift: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "driver-shaped payload projection must stay aligned with OwnResult constructors: {vr:?}"
@@ -498,10 +498,10 @@ fn test_driver_shaped_own_result_unwrap_reconstructs_ok_constructor() {
         "driver-shaped unwrap regression should encode without semantic drift: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "driver-shaped unwrap should verify: {vr:?}"
@@ -614,10 +614,10 @@ fn test_own_result_ok_method_selector_bridge_full_pipeline() {
         "ok() method pattern should not produce encoding error: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "OwnResult::ok() should verify with selector bridge: {vr:?}"
@@ -695,10 +695,10 @@ fn test_driver_shaped_own_result_unwrap_err_reconstructs_err_constructor() {
         "driver-shaped unwrap_err should encode without semantic drift: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "driver-shaped unwrap_err should verify: {vr:?}"
@@ -796,10 +796,10 @@ fn test_multi_field_ctor_selector_bridge_no_unsoundness() {
         "multi-field ctor selector bridge should not produce encoding error: {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "multi-field ctor selector bridge should verify the quantified selector postcondition: {vr:?}"
@@ -901,12 +901,12 @@ fn test_qualified_ok_reconstruction_enables_unwrap_postcondition() {
         "qualified Ok reconstruction should not produce encoding error (#1296): {result:?}"
     );
     let vr = result.unwrap();
-    // With reconstruction axiom: is_ok(x) ==> OwnResult::Ok(spec_unwrap(x)) = x
-    // the postcondition OwnResult::Ok(result) = self should now verify.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // With the reconstruction axiom `is_ok(x) ==> OwnResult::Ok(spec_unwrap(x)) = x`
+    // the postcondition `OwnResult::Ok(result) = self` is provable.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "qualified Ok reconstruction must enable OwnResult::Ok(result) == self (#1296): {vr:?}"
@@ -998,10 +998,10 @@ fn test_qualified_err_reconstruction_enables_unwrap_err_postcondition() {
         "qualified Err reconstruction should not produce encoding error (#1296): {result:?}"
     );
     let vr = result.unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&vr),
         "qualified Err reconstruction must enable OwnResult::Err(result) == self (#1296): {vr:?}"

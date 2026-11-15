@@ -1407,7 +1407,7 @@ mod substitute_tests {
     #[test]
     fn test_substitute_capture_avoiding_alpha_renames_exists() {
         // exists x. x + y  with {y -> x}
-        // Must alpha-rename: exists x_α0. x_α0 + x
+        // Must alpha-rename: exists x$α0. x$α0 + x
         let expr = PureExpr::Exists {
             var: "x".to_string(),
             var_sort: None,
@@ -1428,7 +1428,7 @@ mod substitute_tests {
             PureExpr::Exists { var, body, .. } => {
                 assert_ne!(var, "x", "bound var must be alpha-renamed to avoid capture");
                 assert!(
-                    var.starts_with("x_"),
+                    var.starts_with("x$"),
                     "fresh name should be based on original"
                 );
                 // The body's RHS (formerly y) should now be x (the substitution value)
@@ -1450,7 +1450,7 @@ mod substitute_tests {
     #[test]
     fn test_substitute_capture_avoiding_alpha_renames_let() {
         // let x = 1 in x + y  with {y -> x}
-        // Must alpha-rename: let x_α0 = 1 in x_α0 + x
+        // Must alpha-rename: let x$α0 = 1 in x$α0 + x
         let expr = PureExpr::Let {
             var: "x".to_string(),
             value: Arc::new(PureExpr::Int(1)),
@@ -1470,7 +1470,7 @@ mod substitute_tests {
             PureExpr::Let { var, body, .. } => {
                 assert_ne!(var, "x", "let-bound var must be alpha-renamed");
                 assert!(
-                    var.starts_with("x_"),
+                    var.starts_with("x$"),
                     "fresh name should be based on original"
                 );
                 match body.as_ref() {
@@ -2980,6 +2980,92 @@ mod postcond_transform_tests {
         let transformed = expr.transform_closure_capture_postcondition(&captures);
         assert_eq!(transformed, expr);
     }
+
+    /// `p@` of a `&mut` param is `(*p)@`, read at the state `*p` is read at
+    /// in the clause. The whole-borrow `p` (a `MutRef`-sorted name) was left
+    /// alone, so `*p == old(*p) + 1 && p@ == old(p@)` read `p@` at one state
+    /// on both sides and the driver verified it of `*p += 1`.
+    #[test]
+    fn test_transform_reads_a_view_of_a_mut_ref_at_its_referent_state() {
+        let p = || {
+            Arc::new(PureExpr::Var(
+                "p".to_string(),
+                Some(ExprSort::MutRef(Box::new(ExprSort::Int))),
+            ))
+        };
+        let view = |inner: PureExpr| PureExpr::View(Arc::new(inner));
+        let postcond = PureExpr::BinOp(
+            Arc::new(view(PureExpr::Var(
+                "p".to_string(),
+                Some(ExprSort::MutRef(Box::new(ExprSort::Int))),
+            ))),
+            BinOp::Eq,
+            Arc::new(PureExpr::Old(Arc::new(view(PureExpr::Var(
+                "p".to_string(),
+                Some(ExprSort::MutRef(Box::new(ExprSort::Int))),
+            ))))),
+        );
+        let params: HashSet<String> = ["p".to_string()].into_iter().collect();
+        assert_eq!(
+            postcond.transform_postcondition_for_mut_refs(&params),
+            PureExpr::BinOp(
+                Arc::new(view(PureExpr::Final(p()))),
+                BinOp::Eq,
+                Arc::new(PureExpr::Old(Arc::new(view(PureExpr::Deref(p()))))),
+            )
+        );
+        // Kept current (Creusot's reading of a clause with no `old`): `*p`
+        // and `p@` are both the entry value.
+        assert_eq!(
+            postcond.transform_postcondition_for_mut_refs_keeping_current(&params, &params),
+            PureExpr::BinOp(
+                Arc::new(view(PureExpr::Deref(p()))),
+                BinOp::Eq,
+                Arc::new(PureExpr::Old(Arc::new(view(PureExpr::Deref(p()))))),
+            )
+        );
+    }
+
+    /// A binder that shadows a `&mut` param is another value: `{ let p = e;
+    /// p@ }` read `p@` as the param's final view.
+    #[test]
+    fn test_transform_leaves_a_binder_that_shadows_a_mut_ref() {
+        let params: HashSet<String> = ["p".to_string()].into_iter().collect();
+        let body = |name: &str| {
+            PureExpr::BinOp(
+                Arc::new(PureExpr::View(Arc::new(PureExpr::Var(
+                    name.to_string(),
+                    None,
+                )))),
+                BinOp::Eq,
+                Arc::new(PureExpr::Deref(Arc::new(PureExpr::Var(
+                    name.to_string(),
+                    None,
+                )))),
+            )
+        };
+        for shadowing in [
+            PureExpr::Let {
+                var: "p".to_string(),
+                value: Arc::new(PureExpr::Var("e".to_string(), None)),
+                body: Arc::new(body("p")),
+            },
+            PureExpr::Forall {
+                var: "p".to_string(),
+                var_sort: None,
+                body: Arc::new(body("p")),
+                triggers: vec![],
+            },
+        ] {
+            let transformed = shadowing.transform_postcondition_for_mut_refs(&params);
+            let mut reads_param = false;
+            transformed.for_each_recursive(|node| {
+                reads_param |= matches!(node, PureExpr::Final(_))
+                    || matches!(node, PureExpr::Var(name, _) if name == "p");
+            });
+            assert!(!reads_param, "{shadowing} became {transformed}");
+        }
+    }
 }
 
 // Permission scaling tests (Part of #741)
@@ -3501,7 +3587,7 @@ fn float_bits_from_f32_lossless_promotion() {
 fn float_bits_zero() {
     let fb = FloatBits::from_f64(0.0);
     assert_eq!(fb.to_f64(), 0.0);
-    assert_eq!(fb.0, 0);
+    assert_eq!(fb.ieee_bits(), Some(0));
 }
 
 #[test]
@@ -3537,7 +3623,7 @@ fn float_bits_equality_matches_bits() {
     let a = FloatBits::from_f64(1.0);
     let b = FloatBits::from_f64(1.0);
     assert_eq!(a, b);
-    assert_eq!(a.0, b.0);
+    assert_eq!(a.ieee_bits(), b.ieee_bits());
 }
 
 // =============================================================================

@@ -10,9 +10,9 @@
 //!
 //! Each parsed form is asserted to land on the exact `PureExpr` the encoder
 //! consumes:
-//! - float literals produce `PureExpr::Float(FloatBits::from_f64(_))`, which
-//!   the ay encoder lowers to an SMT `Real` const via
-//!   `pure_encoding`'s `try_real_const(v.to_f64())` (verified by tracing);
+//! - float literals produce `PureExpr::Float`: an unsuffixed literal is
+//!   `FloatBits::unsuffixed` (its format is the one its Rust context infers),
+//!   and an `f32`/`f64` suffix fixes the format;
 //! - type ascriptions are transparent — they return the *inner* expression
 //!   unchanged, introducing no new node, so the encoder sees the same tree it
 //!   would for the un-ascribed term.
@@ -23,7 +23,7 @@ use super::*;
 use crate::formula::FloatBits;
 
 fn float(v: f64) -> PureExpr {
-    PureExpr::Float(FloatBits::from_f64(v))
+    PureExpr::Float(FloatBits::unsuffixed(&v.to_string()).expect("a float spelling"))
 }
 
 // ---------------------------------------------------------------------------
@@ -55,10 +55,23 @@ fn test_parse_float_exponent() {
 
 #[test]
 fn test_parse_float_with_suffix() {
-    // f32 / f64 suffixes are discarded — contract floats are mathematical reals.
-    assert_eq!(parse_ok("1.5f64"), float(1.5));
-    assert_eq!(parse_ok("2.5f32"), float(2.5));
-    assert_eq!(parse_ok("1.0f64"), float(1.0));
+    // A suffix fixes the IEEE format; the decimal is rounded to it directly.
+    assert_eq!(
+        parse_ok("1.5f64"),
+        PureExpr::Float(FloatBits::from_f64(1.5))
+    );
+    assert_eq!(
+        parse_ok("2.5f32"),
+        PureExpr::Float(FloatBits::from_f32(2.5))
+    );
+    assert_eq!(
+        parse_ok("1.0f64"),
+        PureExpr::Float(FloatBits::from_f64(1.0))
+    );
+    assert_eq!(
+        parse_ok("0.1f32"),
+        PureExpr::Float(FloatBits::from_f32(0.1))
+    );
 }
 
 #[test]
@@ -91,8 +104,7 @@ fn test_parse_float_spanned() {
 }
 
 /// Float-literal parse + structural roundtrip: the parsed `FloatBits` must
-/// reproduce the source value bit-exactly via `to_f64`, which is precisely
-/// what the encoder feeds to `try_real_const`.
+/// reproduce the source value bit-exactly via `to_f64`.
 #[test]
 fn test_float_roundtrip_to_f64() {
     for src in ["1.5", "0.0", "-3.25", "6.022e23", "2.5f32"] {
@@ -167,7 +179,8 @@ fn test_method_call_after_integer_not_float() {
 }
 
 // ---------------------------------------------------------------------------
-// Type ascription: `(expr : Type)` — transparent, returns the inner expr.
+// Type ascription: `(expr : Type)` — the value is the inner expr's; an
+// integer or `bool` type becomes the sort the operand is read at.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -178,17 +191,24 @@ fn test_type_ascription_integer() {
 
 #[test]
 fn test_type_ascription_var() {
-    // `(x : Int)` → `x`.
-    assert_eq!(parse_ok("(x : Int)"), PureExpr::Var("x".into(), None));
+    // `(x : Int)` → `x` read at `Int`.
+    assert_eq!(
+        parse_ok("(x : Int)"),
+        PureExpr::Var("x".into(), Some(ExprSort::Int))
+    );
+    assert_eq!(
+        parse_ok("(b : bool)"),
+        PureExpr::Var("b".into(), Some(ExprSort::Bool))
+    );
 }
 
 #[test]
 fn test_type_ascription_in_binop() {
-    // `(a : u32) == b` → `a == b`. The ascription is discarded.
+    // `(a : u32) == b` → `a == b`, `a` read at the integer sort.
     assert_eq!(
         parse_ok("(a : u32) == b"),
         PureExpr::BinOp(
-            Arc::new(PureExpr::Var("a".into(), None)),
+            Arc::new(PureExpr::Var("a".into(), Some(ExprSort::Int))),
             crate::formula::BinOp::Eq,
             Arc::new(PureExpr::Var("b".into(), None)),
         )
@@ -210,9 +230,9 @@ fn test_type_ascription_does_not_break_path() {
 
 #[test]
 fn test_type_ascription_spanned() {
-    // The span-tracking parser must also discard the ascription transparently.
+    // The span-tracking parser reads the ascription exactly as the plain one.
     let spanned = parse_spanned_ok("(x : Int)");
-    assert_eq!(spanned.expr, PureExpr::Var("x".into(), None));
+    assert_eq!(spanned.expr, PureExpr::Var("x".into(), Some(ExprSort::Int)));
 
     let spanned2 = parse_spanned_ok("(5 : u32) == y");
     assert_eq!(

@@ -70,8 +70,7 @@ pub(super) fn apply_nested_transfer_resolutions(parsed: &mut ParsedContract) {
     // paths where no transfer-call substitution fired, both sides collapse to
     // the SAME symbol, yielding a per-path premise `*ma == *ma + 2` — a
     // contradiction that asserts the negation of a REACHABLE path condition
-    // and lets postconditions that are false on that path verify vacuously
-    // (adjudicated 2026-07-22: e2-class should_fail programs false-verified).
+    // and lets postconditions that are false on that path verify vacuously.
     // The exact expiry resolutions appended above already carry the write
     // semantics for every path, so dropping these body premises only removes
     // invalid or redundant facts (fail-closed: premises only get weaker).
@@ -337,14 +336,13 @@ mod tests {
         PureExpr::BinOp(Arc::new(e), BinOp::Add, Arc::new(PureExpr::Int(2)))
     }
 
-    // Regression: adjudication 2026-07-22 (dn33-39 class). The block extractor
-    // synthesizes per-path write facts for `*ma += 2` with collapsed naming;
-    // on the no-substitution path the fact is `*ma == *ma + 2` — a
-    // contradiction that, as a branch-guarded premise, asserts the negation
-    // of a REACHABLE path condition and false-verified e2-class should_fail
-    // programs. The strip must drop every body `LetAssume` fact mentioning a
-    // transfer param (contradictory or not — all use the collapsed model)
-    // while preserving Ite structure and unrelated facts.
+    // The block extractor synthesizes per-path write facts for `*ma += 2`
+    // with collapsed naming; on the no-substitution path the fact is
+    // `*ma == *ma + 2` — a contradiction that, as a branch-guarded premise,
+    // asserts the negation of a REACHABLE path condition and lets a
+    // should_fail program verify. The strip must drop every body `LetAssume`
+    // fact mentioning a transfer param (contradictory or not — all use the
+    // collapsed model) while preserving Ite structure and unrelated facts.
     #[test]
     fn strips_collapsed_write_facts_over_transfer_params() {
         let p = params(&["ma", "mb", "mc"]);

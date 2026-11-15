@@ -81,7 +81,7 @@ fn apply_statement_effects(
     live: &mut HashSet<Local>,
 ) {
     match kind {
-        StatementKind::Assign(box (dest, rvalue)) => {
+        StatementKind::Assign((dest, rvalue)) => {
             // Kill: assignment to a local kills it (if the dest is a plain local).
             if dest.projection.is_empty() && mut_locals.contains(&dest.local) {
                 live.remove(&dest.local);
@@ -141,7 +141,7 @@ fn gen_rvalue_uses(rvalue: &Rvalue<'_>, mut_locals: &HashSet<Local>, live: &mut 
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
             gen_operand_uses(op, mut_locals, live);
         }
-        Rvalue::BinaryOp(_, box (l, r)) => {
+        Rvalue::BinaryOp(_, (l, r)) => {
             gen_operand_uses(l, mut_locals, live);
             gen_operand_uses(r, mut_locals, live);
         }
@@ -202,7 +202,7 @@ pub(super) fn for_each_rvalue_local(
     match rvalue {
         // WithRetag changes provenance only; both modes visit the same local.
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => check_op(op),
-        Rvalue::BinaryOp(_, box (l, r)) => {
+        Rvalue::BinaryOp(_, (l, r)) => {
             check_op(l);
             check_op(r);
         }

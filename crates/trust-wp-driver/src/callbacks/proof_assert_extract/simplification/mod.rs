@@ -8,7 +8,7 @@
 //! type invariant method rewrites, struct field access normalization,
 //! and static match elimination for concrete constructor scrutinees.
 //!
-//! Decomposed from a single 1358-line file (#1988):
+//! Submodules:
 //! - `match_reduction`: Static match elimination for concrete constructors
 //! - `constructor_methods`: Constructor method call reduction and boolean folding
 //! - `tests`: Comprehensive test suite for all simplification passes
@@ -32,8 +32,10 @@ use tracing::debug;
 use trust_wp_core::formula::{BinOp, PureExpr};
 
 use super::super::{
-    contract_rewrite::{annotate_expr_with_param_sorts, rewrite_named_field_access_expr},
-    struct_field_map::build_struct_field_map,
+    contract_rewrite::{
+        annotate_expr_with_param_sorts, rewrite_named_field_access_expr, FieldOrderTables,
+    },
+    struct_field_map::{build_ctor_field_order, build_struct_field_map},
     type_invariants::{
         build_type_invariant_method_map, build_type_invariant_structural_expr_map,
         rewrite_type_invariant_methods_expr_with_structural,
@@ -53,6 +55,7 @@ fn contains_free_var(expr: &PureExpr, var_name: &str) -> bool {
 ///
 /// This pass is intentionally conservative and only applies sound rewrites:
 /// - `p ==> p` → `true`
+/// - `p ==> q` → `true` when `q` simplifies to `true`
 /// - `x == x` → `true`
 /// - `forall<...> true` / `forall<...> false` → body constant
 /// - `exists<...> true` / `exists<...> false` → body constant
@@ -67,6 +70,14 @@ pub(in crate::callbacks) fn simplify_proof_assert_expr(expr: PureExpr) -> PureEx
         PureExpr::BinOp(left, op, right) => {
             if matches!(op, BinOp::Implies | BinOp::Eq) && left == right {
                 PureExpr::Bool(true)
+            } else if matches!(op, BinOp::Implies) {
+                // `p ==> q` holds whatever `p` is once `q` does. A machine-integer
+                // binder's range is a premise wrapped around the body it guards
+                // (D-203), so a tautology under it is one level down.
+                match simplify_proof_assert_expr(Arc::unwrap_or_clone(right)) {
+                    PureExpr::Bool(true) => PureExpr::Bool(true),
+                    right => PureExpr::BinOp(left, op, Arc::new(right)),
+                }
             } else {
                 PureExpr::BinOp(left, op, right)
             }
@@ -665,7 +676,7 @@ fn constructor_tester_selector_facts(
 }
 
 fn call_result_upgrade_name(name: &str) -> Option<String> {
-    if name.starts_with("call_") || name.starts_with("_call_") {
+    if name.starts_with("$call_") || name.starts_with("$_call_") {
         Some(format!("{name}__upgraded"))
     } else {
         None
@@ -697,7 +708,7 @@ pub(in crate::callbacks) fn apply_type_and_field_rewrites(
     verbose: bool,
     assertion: &mut PureExpr,
     preconditions: &mut Vec<PureExpr>,
-) {
+) -> Result<(), crate::callbacks::contract_rewrite::FieldOrderRefusal> {
     let (param_invariant_methods, result_invariant_method) = build_type_invariant_method_map(
         tcx,
         containing_def_id,
@@ -736,19 +747,25 @@ pub(in crate::callbacks) fn apply_type_and_field_rewrites(
             .collect();
     }
 
-    // Rewrite named struct field access to positional tuple-get calls (#1572).
+    // Rewrite named struct field access to positional tuple-get calls (#1572)
+    // and place named-field patterns at their DECLARED indices (D-31).
+    //
+    // This runs unconditionally, with no empty-map guard: a function whose
+    // signature carries only an enum has an empty struct field map and still
+    // needs its reordered variant patterns placed, or the encoder reads them
+    // in source order (s82_structpat_reorder_proof_assert.rs).
     let struct_field_map = build_struct_field_map(tcx, containing_def_id);
-    if !struct_field_map.is_empty() {
-        *assertion = rewrite_named_field_access_expr(assertion, &struct_field_map);
-        for pre in preconditions.iter_mut() {
-            *pre = rewrite_named_field_access_expr(pre, &struct_field_map);
-        }
-        if verbose {
-            debug!(
-                "trust-wp:   (proof_assert: {} named field(s) rewritten to positional access)",
-                struct_field_map.len()
-            );
-        }
+    let ctor_field_order = build_ctor_field_order(tcx, containing_def_id);
+    let tables = FieldOrderTables::new(&struct_field_map, &ctor_field_order);
+    *assertion = rewrite_named_field_access_expr(assertion, tables)?;
+    for pre in preconditions.iter_mut() {
+        *pre = rewrite_named_field_access_expr(pre, tables)?;
+    }
+    if verbose && !struct_field_map.is_empty() {
+        debug!(
+            "trust-wp:   (proof_assert: {} named field(s) rewritten to positional access)",
+            struct_field_map.len()
+        );
     }
 
     *assertion =
@@ -756,4 +773,5 @@ pub(in crate::callbacks) fn apply_type_and_field_rewrites(
     for pre in preconditions.iter_mut() {
         *pre = annotate_expr_with_param_sorts(tcx, containing_def_id, contract_arg_names, pre);
     }
+    Ok(())
 }

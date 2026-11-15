@@ -371,7 +371,7 @@ impl AYEncoder {
             );
         }
 
-        let mut count = 0;
+        let mut count = 0usize;
         for candidate in candidates.into_iter().take(MAX_OPTION_BRIDGE_TERMS) {
             if self.solver.get_sort(candidate) != option_sort {
                 continue;
@@ -389,12 +389,12 @@ impl AYEncoder {
             if let (Some(is_some), Some(is_none)) = (is_some, is_none) {
                 let exhaustive = self.solver.or(is_some, is_none);
                 if self.assert_solver_term("ground/native_option_exhaustive", exhaustive) {
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
                 let both = self.solver.and(is_some, is_none);
                 let disjoint = self.solver.not(both);
                 if self.assert_solver_term("ground/native_option_disjoint", disjoint) {
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
 
@@ -415,7 +415,7 @@ impl AYEncoder {
             let same_payload = self.eq_term(spec_unwrap, native_selector);
             let guarded = self.solver.implies(is_some, same_payload);
             if self.assert_solver_term("ground/native_option_spec_unwrap", guarded) {
-                count += 1;
+                count = count.saturating_add(1);
             }
 
             count += self.assert_native_option_canonical_payload_clauses(
@@ -614,7 +614,7 @@ impl AYEncoder {
             return 0;
         }
 
-        let mut count = 0;
+        let mut count = 0usize;
         let mut seen = HashSet::new();
         for assertion in assertions {
             if count >= remaining_budget {
@@ -659,7 +659,7 @@ impl AYEncoder {
                     canonical_clause,
                 )
             {
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
         count

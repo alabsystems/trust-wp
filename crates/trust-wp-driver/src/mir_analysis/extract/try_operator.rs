@@ -58,6 +58,11 @@ pub(super) fn is_try_branch_path(path: &str) -> bool {
 ///
 /// Returns `true` when the call matches the Try::branch pattern.
 pub(super) fn is_try_branch_call(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    // Provenance: `::Try::branch` is a suffix match; a local `Try` lookalike
+    // must not get `?` desugaring semantics.
+    if !crate::provenance::is_std_item(tcx, def_id) {
+        return false;
+    }
     let path = tcx.def_path_str(def_id);
     is_try_branch_path(&path)
 }
@@ -90,10 +95,15 @@ pub(super) fn classify_try_self_adt_path(adt_path: &str) -> Option<bool> {
 /// Returns `Some(true)` for Option, `Some(false)` for Result,
 /// `None` for unsupported types (ControlFlow, Poll, custom impls).
 pub(super) fn try_branch_type_is_option(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<bool> {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let rustc_middle::ty::TyKind::FnDef(_, substs) = constant.const_.ty().kind() {
-            if let Some(self_ty) = substs.first().and_then(|s| s.as_type()) {
+            if let Some(self_ty) = substs.skip_binder().first().and_then(|s| s.as_type()) {
                 if let rustc_middle::ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
+                    // Provenance: the bare `Option` / `Result` spellings would
+                    // otherwise classify a local enum of the same name.
+                    if !crate::provenance::is_std_item(tcx, adt_def.did()) {
+                        return None;
+                    }
                     let adt_path = tcx.def_path_str(adt_def.did());
                     return classify_try_self_adt_path(&adt_path);
                 }
@@ -155,7 +165,7 @@ pub(super) fn try_extract_try_operator<'tcx>(
             .map_or(targets.otherwise(), |(_, bb)| bb),
         // If next_bb doesn't end with SwitchInt, this isn't the expected pattern.
         // Could be a Goto to the SwitchInt block — try one more level.
-        TerminatorKind::Goto { target } => {
+        TerminatorKind::Goto { target, .. } => {
             let goto_data = &body.basic_blocks[*target];
             match &goto_data.terminator().kind {
                 TerminatorKind::SwitchInt { targets, .. } => targets
@@ -197,7 +207,7 @@ pub(super) fn try_extract_try_operator<'tcx>(
 
     let continue_data = &body.basic_blocks[continue_bb];
     for stmt in &continue_data.statements {
-        if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+        if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
             if place.projection.is_empty() {
                 if rvalue_reads_from_local(rvalue, destination_local) {
                     // This reads from the branch result (Downcast+Field).
@@ -221,7 +231,26 @@ pub(super) fn try_extract_try_operator<'tcx>(
     // Follow continue_bb's terminator to the next block and extract from there.
     let continue_term = continue_data.terminator();
     let continue_result = match &continue_term.kind {
-        TerminatorKind::Goto { target } | TerminatorKind::Drop { target, .. } => {
+        TerminatorKind::Goto { target, .. } => {
+            extract_from_block_with_context(tcx, body, *target, local_exprs, visited, ctx, effects)
+        }
+        TerminatorKind::Drop { place, target, .. } => {
+            // D-140, as the primary walk's `on_drop_place`.
+            if let Some(changed) = super::drop_glue_writes::locals_changed_by_drop(tcx, body, place)
+            {
+                let mut changed: Vec<Local> = changed.into_iter().collect();
+                changed.sort();
+                for local in changed {
+                    let sort = super::super::translate::ty_to_expr_sort_enriched(
+                        tcx,
+                        body.local_decls[local].ty,
+                    );
+                    let name =
+                        super::unannotated_loops::fresh_name(&format!("drop{}", local.as_usize()));
+                    local_exprs.insert(local, PureExpr::Var(name, sort));
+                }
+                super::borrow_carriers::note_unsupported();
+            }
             extract_from_block_with_context(tcx, body, *target, local_exprs, visited, ctx, effects)
         }
         TerminatorKind::Return => local_exprs.get(&Local::from_u32(0)).cloned(),

@@ -38,7 +38,7 @@ pub(super) fn call_result_symbol<'tcx>(
         };
     }
     let sort = ty_to_expr_sort_enriched(tcx, body.local_decls[destination].ty);
-    PureExpr::Var(format!("call_{}", destination.as_u32()), sort)
+    PureExpr::Var(format!("$call_{}", destination.as_u32()), sort)
 }
 
 #[cfg(test)]
@@ -60,6 +60,10 @@ pub(super) fn translate_call_args_for_substitutions_with_tcx<'tcx>(
     body: Option<&Body<'tcx>>,
     tcx: Option<rustc_middle::ty::TyCtxt<'tcx>>,
 ) -> Vec<TranslatedArg> {
+    let mut stale = body
+        .map(|body| stale_arguments(tcx, body, args))
+        .unwrap_or_default()
+        .into_iter();
     args.iter()
         .enumerate()
         .map(|(idx, arg)| {
@@ -77,13 +81,61 @@ pub(super) fn translate_call_args_for_substitutions_with_tcx<'tcx>(
             } else {
                 translate_operand(&arg.node, local_exprs)
             };
-            if let Some(expr) = expr {
+            let mut translated = if let Some(expr) = expr {
                 TranslatedArg::new(expr)
             } else {
                 TranslatedArg::fallback(fallback_arg_expr(idx, arg, body, tcx))
-            }
+            };
+            translated.stale = stale.next().unwrap_or(false);
+            translated
         })
         .collect()
+}
+
+/// Per argument of the call `args` is the argument list of, whether it reads
+/// a pointee after a store through it (or an alias) that a translation of it
+/// does not see: it translates to the pointee's ENTRY value, and the call's
+/// clauses read it at the call, so it is marked (`TranslatedArg::stale`) for
+/// them to refuse. Empty when no call of `body` holds the list.
+pub(in crate::mir_analysis) fn stale_arguments<'tcx>(
+    tcx: Option<rustc_middle::ty::TyCtxt<'tcx>>,
+    body: &Body<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+) -> Vec<bool> {
+    let Some(at) = call_location_of(body, args) else {
+        return Vec::new();
+    };
+    let mut staleness =
+        crate::mir_analysis::deref_store_staleness::DerefStoreStaleness::new(tcx, body);
+    args.iter()
+        .map(|arg| staleness.operand_may_read_stale(&arg.node, at))
+        .collect()
+}
+
+/// The location of the call `args` is (part of) the argument list of: the
+/// terminator whose arguments hold the slice. `None` when no call of `body`
+/// holds it (the list was built elsewhere).
+fn call_location_of<'tcx>(
+    body: &Body<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+) -> Option<rustc_middle::mir::Location> {
+    let first = args.first()?;
+    body.basic_blocks
+        .iter_enumerated()
+        .find_map(|(block, data)| match &data.terminator().kind {
+            rustc_middle::mir::TerminatorKind::Call {
+                args: call_args, ..
+            } if call_args
+                .iter()
+                .any(|call_arg| std::ptr::eq(call_arg, first)) =>
+            {
+                Some(rustc_middle::mir::Location {
+                    block,
+                    statement_index: data.statements.len(),
+                })
+            }
+            _ => None,
+        })
 }
 
 fn fallback_arg_expr<'tcx>(
@@ -98,7 +150,7 @@ fn fallback_arg_expr<'tcx>(
         }
         _ => None,
     };
-    PureExpr::Var(format!("arg{idx}"), sort)
+    crate::mir_analysis::fresh_fallback_arg_var(idx, sort)
 }
 
 /// Derive `self_expr` from the first translated argument when it's not a

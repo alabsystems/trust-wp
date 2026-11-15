@@ -265,7 +265,7 @@ impl AYEncoder {
         // constants. Recursing through nested existentials yields fully-ground
         // postcondition_mut chain facts when possible.
         let sk_counter = self.next_quantifier_var_id();
-        let sk_name = format!("sk_exists_{var}_{sk_counter}");
+        let sk_name = format!("sk$exists_{var}_{sk_counter}");
         // Infer sort from (1) ExprSort annotation, (2) postcondition_mut receiver
         // context, (3) fallback to Int. Using Int for generic state params causes
         // sort mismatches when postcondition_mut was declared with a closure env

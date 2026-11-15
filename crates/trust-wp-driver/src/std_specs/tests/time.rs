@@ -8,7 +8,11 @@ use super::{super::*, helpers::*};
 fn test_lookup_duration_add_via_trait_qualified_path() {
     let spec = lookup_std_spec("<core::time::Duration as core::ops::Add>::add")
         .expect("Duration Add spec via trait-qualified path should match");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "self@ + rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999",
+        "Duration::add",
+    );
     assert_ensures_contains(&spec, "result@ == self@ + rhs@", "Duration::add");
 }
 
@@ -24,14 +28,14 @@ fn test_lookup_duration_sub_via_trait_qualified_path() {
 fn test_lookup_instant_add_via_trait_qualified_path() {
     let spec = lookup_std_spec("<std::time::Instant as core::ops::Add>::add")
         .expect("Instant Add spec via trait-qualified path should match");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(&spec, "rhs@ == 0", "Instant::add");
     assert_ensures_contains(&spec, "result@ == self@ + rhs@", "Instant::add");
 }
 
 #[test]
 fn test_lookup_instant_add_core_path() {
     let spec = lookup_std_spec("core::time::Instant::add").expect("Instant Add core path");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(&spec, "rhs@ == 0", "Instant::add core");
     assert_ensures_contains(&spec, "result@ == self@ + rhs@", "Instant::add core");
 }
 
@@ -39,7 +43,11 @@ fn test_lookup_instant_add_core_path() {
 fn test_lookup_instant_sub_via_trait_qualified_path() {
     let spec = lookup_std_spec("<core::time::Instant as core::ops::Sub>::sub")
         .expect("Instant Sub spec via trait-qualified path should match");
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "__trust_wp_std_site_same_Self_Rhs() || self@ >= rhs@",
+        "Instant::sub",
+    );
     assert_ensures_contains(
         &spec,
         "self@ >= rhs@ ==> result@ == self@ - rhs@",
@@ -58,7 +66,11 @@ fn test_lookup_duration_add_cross_prefix_std_type_core_trait() {
     let spec = lookup_std_spec("<std::time::Duration as core::ops::Add>::add")
         .expect("cross-prefix Duration Add path should match after normalization");
     // Must match the same spec as the canonical path (#1034)
-    assert!(spec.requires.is_empty(), "Duration Add has no precondition");
+    assert_eq!(
+        spec.requires,
+        ["self@ + rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999"],
+        "Duration Add owes its overflow panic"
+    );
     assert_eq!(
         spec.ensures.len(),
         1,
@@ -78,13 +90,12 @@ fn test_lookup_instant_add_cross_prefix_core_type_std_trait() {
     let spec = lookup_std_spec("<core::time::Instant as std::ops::Add>::add")
         .expect("cross-prefix Instant Add path should match after normalization");
     // Must match the same spec as the canonical path (#1034)
-    // Instant ADD_DURATION has 3 ensures: result@ == self@ + rhs@, identity, monotonicity
-    assert!(spec.requires.is_empty(), "Instant Add has no precondition");
     assert_eq!(
-        spec.ensures.len(),
-        3,
-        "Instant Add has three postconditions"
+        spec.requires,
+        ["rhs@ == 0"],
+        "Instant Add owes the zero duration `checked_add` promises `Some` for"
     );
+    assert_eq!(spec.ensures.len(), 1, "Instant Add has one postcondition");
     assert!(
         spec.ensures.iter().any(|e| e.contains("self@ + rhs@")),
         "Instant Add ensures should reference self@ + rhs@, got: {:?}",

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Integration tests for ghost code support (Phase 2)
+//! Integration tests for ghost code support
 //!
 //! These tests verify the integration of ghost code support:
 //! 1. Runtime behavior: ghost blocks erase to `{}` when `cfg(trust_wp)` is not set
@@ -10,7 +10,7 @@
 //! 3. Semantics: ghost code can read program variables but is erased at runtime
 //!
 //! For verification-time behavior (driver ghost block detection), see
-//! `designs/2026-02-01-ghost-code.md` and `crates/trust-wp-driver/src/ghost.rs`.
+//! `find_ghost_blocks` in `crates/trust-wp-driver/src/ghost/mod.rs`.
 
 use trust_wp_std::{
     cell::PermCell,
@@ -126,12 +126,14 @@ fn test_ghost_clone_payload_does_not_nest_ghost() {
     assert_eq!(std::mem::size_of_val(&cloned), 0);
 }
 
+/// A `PermCell` has no `Clone`, as Creusot's (D-139), so a cell is a logical
+/// key only by reference: a `Mapping` keyed by the cell itself cannot `set`.
 #[test]
 fn test_permcell_logical_key_surface_compiles() {
     let (cell, mut perm) = PermCell::new(1i32);
-    let _updated: Ghost<Mapping<PermCell<i32>, Int>> = ghost!({
-        let mut map: Mapping<PermCell<i32>, Int> = Mapping::cst(Int(0));
-        map = map.set(cell.clone(), Int(1));
+    let _updated: Ghost<Mapping<&PermCell<i32>, Int>> = ghost!({
+        let mut map: Mapping<&PermCell<i32>, Int> = Mapping::cst(Int(0));
+        map = map.set(&cell, Int(1));
         map
     });
 
@@ -141,10 +143,12 @@ fn test_permcell_logical_key_surface_compiles() {
     assert_eq!(std::mem::size_of_val(&borrowed), 0);
 }
 
+/// `*rc@` is the pointee a `Rc<PermCell<_>>` shares (bug/1562's list node);
+/// the view is read in place, never cloned out of it.
 #[test]
 fn test_rc_permcell_view_surface_compiles() {
     let cell = std::rc::Rc::new(PermCell::new(1i32).0);
-    let viewed: Ghost<PermCell<i32>> = ghost!((*cell.view()).clone());
+    let viewed: Ghost<Box<PermCell<i32>>> = ghost!(cell.view());
     let _ = viewed;
 }
 
@@ -302,9 +306,8 @@ fn test_ghost_with_references() {
 
 // ── seq! inside ghost/snapshot (#1345 coverage gap) ─────────────────
 
-/// Test that seq! macro works inside ghost! blocks.
-/// This was the stated motivation for adding the seq! macro (c1e4fb72)
-/// but was not tested by the original commit.
+/// Test that seq! macro works inside ghost! blocks, the use the macro exists
+/// to serve.
 #[test]
 fn test_seq_inside_ghost_block() {
     let _ = ghost! {
@@ -316,9 +319,8 @@ fn test_seq_inside_ghost_block() {
     };
 }
 
-/// Test that seq! macro works inside snapshot! blocks.
-/// cell/03_as_slice_of_cells.rs uses `seq!(pred0, pred1)` inside snapshot!,
-/// which was the original failing test case.
+/// Test that seq! macro works inside snapshot! blocks, the shape
+/// `cell/03_as_slice_of_cells.rs` uses with `seq!(pred0, pred1)`.
 #[test]
 fn test_seq_inside_snapshot_block() {
     let x = 10i32;

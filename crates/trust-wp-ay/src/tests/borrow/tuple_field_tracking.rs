@@ -134,10 +134,10 @@ fn test_pair_bor_mut_with_final_values() {
         MutBorrowRequest::new(&[], &[ens], &final_values).return_expr(Some(&return_expr)),
     )
     .unwrap();
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN (#133): the verdict demotes to `Unknown(ProofTrusted)`
+    // under ay's mandatory strict UNSAT certification; the property this test
+    // guards is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result),
         "pair_bor_mut should verify with identity final_values and conditional return: got {result:?}"
@@ -323,8 +323,9 @@ fn test_drop_pair_deref_var_postcondition_form() {
         deref(logic_fn_call(&tuple_get_1, vec![deref(var("_x"))])),
     );
 
-    // resolve(_x) -> Deref form: resolve(Deref(Var("_x")))
-    let ens2 = logic_fn_call("resolve", vec![deref(var("_x"))]);
+    // resolve(_x): the variable itself. `resolve(*_x)` is the resolve of its
+    // referent at the referent's own type, and is refused (D-127).
+    let ens2 = logic_fn_call("resolve", vec![var("_x")]);
 
     // Body: identity -- _x_final = *_x (i.e., _x_current)
     let mut final_values = HashMap::new();

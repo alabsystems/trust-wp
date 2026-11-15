@@ -94,20 +94,12 @@ fn test_lookup_str_is_empty() {
 #[test]
 fn test_lookup_str_split_at() {
     let spec = lookup_std_spec("core::str::split_at").unwrap();
-    // Non-singleton case: mid must be within byte length.
-    assert_requires_contains(
-        &spec,
-        "self@.len() != 1 ==> mid@ <= self.len()",
-        "str::split_at non-singleton",
-    );
-    // Singleton-view case: mid must fit within the encoded UTF-8 byte length.
-    // This view-level form lets callers discharge the precondition from
-    // `s@ == seq!['c']` plus `'c'.to_utf8() == seq![...]` without invoking
-    // `self.len()` first.
-    assert_requires_contains(
-        &spec,
-        "self@.len() == 1 ==> mid@ <= self@.index_logic(0).to_utf8().len()",
-        "str::split_at singleton UTF-8 byte length",
+    // The byte index must be a char boundary the char view can name: 0, or
+    // the end of a one-char string. A char-count bound names none.
+    assert_eq!(
+        spec.requires,
+        ["mid@ == 0 || (self@.len() == 1 && mid@ == self@.index_logic(0).to_utf8().len())"],
+        "str::split_at requires a nameable char boundary"
     );
     assert_ensures_contains(
         &spec,

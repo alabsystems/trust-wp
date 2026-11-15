@@ -261,7 +261,7 @@ fn bool_field_wrong_postcondition_not_verified() {
     .unwrap_or_else(|err| panic!("Verification should not error: {err:?}"));
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "Contradictory Bool field postcondition should fail: {result:?}"
     );
 

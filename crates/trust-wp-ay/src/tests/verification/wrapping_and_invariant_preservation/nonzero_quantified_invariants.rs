@@ -103,7 +103,7 @@ fn test_verify_nonzero_sub_by_value_without_extra_precondition_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "NonZero sub(self, rhs) without sub_pre should produce counterexample: got {result:?}"
     );
 }
@@ -193,7 +193,7 @@ fn test_verify_invariant_identity_function_violation() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "identity function returning 0 should FAIL invariant check: got {result:?}"
     );
 }
@@ -392,7 +392,7 @@ fn test_verify_nonzero_new_without_precondition_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "NonZero::new(n) without precondition should produce counterexample (n=0): got {result:?}"
     );
 }

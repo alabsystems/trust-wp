@@ -115,6 +115,8 @@ pub(super) fn expr_is_known_int_key(expr: &PureExpr) -> bool {
                 | "discriminant"
                 | "capacity"
         ),
+        // A machine bit operation at its type (D-242) is an integer.
+        PureExpr::LogicFnCall { name, .. } => crate::encoder::parse_int_bitop_name(name).is_some(),
         _ => false,
     }
 }

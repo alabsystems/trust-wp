@@ -7,7 +7,9 @@
 //! This module is decomposed by concern:
 //! - `ident_capture`: Test-only free variable extraction and quantifier binding analysis
 //! - `proof_assert`: `proof_assert`! and `trusted_proof_assert`! expansion
-//! - `snapshot`: snapshot! expansion and spec-only call detection
+//! - `snapshot`: snapshot! expansion
+//! - `snapshot_expr_kind`: syntactic classification of the snapshot! argument
+//!   (spec-only calls, place/reference expressions)
 //! - `ghost_block`: ghost! expansion
 //! - `ghost_let`: `ghost_let`! expansion and parsing
 
@@ -18,6 +20,7 @@ pub(crate) mod ident_capture;
 mod proof_assert;
 mod proof_by;
 mod snapshot;
+mod snapshot_expr_kind;
 
 #[cfg(test)]
 mod tests;

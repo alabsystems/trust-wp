@@ -185,6 +185,23 @@ pub(in crate::callbacks) fn verify_proof_assert_snapshots(
     pa_counters: &mut ProofAssertCounters,
 ) {
     for snapshot_result in snapshots {
+        // Crate wall-clock budget (#2674). A crate whose obligations all live
+        // in one function's `ghost!` block spends its whole budget HERE, where
+        // no per-function check can fire: ghost/ghost_set ran every assertion
+        // at the full per-obligation budget until the harness killed the
+        // process, and a killed process reports nothing at all — no verdict,
+        // no goal coverage, not even the assertions it had discharged. Stop on
+        // the crate's own budget and say so: a snapshot skipped here is
+        // counted as an error, never as a pass.
+        if super::timeout_budget::crate_budget_exhausted() {
+            eprintln!(
+                "trust-wp: {} proof_assert skipped (crate wall-clock budget \
+                 exhausted) (#2674)",
+                host.def_path(),
+            );
+            pa_counters.errors += 1;
+            continue;
+        }
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(err) => {
@@ -264,19 +281,23 @@ fn verify_single_snapshot(
         ..
     } = host
     {
+        // fact-source: loop_lane_exit_facts
         extend_with_loop_assumptions(
             &mut prepared.preconditions,
             pa.span,
             loop_spans,
             *loop_exit_assumptions,
             snapshot,
+            &super::super::proof_assert_verify::rebound_param_names(tcx, snapshot),
             ctx.pa_ctx.verbose,
         );
     }
+    // fact-source: match_exit_goals
     let post_loop_derived = synthesize_post_loop_match_exit_goals(
         &mut prepared.preconditions,
         &prepared.ensures,
         ctx.pa_ctx.logic_fn_defs,
+        &|get| crate::callbacks::list_match_exit::cons_discriminant_of(tcx, get),
     );
     if ctx.pa_ctx.verbose && post_loop_derived > 0 {
         debug!(
@@ -303,8 +324,10 @@ fn verify_single_snapshot(
             prepared.return_expr.as_ref(),
         ),
         Some(pa.span),
+        pa.location,
     );
 
+    // fact-source: ghost_context_handoff
     let mut pa_ghost_context = ghost_facts.alias_facts;
 
     // Semantic facts are postcondition-derived assumptions from ghost helper
@@ -313,10 +336,12 @@ fn verify_single_snapshot(
     // divergence, not a deliberate design choice. (#2332)
     for fact in ghost_facts.semantic_facts {
         if !prepared.preconditions.contains(&fact) {
+            // fact-source: ghost_context_handoff
             prepared.preconditions.push(fact);
         }
     }
 
+    // fact-source: substitution_facts
     merge_substitution_facts(
         &mut pa_ghost_context,
         &snapshot.substitution_facts,
@@ -331,6 +356,7 @@ fn verify_single_snapshot(
         (!pa_ghost_context.is_empty()).then_some(pa_ghost_context.as_slice());
     let mut_borrow_body = host.mut_borrow_body();
     if let Some(body) = mut_borrow_body {
+        // fact-source: delayed_writebacks
         merge_delayed_writeback_assumptions(
             &mut prepared.preconditions,
             &body.delayed_writeback_assumptions,
@@ -355,6 +381,7 @@ fn verify_single_snapshot(
         // Only the entry-time-pinning side is unsound. The
         // `^<param> == call_N` substitution is preserved (it correctly
         // identifies the prophecy final with the post-call value).
+        // fact-source: entry_pinning_withdrawal
         retain_non_entry_pinning_substitution_facts(
             &mut prepared.preconditions,
             &body.mutation_continued_params,
@@ -363,9 +390,11 @@ fn verify_single_snapshot(
 
     let closure_call_assumptions = collect_closure_call_assumptions(&prepared.preconditions);
     let mutation_continued = collect_proof_assert_mutation_continued_vars(&prepared.preconditions);
+    // fact-source: call_assumption_handoff
     let mut proof_assert_call_assumptions = snapshot.call_assumptions.clone();
     for assumption in closure_call_assumptions {
         if !proof_assert_call_assumptions.contains(&assumption) {
+            // fact-source: closure_call_assumptions
             proof_assert_call_assumptions.push(assumption);
         }
     }
@@ -397,8 +426,8 @@ fn verify_single_snapshot(
     // unless `projected_expiry` PROVED a death point (R0..R11); the encoder
     // refuses fail-closed on top of that whenever the projection cannot be
     // walked exactly (`bind_projected_final_value`).
-    let projected_pins = (!host.projected_final_pins().is_empty())
-        .then(|| host.projected_final_pins().to_vec());
+    let projected_pins =
+        (!host.projected_final_pins().is_empty()).then(|| host.projected_final_pins().to_vec());
     if let Some(pins) = projected_pins.as_ref() {
         debug!(
             "prophecy-slots M6: {} caller-side expiry pin(s) available for proof_assert in {}",
@@ -456,8 +485,8 @@ fn verify_single_snapshot(
     // immutable through `&mut [T]`). Without it, a slice param mutated across
     // an inner call has its prophecy length left free (bitvectors/bitwalker).
     let slice_length_stable_vars: Option<Vec<String>> =
-        super::super::try_get_body_with_context(pa.containing_fn).and_then(|bwf| {
-            let mir_body = crate::mir_analysis::get_mir_body(bwf);
+        super::super::try_get_body_with_context(tcx, pa.containing_fn).and_then(|bwf| {
+            let mir_body = crate::mir_analysis::get_mir_body(&bwf);
             let arg_names = host.arg_names();
             let names: Vec<String> = arg_names
                 .iter()
@@ -615,6 +644,7 @@ fn merge_substitution_facts(
             continue;
         }
         if !existing.contains(&format!("{fact}")) {
+            // fact-source: substitution_facts
             ghost_context.push(fact.clone());
         }
     }
@@ -639,6 +669,7 @@ fn merge_delayed_writeback_assumptions(
             continue;
         }
         if !preconditions.contains(assumption) {
+            // fact-source: delayed_writebacks
             preconditions.push(assumption.clone());
         }
     }
@@ -717,7 +748,7 @@ fn is_final_eq_call_carrier_sides(
     let PureExpr::Var(carrier_name, _) = carrier_side else {
         return false;
     };
-    carrier_name.starts_with("call_") || carrier_name.starts_with("_call_")
+    carrier_name.starts_with("$call_") || carrier_name.starts_with("$_call_")
 }
 
 /// Match the entry-time pinning shape generated by the proof_assert snapshot
@@ -763,12 +794,12 @@ fn is_entry_pinning_sides(
     let PureExpr::Var(carrier_name, _) = carrier_side else {
         return false;
     };
-    carrier_name.starts_with("call_") || carrier_name.starts_with("_call_")
+    carrier_name.starts_with("$call_") || carrier_name.starts_with("$_call_")
 }
 
 /// Match the `*parent == ^child` shape emitted by
 /// `build_delayed_writeback_assumptions` for two-phase reborrows where the
-/// parent is mutation-continued. The `^parent == ^child` propagation (also
+/// parent, or the root of its reborrow chain, is mutation-continued. The `^parent == ^child` propagation (also
 /// emitted by the same builder when `child` is final) is consistent with the
 /// call_assumption and is NOT matched here.
 fn is_delayed_writeback_for_mutation_continued(
@@ -792,7 +823,11 @@ fn is_delayed_writeback_for_mutation_continued(
         rhs.as_ref(),
         PureExpr::Final(inner) if matches!(inner.as_ref(), PureExpr::Var(_, _))
     );
-    parent_name.is_some_and(|name| is_final_var && mutation_continued_params.contains(&name))
+    parent_name.is_some_and(|name| {
+        is_final_var
+            && (mutation_continued_params.contains(&name)
+                || mutation_continued_params.contains(trust_wp_core::formula::reborrow_root(&name)))
+    })
 }
 
 fn collect_closure_call_assumptions(preconditions: &[PureExpr]) -> Vec<PureExpr> {
@@ -1040,10 +1075,16 @@ fn synthesize_post_loop_match_exit_goals(
     preconditions: &mut Vec<PureExpr>,
     ensures: &[PureExpr],
     logic_fns: &[LogicFnDef],
+    cons_discriminant: &dyn Fn(&LogicFnDef) -> Option<i64>,
 ) -> usize {
     let mut synthesized = Vec::new();
     for ensure in ensures {
-        let supported = post_loop_match_exit_goal_is_supported(ensure, preconditions, logic_fns);
+        let supported = post_loop_match_exit_goal_is_supported(
+            ensure,
+            preconditions,
+            logic_fns,
+            cons_discriminant,
+        );
         if supported
             && !preconditions.iter().any(|pre| expr_matches(pre, ensure))
             && !synthesized.iter().any(|pre| expr_matches(pre, ensure))
@@ -1052,6 +1093,7 @@ fn synthesize_post_loop_match_exit_goals(
         }
     }
     let count = synthesized.len();
+    // fact-source: match_exit_goals
     preconditions.extend(synthesized);
     count
 }
@@ -1060,6 +1102,7 @@ fn post_loop_match_exit_goal_is_supported(
     ensure: &PureExpr,
     preconditions: &[PureExpr],
     logic_fns: &[LogicFnDef],
+    cons_discriminant: &dyn Fn(&LogicFnDef) -> Option<i64>,
 ) -> bool {
     let Some(goal) = forall_implication_equality(ensure) else {
         return false;
@@ -1078,8 +1121,15 @@ fn post_loop_match_exit_goal_is_supported(
         let Some(match_info) = match_invariant_none_branch_for_goal(&invariant, &goal) else {
             return false;
         };
-        has_completed_list_cons_exit(preconditions, match_info.receiver)
-            && logic_get_returns_none_after_cons_exit(logic_fns, match_info.method)
+        // The exit fact says the receiver is `Nil` only for the discriminant
+        // its enum gives `Cons` (D-237).
+        crate::callbacks::list_match_exit::list_exit_discriminant(
+            logic_fns,
+            match_info.method,
+            list_get_definition_has_nil_none_cons_recursive,
+            cons_discriminant,
+        )
+        .is_some_and(|cons| has_completed_list_cons_exit(preconditions, match_info.receiver, cons))
     })
 }
 
@@ -1212,10 +1262,14 @@ fn logic_or_method_call(expr: &PureExpr) -> Option<(&PureExpr, &str, &[PureExpr]
     }
 }
 
-fn has_completed_list_cons_exit(preconditions: &[PureExpr], receiver: &PureExpr) -> bool {
+fn has_completed_list_cons_exit(
+    preconditions: &[PureExpr],
+    receiver: &PureExpr,
+    cons_discriminant: i64,
+) -> bool {
     preconditions
         .iter()
-        .any(|pre| is_not_discriminant_value(pre, receiver, 1))
+        .any(|pre| is_not_discriminant_value(pre, receiver, cons_discriminant))
 }
 
 fn is_not_discriminant_value(expr: &PureExpr, receiver: &PureExpr, discriminant: i64) -> bool {
@@ -1252,12 +1306,6 @@ fn discriminant_call_matches(
                 args,
             } if method == "discriminant" && args.is_empty() && proof_expr_equiv(call_receiver, receiver)
         )
-}
-
-fn logic_get_returns_none_after_cons_exit(logic_fns: &[LogicFnDef], method: &str) -> bool {
-    logic_fns
-        .iter()
-        .any(|def| def.name() == method && list_get_definition_has_nil_none_cons_recursive(def))
 }
 
 fn list_get_definition_has_nil_none_cons_recursive(def: &LogicFnDef) -> bool {
@@ -1374,8 +1422,9 @@ fn proof_expr_equiv(lhs: &PureExpr, rhs: &PureExpr) -> bool {
                 args: rhs_args,
             },
         ) => {
-            short_constructor_name(lhs_name) == short_constructor_name(rhs_name)
-                && expr_slices_equiv(lhs_args, rhs_args)
+            // Two logic functions that share a last path segment are two
+            // functions (D-237).
+            lhs_name == rhs_name && expr_slices_equiv(lhs_args, rhs_args)
         }
         (
             PureExpr::MethodCall {
@@ -1733,35 +1782,45 @@ fn normalize_wrapped_var_name(name: &str) -> String {
 }
 
 /// Extend preconditions with loop-exit and post-loop assumptions (contracted host only).
+///
+/// A loop-exit fact holds of the names at the loop's exit, and it is read at
+/// the assertion through the assertion's substitution. A parameter in
+/// `rebound` may have been re-bound since, which would make the fact a premise
+/// about its new binding (an entry precondition the loop lane carried across
+/// the loop, read after drop glue wrote the parameter: `after_loop` in
+/// proof_assert_entry_requires_pins_param_after_drop_glue.rs), so the facts
+/// naming one are withdrawn (D-140).
 fn extend_with_loop_assumptions(
     preconditions: &mut Vec<PureExpr>,
     pa_span: rustc_span::Span,
     loop_spans: &[(u32, u32)],
     loop_exit_assumptions: Option<&[PureExpr]>,
     snapshot: &AssertionSnapshot,
+    rebound: &crate::mir_analysis::InvalidatedEntryNames,
     verbose: bool,
 ) {
-    // Inject loop-exit assumptions for proof_asserts after all loops.
+    // Inject loop-exit assumptions for proof_asserts after all loops, only
+    // where every path to the assertion left each loop through its exit arm,
+    // and never over a name written since or bound to two locals (D-189).
+    let Some(stale) = snapshot.exit_fact_stale_names.as_ref() else {
+        return;
+    };
     if super::proof_assert_loop_assumptions::proof_assert_after_all_loops(pa_span, loop_spans) {
         if let Some(assumptions) = loop_exit_assumptions {
+            let mut assumptions: Vec<PureExpr> = assumptions
+                .iter()
+                .filter(|fact| !fact.free_vars().iter().any(|name| stale.contains(name)))
+                .cloned()
+                .collect();
+            super::super::proof_assert_verify::drop_stale_param_facts(&mut assumptions, rebound);
             for assumption in
                 super::proof_assert_loop_assumptions::rewrite_post_loop_proof_assert_assumptions(
-                    assumptions,
+                    &assumptions,
                     &snapshot.substitutions,
                 )
             {
                 if !preconditions.contains(&assumption) {
-                    preconditions.push(assumption);
-                }
-            }
-        }
-        if loop_exit_assumptions.is_some() && !snapshot.post_loop_call_assumptions.is_empty() {
-            let normalized =
-                super::proof_assert_loop_assumptions::normalize_post_loop_proof_assert_assumptions(
-                    &snapshot.post_loop_call_assumptions,
-                );
-            for assumption in normalized {
-                if !preconditions.contains(&assumption) {
+                    // fact-source: loop_lane_exit_facts
                     preconditions.push(assumption);
                 }
             }
@@ -1796,9 +1855,197 @@ mod tests {
     use trust_wp_core::formula::ExprSort;
 
     use super::{
-        collect_proof_assert_mutation_continued_vars, proof_assert_goals_directly_assumed, BinOp,
-        PureExpr,
+        collect_proof_assert_mutation_continued_vars, is_delayed_writeback_for_mutation_continued,
+        proof_assert_goals_directly_assumed, BinOp, PureExpr,
     };
+
+    /// The post-loop match-exit lane: a loop invariant `forall i. A ==> m.at(i)
+    /// == match l.get(i) { None => d, Some(v) => Some(v) }` and the exit fact
+    /// `discriminant(l) != K` make the goal `forall i. A ==> m.at(i) == d` a
+    /// premise, where `K` must say `l` is not `Cons` (D-237).
+    mod match_exit {
+        use std::sync::Arc;
+
+        use trust_wp_core::{
+            formula::{ExprSort, MatchArm, Pattern},
+            logic::LogicFnDef,
+        };
+
+        use super::{
+            super::{proof_expr_equiv, synthesize_post_loop_match_exit_goals},
+            BinOp, PureExpr,
+        };
+
+        fn var(name: &str) -> PureExpr {
+            PureExpr::Var(name.to_string(), None)
+        }
+
+        fn method(receiver: PureExpr, name: &str, args: Vec<PureExpr>) -> PureExpr {
+            PureExpr::MethodCall {
+                receiver: Arc::new(receiver),
+                method: name.to_string(),
+                args,
+            }
+        }
+
+        fn bin(lhs: PureExpr, op: BinOp, rhs: PureExpr) -> PureExpr {
+            PureExpr::BinOp(Arc::new(lhs), op, Arc::new(rhs))
+        }
+
+        fn forall_eq(rhs: PureExpr) -> PureExpr {
+            PureExpr::Forall {
+                var: "i".to_string(),
+                var_sort: Some(ExprSort::Int),
+                body: Arc::new(bin(
+                    bin(PureExpr::Int(0), BinOp::Le, var("i")),
+                    BinOp::Implies,
+                    bin(method(var("m"), "at", vec![var("i")]), BinOp::Eq, rhs),
+                )),
+                triggers: vec![],
+            }
+        }
+
+        fn list_get() -> LogicFnDef {
+            let body = PureExpr::Match {
+                scrutinee: Arc::new(var("self")),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "L::Nil".to_string(),
+                            inner: None,
+                        },
+                        body: var("None"),
+                    },
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "L::Cons".to_string(),
+                            inner: Some(Box::new(Pattern::Wildcard)),
+                        },
+                        body: method(var("self"), "get", vec![var("i")]),
+                    },
+                ],
+            };
+            let mut def = LogicFnDef::new(
+                "get".to_string(),
+                "crate::L::get".to_string(),
+                vec!["self".to_string(), "i".to_string()],
+                body,
+            );
+            def.set_is_recursive(true);
+            def
+        }
+
+        fn premises() -> Vec<PureExpr> {
+            let invariant = forall_eq(PureExpr::Match {
+                scrutinee: Arc::new(method(var("l"), "get", vec![var("i")])),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "None".to_string(),
+                            inner: None,
+                        },
+                        body: var("d"),
+                    },
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "Some".to_string(),
+                            inner: Some(Box::new(Pattern::Binding("v".to_string()))),
+                        },
+                        body: PureExpr::LogicFnCall {
+                            name: "Some".to_string(),
+                            args: vec![var("v")],
+                        },
+                    },
+                ],
+            });
+            let exited = bin(
+                method(var("l"), "discriminant", vec![]),
+                BinOp::Ne,
+                PureExpr::Int(1),
+            );
+            vec![invariant, exited]
+        }
+
+        fn synthesized(cons: Option<i64>, logic_fns: &[LogicFnDef]) -> usize {
+            let mut preconditions = premises();
+            synthesize_post_loop_match_exit_goals(
+                &mut preconditions,
+                &[forall_eq(var("d"))],
+                logic_fns,
+                &|_| cons,
+            )
+        }
+
+        #[test]
+        fn the_exit_fact_reads_as_nil_where_one_is_the_cons_discriminant() {
+            assert_eq!(synthesized(Some(1), &[list_get()]), 1);
+        }
+
+        /// `enum L { Cons(..), Nil }`: `discriminant(l) != 1` says `l` is a
+        /// `Cons`, whose `get` is not `None`. The lane took `1` for `Cons`
+        /// whatever the enum said and stated the goal.
+        #[test]
+        fn the_exit_fact_is_not_read_as_nil_where_cons_is_the_first_variant() {
+            assert_eq!(synthesized(Some(0), &[list_get()]), 0);
+        }
+
+        #[test]
+        fn an_enum_that_cannot_be_named_states_nothing() {
+            assert_eq!(synthesized(None, &[list_get()]), 0);
+        }
+
+        /// A user logic function named `discriminant` is spelled as the MIR
+        /// discriminant read is, so its calls say nothing about the variant.
+        #[test]
+        fn a_logic_fn_named_discriminant_states_nothing() {
+            let user = LogicFnDef::new(
+                "discriminant".to_string(),
+                "crate::L::discriminant".to_string(),
+                vec!["self".to_string()],
+                PureExpr::Int(1),
+            );
+            assert_eq!(synthesized(Some(1), &[list_get(), user]), 0);
+        }
+
+        #[test]
+        fn logic_fns_sharing_a_last_segment_are_not_one_function() {
+            let call = |name: &str| PureExpr::LogicFnCall {
+                name: name.to_string(),
+                args: vec![var("x")],
+            };
+            assert!(!proof_expr_equiv(&call("a::f"), &call("b::f")));
+            assert!(proof_expr_equiv(&call("a::f"), &call("a::f")));
+        }
+    }
+
+    /// `keep(v, &mut *p)` before an assertion: the outer reborrow's
+    /// `_current` is `p`'s entry value, so `*p$rb9 == ^p$rb9$rb8` of a
+    /// mutation-continued `p` let `proof_assert!(*p == before)` hold of a
+    /// callee that stores 7 through it (D-107).
+    #[test]
+    fn a_writeback_into_a_reborrow_of_a_mutation_continued_param_is_dropped() {
+        let var = |name: &str| PureExpr::Var(name.to_string(), None);
+        let writeback = |parent: PureExpr, child: &str| {
+            PureExpr::BinOp(
+                Arc::new(parent),
+                BinOp::Eq,
+                Arc::new(PureExpr::Final(Arc::new(var(child)))),
+            )
+        };
+        let continued = HashSet::from(["p".to_string()]);
+        assert!(is_delayed_writeback_for_mutation_continued(
+            &writeback(PureExpr::Deref(Arc::new(var("p$rb9"))), "p$rb9$rb8"),
+            &continued,
+        ));
+        assert!(!is_delayed_writeback_for_mutation_continued(
+            &writeback(PureExpr::Final(Arc::new(var("p$rb9"))), "p$rb9$rb8"),
+            &continued,
+        ));
+        assert!(!is_delayed_writeback_for_mutation_continued(
+            &writeback(PureExpr::Deref(Arc::new(var("v$rb7"))), "v$rb7$rb6"),
+            &continued,
+        ));
+    }
 
     fn seq_var(name: &str) -> PureExpr {
         PureExpr::Var(name.to_string(), Some(ExprSort::Seq))

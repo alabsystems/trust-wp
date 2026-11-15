@@ -56,7 +56,7 @@ fn assert_negated_conjunction(encoder: &mut AYEncoder, terms: Vec<Term>) {
         encoder.solver_mut().and_many(&coerced)
     };
     let negated = encoder.solver_mut().not(conjoined);
-    encoder.assert_term(negated);
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(negated));
 }
 
 /// Negate a postcondition at the PureExpr level when it contains a top-level
@@ -325,7 +325,7 @@ pub(crate) fn is_trivially_true_postcondition_under_requires(
     is_trivially_true_shift_nonzero_shape(expr, requires)
 }
 
-/// ★ #125 fail-closed guard, mirroring 8d7bf70's
+/// ★ #125 fail-closed guard, mirroring the encoder's
 /// `refuse_prophecy_over_constant`: a `Final` wrapper whose operand is a
 /// ground literal is the print of the driver's borrow-chain advance of a
 /// borrowed place's constant value (`^p` rendered as `^<c>`), and two such
@@ -1045,7 +1045,7 @@ pub(crate) fn result_equals_return_expr_via_logic_body_with_requires(
 /// of its receiver. Stripping it from both sides of an equality preserves
 /// soundness in the direction the matcher relies on — if the stripped sides
 /// are equal as Rust values then by congruence the original `.deep_model()`
-/// forms are equal as logical values. (#181_ident, Phase 3 B4)
+/// forms are equal as logical values. (#181_ident)
 ///
 /// The `Deref` wrapper (parsed from the Creusot `*result` form, encoding the
 /// current value of a borrow) is also accepted on the same congruence grounds.
@@ -1054,7 +1054,6 @@ pub(crate) fn result_equals_return_expr_via_logic_body_with_requires(
 /// purely a *matcher* operation: it only fires when the matcher would compare
 /// syntactically identical PureExprs after normalization, so the resulting
 /// postcondition equality is justified by congruence of `Deref` over equality.
-/// (Phase 3 B4)
 fn is_result_selector(expr: &PureExpr) -> bool {
     match expr {
         PureExpr::Var(name, _) => name == "result",
@@ -1578,8 +1577,9 @@ fn eval_int_literal_expr(expr: &PureExpr) -> Option<i64> {
                 BinOp::Add => left.checked_add(right),
                 BinOp::Sub => left.checked_sub(right),
                 BinOp::Mul => left.checked_mul(right),
-                BinOp::Div => left.checked_div(right),
-                BinOp::Mod => left.checked_rem(right),
+                // `Div`/`Mod` are EUCLIDEAN; only the `*Trunc` ops truncate.
+                BinOp::Div => left.checked_div_euclid(right),
+                BinOp::Mod => left.checked_rem_euclid(right),
                 BinOp::DivTrunc => left.checked_div(right),
                 BinOp::RemTrunc => left.checked_rem(right),
                 _ => None,
@@ -1593,12 +1593,12 @@ fn eval_int_literal_expr(expr: &PureExpr) -> Option<i64> {
             }
         }
         // Old/Deref are same-state projections over an already-evaluated
-        // value; folding them is faithful (8d7bf70's prophecy-opaque rule
+        // value; folding them is faithful (the encoder's prophecy-opaque rule
         // keeps exactly these and refuses `Final`).
         PureExpr::Old(inner) | PureExpr::Deref(inner) => eval_int_literal_expr(inner),
-        // ★ #125: `Final` REFUSES, mirroring 8d7bf70's
-        // `refuse_prophecy_over_constant` fail-closed semantics. The old
-        // RESIDUAL fold is gone: `Final(<literal>)` at this layer was
+        // ★ #125: `Final` REFUSES, mirroring the encoder's
+        // `refuse_prophecy_over_constant` fail-closed semantics. There is no
+        // residual fold: `Final(<literal>)` at this layer is
         // AMBIGUOUS between (a) the driver's borrow-chain advance of a
         // borrowed place's constant value — folding that is the `^p == *p`
         // inversion, on an ACCEPTING path
@@ -1606,7 +1606,7 @@ fn eval_int_literal_expr(expr: &PureExpr) -> Option<i64> {
         // `verify/pipeline.rs` mark a slice `Verified(None)` with NO SOLVE AT
         // ALL) — and (b) binder-erasing substitution of a logic-fn formal /
         // quantifier witness / match payload / `Let` value, where the fold is
-        // licensed. Route (b) is now normalised AT the erasing sites
+        // licensed. Route (b) is normalised AT the erasing sites
         // (`PureExpr::substitute_binder_erasing`, which rewrites
         // `^x [x := c]` to `c` before the wrapper is ever minted), so any
         // `Final` that still reaches these evaluators is either route (a) or
@@ -1767,7 +1767,7 @@ fn normalize_result_logic_body_expr(expr: &PureExpr) -> PureExpr {
         // `deep_model`: `Deref` is a deterministic projection, so if both
         // sides of an equality cancel through `*`, the stripped operands being
         // syntactically equal implies the original equality holds by
-        // congruence of `Deref` over `=`. (Phase 3 B4)
+        // congruence of `Deref` over `=`.
         PureExpr::Deref(inner) => normalize_result_logic_body_expr(inner),
         PureExpr::Final(inner) => {
             PureExpr::Final(Arc::new(normalize_result_logic_body_expr(inner)))
@@ -1776,13 +1776,13 @@ fn normalize_result_logic_body_expr(expr: &PureExpr) -> PureExpr {
         // Treat the explicit method-call form `expr.view()` identically to
         // the `View(expr)` operator (parsed from `expr@`). Both lower to
         // `encode_view_expr` in the encoder, so the body matcher must strip
-        // them on both sides to keep the comparison symmetric. (Phase 3 B4)
+        // them on both sides to keep the comparison symmetric.
         //
         // `expr.deep_model()` is stripped on the same structural-cancellation
         // grounds: it is a deterministic function of its receiver, so if both
         // sides of the equality use `.deep_model()` then `strip(LHS) ==
         // strip(RHS)` (as Rust-level values) implies the original logical
-        // equality by congruence. (Phase 3 B4)
+        // equality by congruence.
         PureExpr::MethodCall {
             receiver,
             method,
@@ -1959,7 +1959,7 @@ fn bitand_complement_yields_zero(left_body: &PureExpr, right_body: &PureExpr) ->
     is_complement_of_mask(and_left) || is_complement_of_mask(and_right)
 }
 
-/// Strip `LetAssume`/`LetObligation` wrappers used to carry precondition
+/// Strip `LetAssume`/`LetObligation` wrappers that carry precondition
 /// facts into a body, returning the inner body for structural matching.
 fn let_wrapper_body(expr: &PureExpr) -> &PureExpr {
     let mut current = expr;
@@ -2136,6 +2136,25 @@ impl IntRel {
             Self::Eq => None,
         }
     }
+}
+
+/// Is `expr` ESTABLISHED in the environment this obligation is discharged in?
+///
+/// A structural precheck that hands a caller a fact proved only under some
+/// domain must establish that domain in the SAME environment, or it grants a
+/// credit nobody owes. Two discharges count: the instantiated condition is a
+/// closed literal that evaluates to `true`, or the surrounding `requires`
+/// already imply it. A literal `false` is never routed to the `requires`
+/// lane — an inconsistent context must not be allowed to license the fact.
+/// Everything else is NOT established here and the caller must fall through
+/// to the solver, which holds the guarded `forall args. requires => ensures`
+/// and no unguarded form of it.
+/// (`logic_fn_ensures_granted_outside_requires.rs`)
+pub(crate) fn expr_established_by_context(expr: &PureExpr, requires: &[PureExpr]) -> bool {
+    if let Some(value) = eval_bool_literal_expr(expr) {
+        return value;
+    }
+    requires_imply_expr(expr, requires)
 }
 
 fn requires_imply_expr(expr: &PureExpr, requires: &[PureExpr]) -> bool {
@@ -2333,11 +2352,30 @@ fn inline_logic_fn_calls_from_defs_with_depth(
                     args: expanded_args,
                 };
             }
-            let Some(logic_fn) = logic_fns.iter().find(|logic_fn| {
-                logic_fn.name() == name
-                    && logic_fn.params().len() == expanded_args.len()
+            let usable = |logic_fn: &&trust_wp_core::logic::LogicFnDef| {
+                logic_fn.params().len() == expanded_args.len()
                     && logic_fn_body_available_under_requires(logic_fn, &expanded_args, requires)
-            }) else {
+            };
+            // A colliding short name denotes the receiver-resolved definition
+            // only (never the first same-named one).
+            let found = match crate::logic::resolve_colliding_call_by_annotation(
+                name,
+                args.first(),
+                args.len(),
+            ) {
+                Some(Ok(id)) => logic_fns
+                    .iter()
+                    .find(|logic_fn| logic_fn.name() == id)
+                    .filter(usable),
+                Some(Err(_)) => None,
+                // Every local definition carries a unique id: a bare name here can only
+                // be a method/short name no resolution bound, and must bind nothing.
+                None if crate::logic::bare_logic_fn_name_bindable(name) => logic_fns
+                    .iter()
+                    .find(|logic_fn| logic_fn.name() == name && usable(logic_fn)),
+                None => None,
+            };
+            let Some(logic_fn) = found else {
                 return PureExpr::LogicFnCall {
                     name: name.clone(),
                     args: expanded_args,
@@ -2408,11 +2446,28 @@ fn inline_logic_fn_calls_from_defs_with_depth(
             logic_args.push(expanded_receiver.clone());
             logic_args.extend(expanded_args.iter().cloned());
             if depth < MAX_LOGIC_FN_INLINE_DEPTH {
-                if let Some(logic_fn) = logic_fns.iter().find(|logic_fn| {
-                    logic_fn.name() == method
-                        && logic_fn.params().len() == logic_args.len()
+                let usable = |logic_fn: &&trust_wp_core::logic::LogicFnDef| {
+                    logic_fn.params().len() == logic_args.len()
                         && logic_fn_body_available_under_requires(logic_fn, &logic_args, requires)
-                }) {
+                };
+                let found = match crate::logic::resolve_colliding_call_by_annotation(
+                    method,
+                    Some(receiver.as_ref()),
+                    args.len() + 1,
+                ) {
+                    Some(Ok(id)) => logic_fns
+                        .iter()
+                        .find(|logic_fn| logic_fn.name() == id)
+                        .filter(usable),
+                    Some(Err(_)) => None,
+                    // Every local definition carries a unique id: a bare name here can only
+                    // be a method/short name no resolution bound, and must bind nothing.
+                    None if crate::logic::bare_logic_fn_name_bindable(method) => logic_fns
+                        .iter()
+                        .find(|logic_fn| logic_fn.name() == method && usable(logic_fn)),
+                    None => None,
+                };
+                if let Some(logic_fn) = found {
                     let substitutions: HashMap<String, PureExpr> =
                         logic_fn.params().iter().cloned().zip(logic_args).collect();
                     // Binder-erasing (#125): formals := call arguments.
@@ -2655,9 +2710,8 @@ pub(crate) fn classify_negated_postcondition_route(
 /// Shared between the function and mut-borrow verification paths so new
 /// postcondition-negation strategies land once. (#2365)
 ///
-/// Skolemization of triggerless universals is now unconditional in the slow
-/// path (the previous `force_skolemize` gate was removed; see the
-/// Skolemization branch below). (#2696)
+/// Skolemization of triggerless universals is unconditional in the slow
+/// path (see the Skolemization branch below). (#2696)
 pub(crate) fn encode_negated_postcondition(
     encoder: &mut AYEncoder,
     ensure: &PureExpr,
@@ -2769,9 +2823,9 @@ pub(crate) fn encode_negated_postcondition(
         // creates ground Skolem constants that are visible to the encoder's
         // ground pool and trigger E-matching on defining axioms. (#1296, #2696)
         //
-        // Unconditional in the slow path: previously gated on has_open_logic_fns(),
-        // but that caused quantifier-unhandled on mixed universal/non-universal
-        // postconditions without open logic fns (e.g., vector/09_capacity.rs). (#2696)
+        // Unconditional in the slow path: gating on has_open_logic_fns() leaves
+        // mixed universal/non-universal postconditions without open logic fns
+        // quantifier-unhandled (e.g., vector/09_capacity.rs). (#2696)
         //
         // If Skolemized encoding fails (e.g., the body references unregistered
         // method calls that `encode_pure` cannot resolve), fall back to the
@@ -3397,7 +3451,7 @@ fn option_none_value(expr: &PureExpr) -> Option<()> {
 /// The option-match shortcuts collapse `*b`/`^b` on the binder and substitute
 /// the payload. That collapse is sort-blind — for a binder over an
 /// `Option<&mut T>` payload it asserts the prophecy inversion `^b == *b`
-/// (the adjudicated take_first_mut false accept). Registry-free layer: uses
+/// (the take_first_mut false accept, D-14). Registry-free layer: uses
 /// the syntactic fail-closed variant (missing/unresolvable annotations count
 /// as embedding). When this returns true the shortcut must DECLINE, letting
 /// the general match-encoding path re-examine the expression under the
@@ -3640,8 +3694,9 @@ pub(crate) fn encode_and_assert_negated_postconditions(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Drain ALL division obligations (from body, precondition, AND postcondition
-        // encoding) and conjoin with postconditions. NOT(ensures AND obligations) =
+        // Drain ALL division obligations (from body and postcondition encoding;
+        // a precondition is an assumption and collects none, D-114) and conjoin
+        // with postconditions. NOT(ensures AND obligations) =
         // NOT ensures OR NOT obligations, so a zero divisor makes the overall check
         // SAT (= verification failure). Draining after encode_pure() captures
         // obligations from postcondition expressions like `result == x / y`. (#1629)
@@ -3665,7 +3720,7 @@ pub(crate) fn encode_and_assert_negated_postconditions(
     //   - Top-level existentials: De Morgan + dual-form OR (#970, #1106)
     //   - Embedded existentials: witness instantiation (#1152)
     //   - Others: ay-level NOT
-    // `all_universal_triggerless` is no longer propagated: Skolemization is
+    // `all_universal_triggerless` is not propagated: Skolemization is
     // unconditional in the slow path of `encode_negated_postcondition`. The
     // local detects the routing condition so we still reach this branch for
     // all-universal-triggerless ensures (see block above). (#2696)
@@ -3706,8 +3761,7 @@ mod tests {
     //! `result.view()` method-call form (mirror of `result@` / `View(result)`),
     //! the `result.deep_model()` conversion (a function of its receiver, so
     //! stripping is sound by congruence), and the Creusot `*result` Deref form
-    //! (likewise a deterministic projection — symmetric strip is sound). Phase
-    //! 3 (B4) extension following commit 4a3dbe6 (deep_model) and cec1575.
+    //! (likewise a deterministic projection — symmetric strip is sound).
 
     use std::sync::Arc;
 

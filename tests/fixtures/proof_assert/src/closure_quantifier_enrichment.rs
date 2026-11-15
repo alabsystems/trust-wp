@@ -32,10 +32,20 @@ fn require_forall_obligation<F: FnMut(i32) -> i32>(f: &mut F, arg: i32) {
 #[requires(seed > 0)]
 fn proof_assert_closure_quantifier_enrichment(seed: i32) {
     let base = seed;
+    // The closure captures `base` and carries a contract; its body must be
+    // total on its own precondition (every arithmetic obligation is checked),
+    // so it selects rather than adds — `arg + base` overflows `i32` for
+    // `arg == i32::MAX`, which `arg > 0` admits.
     let mut closure = {
         #[requires(arg > 0)]
-        #[ensures(result == arg + base)]
-        |arg: i32| -> i32 { arg + base }
+        #[ensures(result >= arg && result >= base)]
+        |arg: i32| -> i32 {
+            if arg > base {
+                arg
+            } else {
+                base
+            }
+        }
     };
 
     call_with_existential(&mut closure, 2);

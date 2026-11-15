@@ -16,6 +16,32 @@ use super::super::{
     AYEncoder,
 };
 
+/// A `Bool`-ranged projection over a payload that is NOT `Bool` has no
+/// faithful defining equation.
+///
+/// `select_structural_sort_target(Bool, Int)` answers `Some(Bool)` (the
+/// inference-fallback arm), so the sort guards in this module used to admit the
+/// pair, and `eq_term(get_I(..), x)` then bridged it through the 0/1 lane as
+/// `ite(get_I(..), 1, 0) = x`. Quantified over `x: Int` that is
+/// `forall x. x = 0 \/ x = 1` — FALSE on its own, so every query carrying it is
+/// vacuously UNSAT and every contract over it "verifies" with a genuinely
+/// checkable certificate. Measured on the checked-add tuple `(u64, bool)` whose
+/// constructor carried an Int flag while `get_1` was declared Bool
+/// (tests/adversarial/cases/s34_field_nested_struct.rs: ay certified the
+/// refutation, z3 reports the lone axiom unsat).
+///
+/// Only the quantified constructor/destructor axiom consulted
+/// `select_structural_sort_target`; the payload and ground-instance emitters
+/// in this module admit a sort mismatch only for the `Bool` payload / `Int`
+/// accessor bridge, so they already refuse this pair.
+///
+/// The opposite direction (`Bool` payload, `Int` accessor, `ite(x, 1, 0)`)
+/// only constrains the uninterpreted accessor and stays allowed. Skipping
+/// leaves the accessor uninterpreted on this family: strictly weaker, sound.
+fn bool_accessor_over_non_bool_payload(accessor_range: &Sort, payload_sort: &Sort) -> bool {
+    *accessor_range == Sort::Bool && *payload_sort != Sort::Bool
+}
+
 impl AYEncoder {
     /// Assert tuple constructor/destructor axioms.
     ///
@@ -138,9 +164,10 @@ impl AYEncoder {
                         continue;
                     }
                     let accessor_range = accessor_decl.range().clone();
-                    if accessor_range != elem_sort
+                    if (accessor_range != elem_sort
                         && !(elem_sort == Sort::Bool && accessor_range == Sort::Int)
-                        && select_structural_sort_target(&accessor_range, &elem_sort).is_none()
+                        && select_structural_sort_target(&accessor_range, &elem_sort).is_none())
+                        || bool_accessor_over_non_bool_payload(&accessor_range, &elem_sort)
                     {
                         continue;
                     }

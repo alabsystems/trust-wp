@@ -1,0 +1,43 @@
+//@ expect: reject
+//@ mechanism: a function whose loops carry an invariant takes its premises from
+//@ mechanism: `collect_call_effects_for_blocks`, a flat walk over the non-loop blocks that keeps no path:
+//@ mechanism: a callee postcondition recorded for one block is a premise of every goal of the function VC,
+//@ mechanism: guarded only by the obligations of the blocks that can reach its call
+//@ mechanism: (`guard_assumptions_by_reaching_obligations`). D-169 scopes the primary walk's premises to
+//@ mechanism: their arm; this lane is not the primary walk, and its premises are scoped to nothing.
+//@ mechanism: here `below(x)` runs on the `flag` arm and the panic goal `!(x >= 100)` is owed on both paths.
+//@ accept-means: a body that panics on the path that skips the call is verified, and the crate exits 0.
+//@ WHY THE CONTRACT IS FALSE: `f(200, false)` panics, and a function with a contract must not panic.
+//@ teeth: ACCEPTED at the campaign tip and with D-169; the primary-walk spelling
+//@ teeth: panic_arm_goal_discharged_by_callee_post_on_other_arm_ensures.rs is rejected with D-169.
+//@ also-verified: below
+//@ fixed-by: D-243: each premise of the block-slice walker is stated under a formula that holds only where its block
+//@ fixed-by: runs, and each goal under one that holds wherever it runs (`call_effect_reach::BlockReach`).
+//@ teeth: ACCEPTED at exit 0 before D-243; `failed` with D-243.
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+extern crate creusot_std;
+use creusot_std::prelude::*;
+
+#[ensures(x@ < 100)]
+pub fn below(x: u32) {
+    #[invariant(true)]
+    while x >= 100 {}
+}
+
+#[ensures(true)]
+pub fn f(x: u32, flag: bool) {
+    if flag {
+        below(x);
+    }
+    if x >= 100 {
+        panic!()
+    }
+    let mut i = 0u32;
+    #[invariant(i@ <= 3)]
+    while i < 3 {
+        i += 1;
+    }
+}

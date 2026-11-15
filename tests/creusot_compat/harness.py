@@ -77,6 +77,8 @@ TRUNCATED_OUTPUT_SENTINEL = harness_baseline.TRUNCATED_OUTPUT_SENTINEL
 BACKEND_PASS_PREFIX = harness_classify.BACKEND_PASS_PREFIX
 NO_REPLAY_PASS_PREFIX = harness_classify.NO_REPLAY_PASS_PREFIX
 NO_REPLAY_STRICT_ERROR_MESSAGE = harness_classify.NO_REPLAY_STRICT_ERROR_MESSAGE
+NO_REPLAY_VERIFIED_PREFIX = harness_classify.NO_REPLAY_VERIFIED_PREFIX
+REJECTION_PASS_PREFIX = harness_classify.REJECTION_PASS_PREFIX
 STRICT_PASS_PREFIX = harness_classify.STRICT_PASS_PREFIX
 _KNOWN_BACKEND_SUPERSEDED_TESTS = harness_classify._KNOWN_BACKEND_SUPERSEDED_TESTS
 _KNOWN_STRICT_REJECTION_TESTS = harness_classify._KNOWN_STRICT_REJECTION_TESTS
@@ -100,7 +102,13 @@ _wire_line_shows_pa_only_failure = harness_classify._wire_line_shows_pa_only_fai
 classify_error_category = harness_classify.classify_error_category
 classify_failure = harness_classify.classify_failure
 classify_no_replay_result = harness_classify.classify_no_replay_result
+classify_no_replay_result_with_mode = harness_classify.classify_no_replay_result_with_mode
 classify_should_fail_result = harness_classify.classify_should_fail_result
+classify_should_fail_result_with_credit = (
+    harness_classify.classify_should_fail_result_with_credit
+)
+is_rejection_pass_message = harness_classify.is_rejection_pass_message
+rejection_pass_message = harness_classify.rejection_pass_message
 classify_unknown_category = harness_classify.classify_unknown_category
 
 # ---------------------------------------------------------------------------
@@ -140,6 +148,7 @@ def _facade_forward(fn):
 # ---------------------------------------------------------------------------
 _format_bytes = _harness_disk._format_bytes
 _disk_usage_percent = _harness_disk._disk_usage_percent
+_disk_free_bytes = _harness_disk._disk_free_bytes
 _directory_size_bytes = _harness_disk._directory_size_bytes
 _is_auxiliary_workspace_target = _harness_disk._is_auxiliary_workspace_target
 _prune_directory = _harness_disk._prune_directory
@@ -233,13 +242,20 @@ def ensure_harness_binaries(workspace: Path, verbose: bool) -> None:
                 "workspace binaries."
             )
         return
+    detail_before = harness_targets.source_state_detail(workspace)
     source_before = _harness_source_fingerprint(workspace)
     _runner_ensure_harness_binaries(workspace, verbose, facade=_current_facade())
     source_after = _harness_source_fingerprint(workspace)
     if source_after != source_before:
+        # Name the ingredient that moved: a dirty crate, a path dependency at a
+        # new revision, and a second worker writing scratch into this checkout
+        # are three different problems behind one hash.
+        delta = harness_targets.describe_source_state_change(
+            detail_before, harness_targets.source_state_detail(workspace)
+        )
         raise RuntimeError(
             "harness source, path dependency, toolchain, or build environment "
-            "changed while binaries were being built"
+            "changed while binaries were being built:\n" + delta
         )
     _write_harness_binary_provenance(workspace, source_after)
 

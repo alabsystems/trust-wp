@@ -39,9 +39,25 @@ impl AYEncoder {
             self.solver.assert_term(axiom);
         }
 
-        // Without fset_contains, remaining linking axioms are not meaningful.
-        let Some(contains_decl) = contains_decl else {
-            return;
+        let len_declared = self.spec_func_decl_cloned("fset_len").is_some();
+        // The axioms below state what `peek`, `insert`, `remove` and `len` mean
+        // through membership, so they need `fset_contains` whether or not the
+        // query names it: `s.remove(s.peek()).len() < s.len()` (a logic
+        // function's variant decrease, bug/vcgen) mentions no `contains`, and
+        // without these axioms every such goal failed on a model no finite set
+        // has. Declaring the symbol adds no fact of its own; each axiom holds
+        // of every finite set. With none of those functions there is nothing
+        // to link.
+        let contains_decl = match contains_decl {
+            Some(decl) => decl,
+            None if peek_decl.is_some()
+                || insert_decl.is_some()
+                || remove_decl.is_some()
+                || len_declared =>
+            {
+                self.get_or_declare_spec_func("fset_contains", &[Sort::Int, Sort::Int], Sort::Bool)
+            }
+            None => return,
         };
 
         // ── Peek-contains: !is_empty(s) ==> contains(s, peek(s)) ──
@@ -253,6 +269,124 @@ impl AYEncoder {
                     self.solver.assert_term(is_empty_eq);
                 }
             }
+        }
+
+        // ── FsetInt.interval: Why3 stdlib `set.mlw`, theory `FsetInt`:
+        //      function interval (l r: int) : fset int
+        //      axiom interval_def:
+        //        forall l r x: int. mem x (interval l r) <-> l <= x < r
+        //    Creusot binds `FSet::interval` to `set.FsetInt.interval`
+        //    (creusot-std/src/logic/fset.rs). Encoded literally, triggered on
+        //    the membership application. No cardinality fact is added.
+        if let Some(interval_decl) = self.spec_func_decl_cloned("fset_interval") {
+            let l = self.solver.fresh_var("fset_ax_l_iv", Sort::Int);
+            let r = self.solver.fresh_var("fset_ax_r_iv", Sort::Int);
+            let x = self.solver.fresh_var("fset_ax_x_iv", Sort::Int);
+            let interval_lr = self.solver.apply(&interval_decl, &[l, r]);
+            let mem = self.solver.apply(&contains_decl, &[interval_lr, x]);
+            let lower = self.solver.le(l, x);
+            let upper = self.solver.lt(x, r);
+            let in_range = self.solver.and(lower, upper);
+            let iff = self.eq_term(mem, in_range);
+            let axiom = self.solver.forall_with_triggers(&[l, r, x], iff, &[&[mem]]);
+            self.solver.assert_term(axiom);
+        }
+
+        // ── Fset.map: Why3 stdlib `set.mlw`, theory `Fset`:
+        //      function map (f: 'a -> 'b) (u: fset 'a) : fset 'b
+        //      axiom map_def:
+        //        forall f: 'a -> 'b, u: fset 'a, y: 'b.
+        //        mem y (map f u) <-> exists x: 'a. mem x u /\ y = f x
+        //    Creusot's `FSet::map(self, f)` is open: `FSet::fmap(f, self)`,
+        //    and `fmap` is `#[builtin("set.Fset.map")]`. `f x` is
+        //    `Mapping::get` (`map.Map.get`), encoded as `mapping_get`.
+        //
+        //    ay declines quantifiers nested under an iff, so map_def is
+        //    asserted in its Skolemized form, a conservative extension with a
+        //    fresh witness symbol `fset_map_witness` that nothing else uses:
+        //      (->) forall u f y. mem y (map f u) ->
+        //             mem (w u f y) u /\ y = f (w u f y)
+        //      (<-) forall u f x. mem x u -> mem (f x) (map f u)
+        //    The (<-) half is exactly map_def's right-to-left direction
+        //    (Why3 also states it as lemma `mem_map`).
+        if let Some(map_decl) = self.spec_func_decl_cloned("fset_map") {
+            let mapping = crate::encoder::sort_context::sort_inference::mapping_sort();
+            let get_decl = self.get_or_declare_spec_fn(
+                "mapping_get",
+                &[mapping.clone(), Sort::Int],
+                Sort::Int,
+            );
+            let witness_decl = self.get_or_declare_spec_fn(
+                "fset_map_witness",
+                &[Sort::Int, mapping.clone(), Sort::Int],
+                Sort::Int,
+            );
+            // (->)
+            {
+                let u = self.solver.fresh_var("fset_ax_u_mpl", Sort::Int);
+                let f = self.solver.fresh_var("fset_ax_f_mpl", mapping.clone());
+                let y = self.solver.fresh_var("fset_ax_y_mpl", Sort::Int);
+                let map_uf = self.solver.apply(&map_decl, &[u, f]);
+                let mem_y = self.solver.apply(&contains_decl, &[map_uf, y]);
+                let w = self.solver.apply(&witness_decl, &[u, f, y]);
+                let mem_w = self.solver.apply(&contains_decl, &[u, w]);
+                let fw = self.solver.apply(&get_decl, &[f, w]);
+                let y_eq_fw = self.eq_term(y, fw);
+                let rhs = self.solver.and(mem_w, y_eq_fw);
+                let body = self.solver.implies(mem_y, rhs);
+                let axiom = self
+                    .solver
+                    .forall_with_triggers(&[u, f, y], body, &[&[mem_y]]);
+                self.solver.assert_term(axiom);
+            }
+            // (<-)
+            {
+                let u = self.solver.fresh_var("fset_ax_u_mpr", Sort::Int);
+                let f = self.solver.fresh_var("fset_ax_f_mpr", mapping);
+                let x = self.solver.fresh_var("fset_ax_x_mpr", Sort::Int);
+                let map_uf = self.solver.apply(&map_decl, &[u, f]);
+                let mem_x = self.solver.apply(&contains_decl, &[u, x]);
+                let fx = self.solver.apply(&get_decl, &[f, x]);
+                let mem_fx = self.solver.apply(&contains_decl, &[map_uf, fx]);
+                let body = self.solver.implies(mem_x, mem_fx);
+                let axiom = self
+                    .solver
+                    .forall_with_triggers(&[u, f, x], body, &[&[mem_x, map_uf]]);
+                self.solver.assert_term(axiom);
+            }
+        }
+
+        // ── Fset.filter: Why3 stdlib `set.mlw`, theory `Fset`:
+        //      function filter (s: fset 'a) (p: 'a -> bool) : fset 'a
+        //      axiom filter_def:
+        //        forall s: fset 'a, p: 'a -> bool, x: 'a.
+        //        mem x (filter s p) <-> mem x s /\ p x
+        //    Creusot binds `FSet::filter` to `set.Fset.filter`. `p x` is
+        //    `Mapping<T, bool>::get`; a Bool-position `get` is encoded as
+        //    `mapping_get(p, x) != 0` (`coerce_bool_operand`), so the axiom
+        //    reads the predicate the same way (bool embedded as 0 / non-0).
+        if let Some(filter_decl) = self.spec_func_decl_cloned("fset_filter") {
+            let mapping = crate::encoder::sort_context::sort_inference::mapping_sort();
+            let get_decl = self.get_or_declare_spec_fn(
+                "mapping_get",
+                &[mapping.clone(), Sort::Int],
+                Sort::Int,
+            );
+            let s = self.solver.fresh_var("fset_ax_s_ft", Sort::Int);
+            let p = self.solver.fresh_var("fset_ax_p_ft", mapping);
+            let x = self.solver.fresh_var("fset_ax_x_ft", Sort::Int);
+            let filter_sp = self.solver.apply(&filter_decl, &[s, p]);
+            let mem_filter = self.solver.apply(&contains_decl, &[filter_sp, x]);
+            let mem_s = self.solver.apply(&contains_decl, &[s, x]);
+            let px = self.solver.apply(&get_decl, &[p, x]);
+            let zero = self.solver.int_const(0);
+            let px_holds = self.solver.neq(px, zero);
+            let rhs = self.solver.and(mem_s, px_holds);
+            let iff = self.eq_term(mem_filter, rhs);
+            let axiom = self
+                .solver
+                .forall_with_triggers(&[s, p, x], iff, &[&[mem_filter]]);
+            self.solver.assert_term(axiom);
         }
 
         // ── FSet empty-contains axiom (#2549) ──

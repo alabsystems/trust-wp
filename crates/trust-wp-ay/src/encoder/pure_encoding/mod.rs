@@ -12,6 +12,7 @@
 //! - `vars` — `Var` encoding
 //! - `bindings` — `LetAssume` / `LetObligation`
 //! - `binop` — `BinOp` expression encoding
+//! - `ieee` — IEEE-754 float literals and the reserved float operations
 //! - `wrapper` — `Deref` / `Final` wrapper rewriting
 //! - sibling `operators` module — binary/unary operator terms and bitwise axioms
 //!
@@ -19,6 +20,7 @@
 
 mod bindings;
 mod binop;
+pub(crate) mod ieee;
 mod vars;
 mod wrapper;
 
@@ -42,7 +44,7 @@ impl AYEncoder {
     }
 
     fn is_one_shift_mask(expr: &PureExpr) -> bool {
-        let PureExpr::BinOp(left, BinOp::Shl, _) = expr else {
+        let PureExpr::BinOp(left, BinOp::Shl, _) = strip_low_bitop_marker(expr) else {
             return false;
         };
         Self::int_literal(left) == Some(1)
@@ -66,14 +68,14 @@ impl AYEncoder {
     }
 
     fn shl_one_shift(expr: &PureExpr) -> Option<&PureExpr> {
-        let PureExpr::BinOp(left, BinOp::Shl, shift) = expr else {
+        let PureExpr::BinOp(left, BinOp::Shl, shift) = strip_low_bitop_marker(expr) else {
             return None;
         };
         (Self::int_literal(left) == Some(1)).then_some(shift.as_ref())
     }
 
     fn bitnot_shl_one_shift(expr: &PureExpr) -> Option<&PureExpr> {
-        let PureExpr::UnOp(UnOp::BitNot | UnOp::Not, inner) = expr else {
+        let PureExpr::UnOp(UnOp::BitNot | UnOp::Not, inner) = strip_low_bitop_marker(expr) else {
             return None;
         };
         Self::shl_one_shift(inner)
@@ -95,7 +97,7 @@ impl AYEncoder {
 
     fn clear_bit_value_parts(expr: &PureExpr) -> Option<(PureExpr, PureExpr)> {
         let expr = Self::inline_single_bit_alias_context(expr);
-        let PureExpr::BinOp(left, BinOp::BitAnd, right) = expr else {
+        let PureExpr::BinOp(left, BinOp::BitAnd, right) = strip_low_bitop_marker(&expr) else {
             return None;
         };
         if let Some(bit) = Self::bitnot_shl_one_shift(&right) {
@@ -409,10 +411,7 @@ impl AYEncoder {
         match expr {
             PureExpr::Bool(b) => Ok(self.solver.bool_const(*b)),
             PureExpr::Int(n) => Ok(self.solver.int_const(*n)),
-            PureExpr::Float(v) => self
-                .solver
-                .try_real_const(v.to_f64())
-                .map_err(|e| EncodingError::unsupported(format!("float constant: {e}"))),
+            PureExpr::Float(bits) => self.encode_float_literal(*bits),
             PureExpr::Var(name, sort_ann) => self.encode_var(name, sort_ann.as_ref(), prefix),
             PureExpr::BinOp(l, op, r) => self.encode_binop_expr(l, *op, r, prefix),
             PureExpr::UnOp(op, inner) => {
@@ -560,6 +559,12 @@ impl AYEncoder {
                 self.encode_match_impl(scrutinee, arms, prefix)
             }
             PureExpr::LogicFnCall { name, args } => {
+                if let Some(f) = trust_wp_core::formula::ieee::IeeeFn::parse(name) {
+                    return self.encode_ieee_call(f, args, prefix);
+                }
+                if let Some(f) = trust_wp_core::formula::ieee::OpaqueFloatFn::parse(name) {
+                    return self.encode_opaque_float_call(f, args, prefix);
+                }
                 // Integer narrowing cast via BV truncation (#2666, #938).
                 // The driver emits `__trust_wp_int_truncate_{s|u}{bits}(value)`
                 // for narrowing IntToInt casts. Intercept here to call
@@ -568,6 +573,16 @@ impl AYEncoder {
                     if let Some(operand) = args.first() {
                         let value_term = self.encode_pure_impl(operand, prefix)?;
                         return Ok(self.encode_unsigned_to_signed_same_width(value_term, bits));
+                    }
+                }
+
+                // Machine-integer bit operation at its type (D-242): the
+                // driver wraps a `<<`/`!` below 64 bits, every signed bit
+                // operation, and every 128-bit one in this marker, because
+                // the bare operator is read at 64 bits, unsigned.
+                if let Some((bits, signed)) = parse_int_bitop_name(name) {
+                    if let [operand] = args.as_slice() {
+                        return self.encode_machine_bitop_marker(operand, bits, signed, prefix);
                     }
                 }
 
@@ -660,6 +675,62 @@ impl AYEncoder {
                 "unhandled PureExpr variant: {expr:?}"
             ))),
         }
+    }
+
+    /// Encode `__trust_wp_int_bitop_{s|u}{bits}(operand)` (D-242): the
+    /// machine bit operation `operand` at its type, `bits` wide.
+    ///
+    /// The marker's operand is the operation the driver lowered: `&`, `|`,
+    /// `^`, `<<`, `>>` or `!`, encoded by [`AYEncoder::encode_int_bitop_at_type`]
+    /// at the type, a `>>` by a literal by
+    /// [`AYEncoder::encode_machine_shr_by_literal`]. Anything else (an operand
+    /// a rewrite has already folded or replaced) denotes the operation's
+    /// VALUE, and the marker then reads it at the type, as the cast `as`
+    /// does: the Rust result of a bit operation is its mathematical value
+    /// reduced into the type.
+    fn encode_machine_bitop_marker(
+        &mut self,
+        operand: &PureExpr,
+        bits: u32,
+        signed: bool,
+        prefix: Option<DerivedKind>,
+    ) -> Result<Term, EncodingError> {
+        use super::operators::MachineBitOp;
+        if self.arithmetic_mode.bitwise_proof_mode() {
+            if let PureExpr::BinOp(left, BinOp::Shr, right) = operand {
+                if let Some(shift) = literal_shift_amount(right, bits) {
+                    let left = self.encode_pure_impl(left, prefix)?;
+                    return self.encode_machine_shr_by_literal(left, bits, signed, shift);
+                }
+            }
+            match operand {
+                PureExpr::BinOp(left, op, right) => {
+                    if let Some(op) = MachineBitOp::from_binop(*op) {
+                        let left = self.encode_pure_impl(left, prefix)?;
+                        let right = self.encode_pure_impl(right, prefix)?;
+                        return self.encode_int_bitop_at_type(op, left, Some(right), bits, signed);
+                    }
+                }
+                PureExpr::UnOp(UnOp::BitNot, inner) => {
+                    let inner = self.encode_pure_impl(inner, prefix)?;
+                    return self.encode_int_bitop_at_type(
+                        MachineBitOp::Not,
+                        inner,
+                        None,
+                        bits,
+                        signed,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if let PureExpr::Int(value) = operand {
+            if let Some(folded) = fold_int_truncate_const(*value, bits, signed) {
+                return Ok(self.solver.int_const(folded));
+            }
+        }
+        let value = self.encode_pure_impl(operand, prefix)?;
+        Ok(self.encode_int_truncation_bv(value, bits, signed))
     }
 
     /// Encode a closure expression in logic context (#985, #2683).
@@ -840,6 +911,38 @@ pub(crate) fn parse_int_truncate_name(name: &str) -> Option<(u32, bool)> {
     };
     let bits: u32 = bits_str.parse().ok()?;
     Some((bits, signed))
+}
+
+/// Parse a machine-integer bit-operation marker name
+/// (`__trust_wp_int_bitop_{s|u}{bits}`, D-242) into `(bits, signed)`.
+pub(crate) fn parse_int_bitop_name(name: &str) -> Option<(u32, bool)> {
+    trust_wp_core::formula::internal::machine_bitop::parse(name)
+}
+
+/// A shift amount that is a literal inside the shifted type, `0 <= k < bits`.
+fn literal_shift_amount(amount: &PureExpr, bits: u32) -> Option<u32> {
+    let PureExpr::Int(k) = amount else {
+        return None;
+    };
+    u32::try_from(*k).ok().filter(|k| *k < bits)
+}
+
+/// The operation under a machine bit-operation marker of at most 64 bits
+/// (D-242), for the single-bit-test recognizers only: they test one bit
+/// `s < bits` of a `bits`-wide value (`v & (1 << s) != 0`, `v & m == 0`,
+/// `v & !(1 << c)`), and bit `s` of a value of the type is the same bit of
+/// its 64-bit two's-complement pattern, which is what they read. Any other
+/// expression is returned unchanged; a 128-bit marker is never looked
+/// through (its high bits are not in a 64-bit pattern).
+pub(super) fn strip_low_bitop_marker(expr: &PureExpr) -> &PureExpr {
+    if let PureExpr::LogicFnCall { name, args } = expr {
+        if let (Some((bits, _)), [inner]) = (parse_int_bitop_name(name), args.as_slice()) {
+            if bits <= 64 {
+                return inner;
+            }
+        }
+    }
+    expr
 }
 
 /// Prefix for the shift-amount-in-range marker emitted by the driver for

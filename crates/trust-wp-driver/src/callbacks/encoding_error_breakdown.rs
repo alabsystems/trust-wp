@@ -41,9 +41,9 @@ impl EncodingErrorBreakdown {
 
     /// Merge another breakdown into this one (for summary aggregation).
     pub(crate) fn merge_from(&mut self, other: &Self) {
-        self.unsupported += other.unsupported;
-        self.sort_inference += other.sort_inference;
-        self.solver += other.solver;
+        self.unsupported = self.unsupported.saturating_add(other.unsupported);
+        self.sort_inference = self.sort_inference.saturating_add(other.sort_inference);
+        self.solver = self.solver.saturating_add(other.solver);
     }
 
     /// Returns `true` when no encoding-error subtypes have been recorded.

@@ -9,9 +9,7 @@
 //! invariant receiver extraction.
 //!
 //! Shared utilities (`infer_result_sort`, `assert_current_chain_alias_constraints`)
-//! moved to `verify/shared_constraints.rs` per #1939.
-//!
-//! Extracted from `function.rs` per designs/2026-03-06-code-structure-execution-plan.md Phase D.
+//! live in `verify::shared_constraints`.
 
 use tracing::debug;
 use trust_wp_core::formula::PureExpr;

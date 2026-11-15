@@ -345,7 +345,7 @@ impl AYEncoder {
                 ..
             } = current
             {
-                let name = format!("sk_{var}");
+                let name = format!("sk${var}");
                 if !skolems.iter().any(|(n, _)| n == &name) {
                     skolems.push((name, var_sort.clone()));
                 }

@@ -28,6 +28,11 @@ use super::{
 use crate::mir_analysis::{collect_loop_body_call_obligations, LoopBodySpecContext};
 
 mod call_results;
+mod loop_merges;
+mod one_path_bindings;
+mod return_sink;
+mod stale_pointee_params;
+mod write_sites;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,7 +73,6 @@ impl Callbacks for LoopCallbacks {
                     loop_info,
                     Some(&analysis.loops),
                     Some(&call_spec_ctx),
-                    false,
                 )
             });
 
@@ -135,6 +139,90 @@ fn analyze_function(
     )
 }
 
+/// Analyze EVERY loop of `fn_name`, in `detect_loops` order.
+fn analyze_all_loops(source: &str, fn_name: &str, arg_names: &[&str]) -> Vec<LoopBodyExpr> {
+    struct AllLoopCallbacks {
+        fn_name: String,
+        arg_names: Vec<String>,
+        bodies: Vec<LoopBodyExpr>,
+        ran: bool,
+    }
+    impl Callbacks for AllLoopCallbacks {
+        #[allow(clippy::elidable_lifetime_names)]
+        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+            let suffix = format!("::{}", self.fn_name);
+            for local_def_id in tcx.hir_body_owners() {
+                let def_path = tcx.def_path_str(local_def_id);
+                if def_path != self.fn_name && !def_path.ends_with(&suffix) {
+                    continue;
+                }
+                let body = tcx.optimized_mir(local_def_id.to_def_id());
+                let analysis = detect_loops(body);
+                let user_specs = HashMap::new();
+                let trait_specs = HashMap::new();
+                let extern_specs = HashMap::new();
+                let call_spec_ctx = CallSpecContext {
+                    tcx,
+                    user_specs: &user_specs,
+                    trait_specs: &trait_specs,
+                    extern_specs: &extern_specs,
+                };
+                self.bodies = analysis
+                    .loops
+                    .iter()
+                    .map(|loop_info| {
+                        extract_loop_body(
+                            body,
+                            &self.arg_names,
+                            loop_info,
+                            Some(&analysis.loops),
+                            Some(&call_spec_ctx),
+                        )
+                    })
+                    .collect();
+                self.ran = true;
+                break;
+            }
+            Compilation::Stop
+        }
+    }
+
+    let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "trust_wp_loop_all_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    fs::create_dir_all(&temp_dir).expect("create test temp dir");
+    let source_path = temp_dir.join("test.rs");
+    fs::write(&source_path, source).expect("write test source");
+    let args = vec![
+        "rustc".to_string(),
+        source_path.to_string_lossy().into_owned(),
+        "--crate-name".to_string(),
+        "trust_wp_loop_test".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        "--edition=2021".to_string(),
+        "--out-dir".to_string(),
+        temp_dir.to_string_lossy().into_owned(),
+    ];
+    let mut callbacks = AllLoopCallbacks {
+        fn_name: fn_name.to_string(),
+        arg_names: arg_names.iter().map(|name| (*name).to_string()).collect(),
+        bodies: Vec::new(),
+        ran: false,
+    };
+    run_compiler(&args, &mut callbacks);
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        callbacks.ran,
+        "failed to locate function `{fn_name}` in rustc callback"
+    );
+    callbacks.bodies
+}
+
 struct PoisonedExitCallbacks {
     fn_name: String,
     arg_names: Vec<String>,
@@ -167,7 +255,6 @@ impl Callbacks for PoisonedExitCallbacks {
                     &poisoned_loop,
                     Some(&analysis.loops),
                     None,
-                    false,
                 )
             });
 
@@ -189,7 +276,7 @@ fn find_test_cond_block(body: &Body<'_>, loop_info: &LoopInfo) -> BasicBlock {
             target: Some(switch_bb),
             ..
         } => *switch_bb,
-        TerminatorKind::Goto { target } => *target,
+        TerminatorKind::Goto { target, .. } => *target,
         _ => loop_info.header,
     };
     let cond_data = &body.basic_blocks[cond_block];
@@ -1033,16 +1120,25 @@ i
     let (_, loop_body) = analyze_function(source, "missing_temp_resolution", &["n"]);
     let loop_body = loop_body.expect("expected loop body extraction");
     // Temp resolution now correctly inlines `i = tmp` → `i = i & 1`.
-    // The body effect for `i` should be `BinOp(Var("i"), BitAnd, Int(1))`.
+    // The body effect for `i` is that `&` at its type, `i32` (D-242):
+    // `__trust_wp_int_bitop_s32(BinOp(Var("i"), BitAnd, Int(1)))`.
     assert!(
         loop_body.body_effects.contains_key("i"),
         "temp resolution should produce i effect: {:?}",
         loop_body.body_effects
     );
     let i_effect = &loop_body.body_effects["i"];
+    let PureExpr::LogicFnCall { name, args } = i_effect else {
+        panic!("i effect should be the i32 bit operation marker over (i & 1), got {i_effect:?}");
+    };
+    assert_eq!(
+        trust_wp_core::formula::internal::machine_bitop::parse(name),
+        Some((32, true)),
+        "i effect should be read at i32, got {i_effect:?}"
+    );
     assert!(
-        matches!(i_effect, PureExpr::BinOp(_, _, _)),
-        "i effect should be BinOp (i & 1), got {i_effect:?}"
+        matches!(args.as_slice(), [PureExpr::BinOp(_, BinOp::BitAnd, _)]),
+        "i effect should wrap BinOp (i & 1), got {i_effect:?}"
     );
 }
 
@@ -1518,12 +1614,13 @@ acc
         .condition
         .expect("expected synthesized condition for for-range loop");
 
-    // After #2171, synthesize_for_range_condition returns only the
-    // produced-count bound. The element guard (pass >= start && pass < end)
-    // is planned but not yet implemented — tracked as part of #2171.
-    // The receiver is View(Var("produced")) because the condition synthesis
-    // in condition.rs wraps the ghost seq variable in a view projection
-    // (commit 7a76c463, #2171 transition-model follow-up).
+    // `synthesize_for_range_condition` states only the produced-count bound.
+    // The yielded element is introduced by `Iterator::next` inside the body,
+    // not by the loop guard, so conjoining an element bound (`pass >= start
+    // && pass < end`) would make `!condition` too weak at loop exit: it can
+    // hold through an unconstrained element variable while the iterator is
+    // not proven exhausted (#2171). The receiver is `View(Var("produced"))`
+    // because the synthesis wraps the ghost seq variable in a view projection.
     let expected = PureExpr::BinOp(
         Arc::new(PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::View(Arc::new(PureExpr::Var(
@@ -1669,6 +1766,364 @@ i
     }
 }
 
+/// A branch after the loop picks the returned value by path: the walk states
+/// a value over the branch condition, never one arm's
+/// (loop_post_return_branch_arm.rs).
+#[test]
+fn post_loop_return_reads_the_branch_that_picks_it() {
+    let source = r#"
+pub fn pick(n: u32) -> u32 {
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+if n > 5 { 1 } else { 2 }
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "pick", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    let value = loop_body
+        .return_expr
+        .expect("both arms return a value the walk translates");
+    assert!(
+        value.free_vars().contains("n"),
+        "the returned value depends on the branch over `n`, got {value:?}"
+    );
+}
+
+/// A path from the exit that runs another loop before it returns has no
+/// single value; the loop the path ends after states it
+/// (loop_post_return_crosses_later_loop.rs, loop_post_return_inner_crosses_outer_body.rs).
+#[test]
+fn post_loop_return_is_stated_only_by_the_loop_no_later_loop_follows() {
+    let sequential = r#"
+pub fn two(n: u32) -> u32 {
+let mut k = 0;
+let mut i = 0;
+while i < n { i += 1; }
+k = 0;
+let mut j = 0;
+while j < 3 { k = 7; j += 1; }
+k
+}
+"#;
+    let nested = r#"
+pub fn nest() -> u32 {
+let mut k = 0;
+let mut i = 0;
+while i < 1 {
+    k = 0;
+    while k != 0 {}
+    k = 5;
+    i += 1;
+}
+k
+}
+"#;
+    for (source, name) in [(sequential, "two"), (nested, "nest")] {
+        let bodies = analyze_all_loops(source, name, &[]);
+        assert_eq!(bodies.len(), 2, "{name}: expected two loops");
+        let stated: Vec<&PureExpr> = bodies
+            .iter()
+            .filter_map(|b| b.return_expr.as_ref())
+            .collect();
+        assert!(
+            matches!(stated.as_slice(), [PureExpr::Var(var, _)] if var == "k"),
+            "{name}: exactly one loop's walk states the returned `k`, got {stated:?}"
+        );
+    }
+}
+
+/// A store through a pointer forgets every local whose address is taken, so a
+/// local written through a borrow after the loop has no value here
+/// (loop_post_return_mut_borrow_write.rs).
+#[test]
+fn post_loop_return_forgets_a_local_written_through_a_borrow() {
+    let source = r#"
+pub fn store() -> u32 {
+let mut k = 0u32;
+let mut i = 0u32;
+while i < 3 { i += 1; }
+let r = &mut k;
+*r = 9;
+k
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "store", &[]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert_ne!(
+        loop_body.return_expr,
+        Some(PureExpr::Int(0)),
+        "the value before the store is not the value returned"
+    );
+}
+
+/// The post-loop walk keeps an enum aggregate's constructor: `Err(i)` and
+/// `Ok(i)` are different results, and the syntax-only translator reads both as
+/// `i`.
+#[test]
+fn extract_post_loop_return_keeps_the_enum_variant() {
+    let source = r#"
+pub fn post_loop_err(n: u32) -> Result<u32, u32> {
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+Err(i)
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_err", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    match loop_body.return_expr {
+        Some(PureExpr::LogicFnCall { ref name, ref args }) => {
+            assert_eq!(name, "Err");
+            assert!(
+                matches!(args.as_slice(), [PureExpr::Var(v, _)] if v == "i"),
+                "expected `Err(i)`, got args {args:?}"
+            );
+        }
+        other => panic!("expected the return expr `Err(i)`, got {other:?}"),
+    }
+}
+
+/// A field-less variant of a user enum is read as that variant, not as the
+/// unit tuple every field-less variant shares.
+#[test]
+fn extract_post_loop_return_keeps_a_fieldless_user_variant() {
+    let source = r#"
+pub enum E { A, B }
+pub fn post_loop_b(n: u32) -> E {
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+E::B
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_b", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    match loop_body.return_expr {
+        Some(PureExpr::LogicFnCall { ref name, ref args }) => {
+            assert_eq!(name, "E::B");
+            assert!(args.is_empty(), "expected `E::B`, got args {args:?}");
+        }
+        other => panic!("expected the return expr `E::B`, got {other:?}"),
+    }
+}
+
+/// A branch after the loop is an `ite` over its arms, never the one arm a
+/// walk happens to reach first.
+#[test]
+fn extract_post_loop_return_joins_a_branch_as_an_ite() {
+    let source = r#"
+pub fn post_loop_branch(n: u32, c: bool) -> u32 {
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+if c { i } else { 0 }
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_branch", &["n", "c"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    match loop_body.return_expr {
+        Some(PureExpr::Ite(ref cond, ref then_expr, ref else_expr)) => {
+            assert!(matches!(cond.as_ref(), PureExpr::Var(v, _) if v == "c"));
+            assert!(matches!(then_expr.as_ref(), PureExpr::Var(v, _) if v == "i"));
+            assert!(matches!(else_expr.as_ref(), PureExpr::Int(0)));
+        }
+        other => panic!("expected `ite(c, i, 0)`, got {other:?}"),
+    }
+}
+
+/// A call's destination holds a value the walk does not model: the local is
+/// forgotten, not kept at the value it held before the call.
+#[test]
+fn extract_post_loop_return_forgets_a_local_a_call_writes() {
+    let source = r#"
+pub fn one() -> u32 { 1 }
+pub fn post_loop_call(n: u32) -> u32 {
+let mut x = 0u32;
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+x = one();
+x
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_call", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "a value a call returned must not be read as the local's earlier value, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A one-argument call is not the identity; only `Ghost::new` is read as its
+/// argument.
+#[test]
+fn extract_post_loop_return_does_not_read_a_call_as_its_argument() {
+    let source = r#"
+pub fn succ(x: u32) -> u32 { x + 1 }
+pub fn post_loop_succ(n: u32) -> u32 {
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+succ(i)
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_succ", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "`succ(i)` must not be read as `i`, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A write into a field leaves the walk no value for the tuple, so a read of
+/// the field is not the value it held before the loop.
+#[test]
+fn extract_post_loop_return_forgets_a_local_a_field_write_changes() {
+    let source = r#"
+pub fn post_loop_field(n: u32, x: u32) -> u32 {
+let mut t = (0u32, 0u32);
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+t.0 = x;
+t.0
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_field", &["n", "x"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "`t.0` after `t.0 = x` must not be read from the tuple before the write, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A local lent out by `&mut` can be written through the loan, which the walk
+/// does not follow, so the local is forgotten at the borrow.
+#[test]
+fn extract_post_loop_return_forgets_a_local_lent_mutably() {
+    let source = r#"
+pub fn post_loop_lent(n: u32, x: u32) -> u32 {
+let mut t = (0u32, 0u32);
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+let r = &mut t;
+r.0 = x;
+t.0
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "post_loop_lent", &["n", "x"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "`t.0` after a write through `&mut t` must not be read from the tuple before it, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A loan made before the loop is live after it, and a write through it names
+/// the loan, not the local: the local is forgotten at the write.
+#[test]
+fn extract_post_loop_return_forgets_a_local_lent_before_the_loop_at_a_write_through_the_loan() {
+    let source = r#"
+pub fn pre_loop_lent(n: u32) -> Option<u32> {
+let mut o = Some(1u32);
+let r = &mut o;
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+*r = None;
+o
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "pre_loop_lent", &["n"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "`o` after `*r = None` through a loan made before the loop must not be read as `Some(1)`, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A call may write through a loan made before the loop that it is handed.
+#[test]
+fn extract_post_loop_return_forgets_a_local_lent_before_the_loop_at_a_call() {
+    let source = r#"
+fn set(p: &mut u32, x: u32) {
+*p = x;
+}
+
+pub fn pre_loop_lent_call(n: u32, x: u32) -> u32 {
+let mut t = 0u32;
+let r = &mut t;
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+set(r, x);
+t
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "pre_loop_lent_call", &["n", "x"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_none(),
+        "`t` after `set(r, x)` through a loan made before the loop must not be read as `0`, got {:?}",
+        loop_body.return_expr
+    );
+}
+
+/// A local no loan points at keeps its value across a call after the loop.
+#[test]
+fn extract_post_loop_return_keeps_an_unlent_local_across_a_call() {
+    let source = r#"
+fn touch(x: u32) -> u32 {
+x
+}
+
+pub fn unlent_across_call(n: u32, x: u32) -> u32 {
+let t = x;
+let mut i = 0;
+while i < n {
+    i += 1;
+}
+touch(i);
+t
+}
+"#;
+
+    let (_, loop_body) = analyze_function(source, "unlent_across_call", &["n", "x"]);
+    let loop_body = loop_body.expect("expected loop body extraction");
+    assert!(
+        loop_body.return_expr.is_some(),
+        "`t` is lent to nothing, so a call after the loop cannot change it"
+    );
+}
+
 #[test]
 fn extract_post_loop_deref_writes_marks_post_loop_mutation() {
     let source = r#"
@@ -1788,7 +2243,7 @@ while *v < 10 {
 /// #2085: When the post-loop CFG branches (SwitchInt), `extract_post_loop_deref_final_values`
 /// must conservatively return an empty map. A branching post-loop path means we cannot
 /// determine which branch will be taken, so last-write-wins is unsound — different branches
-/// might write different values to `*x`. Flagged by P1-83 as over-approximation concern.
+/// might write different values to `*x`.
 #[test]
 fn extract_post_loop_deref_final_values_empty_on_branching_post_loop() {
     let source = r#"
@@ -1817,8 +2272,8 @@ if flag {
 
 /// Regression test: while-let on a 3-variant enum must generate a condition
 /// that only continues for the matched variant, not `discr != first_exit`.
-/// Before fix (#1001), the condition was `discr != 0` which incorrectly
-/// continued the loop for variant C (discriminant 2). (#1001)
+/// A `discr != 0` condition would also continue the loop for variant C
+/// (discriminant 2). (#1001)
 #[test]
 fn whilelet_condition_three_variant_enum() {
     let source = r#"
@@ -1863,7 +2318,7 @@ count
         "while-let on Three::B must generate `discr == 1`, got: {condition:?}"
     );
 
-    // Negative check: the old buggy condition `discr != 0` must NOT be generated.
+    // Negative check: the `discr != 0` shape must NOT be generated.
     let is_ne_zero = matches!(
         &condition,
         PureExpr::BinOp(_, BinOp::Ne, rhs) if matches!(rhs.as_ref(), PureExpr::Int(0))

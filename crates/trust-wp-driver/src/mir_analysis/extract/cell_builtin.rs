@@ -63,6 +63,8 @@ pub(super) fn handle_cell_builtin_call<'tcx>(
             .into_iter()
             .map(|arg| arg.expr)
             .collect();
+    let permission_identity = permcell_permission_identity(builtin, &arg_exprs);
+    let permission_ward_kept = permcell_permission_ward_kept(builtin, &arg_exprs);
     if matches!(
         builtin,
         CellBuiltin::PermCellSet
@@ -97,6 +99,8 @@ pub(super) fn handle_cell_builtin_call<'tcx>(
         session.effects.assumptions.push(identity);
     }
 
+    session.effects.obligations.extend(permission_identity);
+    session.effects.assumptions.extend(permission_ward_kept);
     session
         .effects
         .obligations
@@ -122,6 +126,9 @@ pub(super) fn handle_cell_builtin_call<'tcx>(
                 body,
                 ctx.arg_names,
                 self_expr,
+                // The effective PermCell receiver state may be rewritten to a
+                // place other than the first operand: freeze nothing.
+                None,
                 None,
             );
         }
@@ -346,7 +353,13 @@ fn build_cell_builtin_application(
                     bounded_elem_bridge(1),
                     elem_bridge,
                 ],
-                obligations: Vec::new(),
+                // `_pred` is the caller's own snapshot, so these grants hold only
+                // under Creusot's precondition, which relates it to the slice
+                // cell's predicate: `forall<s> self@[s] == (_pred.len() == s@.len()
+                // && forall<i> _pred[i][s[i]])`. A `PredCell<[T]>` has no view a
+                // contract can state (the spec type check refuses `cell@` on an
+                // unsized cell), so it is owed as the fail-closed `false`.
+                obligations: vec![PureExpr::Bool(false)],
                 mutating_ref_positions: Vec::new(),
                 mutates_receiver: false,
             }
@@ -477,11 +490,13 @@ fn build_cell_builtin_application(
             // Creusot model: result.0@ == *t, (^result.0)@ == ^t
             let target = args[0].clone();
             let cell = tuple_field(result_expr.clone(), 0);
+            let ward = method(tuple_field(result_expr.clone(), 1), "ward", Vec::new());
             CellBuiltinApplication {
                 result_expr,
                 assumptions: vec![
                     eq(view(cell.clone()), deref(target.clone())),
-                    eq(view(final_expr(cell)), final_expr(target)),
+                    eq(view(final_expr(cell.clone())), final_expr(target)),
+                    eq(cell, ward),
                 ],
                 obligations: Vec::new(),
                 mutating_ref_positions: vec![0],
@@ -496,6 +511,56 @@ fn build_cell_builtin_application(
             mutates_receiver: false,
         },
     }
+}
+
+/// What a `PermCell` access owes about its permission: Creusot's
+/// `self == perm.ward()`.
+///
+/// Every access takes `&self`, so only the permission argument keeps a `&mut`
+/// and a `&` of one cell apart; one that guards another cell lets them alias.
+/// Stated over the receiver as the call writes it, before
+/// `effective_permcell_receiver_state` replaces it by the cell's current
+/// state, because `ward()` names the cell and `PermCellNew` states it of the
+/// cell it returns. A call missing either operand owes `false`.
+fn permcell_permission_identity(builtin: CellBuiltin, args: &[PureExpr]) -> Option<PureExpr> {
+    if !matches!(
+        builtin,
+        CellBuiltin::PermCellSet
+            | CellBuiltin::PermCellGet
+            | CellBuiltin::PermCellBorrow
+            | CellBuiltin::PermCellBorrowMut
+            | CellBuiltin::PermCellReplace
+            | CellBuiltin::PermCellIntoInner
+            | CellBuiltin::PermCellTake
+    ) {
+        return None;
+    }
+    Some(match args {
+        [cell, perm, ..] => eq(cell.clone(), method(perm.clone(), "ward", Vec::new())),
+        _ => PureExpr::Bool(false),
+    })
+}
+
+/// Creusot's `self == (^perm).ward()` for an access that takes the permission
+/// by `&mut`: the permission still guards the same cell after the call, so a
+/// later access through it can discharge `permcell_permission_identity`.
+fn permcell_permission_ward_kept(builtin: CellBuiltin, args: &[PureExpr]) -> Option<PureExpr> {
+    if !matches!(
+        builtin,
+        CellBuiltin::PermCellSet
+            | CellBuiltin::PermCellBorrowMut
+            | CellBuiltin::PermCellReplace
+            | CellBuiltin::PermCellTake
+    ) {
+        return None;
+    }
+    let [cell, perm, ..] = args else {
+        return None;
+    };
+    Some(eq(
+        cell.clone(),
+        method(final_expr(perm.clone()), "ward", Vec::new()),
+    ))
 }
 
 /// Connecting identity `(*c)@ == c@` for a PredCell predicate builtin whose
@@ -712,6 +777,7 @@ mod tests {
             }
             other => panic!("expected single forall bridge, got {other:?}"),
         }
+        assert_eq!(application.obligations, vec![PureExpr::Bool(false)]);
     }
 
     #[test]
@@ -912,19 +978,91 @@ mod tests {
             Some(ExprSort::Tuple(2)),
         );
 
-        let cell = tuple_field(result, 0);
-        assert_eq!(application.assumptions.len(), 2);
+        let cell = tuple_field(result.clone(), 0);
+        assert_eq!(application.assumptions.len(), 3);
         assert_eq!(
             application.assumptions[0],
             eq(view(cell.clone()), deref(target.clone())),
         );
         assert_eq!(
             application.assumptions[1],
-            eq(view(final_expr(cell)), final_expr(target)),
+            eq(view(final_expr(cell.clone())), final_expr(target)),
+        );
+        assert_eq!(
+            application.assumptions[2],
+            eq(cell, method(tuple_field(result, 1), "ward", Vec::new())),
         );
         assert!(application.obligations.is_empty());
         assert_eq!(application.mutating_ref_positions, vec![0]);
         assert!(!application.mutates_receiver);
+    }
+
+    #[test]
+    fn permcell_access_owes_the_permission_that_guards_the_cell() {
+        let cell = var("c", Some(ExprSort::Datatype(1)));
+        let perm = var("perm", Some(ExprSort::Datatype(2)));
+        let owed = eq(cell.clone(), method(perm.clone(), "ward", Vec::new()));
+        for builtin in [
+            CellBuiltin::PermCellSet,
+            CellBuiltin::PermCellGet,
+            CellBuiltin::PermCellBorrow,
+            CellBuiltin::PermCellBorrowMut,
+            CellBuiltin::PermCellReplace,
+            CellBuiltin::PermCellIntoInner,
+            CellBuiltin::PermCellTake,
+        ] {
+            assert_eq!(
+                permcell_permission_identity(builtin, &[cell.clone(), perm.clone()]),
+                Some(owed.clone()),
+                "{builtin:?}"
+            );
+            assert_eq!(
+                permcell_permission_identity(builtin, std::slice::from_ref(&cell)),
+                Some(PureExpr::Bool(false)),
+                "{builtin:?} without a permission operand"
+            );
+        }
+        assert_eq!(
+            permcell_permission_identity(CellBuiltin::PermCellNew, &[cell.clone()]),
+            None
+        );
+        assert_eq!(
+            permcell_permission_identity(CellBuiltin::PredCellGet, &[cell, perm]),
+            None
+        );
+    }
+
+    #[test]
+    fn permcell_mutable_access_keeps_the_ward_of_the_final_permission() {
+        let cell = var("c", Some(ExprSort::Datatype(1)));
+        let perm = var("perm", Some(ExprSort::Datatype(2)));
+        let kept = eq(
+            cell.clone(),
+            method(final_expr(perm.clone()), "ward", Vec::new()),
+        );
+        for builtin in [
+            CellBuiltin::PermCellSet,
+            CellBuiltin::PermCellBorrowMut,
+            CellBuiltin::PermCellReplace,
+            CellBuiltin::PermCellTake,
+        ] {
+            assert_eq!(
+                permcell_permission_ward_kept(builtin, &[cell.clone(), perm.clone()]),
+                Some(kept.clone()),
+                "{builtin:?}"
+            );
+        }
+        for builtin in [
+            CellBuiltin::PermCellGet,
+            CellBuiltin::PermCellBorrow,
+            CellBuiltin::PermCellIntoInner,
+        ] {
+            assert_eq!(
+                permcell_permission_ward_kept(builtin, &[cell.clone(), perm.clone()]),
+                None,
+                "{builtin:?}"
+            );
+        }
     }
 
     #[test]

@@ -143,7 +143,7 @@ fn collect_quantifier_bindings(
     for tt in iter.by_ref() {
         match &tt {
             proc_macro2::TokenTree::Punct(p) if p.as_char() == '<' => {
-                angle_depth += 1;
+                angle_depth = angle_depth.saturating_add(1);
             }
             proc_macro2::TokenTree::Punct(p) if p.as_char() == '>' => {
                 if angle_depth == 0 {

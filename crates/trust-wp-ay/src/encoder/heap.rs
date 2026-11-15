@@ -10,8 +10,6 @@
 //! - Heap writes: assigning through raw pointers
 //! - Allocation: `Box::new`, malloc, etc.
 //! - Deallocation: drop, free, etc.
-//!
-//! See: designs/2026-01-31-separation-logic-encoding.md Section 6
 
 #[cfg(feature = "unsafe-heap")]
 use ay_dpll::api::Sort;

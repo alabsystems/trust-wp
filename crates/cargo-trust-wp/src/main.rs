@@ -117,12 +117,12 @@ fn main() -> ExitCode {
     // This ensures trust-wp-rustc runs even when dependencies are cached.
     touch_source_file(&cargo_args);
 
-    // Run cargo check with trust-wp-rustc as RUSTC_WRAPPER.
+    // Run `targo --unverified check` with trust-wp-rustc as RUSTC_WRAPPER.
     // CARGO_TRUST_WP signals to trust-wp-rustc that it's invoked via cargo-trust-wp,
     // so it can skip analysis for dependency crates (only primary package).
     // TRUST_WP_RESULT_PROTOCOL requests structured wire-line output (#1690).
-    let output = Command::new("cargo")
-        .arg("check")
+    let tool = build_tool();
+    let output = build_tool_command(&tool, "check")
         .args(&cargo_args)
         .env("RUSTC_WRAPPER", &trust_wp_rustc)
         .env("TRUST_WP_ARGS", &trust_wp_args_env)
@@ -130,7 +130,10 @@ fn main() -> ExitCode {
         .env(trust_wp_core::result_protocol::RESULT_PROTOCOL_ENV, "1")
         .output()
         .unwrap_or_else(|e| {
-            eprintln!("error: Failed to run cargo: {e}");
+            eprintln!("error: Failed to run {}: {e}", tool.display());
+            eprintln!(
+                "       Crate mode drives targo, the Trust toolchain's cargo: put it on PATH or set $CARGO."
+            );
             exit(EXIT_ENCODING_ERROR);
         });
 
@@ -156,6 +159,36 @@ fn main() -> ExitCode {
     // Exit codes are small integers (0-3) that fit in u8
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     ExitCode::from(exit_code as u8)
+}
+
+/// The build tool crate mode drives: `$CARGO` when the caller set it (targo
+/// exports it to the subcommands it runs), else `targo` from `PATH`.
+///
+/// Never a bare `cargo`: on a Trust machine that name is not the Trust
+/// toolchain's build tool, and trust-wp-rustc must run inside the compiler it
+/// was built against.
+fn build_tool() -> PathBuf {
+    build_tool_from(env::var_os("CARGO").as_deref())
+}
+
+fn build_tool_from(cargo: Option<&OsStr>) -> PathBuf {
+    cargo
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("targo"), PathBuf::from)
+}
+
+/// `<tool> [--unverified] <subcommand>`. targo refuses a compilation command
+/// without a lane, and refuses `--unverified` on anything else (`metadata`).
+/// Crate mode is trust-wp's own verification through `RUSTC_WRAPPER`, not a
+/// Trust proof claim, so `check` takes the explicit unverified lane. A
+/// `$CARGO` that is not targo is run as given.
+fn build_tool_command(tool: &Path, subcommand: &str) -> Command {
+    let mut command = Command::new(tool);
+    if subcommand == "check" && tool.file_stem().and_then(OsStr::to_str) == Some("targo") {
+        command.arg("--unverified");
+    }
+    command.arg(subcommand);
+    command
 }
 
 fn verbose_requested(args: &[String]) -> bool {
@@ -347,13 +380,13 @@ fn which_in_path_with(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
 
 /// Touch source files to force recompilation via cargo metadata target discovery.
 ///
-/// Uses `cargo metadata --no-deps` to discover all target source paths for the
+/// Uses `targo metadata --no-deps` (`$CARGO` when set) to discover all target source paths for the
 /// selected package(s), then touches each one to invalidate cargo's mtime cache.
 /// This ensures `RUSTC_WRAPPER` (trust-wp-rustc) is invoked even when artifacts
 /// are cached.
 ///
 /// Falls back to hardcoded `src/lib.rs` / `src/main.rs` when metadata is
-/// unavailable (e.g., minimal environments without cargo in PATH).
+/// unavailable (e.g., minimal environments without targo on PATH).
 ///
 /// Fixes: #1825 (cache invalidation misses custom/virtual manifests)
 fn touch_source_file(cargo_args: &[String]) {
@@ -420,16 +453,14 @@ fn touch_file(path: &Path) {
     }
 }
 
-/// Discover target source paths from `cargo metadata --no-deps`.
+/// Discover target source paths from `targo metadata --no-deps`.
 ///
 /// Respects `--manifest-path` and `-p`/`--package` from cargo args.
 /// Returns source paths for all targets (lib, bin, example, etc.) of
 /// the selected packages.
 fn discover_target_paths(cargo_args: &[String]) -> Vec<PathBuf> {
-    let mut cmd = Command::new("cargo");
-    cmd.arg("metadata")
-        .arg("--no-deps")
-        .arg("--format-version=1");
+    let mut cmd = build_tool_command(&build_tool(), "metadata");
+    cmd.arg("--no-deps").arg("--format-version=1");
 
     // Forward --manifest-path if present
     if let Some(pos) = cargo_args.iter().position(|a| a == "--manifest-path") {
@@ -966,7 +997,7 @@ fn derive_exit_code(
         tracing::error!(
             "cargo-trust-wp: no verification summary detected. \
              trust-wp-rustc may not have been invoked (cached build artifacts). \
-             Re-run with `cargo clean` or check your manifest layout."
+             Re-run with `targo clean` or check your manifest layout."
         );
         return EXIT_ENCODING_ERROR;
     }

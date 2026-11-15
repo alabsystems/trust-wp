@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use trust_wp_core::formula::elaborate::Signature;
 use trust_wp_driver::StdSpec;
 
 use super::*;
@@ -38,6 +39,7 @@ fn apply_postconditions_capture(
     let mut effects = CallEffects::new();
     let result = apply_postconditions_with_effects(
         ensures,
+        &Signature::default(),
         result_var,
         translated_args,
         param_names,
@@ -56,6 +58,7 @@ fn apply_postconditions_for_loop_body(
     let mut effects = CallEffects::new();
     apply_postconditions_for_loop_body_with_effects(
         ensures,
+        &Signature::default(),
         result_var,
         translated_args,
         param_names,
@@ -90,6 +93,7 @@ fn apply_postconditions_with_self_capture(
     let mut effects = CallEffects::new();
     let result = apply_postconditions_with_self_and_effects(
         ensures,
+        &Signature::default(),
         result_var,
         translated_args,
         param_names,
@@ -133,6 +137,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_result_equals_expr() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self + 1".to_string()],
             param_names: None,
@@ -151,6 +157,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_expr_equals_result() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["self + 1 == result".to_string()],
             param_names: None,
@@ -169,6 +177,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_with_value_arg() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == value".to_string()],
             param_names: None,
@@ -194,6 +204,8 @@ mod apply_postconditions_tests {
             "result == rhs",
         ] {
             let spec = StdSpec {
+                capture_inv_requires: Vec::new(),
+                inv_requires: Vec::new(),
                 requires: vec![],
                 ensures: vec![clause.to_string()],
                 param_names: None,
@@ -218,6 +230,8 @@ mod apply_postconditions_tests {
             "result == rhs",
         ] {
             let spec = StdSpec {
+                capture_inv_requires: Vec::new(),
+                inv_requires: Vec::new(),
                 requires: vec![],
                 ensures: vec![clause.to_string()],
                 param_names: None,
@@ -234,6 +248,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_indexed_arg_aliases_bind_positionally() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == arg0 + arg1".to_string()],
             param_names: None,
@@ -253,6 +269,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_indexed_arg_aliases_keep_fallback_placeholders() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == arg1".to_string()],
             param_names: None,
@@ -270,6 +288,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_no_result_pattern_returns_unconstrained() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["x > 0".to_string()],
             param_names: None,
@@ -288,6 +308,8 @@ mod apply_postconditions_tests {
         // double-pushing assumptions that the full extraction (pass 2)
         // will record with correctly advanced receiver state.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["self.postcondition(arg, result)".to_string()],
             param_names: None,
@@ -310,6 +332,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_predicate_postconditions_keep_indexed_fallback_aliases() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["self.contains(arg1)".to_string()],
             param_names: None,
@@ -521,6 +545,8 @@ mod apply_postconditions_tests {
         );
 
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["exists<st1, st2, r> f.postcondition_mut((), st1, r) && \
                  st1.postcondition_mut((), st2, result) && resolve(st2)"
@@ -567,6 +593,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_empty_ensures_returns_unconstrained() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec!["x > 0".to_string()],
             ensures: vec![],
             param_names: None,
@@ -580,6 +608,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_unparseable_ensures_returns_unconstrained_and_fails_closed() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["invalid ((( syntax".to_string()],
             param_names: None,
@@ -589,6 +619,7 @@ mod apply_postconditions_tests {
         let mut effects = CallEffects::new();
         let result = apply_postconditions_with_effects(
             &spec.ensures,
+            &Signature::default(),
             &result_var,
             &args,
             None,
@@ -616,6 +647,8 @@ mod apply_postconditions_tests {
     fn test_empty_args_returns_unconstrained() {
         // Edge case: no translated args available
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self + 1".to_string()],
             param_names: None,
@@ -632,6 +665,8 @@ mod apply_postconditions_tests {
         // The parser supports deref (*self) patterns
         // Example: "result == (*self != None)" from Option::is_some
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == (*self != None)".to_string()],
             param_names: None,
@@ -653,6 +688,8 @@ mod apply_postconditions_tests {
         // Std specs use self@ for model access - parser now supports this (Part of #110)
         // Example: "result == self@.len()" from Vec::len
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self@.len()".to_string()],
             param_names: None,
@@ -681,6 +718,8 @@ mod apply_postconditions_tests {
         // view is identity, so result@ == x means result == x.
         // apply_postconditions_for_loop_body matches this pattern. (#1463)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == self@.len()".to_string()],
             param_names: None,
@@ -708,6 +747,8 @@ mod apply_postconditions_tests {
         // Previously (#1463) these fell through to predicate-style handler,
         // leaving results unconstrained. Fixed by #1673.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == self@.len()".to_string()],
             param_names: None,
@@ -733,6 +774,8 @@ mod apply_postconditions_tests {
     fn test_view_result_equality_symmetric_in_normal_path() {
         // Symmetric form: self@.len() == result@ — now extracted in normal path (#1673)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["self@.len() == result@".to_string()],
             param_names: None,
@@ -758,6 +801,8 @@ mod apply_postconditions_tests {
         // Vec::is_empty spec: result@ == (self@.len() == 0)
         // This should now be extracted in the normal path (#1673)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == (self@.len() == 0)".to_string()],
             param_names: None,
@@ -773,6 +818,8 @@ mod apply_postconditions_tests {
     fn test_view_result_equality_symmetric_in_loop_body() {
         // Symmetric form: self@.len() == result@
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["self@.len() == result@".to_string()],
             param_names: None,
@@ -805,6 +852,8 @@ mod apply_postconditions_tests {
         // The extraction should preserve the view wrapper instead of
         // assigning the raw iterator variable the collection-model RHS.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == self@.intersection(other@)".to_string()],
             param_names: Some(vec!["self".to_string(), "other".to_string()]),
@@ -841,6 +890,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_view_result_extraction_peels_transparent_adapter_before_view_wrap() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == Copied(self@.intersection(other@))".to_string()],
             param_names: Some(vec!["self".to_string(), "other".to_string()]),
@@ -877,6 +928,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_result_extraction_preserves_transparent_adapter_witness_in_plain_result_clause() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == Copied(self@.intersection(other@))".to_string()],
             param_names: Some(vec!["self".to_string(), "other".to_string()]),
@@ -917,6 +970,8 @@ mod apply_postconditions_tests {
         // postconditions are not silently dropped for ZST receivers
         // like Ghost<T> and Snapshot<T>. (#1572)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self + 1".to_string()],
             param_names: None,
@@ -940,6 +995,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_result_substitution_is_respected() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == result + 1".to_string()],
             param_names: None,
@@ -959,6 +1016,8 @@ mod apply_postconditions_tests {
         // Regression test: If postcondition has unresolved known symbolic names
         // (self, value, default, result) after substitution, fall back (#87)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             // "default" is a known symbolic name but we don't provide it in args
             ensures: vec!["result == default + 1".to_string()],
@@ -980,6 +1039,8 @@ mod apply_postconditions_tests {
         // User-defined function: fn add(x: i32, y: i32) -> i32
         // ensures: result == x + y
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == x + y".to_string()],
             param_names: None,
@@ -1004,6 +1065,8 @@ mod apply_postconditions_tests {
         // User-defined function: fn increment(n: i32) -> i32
         // ensures: result == n + 1
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == n + 1".to_string()],
             param_names: None,
@@ -1027,6 +1090,8 @@ mod apply_postconditions_tests {
         // that should be substituted for the parameter name in the postcondition.
         // This ensures user param names don't leak into the output (#169).
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == x + y".to_string()],
             param_names: None,
@@ -1052,6 +1117,8 @@ mod apply_postconditions_tests {
     fn test_user_spec_empty_param_names() {
         // Edge case: param_names is Some but empty
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == 42".to_string()],
             param_names: None,
@@ -1069,6 +1136,8 @@ mod apply_postconditions_tests {
     fn test_user_spec_more_params_than_args() {
         // Edge case: param_names has more entries than actual args
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == x".to_string()],
             param_names: None,
@@ -1085,6 +1154,8 @@ mod apply_postconditions_tests {
     #[test]
     fn test_user_spec_missing_param_falls_back() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == y".to_string()],
             param_names: None,
@@ -1103,6 +1174,8 @@ mod apply_postconditions_tests {
         // where param_names = ["self", "x"]
         // The param_names should take precedence over std symbolic "self"
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self + x".to_string()],
             param_names: None,
@@ -1130,6 +1203,8 @@ mod apply_postconditions_tests {
         // and ensures call-site assumptions and user postconditions use the
         // same term structure.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["T::deref_mut.postcondition((self,), result)".to_string()],
             param_names: None,
@@ -1227,6 +1302,8 @@ fn test_trait_spec_named_param_substitution_regression_470() {
     // Simulates: trait Adder { #[ensures(result == x + y)] fn add(&self, x: i32, y: i32) -> i32; }
     // Called at generic site: a.add(1, 2)
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result == x + y".to_string()],
         param_names: None,
@@ -1277,6 +1354,8 @@ mod wrapped_result_postcondition_tests {
         // Since #1673, result@ patterns are extracted in the normal path.
         // The RHS (*self → Deref(rc)) is returned as the constrained result.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == *self".to_string()],
             param_names: None,
@@ -1307,6 +1386,8 @@ mod wrapped_result_postcondition_tests {
         // RC_NEW: `*result == value`
         // Deref(Var("result")) != Var("result"), so falls through.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["*result == value".to_string()],
             param_names: None,
@@ -1341,9 +1422,11 @@ mod wrapped_result_postcondition_tests {
 
     #[test]
     fn test_view_result_with_arithmetic_rhs() {
-        // ADD_DURATION: `result@ == self@ + rhs@`
+        // A view-sum postcondition, `result@ == self@ + rhs@`.
         // Since #1673, result@ is directly extracted.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result@ == self@ + rhs@".to_string()],
             param_names: None,
@@ -1383,11 +1466,13 @@ mod wrapped_result_postcondition_tests {
 
     #[test]
     fn test_multiple_ensures_with_view_result() {
-        // ADD_DURATION has 3 ensures clauses.
+        // Three ensures clauses over one view sum.
         // Since #1673, the first clause (result@ == self@ + rhs@) is directly
         // extracted. The remaining 2 clauses are recorded as assumptions
         // so the solver has the full postcondition context.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "result@ == self@ + rhs@".to_string(),
@@ -1435,6 +1520,8 @@ mod wrapped_result_postcondition_tests {
         // constrains mutation. Before this fix, the second clause was
         // silently dropped by the early return. (#1673 follow-up)
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "result == old(*dest)".to_string(),
@@ -1487,6 +1574,8 @@ mod wrapped_result_postcondition_tests {
         // Simulate ok_or spec: `ensures: match *self { Some(v) => result == Ok(v), None => result == Err(err) }`
         // Simplified to test self resolution: `ensures: result == self`
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == self".to_string()],
             param_names: None,
@@ -1517,6 +1606,8 @@ mod wrapped_result_postcondition_tests {
     #[test]
     fn test_match_postcondition_extracts_none_branch_result_expr() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result == Ok(v), None => result == Err(err), }"
@@ -1553,6 +1644,8 @@ mod wrapped_result_postcondition_tests {
     #[test]
     fn test_match_postcondition_extracts_some_branch_result_expr() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result == Ok(v), None => result == Err(err), }"
@@ -1589,6 +1682,8 @@ mod wrapped_result_postcondition_tests {
     #[test]
     fn test_match_postcondition_alias_pattern_binds_whole_value() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { whole @ Some(v) => result == Ok(whole), None => result == Err(err), }"
@@ -1633,6 +1728,8 @@ mod wrapped_result_postcondition_tests {
     #[test]
     fn test_ite_and_conjunct_result_extraction_with_deref_stripping() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "if *ma >= *mb { *mb == ^mb && result == ma } else { *ma == ^ma && result == mb }"
@@ -1693,6 +1790,8 @@ mod wrapped_result_postcondition_tests {
     #[test]
     fn test_ite_result_extraction_preserves_deref_for_ref_typed_var() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == if *b { Some(false) } else { None }".to_string()],
             param_names: Some(vec!["b".to_string()]),
@@ -1758,6 +1857,8 @@ mod match_postcondition_warning_tests {
         // postcondition is silently dropped. After #1477, this emits a
         // warning. The function falls back to unconstrained result.
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result == v, None => result == 0, }".to_string(),
@@ -1788,6 +1889,8 @@ mod match_postcondition_warning_tests {
     #[test]
     fn test_match_postcondition_warns_when_arm_matches_but_body_not_equality() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result > v, None => result >= 0, }".to_string(),
@@ -1829,6 +1932,8 @@ mod match_postcondition_variable_scrutinee_tests {
     #[test]
     fn test_match_variable_scrutinee_extracts_result_match() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result == Ok(v), None => result == Err(err), }"
@@ -1902,6 +2007,8 @@ mod match_postcondition_variable_scrutinee_tests {
     #[test]
     fn test_match_variable_scrutinee_fails_closed_when_arm_body_not_equality() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result > v, None => result == 0, }".to_string(),
@@ -1925,6 +2032,8 @@ mod match_postcondition_variable_scrutinee_tests {
     #[test]
     fn test_match_variable_scrutinee_unwrap_or_pattern() {
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec![
                 "match *self { Some(v) => result == v, None => result == default, }".to_string(),
@@ -2197,6 +2306,47 @@ mod apply_preconditions_tests {
             DroppedClauseKind::Precondition
         );
     }
+
+    /// A callee's precondition reading the final value of a borrow its
+    /// parameter's referent holds (`^x.m`, `^*x`, `^x[0]`) is no obligation
+    /// a caller can discharge: the encoder would read it as the field the
+    /// argument's OUTER borrow is left with. It is dropped, which leaves a
+    /// `false` obligation; a precondition over the parameter's own final
+    /// value is substituted (D-183).
+    #[test]
+    fn a_callee_precondition_reading_a_held_borrows_final_is_a_false_obligation() {
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("a".to_string(), None)),
+            TranslatedArg::new(PureExpr::Var("b".to_string(), None)),
+        ];
+        let param_names = vec!["x".to_string(), "k".to_string()];
+        for text in [
+            "^x.m == k",
+            "^(x.m) == k",
+            "^*x == k",
+            "^x[0] == k",
+            "^(^x).m == k",
+        ] {
+            let mut effects = CallEffects::new();
+            collect_precondition_obligations(
+                &[text.to_string()],
+                &args,
+                Some(&param_names),
+                &mut effects,
+            );
+            assert_eq!(effects.obligations, vec![PureExpr::Bool(false)], "{text}");
+            assert_eq!(effects.dropped_clauses.len(), 1, "{text}");
+        }
+        let mut effects = CallEffects::new();
+        collect_precondition_obligations(
+            &["^x == k".to_string()],
+            &args,
+            Some(&param_names),
+            &mut effects,
+        );
+        assert!(effects.dropped_clauses.is_empty());
+        assert_ne!(effects.obligations, vec![PureExpr::Bool(false)]);
+    }
 }
 
 // Algorithm audit tests: boundary conditions, off-by-one, correctness
@@ -2212,6 +2362,8 @@ mod algorithm_audit_tests {
     fn test_param_named_result_does_not_override_return_value_binding() {
         // fn foo(result: i32) -> i32  with  ensures: result == result + 1
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == result + 1".to_string()],
             param_names: None,
@@ -2245,6 +2397,8 @@ mod algorithm_audit_tests {
         // fn push(value: i32, target: &mut Vec<i32>)
         // ensures: result == value  (user means args[0])
         let spec = StdSpec {
+            capture_inv_requires: Vec::new(),
+            inv_requires: Vec::new(),
             requires: vec![],
             ensures: vec!["result == value".to_string()],
             param_names: None,
@@ -2680,5 +2834,301 @@ mod replace_var_allow_bound_tests {
             },
             other => panic!("expected Forall, got {other:?}"),
         }
+    }
+}
+
+/// A closure argument never stands in for the result of calling it unless the
+/// exact-thunk rule marked it exact (wp-s23).
+mod opaque_callable_clause_tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn capture_env() -> TranslatedArg {
+        TranslatedArg::new(PureExpr::LogicFnCall {
+            name: "__trust_wp_tuple1".to_string(),
+            args: vec![PureExpr::Var("b".to_string(), None)],
+        })
+    }
+
+    #[test]
+    fn zero_arity_application_of_capturing_env_is_dropped() {
+        let ensures = vec!["self.is_none() ==> result.unwrap_err() == err()".to_string()];
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("n".to_string(), None)),
+            capture_env(),
+        ];
+        let pn = names(&["self", "err"]);
+        let result_var = PureExpr::Var("call_0".to_string(), None);
+        let (result, effects) =
+            apply_postconditions_capture(&ensures, &result_var, &args, Some(&pn), true);
+        assert_eq!(result, result_var);
+        assert!(
+            effects.assumptions.is_empty(),
+            "clause applying an opaque callable must be dropped: {:?}",
+            effects.assumptions
+        );
+    }
+
+    #[test]
+    fn exact_thunk_value_is_substituted() {
+        let ensures = vec!["result == f()".to_string()];
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("n".to_string(), None)),
+            TranslatedArg::exact_thunk_value(PureExpr::Int(3)),
+        ];
+        let pn = names(&["self", "f"]);
+        let result_var = PureExpr::Var("call_0".to_string(), None);
+        let result = apply_postconditions(&ensures, &result_var, &args, Some(&pn), true);
+        assert_eq!(result, PureExpr::Int(3));
+    }
+
+    #[test]
+    fn positive_arity_application_is_dropped_even_for_exact_thunk() {
+        // `default(x)` would otherwise become an arity-shared UF.
+        let ensures = vec!["result == default(self.unwrap_err())".to_string()];
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("r".to_string(), None)),
+            TranslatedArg::exact_thunk_value(PureExpr::Int(3)),
+            TranslatedArg::fallback(PureExpr::Var("arg2".to_string(), None)),
+        ];
+        let pn = names(&["self", "default", "f"]);
+        let found = applied_opaque_callable_param(
+            &trust_wp_core::contract_parser::parse_contract(&ensures[0]).unwrap(),
+            &args,
+            Some(&pn),
+            false,
+        );
+        assert_eq!(found.as_deref(), Some("default"));
+        let result_var = PureExpr::Var("call_0".to_string(), None);
+        let (result, effects) =
+            apply_postconditions_capture(&ensures, &result_var, &args, Some(&pn), true);
+        assert_eq!(result, result_var);
+        assert!(effects.assumptions.is_empty());
+    }
+
+    #[test]
+    fn fallback_and_alias_bindings_are_opaque() {
+        let expr = trust_wp_core::contract_parser::parse_contract("result == arg1()").unwrap();
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("n".to_string(), None)),
+            TranslatedArg::fallback(PureExpr::Var("arg1".to_string(), None)),
+        ];
+        assert_eq!(
+            applied_opaque_callable_param(&expr, &args, None, false).as_deref(),
+            Some("arg1")
+        );
+        let expr = trust_wp_core::contract_parser::parse_contract("result == default()").unwrap();
+        assert_eq!(
+            applied_opaque_callable_param(&expr, &args, None, false).as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn clause_without_application_is_kept() {
+        let ensures = vec!["self.is_some() ==> result == self.unwrap()".to_string()];
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("n".to_string(), None)),
+            capture_env(),
+        ];
+        let pn = names(&["self", "f"]);
+        let expr = trust_wp_core::contract_parser::parse_contract(&ensures[0]).unwrap();
+        assert_eq!(
+            applied_opaque_callable_param(&expr, &args, Some(&pn), false),
+            None
+        );
+    }
+
+    #[test]
+    fn precondition_applying_opaque_callable_fails_closed() {
+        let requires = vec!["f() > 0".to_string()];
+        let args = vec![
+            TranslatedArg::new(PureExpr::Var("n".to_string(), None)),
+            capture_env(),
+        ];
+        let pn = names(&["self", "f"]);
+        let effects = apply_preconditions(&requires, &args, Some(&pn));
+        assert_eq!(effects.dropped_clauses.len(), 1);
+        assert_eq!(
+            effects.dropped_clauses[0].kind,
+            DroppedClauseKind::Precondition
+        );
+        assert!(effects.obligations.contains(&PureExpr::Bool(false)));
+    }
+}
+
+/// A synthesized invariant clause with NO faithful contract-source spelling
+/// still reaches the call site as an obligation. This is the shape a
+/// render-back-to-text route would silently drop, leaving the free grant open
+/// for exactly the enum decompositions.
+#[test]
+fn a_match_shaped_invariant_clause_becomes_a_caller_obligation() {
+    use trust_wp_core::formula::{MatchArm, Pattern};
+
+    let clause = PureExpr::Match {
+        scrutinee: Arc::new(PureExpr::Var("x".to_string(), None)),
+        arms: vec![MatchArm {
+            pattern: Pattern::Binding("v".to_string()),
+            body: PureExpr::MethodCall {
+                receiver: Arc::new(PureExpr::Var("v".to_string(), None)),
+                method: "__trust_wp_invariant_NonZero".to_string(),
+                args: vec![],
+            },
+        }],
+    };
+    let args = vec![TranslatedArg::new(PureExpr::Var(
+        "actual".to_string(),
+        None,
+    ))];
+    let names = vec!["x".to_string()];
+    let mut effects = CallEffects::new();
+
+    apply_invariant_preconditions_with_effects(&[clause], &args, Some(&names), None, &mut effects);
+
+    assert_eq!(effects.obligations.len(), 1);
+    let PureExpr::Match { scrutinee, .. } = &effects.obligations[0] else {
+        panic!("the match shape did not survive substitution");
+    };
+    assert_eq!(**scrutinee, PureExpr::Var("actual".to_string(), None));
+    assert!(effects.dropped_clauses.is_empty());
+}
+
+/// An invariant clause naming a parameter the call site cannot bind takes the
+/// dropped-clause path, which carries a synthetic `false`. Skipping it instead
+/// would hand the callee a premise no caller ever pays for — the defect this
+/// lane closes.
+#[test]
+fn an_unbindable_invariant_clause_fails_closed_rather_than_vanishing() {
+    let clause = PureExpr::MethodCall {
+        receiver: Arc::new(PureExpr::Var("never_bound".to_string(), None)),
+        method: "__trust_wp_invariant_Sum10".to_string(),
+        args: vec![],
+    };
+    let mut effects = CallEffects::new();
+
+    apply_invariant_preconditions_with_effects(&[clause], &[], None, None, &mut effects);
+
+    assert_eq!(effects.dropped_clauses.len(), 1);
+    assert_eq!(
+        effects.dropped_clauses[0].kind,
+        DroppedClauseKind::Precondition
+    );
+    assert!(effects
+        .obligations
+        .iter()
+        .any(|o| matches!(o, PureExpr::Bool(false))));
+}
+
+/// A callee clause read at a call reads its arguments' values at the call.
+/// An argument its translation reads at its pointee's ENTRY value (a store
+/// through it the translation does not see) gives a clause that reads it no
+/// reading there, except through its prophecy: the clause is dropped, and the
+/// drop carries a synthetic `false`.
+#[test]
+fn a_clause_reading_a_stale_argument_is_no_fact_at_the_call() {
+    let result_var = PureExpr::Var("result".to_string(), None);
+    let mut stale = TranslatedArg::new(PureExpr::Var("x".to_string(), None));
+    stale.stale = true;
+    let names = vec!["p".to_string()];
+
+    let mut effects = CallEffects::new();
+    apply_postconditions_with_effects(
+        &["result == *p".to_string()],
+        &Signature::default(),
+        &result_var,
+        std::slice::from_ref(&stale),
+        Some(names.as_slice()),
+        &mut effects,
+        true,
+    );
+    assert_eq!(effects.dropped_clauses.len(), 1, "{effects:?}");
+    assert!(effects
+        .obligations
+        .iter()
+        .any(|o| matches!(o, PureExpr::Bool(false))));
+
+    let mut effects = CallEffects::new();
+    apply_postconditions_with_effects(
+        &["^p == 5".to_string()],
+        &Signature::default(),
+        &result_var,
+        std::slice::from_ref(&stale),
+        Some(names.as_slice()),
+        &mut effects,
+        true,
+    );
+    assert!(effects.dropped_clauses.is_empty(), "{effects:?}");
+    assert_eq!(effects.assumptions.len(), 1);
+}
+
+/// A callee's `old(e)` over its parameters is `e` at the call's pre-state:
+/// the assumption carries no `old`, which the caller would read at its own
+/// entry.
+#[test]
+fn a_callee_old_is_read_at_the_call() {
+    let result_var = PureExpr::Var("result".to_string(), None);
+    let arg = TranslatedArg::new(PureExpr::Var("v".to_string(), None));
+    let names = vec!["x".to_string()];
+    let mut callee = Signature::new();
+    callee.insert(
+        "x",
+        Some(trust_wp_core::formula::elaborate::ParamReference::Value),
+        false,
+    );
+    let mut effects = CallEffects::new();
+    apply_postconditions_with_effects(
+        &["result == old(x) + 1".to_string()],
+        &callee,
+        &result_var,
+        std::slice::from_ref(&arg),
+        Some(names.as_slice()),
+        &mut effects,
+        true,
+    );
+    assert!(
+        effects
+            .assumptions
+            .iter()
+            .all(|a| !a.any_recursive(|node| matches!(node, PureExpr::Old(_)))),
+        "{:?}",
+        effects.assumptions
+    );
+}
+
+/// A lane that matches a callee clause's shape and substitutes the arguments
+/// reads the text as written, so it gets only a clause the call's state
+/// elaboration reads as written: a pre-Creusot clause (its bare `self@` is the
+/// final view) and a callee's `old(e)` (the call's pre-state, not the
+/// caller's entry) mean something else at the call.
+#[test]
+fn a_structural_lane_reads_only_a_clause_the_call_reads_as_written() {
+    use trust_wp_core::formula::elaborate::ParamReference;
+    let mut callee = Signature::new();
+    callee.insert("self", Some(ParamReference::Mutable), true);
+    callee.insert("value", Some(ParamReference::Value), false);
+    assert!(clause_read_as_written("(^self)@ == self@.push_back(value)", &callee).is_some());
+    assert!(clause_read_as_written("result == self@.len()", &callee).is_some());
+    for clause in [
+        "self@ == old(self@).push_back(value)",
+        "(^self)@ == old(self@).push_back(value)",
+        "result == old(*self)",
+    ] {
+        assert!(
+            clause_read_as_written(clause, &callee).is_none(),
+            "{clause}"
+        );
+    }
+}
+
+#[test]
+fn a_positional_alias_is_argn_or_a_value_alias() {
+    for name in ["arg0", "arg12", "value", "default", "arg", "rhs"] {
+        assert!(super::is_positional_alias(name), "{name}");
+    }
+    for name in ["args", "arg_0", "argx", "__twp_arg0", "values", "x"] {
+        assert!(!super::is_positional_alias(name), "{name}");
     }
 }

@@ -1,0 +1,12 @@
+{
+  "origin": "explicit shared-IR calculus fixture, not compiler output",
+  "native_interpreter": "40 executions passed; main/alias for all eight inputs; mutants refuted at true,false,true",
+  "proof_status": "pending; first decoding proof reached Lean maxRecDepth",
+  "sha256": {
+    "wrongBranch.tirb": "bc16bb5a3d5a14c1c6e9bbd9468ec13304c919e8638947cb97779eecfc70492e",
+    "permuted.tirb": "5fe837e2b55c016a6f18037a02aed81d7ec301cee08a3db9b0bc4e20354ecc6c",
+    "wrongArgument.tirb": "5806f13e428f28b710463d47b95fcb1a9f64efc528fb098fafa1ba584530726d",
+    "aliased.tirb": "986861ab5fb337533e9b8322b1851a934485aa85c51539d973be2c54da3ac05e",
+    "wrongCondition.tirb": "19a89c8a73b12f8447895ce23c6a472403f3264145c476c42aaa79ed0564aae1"
+  }
+}

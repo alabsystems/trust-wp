@@ -7,8 +7,10 @@
 
 //! Ghost block move validation test fixtures.
 //!
-//! This module contains test cases for ghost block move validation rules
-//! as defined in `designs/2026-02-01-ghost-code.md` Section D3.
+//! This module contains test cases for ghost block move validation. Ghost
+//! blocks are erased at runtime, so they may observe runtime values but not
+//! consume them: a non-Copy, non-Ghost value moved into a ghost block would
+//! be gone in the verified program yet still present in the executed one.
 //!
 //! ## Validation Rules Tested
 //!
@@ -22,7 +24,7 @@
 //!
 //! ```bash
 //! # Run the ghost move validation integration test
-//! cargo test -p trust-wp-driver --test ghost_move_validation
+//! targo --unverified test -p trust-wp-driver --test ghost_move_validation
 //! ```
 //!
 //! The integration test compiles these fixtures through trust-wp-rustc and

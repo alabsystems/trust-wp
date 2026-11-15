@@ -16,11 +16,12 @@ use super::{
     super::{
         super::contracts::FunctionContract,
         closure_enrichment::{
-            collect_trivial_closure_receivers, enrich_existentials_with_closure_ensures,
+            collect_contract_free_closure_receivers, enrich_existentials_with_closure_ensures,
             enrich_forall_goals_with_closure_ensures, instantiate_forall_precondition_rules,
             normalize_current_closure_capture_postconditions,
-            rewrite_trivial_closure_precondition_goal,
+            rewrite_contract_free_closure_precondition_goal,
             trivialize_closure_env_resolves_in_assumptions, ClosureEnsuresEntry,
+            ClosurePreconditions,
         },
         contract_rewrite::annotate_exprs_with_param_sorts,
         type_invariants::{
@@ -41,6 +42,12 @@ pub(super) struct EnrichmentData<'a> {
     pub(super) type_invariant_defs: &'a [TypeInvariantDef],
     pub(super) synthesized_closure_ensures: &'a [ClosureEnsuresEntry],
     pub(super) closure_capture_infos: &'a [ClosureCaptureInfo],
+    /// Trait and extern contracts, needed to compute a contract-free closure's
+    /// body precondition over the SAME callee specs the body's own
+    /// verification would see.
+    pub(super) trait_specs:
+        &'a std::collections::HashMap<rustc_hir::def_id::DefId, trust_wp_driver::StdSpec>,
+    pub(super) extern_specs: &'a std::collections::HashMap<String, trust_wp_driver::StdSpec>,
 }
 
 /// Apply clause enrichments to effective requires/ensures (#1526).
@@ -101,24 +108,48 @@ pub(super) fn enrich_effective_clauses(
         );
     }
 
-    // (4) Rewrite trivial closure precondition goals.
-    // Concrete closures without explicit requires have vacuous preconditions.
-    let trivial_closure_receivers = collect_trivial_closure_receivers(
+    // (4) Resolve contract-free closure preconditions to their body WP.
+    // A closure without `#[requires]` is transparent, not vacuous.
+    let contract_free_receivers = collect_contract_free_closure_receivers(
+        tcx,
         contract.local_def_id,
         &parsed.arg_names,
         &prep.user_specs,
     );
-    trace!("trivial closure receivers: {trivial_closure_receivers:?}");
-    if !trivial_closure_receivers.is_empty() {
+    trace!("contract-free closure receivers: {contract_free_receivers:?}");
+    if !contract_free_receivers.is_empty() {
+        // GOALS ONLY. `effective_requires` are ASSUMPTIONS when this contract
+        // is verified, and the receiver table is keyed on the source name of a
+        // closure aggregate in the BODY, while a `requires` clause can only
+        // name a PARAMETER — so every hit in premise position is a name
+        // collision, and rewriting there replaces the parameter's
+        // uninterpreted `precondition` with a DIFFERENT closure's body WP.
+        // The caller then discharges a clause about the closure it passed
+        // while the callee assumed one about a local: grant and obligation in
+        // different environments, which is D-54's defect one lane over.
+        let closure_preconditions = ClosurePreconditions::new(
+            tcx,
+            &prep.user_specs,
+            enrichment.trait_specs,
+            enrichment.extern_specs,
+        );
         let mut rewritten = 0usize;
         for goal in effective_ensures.iter_mut() {
-            if rewrite_trivial_closure_precondition_goal(goal, &trivial_closure_receivers) {
+            if rewrite_contract_free_closure_precondition_goal(
+                goal,
+                &contract_free_receivers,
+                &closure_preconditions,
+            ) {
                 rewritten += 1;
             }
         }
         for group in &mut parsed.loop_fields.loop_obligation_groups {
             for goal in &mut group.obligations {
-                if rewrite_trivial_closure_precondition_goal(goal, &trivial_closure_receivers) {
+                if rewrite_contract_free_closure_precondition_goal(
+                    goal,
+                    &contract_free_receivers,
+                    &closure_preconditions,
+                ) {
                     rewritten += 1;
                 }
             }
@@ -126,13 +157,25 @@ pub(super) fn enrich_effective_clauses(
         if rewritten > 0 {
             trace!(
                 rewritten,
-                "trivial closure precondition obligation(s) discharged"
+                "contract-free closure precondition(s) resolved to their body WP"
             );
         }
     }
 
     // (5) Inject type invariant pre/postconditions for non-primitive types (#359).
-    let (inv_requires, inv_ensures) =
+    //
+    // The PRECONDITIONS are read from the callee-keyed spec table, not rebuilt
+    // here. They are a premise in this body and an obligation at every call
+    // site of this function; two independent computations of the same clause
+    // set is precisely how a body ends up enjoying a premise no caller pays
+    // for. The builder is still called for the POSTCONDITIONS, which have no
+    // call-site counterpart — its precondition half is discarded unused.
+    let inv_requires = prep
+        .user_specs
+        .get(&contract.def_id)
+        .map(|spec| spec.inv_requires.clone())
+        .unwrap_or_default();
+    let (_discarded_requires, inv_ensures) =
         build_type_invariant_clauses(tcx, contract.def_id, &parsed.arg_names, type_invariant_defs);
     if !inv_requires.is_empty() || !inv_ensures.is_empty() {
         trace!(
@@ -148,8 +191,13 @@ pub(super) fn enrich_effective_clauses(
     // Closure captures with typed ExprSort annotations get invariant
     // assumptions as regular requires, replacing the ay-side bootstrap
     // injection that happened too late in the pipeline.
-    let capture_inv_requires =
-        build_closure_capture_invariant_requires(closure_capture_infos, type_invariant_defs);
+    //
+    // As with (5), the clauses are READ from the closure's spec-table entry
+    // (carried on the capture info) rather than rebuilt here: they are a
+    // premise in the closure's body and an obligation where the closure is
+    // CONSTRUCTED, and a capture the two sides disagreed about is a premise
+    // nobody pays for (D-66).
+    let capture_inv_requires = build_closure_capture_invariant_requires(closure_capture_infos);
     if !capture_inv_requires.is_empty() {
         trace!(
             count = capture_inv_requires.len(),
@@ -158,7 +206,7 @@ pub(super) fn enrich_effective_clauses(
         effective_requires.extend(capture_inv_requires);
     }
     let current_closure_self_inv_requires =
-        build_current_closure_self_invariant_requires(closure_capture_infos, type_invariant_defs);
+        build_current_closure_self_invariant_requires(closure_capture_infos);
     if !current_closure_self_inv_requires.is_empty() {
         trace!(
             count = current_closure_self_inv_requires.len(),

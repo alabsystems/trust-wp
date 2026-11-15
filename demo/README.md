@@ -50,7 +50,7 @@ Exit codes are the interface for scripts:
 From a fresh checkout, on a machine with the Trust toolchain installed:
 
 ```bash
-cargo build -p trust-wp-cli -p trust-wp-driver -p targo-trust-wp -p trust-wp -p creusot-contracts
+targo --unverified build -p trust-wp-cli -p trust-wp-driver -p targo-trust-wp -p trust-wp -p creusot-contracts
 ./target/debug/trust-wp doctor
 ```
 
@@ -116,9 +116,9 @@ A bounded model checker unrolls a loop to some depth and reports "no bug up to
 N". trust-wp asks for the induction hypothesis instead, and proves it for all N:
 
 ```rust
-#[requires(n >= 0 && n <= 100_000)]
+#[requires(n >= 0 && n <= 46_340)]
 #[ensures(result >= 0)]
-#[invariant(total >= 0 && i >= 0)]
+#[invariant(total >= 0 && i >= 0 && i <= n && total <= 46_340 * i)]
 #[variant(n - i)]
 pub fn sum_to(n: i32) -> i32 { /* ... */ }
 ```
@@ -214,7 +214,7 @@ endorsed by the Creusot project.
 ### 7. A whole crate
 
 Run `trust-wp` with no file inside a Cargo project and it verifies the package,
-driving `cargo check` with the trust-wp driver as the `RUSTC_WRAPPER`:
+driving `targo --unverified check` with the trust-wp driver as the `RUSTC_WRAPPER`:
 
 ```console
 $ cd examples/verified_math && trust-wp
@@ -240,9 +240,11 @@ Everything after `--` goes to cargo untouched: `trust-wp -- -p mycrate
 
 Deliberately, because it would not be honest to claim it:
 
-- **Arithmetic overflow.** The obligations here do not include "this addition
-  does not overflow". Preconditions in the demo bound their inputs; that is
-  specification, not a proof of absence of overflow.
+- **Arithmetic overflow.** Every machine-integer addition, subtraction,
+  multiplication, division and index in a verified function is a proof
+  obligation (`crates/trust-wp-driver/src/mir_analysis/extract/assertion.rs`).
+  The preconditions in the demo bound their inputs so those obligations are
+  provable; without them the run reports a counterexample at the overflow.
 - **`&mut` prophecy contracts** (`^v`, `old(*v)`) are shown only in
   `examples/mut_borrow.rs`, not here. All three of its functions verify and the
   file exits 0. An earlier revision of this document recorded the third,

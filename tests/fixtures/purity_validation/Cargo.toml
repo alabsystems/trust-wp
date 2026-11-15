@@ -25,6 +25,10 @@ name = "should_fail_logic_surface"
 path = "src/should_fail_logic_surface.rs"
 
 [[bin]]
+name = "should_fail_logic_surface_types"
+path = "src/should_fail_logic_surface_types.rs"
+
+[[bin]]
 name = "should_fail_raw_pointer_deref"
 path = "src/should_fail_raw_pointer_deref.rs"
 

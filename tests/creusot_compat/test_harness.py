@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,29 @@ def _wire_line(**overrides: int) -> str:
     return f"TRUST_WP_RESULT:v1 {pairs}\n"
 
 
+def _diag_line(
+    def_path: str,
+    kind: str,
+    *,
+    ay_result: str = "sat",
+    model_validated: str = "true",
+    status: str = "failed",
+    **extra: str,
+) -> str:
+    """A ``TRUST_WP_DIAGNOSTIC:v1`` record; defaults to a VALIDATED refutation."""
+    fields = {
+        "def_path": def_path,
+        "kind": kind,
+        "status": status,
+        "reason": "counterexample",
+        "ay_result": ay_result,
+        "model_validated": model_validated,
+        **extra,
+    }
+    pairs = " ".join(f"{key}={value}" for key, value in fields.items())
+    return f"TRUST_WP_DIAGNOSTIC:v1 {pairs}\n"
+
+
 def test_harness_binary_builds_are_locked(monkeypatch, tmp_path):
     """Both debug and stale-release rebuilds must preserve Cargo.lock authority."""
 
@@ -98,7 +122,98 @@ def test_harness_binary_builds_are_locked(monkeypatch, tmp_path):
     harness_runner.ensure_harness_binaries(tmp_path, verbose=False)
 
     assert len(calls) == 2
-    assert all(cmd[:3] == ["cargo", "build", "--locked"] for cmd, _ in calls)
+    # The Trust build tool with its explicit lane, never a bare `cargo`.
+    expected = harness_targets.build_tool_argv("build", "--locked")
+    assert all(cmd[: len(expected)] == expected for cmd, _ in calls)
+
+
+def test_build_tool_argv_names_the_trust_tool_and_its_lane(monkeypatch):
+    """Harness builds go through targo (or the caller's $CARGO), never a bare
+    `cargo`, and name `--unverified` only where targo accepts it."""
+    monkeypatch.delenv("CARGO", raising=False)
+    monkeypatch.delenv("RUSTC", raising=False)
+    assert harness_targets.build_tool_argv("build", "--locked") == [
+        "targo", "--unverified", "build", "--locked",
+    ]
+    # targo refuses `--unverified` on a non-compilation command.
+    assert harness_targets.build_tool_argv("metadata", "--locked") == [
+        "targo", "metadata", "--locked",
+    ]
+    assert harness_targets.compiler_tool() == "trustc"
+    monkeypatch.setenv("CARGO", "/opt/trust/bin/targo")
+    assert harness_targets.build_tool_argv("check") == [
+        "/opt/trust/bin/targo", "--unverified", "check",
+    ]
+    # A caller's non-targo $CARGO picks its own lane.
+    monkeypatch.setenv("CARGO", "/opt/other/bin/cargo")
+    assert harness_targets.build_tool_argv("check") == ["/opt/other/bin/cargo", "check"]
+
+
+@pytest.mark.parametrize("command", ["/opt/trust/bin/targo", "/opt/trust/bin/trustc"])
+def test_tool_identity_uses_the_closed_native_metadata_query(monkeypatch, command):
+    monkeypatch.setenv("BUILD_SLOT_CPU_PROTOCOL", "3")
+    identity = b"commit-hash: fixture\nhost: fixture\nrelease: fixture\n"
+    calls = []
+
+    def query(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs == {"stderr": subprocess.STDOUT}
+        assert os.environ["BUILD_SLOT_CPU_PROTOCOL"] == "3"
+        return identity
+
+    monkeypatch.setattr(harness_targets.subprocess, "check_output", query)
+
+    assert harness_targets._tool_identity(command) == identity
+    assert calls == [[command, "-vV"]]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("compiler unavailable"),
+        subprocess.CalledProcessError(75, ["trustc", "-vV"], output=b"custody refused"),
+    ],
+)
+def test_tool_identity_fails_closed_without_retry_or_fallback(monkeypatch, error):
+    calls = []
+
+    def query(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs == {"stderr": subprocess.STDOUT}
+        raise error
+
+    monkeypatch.setattr(harness_targets.subprocess, "check_output", query)
+
+    with pytest.raises(RuntimeError, match="cannot fingerprint build tool trustc") as raised:
+        harness_targets._tool_identity("trustc")
+    assert raised.value.__cause__ is error
+    assert calls == [["trustc", "-vV"]]
+
+
+def test_the_offline_retry_goes_after_the_subcommand(monkeypatch, tmp_path):
+    """`targo --unverified build`: the retry's `--offline` must follow `build`,
+    not split the lane from its subcommand."""
+    monkeypatch.delenv("CARGO", raising=False)
+    calls = []
+
+    class RecordingSubprocess:
+        @staticmethod
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["git", "checkout"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    returncode=101, stdout="", stderr="error: cannot update the lock file"
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    harness = SimpleNamespace(subprocess=RecordingSubprocess)
+    cmd = harness_targets.build_tool_argv("build", "--locked", "-p", "trust-wp-driver")
+    result = harness_runner._run_cargo_build(harness, cmd, tmp_path, verbose=False)
+
+    assert result.returncode == 0
+    assert calls[1] == ["targo", "--unverified", "build", "--offline", "-p", "trust-wp-driver"]
 
 
 def _seed_harness_provenance_workspace(monkeypatch, tmp_path: Path) -> Path:
@@ -163,6 +278,25 @@ def test_skip_prebuild_rejects_source_drift(monkeypatch, tmp_path):
     monkeypatch.setenv("TRUST_WP_HARNESS_SKIP_PREBUILD", "1")
     with pytest.raises(RuntimeError, match="source/dependency/toolchain fingerprint changed"):
         harness.ensure_harness_binaries(workspace, verbose=False)
+
+
+def test_harness_fingerprint_ignores_how_the_build_tool_is_spelled(monkeypatch, tmp_path):
+    """One toolchain, one fingerprint: under targo `$CARGO` is targo's absolute
+    path, from a shell it is unset and the harness runs bare `targo`. Skip-
+    prebuild provenance written in one context must hold in the other, and a
+    different toolchain identity must still move the fingerprint."""
+    workspace = _seed_harness_provenance_workspace(monkeypatch, tmp_path)
+    monkeypatch.delenv("RUSTC", raising=False)
+    identities = {"targo": b"targo (commit A)", "trustc": b"trustc (commit A)"}
+    monkeypatch.setattr(
+        harness_targets, "_tool_identity", lambda command: identities[Path(command).name]
+    )
+    monkeypatch.delenv("CARGO", raising=False)
+    from_shell = harness_targets._harness_source_fingerprint(workspace)
+    monkeypatch.setenv("CARGO", "/opt/trust/bin/targo")
+    assert harness_targets._harness_source_fingerprint(workspace) == from_shell
+    identities["targo"] = b"targo (commit B)"
+    assert harness_targets._harness_source_fingerprint(workspace) != from_shell
 
 
 def test_skip_prebuild_rejects_binary_drift(monkeypatch, tmp_path):
@@ -270,9 +404,9 @@ def test_derive_solver_timeout_restores_watchdog_inside_wall(monkeypatch):
     """The derived solver budget keeps every driver envelope inside the wall.
 
     Invariant (#2708): wall >= compile margin (20s) + 5 x B (driver crate
-    wall, #2674) + 1.5 x B + 0.1s (driver watchdog envelope).  Historically
-    the harness passed the wall itself as --timeout, so the watchdog at
-    1.5 x wall could NEVER fire before the process kill at the wall.
+    wall, #2674) + 1.5 x B + 0.1s (driver watchdog envelope).  Passing the
+    wall itself as --timeout breaks it: the watchdog at 1.5 x wall could
+    NEVER fire before the process kill at the wall.
     """
     monkeypatch.delenv("TRUST_WP_HARNESS_SOLVER_TIMEOUT", raising=False)
     # The standard walls: SS lane, per-test overrides, SF lane, default.
@@ -537,7 +671,10 @@ def test_private_wrapper_rejects_ambiguous_driver_identity(tmp_path):
         [
             str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
             str(fake_rustc),
-            "--version",
+            "--crate-name",
+            "trust_wp_driver",
+            "--emit=metadata",
+            "input.rs",
         ],
         cwd=WORKSPACE_ROOT,
         capture_output=True,
@@ -805,10 +942,13 @@ def test_private_wrapper_rejects_target_spec_paths_before_cache_use(tmp_path):
     result = subprocess.run(
         [
             str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
-            "/bin/false",
+            sys.executable,  # Invalid targets must be refused before compiler probing.
             "--target",
             str(target_spec),
-            "--version",
+            "--crate-name",
+            "trust_wp_driver",
+            "--emit=metadata",
+            "input.rs",
         ],
         cwd=WORKSPACE_ROOT,
         capture_output=True,
@@ -827,7 +967,10 @@ def test_private_wrapper_rejects_ambiguous_private_sysroots(tmp_path):
         [
             str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
             str(fake_rustc),
-            "--version",
+            "--crate-name",
+            "trust_wp_driver",
+            "--emit=metadata",
+            "input.rs",
         ],
         cwd=WORKSPACE_ROOT,
         capture_output=True,
@@ -861,7 +1004,10 @@ def test_private_wrapper_does_not_reclaim_observed_stale_lock(tmp_path):
         [
             str(WORKSPACE_ROOT / "scripts" / "trustc-private-wrapper.sh"),
             str(fake_rustc),
-            "--version",
+            "--crate-name",
+            "trust_wp_driver",
+            "--emit=metadata",
+            "input.rs",
         ],
         cwd=WORKSPACE_ROOT,
         stdout=subprocess.PIPE,
@@ -964,17 +1110,9 @@ def review_dependency_fixture(tmp_path):
         ],
         check=True,
     )
-    ay_commit = subprocess.run(
-        ["git", "-C", str(ay), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
     trust_ir_commit = "1" * 40
     (project / "Cargo.toml").write_text(
         f"""\
-# Current AY authority: version=0.1.0 commit={ay_commit}
 [workspace]
 members = []
 
@@ -983,12 +1121,6 @@ trust-ir = {{ git = "https://github.com/alabsystems/trust-ir.git", rev = "{trust
 ay-core = {{ path = "../ay/crates/ay-core" }}
 ay-dpll = {{ path = "../ay/crates/ay-dpll" }}
 """
-    )
-    (project / "VISION.md").write_text(
-        "| Component | Status | Tests | Notes |\n"
-        f"| trust-wp-ay | Building | fixture | AY v0.1.0 backend at `{ay_commit[:8]}` "
-        "on current `main` |\n",
-        encoding="utf-8",
     )
     (project / "Cargo.lock").write_text(
         f"""\
@@ -1011,9 +1143,11 @@ version = "0.1.0"
     return project, ay, trust_ir_commit
 
 
-def _run_review_dependency_validator(project: Path, ay: Path, trust_ir_ref: str):
+def _run_review_dependency_validator(
+    project: Path, ay: Path, trust_ir_ref: str, *, ay_ref: str = ""
+):
     return subprocess.run(
-        [sys.executable, "-", str(project), str(ay), "", "", trust_ir_ref],
+        [sys.executable, "-", str(project), str(ay), "", ay_ref, trust_ir_ref],
         input=_review_dependency_validator_source(),
         capture_output=True,
         text=True,
@@ -1023,12 +1157,19 @@ def _run_review_dependency_validator(project: Path, ay: Path, trust_ir_ref: str)
 
 def test_review_dependency_validator_accepts_exact_fixture(review_dependency_fixture):
     project, ay, trust_ir_commit = review_dependency_fixture
-    result = _run_review_dependency_validator(project, ay, trust_ir_commit)
+    ay_commit = subprocess.check_output(
+        ["git", "-C", str(ay), "rev-parse", "HEAD"], text=True
+    ).strip()
+    result = _run_review_dependency_validator(
+        project, ay, trust_ir_commit, ay_ref=ay_commit
+    )
     assert result.returncode == 0, result.stderr
     assert "cargo_toml_trust_ir_matches_lock: yes" in result.stdout
     assert "sibling_ay_is_path_dep_source_of_truth: yes" in result.stdout
     assert "ay_evidence_version: 0.1.0" in result.stdout
-    assert "active_ay_provenance_claims_match_evidence: yes" in result.stdout
+    assert f"ay_evidence_commit: {ay_commit}" in result.stdout
+    assert "ay_dependency_evidence_validated: yes" in result.stdout
+    assert not (project / "VISION.md").exists()
 
 
 def test_review_dependency_validator_rejects_wrong_remote(review_dependency_fixture):
@@ -1101,31 +1242,51 @@ def test_review_dependency_validator_rejects_dirty_ay(review_dependency_fixture)
     assert "uncommitted path" in result.stderr
 
 
-def test_review_dependency_validator_rejects_cargo_ay_claim_drift(
+def test_review_dependency_validator_uses_dependencies_despite_stale_document_claims(
     review_dependency_fixture,
 ):
     project, ay, trust_ir_commit = review_dependency_fixture
-    manifest = (project / "Cargo.toml").read_text().replace(
-        "Current AY authority: version=0.1.0",
-        "Current AY authority: version=9.9.9",
+    manifest = (project / "Cargo.toml").read_text()
+    (project / "Cargo.toml").write_text(
+        "# Current AY authority: version=9.9.9 commit=" + "0" * 40 + "\n" + manifest
     )
-    (project / "Cargo.toml").write_text(manifest)
+    (project / "VISION.md").write_text(
+        "| trust-wp-ay | Historical prose without dependency authority |\n"
+    )
     result = _run_review_dependency_validator(project, ay, trust_ir_commit)
-    assert result.returncode != 0
-    assert "current AY authority claim" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "ay_evidence_version: 0.1.0" in result.stdout
 
 
-def test_review_dependency_validator_rejects_vision_ay_claim_drift(
+@pytest.mark.parametrize("ay_ref", ["main", "0" * 40])
+def test_review_dependency_validator_rejects_ay_expected_ref_drift(
     review_dependency_fixture,
+    ay_ref,
 ):
     project, ay, trust_ir_commit = review_dependency_fixture
-    vision = (project / "VISION.md").read_text().replace(
-        "AY v0.1.0 backend", "AY v9.9.9 backend"
+    result = _run_review_dependency_validator(
+        project, ay, trust_ir_commit, ay_ref=ay_ref
     )
-    (project / "VISION.md").write_text(vision)
+    assert result.returncode != 0
+    assert (
+        "must be the 40-hex sibling ../ay HEAD commit" in result.stderr
+        if ay_ref == "main"
+        else "does not match sibling ../ay HEAD" in result.stderr
+    )
+
+
+def test_review_dependency_validator_rejects_wrong_ay_origin(review_dependency_fixture):
+    project, ay, trust_ir_commit = review_dependency_fixture
+    subprocess.run(
+        [
+            "git", "-C", str(ay), "remote", "set-url", "origin",
+            "https://github.com/example/ay.git",
+        ],
+        check=True,
+    )
     result = _run_review_dependency_validator(project, ay, trust_ir_commit)
     assert result.returncode != 0
-    assert "VISION.md current trust-wp-ay claim" in result.stderr
+    assert "expected github.com/alabsystems/ay" in result.stderr
 
 
 def test_review_dependency_validator_rejects_stale_ay_lock_version(
@@ -1142,6 +1303,45 @@ def test_review_dependency_validator_rejects_stale_ay_lock_version(
     result = _run_review_dependency_validator(project, ay, trust_ir_commit)
     assert result.returncode != 0
     assert "does not match sibling package version" in result.stderr
+
+
+@pytest.mark.parametrize("drift", [None, "origin", "selector", "manifest", "expected"])
+def test_review_dependency_validator_requires_exact_git_ay_evidence(
+    review_dependency_fixture, drift,
+):
+    project, ay, trust_ir_commit = review_dependency_fixture
+    commit = "3" * 40
+    manifest = (project / "Cargo.toml").read_text()
+    lock = (project / "Cargo.lock").read_text()
+    for crate in ("ay-core", "ay-dpll"):
+        manifest = manifest.replace(
+            f'{crate} = {{ path = "../ay/crates/{crate}" }}',
+            f'{crate} = {{ git = "https://github.com/alabsystems/ay.git", rev = "{commit}" }}',
+        )
+        lock = lock.replace(
+            f'name = "{crate}"\nversion = "0.1.0"',
+            f'name = "{crate}"\nversion = "0.1.0"\n'
+            f'source = "git+https://github.com/alabsystems/ay.git?rev={commit}#{commit}"',
+        )
+    if drift == "origin":
+        lock = lock.replace("github.com/alabsystems/ay.git", "github.com/example/ay.git")
+    elif drift == "selector":
+        lock = lock.replace(f"?rev={commit}", "?branch=main")
+    elif drift == "manifest":
+        manifest = manifest.replace(commit, "4" * 40)
+    (project / "Cargo.toml").write_text(manifest)
+    (project / "Cargo.lock").write_text(lock)
+    result = _run_review_dependency_validator(
+        project, ay, trust_ir_commit, ay_ref="4" * 40 if drift == "expected" else commit
+    )
+    if drift is None:
+        assert result.returncode == 0, result.stderr
+        assert "ay_dependency_mode: git" in result.stdout
+        assert f"ay_evidence_commit: {commit}" in result.stdout
+        assert "ay_dependency_evidence_validated: yes" in result.stdout
+    else:
+        assert result.returncode != 0, result.stdout
+        assert "ay" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1280,8 +1480,44 @@ class TestExitCodes:
 class TestProjectHelpers:
     """Tests for extracted project helper functions."""
 
-    def test_create_warmup_project_writes_scaffold(self, tmp_path):
+    def test_create_warmup_project_writes_scaffold(self, tmp_path, monkeypatch):
+        harness_project = harness.harness_project
+        ws_lock_text = (WORKSPACE_ROOT / "Cargo.lock").read_text()
+        # Exercise scaffolding and the real lock-subgraph validator without
+        # requiring a populated Cargo cache or waiting on another Cargo build.
+        # Metadata resolution itself belongs to the locked build integration
+        # gate. This stand-in adds only the fixture root to the reviewed graph.
+        expected_child_lock = ws_lock_text + '''
+[[package]]
+name = "creusot_test"
+version = "0.1.0"
+dependencies = [
+ "creusot-contracts",
+ "creusot-std",
+ "trust-wp",
+ "trust-wp-std",
+]
+'''
+        metadata_calls = []
+
+        def metadata(cmd, **kwargs):
+            metadata_calls.append(cmd)
+            assert kwargs["env"]["CARGO_NET_OFFLINE"] == "true"
+            lock_path = Path(kwargs["cwd"]) / "Cargo.lock"
+            if "--locked" in cmd:
+                assert lock_path.read_text() == expected_child_lock
+            else:
+                assert lock_path.read_text() == ws_lock_text
+                lock_path.write_text(expected_child_lock)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(harness_project, "_CHILD_LOCK_CACHE", {})
+        monkeypatch.setattr(harness_project.subprocess, "run", metadata)
         project_dir = harness.create_warmup_project(WORKSPACE_ROOT, tmp_path)
+        assert metadata_calls == [
+            harness_targets.build_tool_argv("metadata", "--format-version", "1"),
+            harness_targets.build_tool_argv("metadata", "--locked", "--format-version", "1"),
+        ]
         assert project_dir == tmp_path / "test_project", (
             f"Expected warmup project at {tmp_path / 'test_project'}, got {project_dir}"
         )
@@ -1297,10 +1533,8 @@ class TestProjectHelpers:
         # from its graph). The derivation itself verifies, fail-closed, that
         # every package is pinned identically to the workspace lock; here we
         # re-assert the observable contract on the written file.
-        from tests.creusot_compat import harness_project
-
         child_lock_text = (project_dir / "Cargo.lock").read_text()
-        ws_lock_text = (WORKSPACE_ROOT / "Cargo.lock").read_text()
+        assert child_lock_text == expected_child_lock
         harness_project._verify_child_lock_subgraph(child_lock_text, ws_lock_text)
         child_packages = harness_project._parse_lock_packages(child_lock_text)
         assert any(p["name"] == "creusot_test" for p in child_packages), (
@@ -2312,9 +2546,9 @@ def test_parse_wire_line_rejects_future_fields():
 
 
 def test_parse_wire_line_accepts_current_driver_emitter_shape():
-    """The exact line the a6a8511 driver emits (with proof_assert_verified) must
-    parse; its rejection was the tip13 26-test no-reason signature — every
-    wire-based classification carve-out silently collapsed to error."""
+    """The exact line the current driver emits (with proof_assert_verified)
+    must parse: when parse_wire_line rejects it, every wire-based
+    classification carve-out silently collapses to error with no reason."""
     line = (
         "TRUST_WP_RESULT:v1 base_exit_code=2 verified=2 failed=0 errors=0 "
         "warnings=0 assumed=0 trusted=2 skipped=0 verified_with_axiom_deps=0 "
@@ -2332,9 +2566,9 @@ def test_parse_wire_line_accepts_current_driver_emitter_shape():
 
 
 def test_parse_wire_line_accepts_missing_proof_assert_verified():
-    """Lines emitted before the field existed (pre-a6a8511 drivers, stored
-    baselines) must keep parsing: the field is optional, mirroring the Rust
-    decoder's REQUIRED_FIELDS bitmask which claims no bit for it."""
+    """Lines without the field (older drivers, stored baselines) must keep
+    parsing: the field is optional, mirroring the Rust decoder's
+    REQUIRED_FIELDS bitmask which claims no bit for it."""
     line = " ".join(
         token
         for token in _wire_line(verified=1, trusted=1).strip().split()
@@ -2355,9 +2589,9 @@ def test_parse_wire_line_accepts_missing_proof_assert_verified():
 # Rust emitter and decoder are driven by) and pinned by a Rust unit test
 # (wire_manifest_fixture_matches_code). The tests below pin BOTH Python
 # decoders to the same file, so a wire-field change cannot land without
-# touching the mirrors — the drift class behind the two mirror incidents (the
-# stale hand-maintained tuple documented atop this file, and the
-# proof_assert_verified day fixed by commit 6cd6400). Unknown-field rejection
+# touching the mirrors — the drift class behind the stale hand-maintained
+# tuple documented atop this file and a decoder that lagged the
+# proof_assert_verified field. Unknown-field rejection
 # stays (test_parse_wire_line_rejects_future_fields): the fixture enforces
 # agreement, not tolerance.
 
@@ -2614,14 +2848,39 @@ class TestClassifyShouldFailResult:
     """Tests for the should_fail classification logic."""
 
     def test_expected_reject_is_pass(self):
-        """When trust-wp rejects (success=False, raw=fail), should_fail -> pass."""
+        """A ``FAILED ✗`` verdict backed by a validated model -> pass."""
         status, reason = harness.classify_should_fail_result(
             success=False,
-            output="FAILED: verification counterexample found",
+            output=(
+                _diag_line("bad", "function_contract")
+                + "trust-wp: bad FAILED ✗ (counterexample found)\n"
+                + _wire_line(failed=1, base_exit_code=1)
+            ),
             source="fn bad() {}",
         )
         assert status == "pass"
         assert reason is None, f"Rc source should not produce a skip reason, got {reason!r}"
+
+    def test_bare_failed_verdict_line_is_unknown(self):
+        """The driver prints ``FAILED ✗`` for unvalidated results too; the line
+        alone is not a refutation."""
+        status, _reason, credit = harness.classify_should_fail_result_with_credit(
+            success=False,
+            output="trust-wp: bad FAILED ✗ (counterexample found)",
+            source="fn bad() {}",
+        )
+        assert (status, credit) == ("unknown", None)
+
+    def test_generic_fail_without_disproof_evidence_is_unknown(self):
+        """classify_failure's ``fail`` without a refutation line
+        (no ``FAILED ✗`` verdict, no wire failed, no ghost validation error)
+        is not a credited rejection."""
+        status, reason, credit = harness.classify_should_fail_result_with_credit(
+            success=False,
+            output="FAILED: verification counterexample found",
+            source="fn bad() {}",
+        )
+        assert (status, credit) == ("unknown", None), (status, reason, credit)
 
     def test_broad_compile_error_is_error_without_expected_evidence(self):
         """Broad compile diagnostics do not prove an expected should-fail rejection."""
@@ -2704,7 +2963,7 @@ class TestClassifyShouldFailResult:
                 "error: could not compile `creusot_test` (lib) due to 1 previous error\n"
             ),
             source="fn bad() {}",
-            test_name="tests/should_fail/ignore_overflow.rs",
+            test_name="tests/should_fail/unsupported/char_pattern.rs",
             exit_code=101,
         )
         assert status == "error", (
@@ -2712,6 +2971,24 @@ class TestClassifyShouldFailResult:
         )
         assert reason is None, (
             f"Backend compile error should not produce a reason, got {reason!r}"
+        )
+
+    def test_ignore_overflow_is_not_backend_superseded(self):
+        """ignore_overflow must be credited by a real rejection, never allowlisted.
+
+        `const { N + 1 }` overflows for N = u32::MAX; crediting it as
+        "backend superseded" would hide a false accept.
+        """
+        assert harness._check_backend_superseded("tests/should_fail/ignore_overflow.rs") is None
+        status, _reason = harness.classify_should_fail_result(
+            success=True,
+            output="trust-wp: 0 verified, 0 failed, 0 errors\n",
+            source="pub fn f<const N: u32>() { const { N + 1 }; }",
+            test_name="tests/should_fail/ignore_overflow.rs",
+            exit_code=0,
+        )
+        assert status != "pass", (
+            f"an accepted ignore_overflow run must not classify as pass, got {status!r}"
         )
 
     def test_cargo_lock_error_stays_error(self):
@@ -2784,7 +3061,11 @@ class TestClassifyShouldFailResult:
         assert reason == "vacuous accept: no verification activity"
 
     def test_should_fail_per_function_rejection_is_not_vacuous(self):
-        """Per-function status lines prove the lane saw real verification work."""
+        """Per-function status lines prove the lane saw real verification work.
+
+        Without a validated refutation record the failure is ``unknown`` —
+        but never the vacuous-accept ``error``.
+        """
         output = (
             "trust-wp: bad failed \u2717\n"
             "trust-wp: 0 verified, 1 failed, 0 errors\n"
@@ -2796,12 +3077,12 @@ class TestClassifyShouldFailResult:
             test_name="tests/should_fail/synthetic_contract.rs",
             exit_code=1,
         )
-        assert status == "pass"
+        assert status == "unknown"
         assert reason is None
 
     def test_unsupported_source_is_error(self):
         """Unsupported should_fail sources fail closed instead of skipping."""
-        # Use `#[open]` as the unsupported feature — prophetic is now supported (#2683).
+        # Use `#[open]` as the unsupported feature — prophetic is supported (#2683).
         status, reason = harness.classify_should_fail_result(
             success=False,
             output="some output",
@@ -2821,7 +3102,7 @@ class TestClassifyShouldFailResult:
         assert reason is None, f"Expected no skip reason for #[law] fallthrough, got {reason!r}"
 
     def test_logic_law_source_should_fail_result_falls_through(self):
-        """#[logic(law)] should no longer be intercepted as unsupported."""
+        """#[logic(law)] is not intercepted as unsupported."""
         status, reason = harness.classify_should_fail_result(
             success=True,
             output="verified ✓",
@@ -2959,11 +3240,11 @@ class TestClassifyShouldFailResult:
         )
 
     def test_duplicate_specs_correctly_rejected(self):
-        """duplicate_specs: trust-wp now detects duplicate extern_spec (#2686).
+        """duplicate_specs: trust-wp detects duplicate extern_spec (#2686).
 
-        duplicate_specs.rs was removed from _KNOWN_EXPECTED_DIVERGENCE_TESTS
-        (2026-04-14) because trust-wp now detects duplicate/conflicting
-        extern_spec declarations and rejects them with exit code 2.
+        duplicate_specs.rs is not in _KNOWN_EXPECTED_DIVERGENCE_TESTS because
+        trust-wp detects duplicate/conflicting extern_spec declarations and
+        rejects them with exit code 2.
         When the output contains 'duplicate/conflicting extern_spec',
         the classifier should return 'pass' (correctly rejected).
         """
@@ -3013,6 +3294,30 @@ class TestClassifyShouldFailResult:
         )
         assert status == "pass", (
             f"Ghost-context rejection should classify as pass, got {status!r}"
+        )
+        assert reason is None
+
+    def test_frontend_rejection_ghost_run_time_body_is_pass(self):
+        """generic_deref_ghost: the program-context refusal of a bound that runs
+        a ghost's `Deref` is a valid should-fail result (D-193)."""
+        status, reason = harness.classify_should_fail_result(
+            success=False,
+            output=(
+                "error: trust-wp: `<creusot_std::Ghost<i32> as Deref>` runs outside "
+                "ghost!(...) and snapshot!(...), where its run-time body is not the "
+                "logical operation the verifier reads; move it into ghost!(...), "
+                "snapshot!(...) or a specification\n"
+                "error: could not compile `creusot_test` (lib) due to 1 previous error\n"
+            ),
+            source=(
+                "pub fn deref_wrap<T: Deref>(x: &T) -> &T::Target { &*x }\n"
+                "pub fn bad(x: Ghost<i32>) -> i32 { *deref_wrap(&x) }"
+            ),
+            test_name="tests/should_fail/generic_deref_ghost.rs",
+            exit_code=101,
+        )
+        assert status == "pass", (
+            f"Ghost run-time body refusal should classify as pass, got {status!r}"
         )
         assert reason is None
 
@@ -3538,6 +3843,20 @@ class TestComputeLanePairFreshness:
 
 
 class TestBaselineFreshness:
+    @pytest.fixture(autouse=True)
+    def _mock_commit_relation_for_metadata_tests(self, monkeypatch):
+        from tests.creusot_compat import harness_provenance
+
+        def relation(workspace, commit):
+            age = harness._commit_distance_to_head(workspace, commit)
+            return {
+                "is_ancestor": age is not None,
+                "age_commits": age,
+                "source_equivalent_to_head": False,
+            }
+
+        monkeypatch.setattr(harness_provenance, "_baseline_commit_relation", relation)
+
     def test_commit_override_replaces_lane_metadata(self, monkeypatch, tmp_path):
         canonical_output = tmp_path / "results.json"
         canonical_should_fail_output = tmp_path / "results-should-fail.json"
@@ -3867,13 +4186,13 @@ class TestBaselineFreshness:
 
 
 # ---------------------------------------------------------------------------
-# classify_failure: Rc/Arc source no longer auto-skipped (#634)
+# classify_failure: Rc/Arc source is not auto-skipped (#634)
 # ---------------------------------------------------------------------------
 
 
 class TestClassifyFailureRcArc:
-    """Rc/Arc source patterns should NOT trigger auto-skip now that
-    trust-wp-std has Rc/Arc specs wired in std_specs.rs."""
+    """Rc/Arc source patterns must NOT trigger auto-skip: trust-wp-std has
+    Rc/Arc specs wired in std_specs.rs."""
 
     def test_rc_source_not_skipped(self):
         """Source with Rc:: should fall through to output-based classification."""
@@ -3904,7 +4223,7 @@ class TestClassifyFailureRcArc:
 
     def test_other_unsupported_is_error(self):
         """Other source-level unsupported features fail closed."""
-        # Use `#[open]` as the unsupported feature — prophetic is now supported (#2683).
+        # Use `#[open]` as the unsupported feature — prophetic is supported (#2683).
         status, reason = harness.classify_failure(
             output="FAILED: something",
             source="#[open]\nfn reflexive() {}",
@@ -3913,7 +4232,7 @@ class TestClassifyFailureRcArc:
         assert reason is None, f"Expected no skip reason for open source strict error, got {reason!r}"
 
     def test_law_source_falls_through_to_output_classification(self):
-        """Law annotations should now classify from the output text."""
+        """Law annotations classify from the output text."""
         status, reason = harness.classify_failure(
             output="FAILED: counterexample",
             source="#[law]\nfn reflexive() {}",
@@ -3924,7 +4243,7 @@ class TestClassifyFailureRcArc:
         assert reason is None, f"Expected no skip reason for #[law] output fallthrough, got {reason!r}"
 
     def test_prophetic_source_falls_through_to_output_classification(self):
-        """Prophetic logic is now supported — classify from output, not skip (#2683)."""
+        """Prophetic logic is supported — classify from output, not skip (#2683)."""
         status, reason = harness.classify_failure(
             output="FAILED: counterexample",
             source="#[logic(prophetic)]\nfn reflexive() {}",
@@ -3936,7 +4255,7 @@ class TestClassifyFailureRcArc:
 
     def test_unsupported_source_exit_101_is_error(self):
         """Unsupported sources fail closed even with panic-like exit text."""
-        # Use `#[open]` as the unsupported feature — prophetic is now supported (#2683).
+        # Use `#[open]` as the unsupported feature — prophetic is supported (#2683).
         status, reason = harness.classify_failure(
             output="trust-wp: 0 verified, 0 failed, 0 errors\n(exit status: 101)",
             source="#[open]\nfn p() {}",
@@ -3967,9 +4286,9 @@ class TestClassifyFailureRcArc:
     def test_cell_02_fib_scenario_suppressed_panic_with_contracts(self):
         """cell/02_fib.rs: contracts found, exit code 101, no panic string (#1032).
 
-        Previously misclassified as 'skip' with 'no contracts verified' because
-        the classifier fell through to the contract-count check before the
-        _has_panic_exit_status guard was added.
+        Without the _has_panic_exit_status guard the classifier falls through
+        to the contract-count check and misclassifies this as 'skip' with
+        'no contracts verified'.
         """
         # Simulates the cell/02_fib output: trust-wp finds contracts but panics
         # during encoding (fmap_lookup). The panic hook is suppressed so the
@@ -5966,7 +6285,7 @@ class TestCargoLockContention:
 
     def test_contention_does_not_mask_unsupported_source(self):
         """Source-level unsupported features take priority over contention."""
-        # Use `#[open]` as the unsupported feature — prophetic is now supported (#2683).
+        # Use `#[open]` as the unsupported feature — prophetic is supported (#2683).
         output = (
             "[cargo-lock] Waiting for build lock on trust-wp "
             "(held by slot 0: trust-wp (WORKER))...\n"
@@ -6286,6 +6605,22 @@ class TestInvalidateTestCrateCache:
         assert (build_dir / "trust-wp-abc123").exists(), \
             "trust-wp build dir should be preserved"
 
+    def test_removes_the_package_units_of_the_build_dir_layout(self, tmp_path):
+        """Cargo's build-dir layout keeps a package's units in build/<package>/."""
+        build_dir = tmp_path / "debug" / "build"
+        unit = build_dir / "creusot_test" / "0123abcd"
+        (unit / "fingerprint").mkdir(parents=True)
+        (unit / "out").mkdir()
+        (unit / "out" / "libcreusot_test-0123abcd.rlib").write_text("")
+        dependency = build_dir / "trust-wp" / "4567ef01" / "out"
+        dependency.mkdir(parents=True)
+
+        harness_runner._invalidate_test_crate_cache(tmp_path)
+
+        assert not (build_dir / "creusot_test").exists(), \
+            "creusot_test's units should be removed"
+        assert dependency.exists(), "trust-wp's units should be preserved"
+
 
 class TestWarmupSharedTarget:
     """Tests for _warmup_shared_target runner orchestration."""
@@ -6372,8 +6707,10 @@ class TestWarmupSharedTarget:
         assert warmup_calls == [(workspace, warmup_dir)], (
             f"Expected dedicated warmup project call, got {warmup_calls!r}"
         )
-        assert run_calls == [(["cargo", "check", "--locked"], warmup_project)], (
-            f"Expected cargo check in warmup project, got {run_calls!r}"
+        assert run_calls == [
+            (harness_targets.build_tool_argv("check", "--locked"), warmup_project)
+        ], (
+            f"Expected targo check in warmup project, got {run_calls!r}"
         )
         assert removed_dirs == [(warmup_dir, True)], (
             f"Expected warmup dir cleanup, got {removed_dirs!r}"
@@ -6383,6 +6720,77 @@ class TestWarmupSharedTarget:
 # ---------------------------------------------------------------------------
 # classify_error_category (#2690)
 # ---------------------------------------------------------------------------
+
+
+class TestDriverResultErrorCategory:
+    """A Cargo trailer cannot erase a typed verifier outcome."""
+
+    @pytest.mark.parametrize("counter", ["failed", "proof_assert_failed"])
+    def test_driver_failure_is_not_rust_compilation_failure(self, counter):
+        output = (
+            "trust-wp: f FAILED (postcondition)\n"
+            "error: could not compile `creusot_test` (lib)\n"
+            + _wire_line(base_exit_code=1, **{counter: 1})
+        )
+        assert harness.classify_error_category(output, exit_code=1) == "verification"
+        assert harness.classify_failure(output, "#[ensures(result)] fn f() {}", exit_code=1)[0] == "error"
+
+    def test_driver_unknown_is_not_rust_compilation_failure(self):
+        output = (
+            "trust-wp: f unknown (proof-trusted)\n"
+            "error: could not compile `creusot_test` (lib)\n"
+            + _wire_line(base_exit_code=2, errors=1)
+        )
+        assert harness.classify_error_category(output, exit_code=2) == "unknown"
+
+    @pytest.mark.parametrize("counter", ["parse_errors", "termination_errors", "logic_recursion_errors", "erasure_errors"])
+    def test_frontend_driver_counter_stays_encoding(self, counter):
+        output = "error: could not compile `creusot_test` (lib)\n" + _wire_line(
+            base_exit_code=3, errors=1, **{counter: 1}
+        )
+        assert harness.classify_error_category(output, exit_code=1) == "encoding"
+
+    @pytest.mark.parametrize("diagnostic", [
+        "error: trust-wp: `old_x` is reserved; rename it",
+        "error: ghost type escape: unread Ghost body",
+    ])
+    def test_rustc_rendered_frontend_refusal_is_not_compile(self, diagnostic):
+        output = diagnostic + "\nerror: could not compile `creusot_test` (lib)\n" + _wire_line(base_exit_code=1)
+        assert harness.classify_error_category(output, exit_code=1) == "encoding"
+        assert harness.classify_failure(output, "fn f() {}", exit_code=1)[0] == "error"
+
+    def test_actual_rust_error_code_wins_over_driver_counters(self):
+        output = "error[E0382]: use of moved value\n" + _wire_line(base_exit_code=1, failed=1)
+        assert harness.classify_error_category(output, exit_code=1) == "compile"
+
+    def test_successful_driver_does_not_mask_later_cargo_failure(self):
+        output = "error: could not compile `creusot_test` (lib)\n" + _wire_line(verified=1)
+        assert harness.classify_error_category(output, exit_code=1) == "compile"
+        assert harness.classify_failure(output, "#[ensures(result)] fn f() {}", exit_code=1)[0] == "error"
+
+    def test_malformed_driver_record_cannot_override_compile_fallback(self):
+        output = (
+            "error: could not compile `creusot_test` (lib)\n"
+            "TRUST_WP_RESULT:v1 base_exit_code=1 failed=1\n"
+        )
+        assert harness.classify_error_category(output, exit_code=1) == "compile"
+
+    @pytest.mark.parametrize("diagnostic, wire", [
+        ("trust-wp: f FAILED (postcondition)", _wire_line(base_exit_code=1, failed=1)),
+        ("trust-wp: f unknown (proof-trusted)", _wire_line(base_exit_code=2, errors=1)),
+        ("error: trust-wp: `old_x` is reserved; rename it", _wire_line(base_exit_code=1)),
+        ("error: ghost type escape: unread Ghost body", _wire_line(base_exit_code=1)),
+    ])
+    def test_richer_category_cannot_grant_backend_superseded_credit(self, diagnostic, wire):
+        output = diagnostic + "\nerror: could not compile `creusot_test` (lib)\n" + wire
+        status, reason, credit = harness.classify_should_fail_result_with_credit(
+            success=False,
+            output=output,
+            source="fn bad() {}",
+            test_name="tests/should_fail/unsupported/char_pattern.rs",
+            exit_code=1,
+        )
+        assert (status, reason, credit) == ("error", None, None)
 
 
 class TestClassifyErrorCategory:
@@ -6524,10 +6932,9 @@ class TestClassifyErrorCategory:
 
         The ay library itself emits ``ay solver panic during check_sat`` when
         it crashes inside the SAT loop (e.g., sort mismatch in mk_eq).
-        Historically the classifier only matched the ``during verification``
-        variant, causing check_sat-phase panics to fall through to
-        caught_panic or driver_panic (observed on binary_search_list.rs in
-        baseline-20260418).
+        Matching only the ``during verification`` variant lets a
+        check_sat-phase panic fall through to caught_panic or driver_panic
+        (the binary_search_list.rs shape).
         """
         output = (
             "thread 'rustc' panicked at 'sort mismatch'\n"
@@ -6678,11 +7085,12 @@ class TestCaughtPerFunctionPanic:
             f"should-fail with verified output should be 'fail' (false-accept), got '{status}'"
         )
 
-    def test_final_borrows_proof_assert_rejection_is_pass(self):
-        """final_borrows.rs: proof_assert failures count as correct rejection (#2690).
+    def test_final_borrows_proof_assert_count_alone_is_unknown(self):
+        """final_borrows.rs: a proof_assert failed COUNT is not a refutation.
 
-        This test has 0 function-level failures but 2 proof_assert failures,
-        meaning trust-wp IS correctly rejecting the code.
+        The driver counts unvalidated failures (no model check) in ``M failed``,
+        so 0 function failures + 2 counted proof_assert failures with no
+        validated diagnostic record is inconclusive (D-28).
         """
         output = (
             "trust-wp: 0 verified, 0 failed, 0 errors, 2 trusted\n"
@@ -6694,9 +7102,23 @@ class TestCaughtPerFunctionPanic:
             source="fn foo() {}\nfn bar() {}",
             test_name="tests/should_fail/final_borrows.rs",
         )
-        assert status == "pass", (
-            f"proof_assert failures should count as correct rejection, got '{status}'"
+        assert status == "unknown", status
+
+    def test_validated_proof_assert_refutation_is_pass(self):
+        """proof_assert failures backed by a validated model are a rejection."""
+        output = (
+            _diag_line("creusot_test::foo", "proof_assert")
+            + "trust-wp: proof_assert in creusot_test::foo FAILED ✗\n"
+            "trust-wp: 0 verified, 0 failed, 0 errors, 2 trusted\n"
+            "trust-wp: proof_assert: 5 verified, 2 failed, 0 errors\n"
         )
+        status, reason = harness.classify_should_fail_result(
+            success=False,
+            output=output,
+            source="fn foo() {}\nfn bar() {}",
+            test_name="tests/should_fail/final_borrows.rs",
+        )
+        assert status == "pass", status
 
 
 # ---------------------------------------------------------------------------
@@ -6913,8 +7335,7 @@ class TestTimeoutCausedUnknownReclassification:
     def test_classify_error_category_solver_timeout(self):
         """classify_error_category returns 'timeout' for solver-level timeouts.
 
-        This tests the new detection path added by #2690 — solver-level
-        timeouts were previously falling through to 'unknown'.
+        Solver-level timeouts (#2690) must not fall through to 'unknown'.
         """
         output = (
             "trust-wp: fib_memo unknown (timeout)\n"
@@ -7007,14 +7428,12 @@ class TestFalseAcceptDocumentation:
         )
 
     def test_false_accept_summary_excludes_resolved_snapshot_self_reference(self):
-        """bug/436_2.rs is no longer a known false-accept."""
+        """bug/436_2.rs is not a known false-accept."""
         from harness_classify import get_false_accept_summary
 
         summary = get_false_accept_summary()
-        # generic_deref_ghost.rs and generic_deref_snap.rs removed from
-        # false-accepts (2026-04-18) -- now caught by ghost type escape check.
-        # bug/436_2.rs removed from false-accepts (2026-04-23) -- now caught
-        # by snapshot self-reference validation.
+        # bug/436_2.rs is caught by snapshot self-reference validation, so it
+        # is not a known false accept.
         assert "tests/should_fail/bug/436_2.rs" not in summary, (
             "bug/436_2.rs should not appear in the false-accept summary"
         )
@@ -7099,10 +7518,10 @@ class TestResidualSummary:
         )
 
     def test_r4_false_accept_ledger_is_exact_and_other_residuals_are_empty(self):
-        """The R4 xfail ledger is EMPTY: all five baseline-20260706 rows are
-        fixed (int-shift-full 2026-07-24: shift-amount-in-range obligation;
-        impl_arg + trait_where + trait_where_supertrait 2026-07-24: illegal-
-        recursive-trait bound check; trait_impl_where 2026-07-24: self-named
+        """The R4 false-accept ledger is EMPTY: the baseline-20260706 rows are
+        caught (int-shift-full by the shift-amount-in-range obligation;
+        impl_arg, trait_where and trait_where_supertrait by the illegal-
+        recursive-trait bound check; trait_impl_where by self-named
         self-dispatch callgraph threading). The exact ratchet stays so any
         future false-accept must be ledgered explicitly, never silently."""
         from harness_classify import get_residual_summary
@@ -7271,11 +7690,11 @@ class TestFalseAcceptReclassification:
     """Tests for false-accept reclassification from skip to fail (#2690)."""
 
     def test_resolved_snapshot_self_reference_rejection_classified_as_pass(self):
-        """bug/436_2.rs now has a real snapshot self-reference rejection.
+        """bug/436_2.rs has a real snapshot self-reference rejection.
 
-        generic_deref_ghost.rs and generic_deref_snap.rs removed from
-        false-accepts (#2686) — now detected by check_ghost_type_escape
-        and classified as valid rejections ("pass").
+        generic_deref_ghost.rs and generic_deref_snap.rs are detected by
+        check_ghost_type_escape (#2686) and classified as valid rejections
+        ("pass"), so none of the three is a known false accept.
         """
         output = (
             "error: trust-wp: snapshot self-reference: type Bad contains Snapshot<&mut T>\n"
@@ -7311,11 +7730,11 @@ class TestFalseAcceptReclassification:
         )
 
     def test_resolved_expected_divergence_no_longer_skipped(self):
-        """Resolved expected-divergence tests are no longer skipped.
+        """Resolved expected-divergence tests are not skipped.
 
-        bug/1544_2.rs and bug/603.rs moved to backend-superseded (#2686) —
+        bug/1544_2.rs and bug/603.rs are backend-superseded (#2686) —
         trust-wp-std deliberately does not gate standard Rust traits on spec
-        traits. bug/1762.rs is now rejected by trusted contract validation.
+        traits. bug/1762.rs is rejected by trusted contract validation.
         """
         for test_name in [
             "tests/should_fail/bug/1762.rs",
@@ -7413,24 +7832,23 @@ class TestSummaryCategorySplit:
 class TestCaughtPanicPhaseVariants:
     """Regression tests for phase-qualified caught-panic detection (#2690).
 
-    Historical classification only matched ``panicked during verification:``
-    via a literal substring check.  That missed phase-qualified variants the
-    driver emits for other code paths, e.g.:
+    A literal ``panicked during verification:`` substring check misses the
+    phase-qualified variants the driver emits for other code paths, e.g.:
 
     - ``panicked during proof_assert:`` — proof_assert driver catch
-      (observed on ``mapping_test.rs`` in baseline-20260418)
+      (the ``mapping_test.rs`` shape)
     - ``panicked during loop verification:`` — loop body catch
     - ``panicked during check_sat:`` — check_sat wrapper catch
 
-    These variants were misclassified as ``driver_panic`` (via the rustc panic
-    fall-through) instead of ``caught_panic``.  The regex-based
-    ``_has_caught_panic_marker`` helper now recognizes all phase variants
-    without colliding with ay's ``ay solver panic during <phase>`` form
-    (different verb: ``panic`` vs ``panicked``).
+    Missed, they fall through the rustc panic path to ``driver_panic``
+    instead of ``caught_panic``.  The regex-based ``_has_caught_panic_marker``
+    helper recognizes every phase variant without colliding with ay's
+    ``ay solver panic during <phase>`` form (different verb: ``panic`` vs
+    ``panicked``).
     """
 
     def test_panicked_during_proof_assert_is_caught_panic(self):
-        """Reproduces mapping_test.rs from baseline-20260418 (#2690)."""
+        """Reproduces the mapping_test.rs proof_assert-phase panic (#2690)."""
         from harness_classify import classify_error_category
 
         output = (
@@ -7616,16 +8034,14 @@ class TestNoReplayTelemetryClean:
         kv = " ".join(f"{k}={v}" for k, v in fields.items())
         return f"TRUST_WP_RESULT:v1 {kv}"
 
-    def test_clean_wire_line_passes(self):
-        """All-zero wire line on exit 0 → pass."""
+    def test_clean_wire_line_that_verified_nothing_errors(self):
+        """D-21: an all-zero clean wire line proves
+        nothing, and off the translate-only allowlist it is not a credit."""
         from harness_classify import classify_no_replay_result
 
         output = "trust-wp: 0 verified, 0 failed, 0 errors\n" + self._wire()
-        status, reason = classify_no_replay_result(output, exit_code=0)
-        assert status == "pass", (
-            f"Clean wire line should pass; got status={status!r} reason={reason!r}"
-        )
-        assert reason is None
+        status, _reason = classify_no_replay_result(output, exit_code=0)
+        assert status == "error"
 
     def test_verified_only_wire_line_passes(self):
         """verified>0 with no failures/errors/panics → pass."""
@@ -7730,6 +8146,243 @@ class TestNoReplayTelemetryClean:
         )
 
 
+class TestNoReplayTranslateOnlyAllowlistGenericFnBound:
+    """Only a NO_REPLAY test with genuinely ZERO Creusot goals (bug/511) may pass
+    translate-only on a zero-examined exit-2 run. Tests whose .coma carries a real
+    goal (closures/03/04/05 `call requires` precondition_F, bug/387 and
+    syntax/10_mutual_rec_types `UInt64.add` overflow) are NOT allowlisted: a
+    counterexample or a zero-examined run is not a pass for them."""
+
+    @staticmethod
+    def _wire(**overrides) -> str:
+        return TestNoReplayTelemetryClean._wire(**overrides)
+
+    def test_counterexample_on_generic_call_goal_is_not_a_pass(self):
+        from harness_classify import classify_no_replay_result
+
+        output = self._wire(failed=1, base_exit_code=1)
+        status, _ = classify_no_replay_result(
+            output,
+            exit_code=1,
+            test_name="tests/should_succeed/closures/03_generic_bound.rs",
+        )
+        assert status != "pass"
+
+    def test_zero_examined_exit_two_is_not_a_pass_for_goal_bearing_test(self):
+        from harness_classify import classify_no_replay_result
+
+        for name in (
+            "tests/should_succeed/bug/387.rs",
+            "tests/should_succeed/syntax/10_mutual_rec_types.rs",
+            "tests/should_succeed/closures/05_map.rs",
+        ):
+            output = self._wire(base_exit_code=2)
+            status, _ = classify_no_replay_result(output, exit_code=2, test_name=name)
+            assert status != "pass", name
+
+    def test_zero_examined_exit_two_passes_for_zero_goal_test(self):
+        from harness_classify import classify_no_replay_result
+
+        output = self._wire(base_exit_code=2)
+        status, _ = classify_no_replay_result(
+            output, exit_code=2, test_name="tests/should_succeed/bug/511.rs"
+        )
+        assert status == "pass"
+
+    def test_zero_examined_exit_two_errors_when_not_allowlisted(self):
+        from harness_classify import classify_no_replay_result
+
+        output = self._wire(base_exit_code=2)
+        status, _ = classify_no_replay_result(
+            output, exit_code=2, test_name="tests/should_succeed/bug/5110.rs"
+        )
+        assert status == "error"
+
+    def test_allowlisted_test_with_panic_still_errors(self):
+        from harness_classify import classify_no_replay_result
+
+        output = self._wire(panics=1, base_exit_code=2)
+        status, _ = classify_no_replay_result(
+            output, exit_code=2, test_name="tests/should_succeed/bug/511.rs"
+        )
+        assert status == "error"
+
+    def test_allowlisted_test_without_wire_line_errors(self):
+        from harness_classify import classify_no_replay_result
+
+        status, _ = classify_no_replay_result(
+            "error: could not compile", exit_code=101,
+            test_name="tests/should_succeed/bug/511.rs",
+        )
+        assert status == "error"
+
+
+# Real cargo-trust-wp output (probe crates run through the harness runner and
+# normalized for storage): `lang/empty.rs` as-is, and the same source plus one
+# item using the reserved `__trust_wp_spec_tc_` prefix, which the driver refuses
+# before discovery. The two wire lines are identical; only the build output
+# says that the second crate never compiled.
+ZERO_GOAL_WIRE_LINE = (
+    "TRUST_WP_RESULT:v1 base_exit_code=2 verified=0 failed=0 errors=0 warnings=0 "
+    "assumed=0 trusted=0 skipped=0 verified_with_axiom_deps=0 unverified_axioms=0 "
+    "vacuous=0 evidence_gaps=0 proof_assert_verified=0 proof_assert_inconclusive=0 "
+    "verified_native_only=0 proof_assert_failed=0 proof_assert_errors=0 panics=0 "
+    "demoted=0 parse_errors=0 termination_errors=0 logic_recursion_errors=0 "
+    "erasure_errors=0\n"
+)
+ZERO_GOAL_CLEAN_OUTPUT = (
+    "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.07s\n"
+    + ZERO_GOAL_WIRE_LINE
+)
+# traits/14_assoc_in_logic's real shape: its only item is `#[trusted] fn test`,
+# which Creusot translates to nothing and trust-wp reports trusted (D-158).
+ZERO_GOAL_SOURCE_TRUSTED_OUTPUT = (
+    "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+    "trust-wp: test trusted (skipped)\n\n"
+    "trust-wp: (1 trusted, skipped)\n"
+    "trust-wp: 0 verified, 0 failed, 0 errors, 1 trusted\n"
+    "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.54s\n"
+    + ZERO_GOAL_WIRE_LINE.replace(" trusted=0 ", " trusted=1 ")
+)
+ZERO_GOAL_SOURCE_TRUSTED_ROW = "tests/should_succeed/traits/14_assoc_in_logic.rs"
+ZERO_GOAL_REFUSED_OUTPUT = (
+    "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+    "error: trust-wp: the name prefix `__trust_wp_spec_tc_` is reserved for specification "
+    "type-check helpers generated by trust-wp's contract macros (`__trust_wp_spec_tc_forged`)\n"
+    " --> src/lib.rs:9:1\n"
+    "  |\n"
+    "9 | pub fn __trust_wp_spec_tc_forged() {}\n"
+    "  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    "\n"
+    "error: could not compile `creusot_test` (lib) due to 1 previous error\n"
+    + ZERO_GOAL_WIRE_LINE
+)
+
+
+class TestZeroGoalZeroExaminedExit:
+    """A zero-examined run exits 2 (CLAUDE.md). The ordinary should_succeed lane
+    credits it only when Creusot's .coma exists and carries no goal, and the
+    build output shows the crate compiled."""
+
+    @staticmethod
+    def _wire(**overrides) -> str:
+        # Real build output around the wire line: the predicate reads cargo's
+        # `Finished` line, so a bare wire line is no longer a zero-examined run.
+        return (
+            "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.07s\n"
+            + TestNoReplayTelemetryClean._wire(**overrides)
+        )
+
+    def test_zero_goal_coma_passes(self):
+        from harness_classify import classify_failure
+
+        status, _ = classify_failure(
+            self._wire(base_exit_code=2), "pub fn f() {}", exit_code=2,
+            test_name="tests/should_succeed/lang/empty.rs",
+        )
+        assert status == "pass"
+
+    def test_frontend_refusal_with_the_same_wire_line_errors(self):
+        # The isolating twin of test_zero_goal_coma_passes, from the real
+        # binary: a crate the driver refuses before discovery reports the SAME
+        # all-zero exit-2 wire line; only the build output differs.
+        from harness_classify import classify_failure
+
+        clean, refused = ZERO_GOAL_CLEAN_OUTPUT, ZERO_GOAL_REFUSED_OUTPUT
+        name = "tests/should_succeed/lang/empty.rs"
+        assert clean.splitlines()[-1] == refused.splitlines()[-1]
+        assert classify_failure(clean, "pub fn f() {}", exit_code=2, test_name=name)[0] == "pass"
+        assert classify_failure(refused, "pub fn f() {}", exit_code=2, test_name=name)[0] == "error"
+
+    def test_goal_bearing_coma_errors(self):
+        from harness_classify import classify_failure
+
+        status, _ = classify_failure(
+            self._wire(base_exit_code=2), "pub fn f() {}", exit_code=2,
+            test_name="tests/should_succeed/result/result.rs",
+        )
+        assert status == "error"
+
+    def test_a_test_creusot_translated_to_nothing_passes(self):
+        # bug/1438 has no .coma because Creusot's output for it is empty, and
+        # its ui runner reads the absent file as that empty output (D-157).
+        from harness_classify import classify_failure
+
+        status, _ = classify_failure(
+            self._wire(base_exit_code=2), "pub fn f() {}", exit_code=2,
+            test_name="tests/should_succeed/bug/1438.rs",
+        )
+        assert status == "pass"
+
+    def test_a_missing_coma_creusot_never_ran_errors(self):
+        # The isolating twins of the pass above: the same run, for a test with
+        # no .coma that Creusot's ui runner skips (`// UISKIP` header), and for
+        # a name that is no corpus file. Neither is evidence of no goal.
+        from harness_classify import classify_failure
+
+        for name in (
+            "tests/should_succeed/termination/custom_variant.rs",
+            "tests/should_succeed/bug/no_such_test.rs",
+        ):
+            status, _ = classify_failure(
+                self._wire(base_exit_code=2), "pub fn f() {}", exit_code=2, test_name=name,
+            )
+            assert status == "error", name
+
+    def test_a_source_declared_trusted_item_may_be_all_the_run_names(self):
+        # D-158: the same run passes when the source declares the item it
+        # trusts, and errors when it does not or when the counter counts more
+        # items than the run names.
+        from harness_classify import classify_failure
+
+        out = ZERO_GOAL_SOURCE_TRUSTED_OUTPUT
+        declared = "#[trusted]\n#[ensures(true)]\npub fn test() {}\n"
+        undeclared = "#[ensures(true)]\npub fn test() {}\n"
+        name = ZERO_GOAL_SOURCE_TRUSTED_ROW
+        assert classify_failure(out, declared, exit_code=2, test_name=name)[0] == "pass"
+        assert classify_failure(out, undeclared, exit_code=2, test_name=name)[0] == "error"
+        miscounted = out.replace(" trusted=1 ", " trusted=2 ")
+        assert classify_failure(miscounted, declared, exit_code=2, test_name=name)[0] == "error"
+        goals = "tests/should_succeed/result/result.rs"
+        assert classify_failure(out, declared, exit_code=2, test_name=goals)[0] == "error"
+
+    def test_any_nonzero_counter_errors(self):
+        from harness_classify import classify_failure
+
+        for key in ("warnings", "panics", "parse_errors", "demoted", "trusted"):
+            status, _ = classify_failure(
+                self._wire(base_exit_code=2, **{key: 1}), "pub fn f() {}",
+                exit_code=2, test_name="tests/should_succeed/lang/empty.rs",
+            )
+            assert status == "error", key
+
+    def test_process_exit_must_be_two(self):
+        from harness_classify import classify_failure
+
+        status, _ = classify_failure(
+            self._wire(base_exit_code=2), "pub fn f() {}", exit_code=101,
+            test_name="tests/should_succeed/lang/empty.rs",
+        )
+        assert status == "error"
+
+    def test_goals_the_inventory_does_not_count_are_not_zero_goals(self):
+        # The grant asks the gate's own oracle question (D-89). closures/01_basic
+        # inventories as EMPTY, yet its .coma carries goals in called extspec
+        # closures; the SAME all-zero exit-2 run passes only on lang/empty.
+        from harness_classify import classify_failure
+
+        gc = _load_goal_coverage()
+        basic = "tests/should_succeed/closures/01_basic.rs"
+        assert gc.goal_inventory(basic) == [] and gc.zero_goal_oracle_refusals(basic)
+        for name, expected in (("tests/should_succeed/lang/empty.rs", "pass"), (basic, "error")):
+            status, _ = classify_failure(
+                self._wire(base_exit_code=2), "pub fn f() {}", exit_code=2, test_name=name
+            )
+            assert status == expected, name
+
+
 class TestSiblingModuleCrateAttrs:
     """Sibling modules must not carry crate-root-only inner attributes.
 
@@ -7785,12 +8438,12 @@ class TestSiblingModuleCrateAttrs:
 class TestSoundnessGapOnlyExitProofAssertEvidence:
     """Wire-authenticated gap-only exits with proof_assert-only evidence.
 
-    The a8d74e4 carve-out required wire `verified>0`, but the driver never
-    counts proof_assert verifications there — a proof_assert-only crate with
-    one trusted item (bug/negative_int_pats: 7/7 proof_asserts verified,
-    trusted=1, exit 2) hard-errored despite a failure-free wire line. The
-    carve-out now also accepts a verified>0 proof_assert summary with zero
-    failed/errored assertions.
+    The carve-out cannot require wire `verified>0` alone: the driver never
+    counts proof_assert verifications there, so a proof_assert-only crate
+    with one trusted item (bug/negative_int_pats: 7/7 proof_asserts
+    verified, trusted=1, exit 2) would hard-error despite a failure-free
+    wire line. The carve-out also accepts a verified>0 proof_assert summary
+    with zero failed/errored assertions.
     """
 
     @staticmethod
@@ -7861,9 +8514,8 @@ class TestSoundnessGapOnlyExitProofAssertEvidence:
 # implicit. cfg(debug_assertions) reaches into ay and changes the PUBLISHED
 # VERDICT: on should_succeed/option.rs a debug driver publishes `sat` -- a
 # refutation of a claim that is true -- where a release driver publishes
-# `unknown`. Two runs differing only by profile are therefore incomparable.
-# Left implicit, this presented as a phantom "219 vs 221" regression that
-# consumed a full session before the profile turned out to be the variable.
+# `unknown`. Two runs differing only by profile are therefore incomparable,
+# and a profile left implicit presents as a phantom pass-count regression.
 
 
 def _profile_workspace(tmp_path, *, release: bool, debug: bool, companions: bool = False):
@@ -7911,14 +8563,14 @@ def test_profile_unknown_value_is_refused_not_ignored(monkeypatch, tmp_path):
 
 
 # --- the pin must cover COMPANION binaries too -------------------------------
-# `resolve_driver_profile` pinned the driver; `cargo-trust-wp` was resolved with
-# a hardcoded `profile="debug"`, so `TRUST_WP_HARNESS_PROFILE=release` produced a
-# MIXED-profile run while reporting itself as pinned. Two costs, both real:
-# the env var's fail-closed promise was only half true, and the release lane
-# carried an undeclared dependency on `target/debug` surviving. Pruning that
-# directory during a pinned-release run -- a reasonable thing to do -- made 210
-# of 278 tests error at 0ms with `missing cargo-trust-wp`, which reads exactly
-# like a mass regression and cost a full gate.
+# If `resolve_driver_profile` pins only the driver while `cargo-trust-wp`
+# resolves with a hardcoded `profile="debug"`, `TRUST_WP_HARNESS_PROFILE=release`
+# produces a MIXED-profile run that reports itself as pinned. Two costs, both
+# real: the env var's fail-closed promise is only half true, and the release
+# lane carries an undeclared dependency on `target/debug` surviving. Pruning
+# that directory during a pinned-release run -- a reasonable thing to do --
+# then makes most tests error at 0ms with `missing cargo-trust-wp`, which
+# reads exactly like a mass regression.
 
 
 def test_pinned_profile_also_selects_the_companion_binary(monkeypatch, tmp_path):
@@ -7974,11 +8626,11 @@ def test_prebuild_check_does_not_raise_before_anything_is_built(monkeypatch, tmp
 
 
 # --- source-revision recording (#146) ---------------------------------------
-# ay is an unpinned relative path dep (`../ay`). On 2026-08-28 it moved three
-# times in one day under sibling agents and silently invalidated a measurement,
-# because no result artefact recorded which backend had produced it. The source
-# FINGERPRINT already hashed these roots -- that is how drift was detectable --
-# but a hash cannot say WHICH dependency moved, and that check only runs under
+# ay is an unpinned relative path dep (`../ay`): it can move several times a
+# day under concurrent agents and silently invalidate a measurement unless the
+# result artefact records which backend produced it. The source FINGERPRINT
+# already hashes these roots -- that is how drift is detectable -- but a hash
+# cannot say WHICH dependency moved, and that check only runs under
 # skip-prebuild. These pin the human-readable record.
 
 
@@ -7990,6 +8642,67 @@ def test_source_revisions_include_path_dependencies(tmp_path):
     for name, rev in revisions.items():
         head = rev.split("-")[0]
         assert len(head) == 10 or head == "unknown", f"{name}: {rev!r}"
+
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+@pytest.mark.parametrize("layout", ["checkout", "package", "dotdot"])
+def test_source_revision_alias_keeps_the_physical_provider_head(tmp_path, monkeypatch, dirty, layout):
+    workspace = tmp_path / "trust-wp"
+    workspace.mkdir()
+    (workspace / "crates" / "own").mkdir(parents=True)
+    (tmp_path / "aa-local-link").symlink_to(workspace / "crates" / "own", target_is_directory=True)
+    provider = tmp_path / "qualified-engine-checkout"
+    (provider / "crates" / "ay-core").mkdir(parents=True)
+    (provider / "crates" / "ay-dpll").mkdir()
+    (tmp_path / "ay").symlink_to(provider, target_is_directory=True)
+    (tmp_path / "ay-core-link").symlink_to(provider / "crates" / "ay-core", target_is_directory=True)
+    (tmp_path / "ay-dpll-link").symlink_to(provider / "crates" / "ay-dpll", target_is_directory=True)
+    paths = {
+        "checkout": ("../ay/crates/ay-core", "../ay/crates/ay-dpll", "ay"),
+        "package": ("../ay-core-link", "../ay-dpll-link", "ay-core-link"),
+        "dotdot": ("../ay/crates/../crates/ay-core", "../ay/crates/../crates/ay-dpll", "ay"),
+    }
+    core_path, dpll_path, label = paths[layout]
+    (workspace / "Cargo.toml").write_text(
+        '[workspace.dependencies]\n'
+        f'ay-core = {{ path = "{core_path}" }}\n'
+        f'ay-dpll = {{ path = "{dpll_path}" }}\n'
+        'own = { path = "../aa-local-link" }\n'
+    )
+
+    def git_root(path):
+        physical = path.resolve()
+        return provider if physical.is_relative_to(provider) else workspace
+
+    def git_output(repo, *args):
+        if args == ("rev-parse", "HEAD"):
+            return (("b" if repo == provider else "a") * 40).encode()
+        assert args == ("status", "--porcelain")
+        return b" M src/lib.rs" if repo == provider and dirty else b""
+
+    monkeypatch.setattr(harness_targets, "_git_root", git_root)
+    monkeypatch.setattr(harness_targets, "_git_output", git_output)
+    revisions = harness_targets.resolved_source_revisions(workspace)
+    assert revisions == {"trust-wp": "a" * 10, label: "b" * 10 + ("-dirty" if dirty else "")}
+    assert set(harness_targets._workspace_source_roots(workspace)) == {workspace, provider}
+
+
+def test_source_revision_alias_collision_cannot_hide_a_physical_provider(tmp_path, monkeypatch):
+    workspace = tmp_path / "trust-wp"
+    workspace.mkdir()
+    first = tmp_path / "first" / "ay"
+    second = tmp_path / "second" / "ay"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (workspace / "Cargo.toml").write_text(
+        '[workspace.dependencies]\n'
+        'first = { path = "../first/ay" }\n'
+        'second = { path = "../second/ay" }\n'
+    )
+    monkeypatch.setattr(harness_targets, "_git_root", lambda path: path.resolve())
+    with pytest.raises(RuntimeError, match="ambiguous source revision label"):
+        harness_targets.resolved_source_revisions(workspace)
 
 
 def test_source_revisions_flag_a_dirty_root():
@@ -8010,3 +8723,3655 @@ def test_provenance_payload_carries_source_revisions(monkeypatch, tmp_path):
         "binaries, so a moving path dep cannot go unnoticed"
     )
     assert isinstance(payload["source_revisions"], dict)
+
+
+# ---------------------------------------------------------------------------
+# should_fail rejection-evidence hardening, credited pass messages, the
+# NO_REPLAY verified tier, and the final-gate policy.
+# ---------------------------------------------------------------------------
+
+
+def _load_compare_baselines():
+    spec = importlib.util.spec_from_file_location(
+        "compare_baselines_front_j", WORKSPACE_ROOT / "scripts" / "compare_baselines.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sf(output: str, exit_code: int | None = 2, test_name: str = ""):
+    return harness.classify_should_fail_result_with_credit(
+        success=False,
+        output=output,
+        source="fn f() {}",
+        test_name=test_name,
+        exit_code=exit_code,
+    )
+
+
+class TestShouldFailH1Rules:
+    """Every should_fail pass needs positive rejection evidence."""
+
+    def test_timeout_only_run_is_error_not_rejection(self):
+        output = (
+            "trust-wp: unsound unknown (timeout)\n"
+            "proof_assert: 0 verified, 0 failed, 1 errors\n"
+            + _wire_line(proof_assert_errors=1, base_exit_code=2)
+        )
+        assert _sf(output) == ("error", None, None)
+
+    def test_hard_timeout_is_error_not_rejection(self):
+        output = "hard timeout expired\n" + _wire_line(errors=1, base_exit_code=2)
+        assert _sf(output) == ("error", None, None)
+
+    def test_proof_assert_errors_only_is_unknown(self):
+        """``K errors`` counts Unknown/Assumed/encoding errors, not refutations."""
+        output = (
+            "proof_assert: 0 verified, 0 failed, 1 errors\n"
+            + _wire_line(proof_assert_errors=1, base_exit_code=2)
+        )
+        status, _reason, credit = _sf(output)
+        assert (status, credit) == ("unknown", None)
+
+    def test_wire_proof_assert_errors_counter_alone_is_not_pass(self):
+        output = _wire_line(proof_assert_errors=2, base_exit_code=2)
+        status, _reason, credit = _sf(output)
+        assert status != "pass" and credit is None
+
+    def test_proof_assert_failed_count_alone_is_unknown(self):
+        output = (
+            "proof_assert: 1 verified, 2 failed, 1 errors\n"
+            + _wire_line(proof_assert_failed=2, proof_assert_errors=1, base_exit_code=1)
+        )
+        assert _sf(output) == ("unknown", None, None)
+
+    def test_validated_proof_assert_failure_is_credited(self):
+        output = (
+            _diag_line("creusot_test::f", "proof_assert")
+            + "trust-wp: proof_assert in creusot_test::f FAILED ✗\n"
+            "proof_assert: 1 verified, 2 failed, 1 errors\n"
+            + _wire_line(proof_assert_failed=2, proof_assert_errors=1, base_exit_code=1)
+        )
+        assert _sf(output) == (
+            "pass",
+            None,
+            "validated counterexample: creusot_test::f proof_assert",
+        )
+
+    def test_wire_failed_without_validated_record_is_unknown(self):
+        output = "trust-wp: bad FAILED ✗\n" + _wire_line(failed=3, base_exit_code=1)
+        assert _sf(output, exit_code=1) == ("unknown", None, None)
+
+    def test_validated_wire_failure_is_credited(self):
+        output = (
+            _diag_line("bad", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=3, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == (
+            "pass",
+            None,
+            "validated counterexample: bad function_contract",
+        )
+
+    @pytest.mark.parametrize(
+        "ay_result,model_validated",
+        [
+            ("trust-wp-structural-provenance", "false"),
+            ("sat", "false"),
+            ("none", "unknown"),
+            ("unknown", "false"),
+        ],
+    )
+    def test_unvalidated_failed_diagnostic_is_unknown(self, ay_result, model_validated):
+        """status=failed reason=counterexample without a validated model: the
+        driver's structural-provenance / unvalidated-SAT / no-solver shortcuts
+        and solver-limited Unknown promoted to Failed are not refutations."""
+        output = (
+            _diag_line(
+                "bad", "function_contract", ay_result=ay_result,
+                model_validated=model_validated,
+            )
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == ("unknown", None, None)
+
+    def test_explicit_refutation_validated_field_is_credited(self):
+        """Forward compatibility with the driver half of the verdict fix."""
+        output = (
+            _diag_line(
+                "bad", "function_contract", ay_result="none",
+                model_validated="unknown", refutation="validated",
+            )
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1)[0] == "pass"
+
+    def test_validated_record_must_match_a_verdict_line(self):
+        """A validated record for an obligation with no FAILED ✗ line is not
+        the counted failure."""
+        output = (
+            _diag_line("other", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == ("unknown", None, None)
+
+    def test_validated_record_must_match_its_counter(self):
+        """A validated proof_assert record cannot credit a zero proof_assert
+        failed count, and a function record cannot credit wire failed=0."""
+        pa_uncounted = (
+            _diag_line("creusot_test::f", "proof_assert")
+            + "trust-wp: proof_assert in creusot_test::f FAILED ✗\n"
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(pa_uncounted, exit_code=1) == ("unknown", None, None)
+        fn_uncounted = (
+            _diag_line("bad", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + "proof_assert: 0 verified, 1 failed, 0 errors\n"
+            + _wire_line(proof_assert_failed=1, base_exit_code=1)
+        )
+        assert _sf(fn_uncounted, exit_code=1) == ("unknown", None, None)
+
+    def test_validated_record_kind_must_match_verdict_shape(self):
+        """A proof_assert record does not match a function-contract verdict."""
+        output = (
+            _diag_line("bad", "proof_assert")
+            + "trust-wp: bad FAILED ✗\n"
+            + "proof_assert: 0 verified, 1 failed, 0 errors\n"
+            + _wire_line(failed=1, proof_assert_failed=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == ("unknown", None, None)
+
+    def test_obligation_qualified_def_paths_match(self):
+        variant = (
+            _diag_line("f::variant_decrease%5B1%5D", "recursive_variant")
+            + "trust-wp: f FAILED ✗ (variant decrease)\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(variant, exit_code=1)[2] == (
+            "validated counterexample: f::variant_decrease[1] recursive_variant"
+        )
+        refinement = (
+            _diag_line(
+                "%3C%28%29%20as%20Tr%3E::m::trait%20precondition%20implies%20impl%20precondition",
+                "trait_refinement",
+            )
+            + "trust-wp: <() as Tr>::m trait refinement FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(refinement, exit_code=1)[0] == "pass"
+
+    def test_def_path_prefix_needs_a_path_boundary(self):
+        output = (
+            _diag_line("bad_other", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == ("unknown", None, None)
+
+    def test_wire_failed_with_timeout_elsewhere_still_credited(self):
+        """A validated counterexample is a refutation even if a sibling timed out."""
+        output = (
+            "trust-wp: good unknown (timeout)\n"
+            + _diag_line("bad", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, errors=1, base_exit_code=1)
+        )
+        assert _sf(output, exit_code=1) == (
+            "pass",
+            None,
+            "validated counterexample: bad function_contract",
+        )
+
+    def test_exit_101_without_compile_diag_or_marker_is_error(self):
+        assert _sf("trust-wp: 0 verified, 0 failed, 0 errors\n", exit_code=101) == (
+            "error",
+            None,
+            None,
+        )
+
+    def test_wire_base_exit_101_without_marker_is_error(self):
+        assert _sf(_wire_line(base_exit_code=101), exit_code=None) == (
+            "error",
+            None,
+            None,
+        )
+
+    def test_exit_101_solver_counter_cannot_credit_a_crash(self):
+        output = "trust-wp: bad FAILED ✗\n" + _wire_line(failed=1, base_exit_code=101)
+        assert _sf(output, exit_code=101) == ("error", None, None)
+
+    def test_exit_101_with_frontend_marker_but_no_abort_line_is_error(self):
+        # Without rustc's abort line a 101 is a crash shape; the marker text
+        # printed before it is not rejection evidence.
+        output = (
+            "error: used the `#[trusted]` attribute\n"
+            + _wire_line(base_exit_code=101)
+        )
+        assert _sf(output, exit_code=101) == ("error", None, None)
+
+    def test_exit_101_with_panic_is_error_even_with_marker(self):
+        output = (
+            "error: used the `#[trusted]` attribute\n"
+            "thread 'rustc' panicked at src/lib.rs:1:1\n"
+        )
+        assert _sf(output, exit_code=101) == ("error", None, None)
+
+    def test_exit_101_compile_failure_goes_through_evidence_gates(self):
+        output = (
+            "error: trust-wp: termination check failed: `f` recursive without variant\n"
+            "error: could not compile `test` (lib) due to 1 previous error\n"
+        )
+        assert _sf(output, exit_code=101) == (
+            "pass",
+            None,
+            "termination check failed",
+        )
+
+    def test_counted_frontend_credit_carries_wire_counter(self):
+        output = "error: logic recursion check failed: `g`\n" + _wire_line(
+            logic_recursion_errors=2, base_exit_code=2
+        )
+        assert _sf(output) == (
+            "pass",
+            None,
+            "logic recursion check failed (logic_recursion_errors=2)",
+        )
+
+    def test_compile_rejection_without_allowlist_is_error(self):
+        output = (
+            "error[E0499]: cannot borrow `x` as mutable more than once at a time\n"
+            "error: could not compile `test` (lib) due to 1 previous error\n"
+        )
+        status, _reason, credit = _sf(output, exit_code=101, test_name="tests/should_fail/x.rs")
+        assert status == "error" and credit is None
+
+    def test_allowlisted_compile_rejection_names_its_code(self):
+        output = (
+            "error[E0499]: cannot borrow `x` as mutable more than once at a time\n"
+            "error: could not compile `test` (lib) due to 1 previous error\n"
+        )
+        status, _reason, credit = _sf(
+            output, exit_code=101, test_name="tests/should_fail/bad_borrow.rs"
+        )
+        assert status == "pass" and credit is not None and credit.startswith("compile: ")
+
+    def test_backend_superseded_credit_names_reason(self):
+        name = next(iter(harness._KNOWN_BACKEND_SUPERSEDED_TESTS))
+        status, _reason, credit = _sf(
+            "trust-wp: f verified ✓\n" + _wire_line(verified=1), exit_code=0, test_name=name
+        )
+        assert status == "pass" and credit.startswith("backend superseded: ")
+
+    def test_wrapper_agrees_with_credited_classifier(self):
+        output = (
+            _diag_line("creusot_test::f", "proof_assert")
+            + "trust-wp: proof_assert in creusot_test::f FAILED ✗\n"
+            "proof_assert: 0 verified, 1 failed, 0 errors\n"
+        )
+        assert harness.classify_should_fail_result(
+            False, output, "fn f() {}", exit_code=2
+        ) == ("pass", None)
+
+    def test_non_pass_never_carries_credit(self):
+        for output in (
+            "proof_assert: 0 verified, 0 failed, 1 errors\n",
+            "hard timeout expired\n",
+            "",
+        ):
+            status, _reason, credit = _sf(output)
+            assert status != "pass" and credit is None
+
+
+class TestShouldFailH4Messages:
+    def test_rejection_pass_message_format(self):
+        assert harness.rejection_pass_message("wire failed=2") == (
+            "Correctly rejected (wire failed=2)"
+        )
+        assert harness.rejection_pass_message(None) == "Correctly rejected"
+
+    def test_is_rejection_pass_message(self):
+        assert harness.is_rejection_pass_message("Correctly rejected")
+        assert harness.is_rejection_pass_message("Correctly rejected (frontend: x)")
+        assert not harness.is_rejection_pass_message("Correctly rejectedX")
+        assert not harness.is_rejection_pass_message(None)
+
+    def test_runner_pass_message_names_crediting_gate(self, tmp_path):
+        output = (
+            _diag_line("bad", "function_contract")
+            + "trust-wp: bad FAILED ✗\n"
+            + _wire_line(failed=1, base_exit_code=1)
+        )
+        status, message, *_rest = harness_runner._classify_outcome(
+            harness, tmp_path, "tests/should_fail/synthetic.rs", "fn f() {}",
+            False, output, 1,
+        )
+        assert (status, message) == (
+            "pass",
+            "Correctly rejected (validated counterexample: bad function_contract)",
+        )
+
+    def test_runner_frontend_pass_message(self, tmp_path):
+        output = "error: trust-wp: ghost type escape in `f`\n"
+        status, message, *_rest = harness_runner._classify_outcome(
+            harness, tmp_path, "tests/should_fail/synthetic.rs", "fn f() {}",
+            False, output, 2,
+        )
+        assert (status, message) == ("pass", "Correctly rejected (ghost type escape)")
+
+
+class TestNoReplayVerifiedTier:
+    SOURCE = "// NO_REPLAY\n#[ensures(result == 1)]\nfn f() -> u32 { 1 }\n"
+
+    def _outcome(self, tmp_path, name, output, exit_code):
+        status, message, *_rest = harness_runner._classify_outcome(
+            harness, tmp_path, name, self.SOURCE, exit_code == 0, output, exit_code
+        )
+        tier = harness.classify_verification_tier(name, status, message, None, self.SOURCE)
+        return status, message, tier
+
+    def test_verified_clean_no_replay_is_tier2(self, tmp_path):
+        output = "trust-wp: f verified ✓\n" + _wire_line(verified=2)
+        status, message, tier = self._outcome(
+            tmp_path, "tests/should_succeed/lang/float_ops.rs", output, 0
+        )
+        assert status == "pass"
+        assert message.startswith(harness.NO_REPLAY_VERIFIED_PREFIX)
+        assert tier == "tier2"
+
+    def test_clean_run_that_verified_nothing_is_not_a_pass(self, tmp_path):
+        # D-21: off the allowlist a NO_REPLAY test is credited only as a
+        # real proof; a clean run that verified nothing is not a credit.
+        status, message, tier = self._outcome(
+            tmp_path, "tests/should_succeed/bug/387.rs", _wire_line(), 0
+        )
+        assert status != "pass"
+        assert not message.startswith(harness.NO_REPLAY_PASS_PREFIX)
+        assert tier == "tier3"
+
+    def test_allowlisted_translate_only_stays_parse_only(self, tmp_path):
+        output = "trust-wp: omg FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        status, message, tier = self._outcome(
+            tmp_path, "tests/should_succeed/bug/653.rs", output, 1
+        )
+        assert status == "pass"
+        assert message.startswith(harness.NO_REPLAY_PASS_PREFIX)
+        assert tier == "tier3"
+
+    def test_mode_is_none_for_non_pass(self):
+        output = _wire_line(errors=1, base_exit_code=2)
+        assert harness.classify_no_replay_result_with_mode(output, exit_code=2)[2] is None
+
+    def test_verified_prefix_does_not_override_trusted_marker(self):
+        message = f"{harness.NO_REPLAY_VERIFIED_PREFIX} x\n1 trusted (skipped)"
+        assert harness.classify_verification_tier(
+            "tests/should_succeed/a.rs", "pass", message, None, self.SOURCE
+        ) == "tier3"
+
+
+class TestFinalGatePolicy:
+    def _sf_violations(self, **result):
+        module = _load_compare_baselines()
+        base = {"name": "tests/should_fail/x.rs", "status": "pass"}
+        base.update(result)
+        return module._should_fail_true_100_violation_reasons(base)
+
+    def _ss_violations(self, **result):
+        module = _load_compare_baselines()
+        base = {"status": "pass"}
+        base.update(result)
+        return module._true_100_violation_reasons(base)
+
+    @pytest.mark.parametrize(
+        "key", ["parse_errors", "termination_errors", "logic_recursion_errors"]
+    )
+    def test_frontend_rejection_counters_are_not_violations(self, key):
+        # Exempt only on the matching credit channel.
+        credit = {
+            "parse_errors": "parse_errors=2",
+            "termination_errors": "termination check failed",
+            "logic_recursion_errors": "logic recursion check failed",
+        }[key]
+        reasons = self._sf_violations(
+            message=f"Correctly rejected ({credit})",
+            telemetry=_complete_telemetry(**{key: 2, "base_exit_code": 2}),
+        )
+        assert reasons == []
+
+    @pytest.mark.parametrize(
+        "key", ["trusted", "assumed", "vacuous", "panics", "evidence_gaps", "erasure_errors"]
+    )
+    def test_soundness_counters_still_violate(self, key):
+        reasons = self._sf_violations(
+            message="Correctly rejected (wire failed=1)",
+            telemetry=_complete_telemetry(**{key: 1, "failed": 1}),
+        )
+        assert f"telemetry.{key}=1" in reasons
+
+    def test_frontend_rejection_without_wire_line_is_valid(self):
+        assert self._sf_violations(
+            message="Correctly rejected (compile: error[E0499])", telemetry=None
+        ) == []
+
+    def test_solver_credit_without_wire_line_still_violates(self):
+        reasons = self._sf_violations(
+            message="Correctly rejected (wire failed=1)", telemetry=None
+        )
+        assert "telemetry missing or malformed" in reasons
+
+    def test_legacy_uncredited_rejection_without_wire_line_still_violates(self):
+        reasons = self._sf_violations(message="Correctly rejected", telemetry=None)
+        assert "telemetry missing or malformed" in reasons
+
+    def test_frontend_rejection_with_malformed_telemetry_still_violates(self):
+        reasons = self._sf_violations(
+            message="Correctly rejected (frontend: x)", telemetry={"verified": 0}
+        )
+        assert any("telemetry missing field" in r for r in reasons)
+
+    def test_non_pass_frontend_message_is_not_exempt(self):
+        reasons = self._sf_violations(
+            status="error", message="Correctly rejected (frontend: x)", telemetry=None
+        )
+        assert "telemetry missing or malformed" in reasons
+
+    def test_verified_no_replay_tier2_passes_gate(self):
+        assert self._ss_violations(
+            name="tests/should_succeed/lang/float_ops.rs",
+            message="Verified (NO_REPLAY): verified with clean telemetry",
+            verification_tier="tier2",
+            telemetry=_complete_telemetry(verified=6),
+            driver_report=[
+                f"trust-wp: {fn} verified ✓" for fn in ("eq", "lt", "le", "gt", "ge", "neg")
+            ],
+        ) == []
+
+    def test_verified_no_replay_tier2_missing_an_item_violates(self):
+        reasons = self._ss_violations(
+            name="tests/should_succeed/lang/float_ops.rs",
+            message="Verified (NO_REPLAY): verified with clean telemetry",
+            verification_tier="tier2",
+            telemetry=_complete_telemetry(verified=5),
+            driver_report=[f"trust-wp: {fn} verified ✓" for fn in ("eq", "lt", "le", "gt", "ge")],
+        )
+        assert any(r.startswith("uncovered Creusot goal item neg [postcondition") for r in reasons)
+
+    def test_allowlisted_parse_only_passes_gate(self):
+        assert self._ss_violations(
+            name="tests/should_succeed/bug/653.rs",
+            message="Parse-only (NO_REPLAY): syntax-only test",
+            verification_tier="tier3",
+            telemetry=_complete_telemetry(failed=1, proof_assert_failed=1, base_exit_code=1),
+            driver_report=["trust-wp: omg FAILED ✗ (postcondition)"],
+        ) == []
+
+    def test_allowlisted_parse_only_still_fails_on_trusted(self):
+        reasons = self._ss_violations(
+            name="tests/should_succeed/spec_tests.rs",
+            message="Parse-only (NO_REPLAY): syntax-only test",
+            verification_tier="tier3",
+            telemetry=_complete_telemetry(trusted=1, base_exit_code=2),
+        )
+        # The parse-only row does not name the trusted item, so source
+        # resolution fails closed too.
+        assert "telemetry.trusted=1" in reasons
+        assert any(r.startswith("trusted count 1 != 0") for r in reasons)
+
+    def test_non_allowlisted_parse_only_still_violates(self):
+        reasons = self._ss_violations(
+            name="tests/should_succeed/bug/387.rs",
+            message="Parse-only (NO_REPLAY): syntax-only test",
+            verification_tier="tier3",
+            telemetry=_complete_telemetry(),
+        )
+        assert "NO_REPLAY parse-only pass" in reasons
+        assert "verification_tier='tier3' (expected 'tier2')" in reasons
+
+    def test_allowlist_requires_exact_path_component(self):
+        reasons = self._ss_violations(
+            name="tests/should_succeed/bug/6530.rs",
+            message="Parse-only (NO_REPLAY): syntax-only test",
+            verification_tier="tier3",
+            telemetry=_complete_telemetry(),
+        )
+        assert "NO_REPLAY parse-only pass" in reasons
+
+    def test_gate_allowlist_matches_classifier_allowlist(self):
+        module = _load_compare_baselines()
+        assert tuple(module.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == tuple(
+            harness.harness_classify._NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+        )
+
+    def test_gate_frontend_credits_cover_classifier_frontend_channels(self):
+        """Every frontend credit label the classifier can emit is exempt at the gate."""
+        module = _load_compare_baselines()
+        samples = [
+            ("error: termination check failed\n", None),
+            ("error: logic recursion check failed\n", None),
+            ("parse_errors=1\n", None),
+            ("duplicate/conflicting extern_spec\n", None),
+            ("trusted contract validation\n", None),
+            ("ghost type escape\n", None),
+            ("where its run-time body is not the logical operation the verifier reads\n", None),
+            ("Cannot divide primitive integers in logic\n", None),
+        ]
+        for output, _ in samples:
+            status, _reason, credit = _sf(output)
+            assert status == "pass", output
+            assert credit.startswith(module.FRONTEND_REJECTION_CREDIT_PREFIXES), credit
+
+
+def test_review_compat_timeout_matches_refresh_default():
+    review = (WORKSPACE_ROOT / "scripts" / "creusot_replacement_review.sh").read_text()
+    refresh = (WORKSPACE_ROOT / "scripts" / "refresh-baselines.sh").read_text()
+    import re as _re
+
+    review_default = _re.search(r"^COMPAT_TIMEOUT=(\d+)$", review, _re.M)
+    refresh_default = _re.search(r"TRUST_WP_HARNESS_TIMEOUT:-(\d+)", refresh)
+    assert review_default and refresh_default
+    assert review_default.group(1) == refresh_default.group(1) == "300"
+
+
+def test_review_examples_lane_is_advisory_but_canonical_lanes_gate():
+    review = (WORKSPACE_ROOT / "scripts" / "creusot_replacement_review.sh").read_text()
+    body = review[review.index("run_compat_gates() {") :]
+    body = body[: body.index("\n}\n")]
+    for lane in ("should_succeed", "should_fail"):
+        block = body[body.index(f"run_creusot_lane {lane} ") :]
+        block = block[: block.index("fi")]
+        assert "exit_code=1" in block, f"{lane} must stay a fatal gate"
+    examples = body[body.index("run_creusot_lane examples ") :]
+    examples = examples[: examples.index("fi")]
+    assert "exit_code=1" not in examples
+    assert "WARNING" in examples
+
+
+def test_refresh_baselines_calls_only_existing_python_scripts():
+    import re as _re
+
+    refresh = (WORKSPACE_ROOT / "scripts" / "refresh-baselines.sh").read_text()
+    code = "\n".join(
+        line for line in refresh.splitlines() if not line.lstrip().startswith("#")
+    )
+    for script in _re.findall(r"python3\s+(scripts/[\w./-]+\.py)", code):
+        assert (WORKSPACE_ROOT / script).is_file(), f"refresh calls missing {script}"
+
+
+def test_reference_pin_files_agree():
+    pin = (HARNESS_DIR / "REFERENCE.pin").read_text().split()[0]
+    short = (HARNESS_DIR / "CREUSOT_REFERENCE_PIN").read_text().strip()
+    assert len(short) >= 7 and pin.startswith(short), (pin, short)
+
+
+# ---------------------------------------------------------------------------
+# #[trusted] parity (D-49): trusted>0 is accepted ONLY when every trusted
+# item is declared #[trusted] in the corpus source, graded tier2-source-trusted.
+# ---------------------------------------------------------------------------
+
+
+def _load_trusted_scan():
+    spec = importlib.util.spec_from_file_location(
+        "trusted_source_scan_parity", WORKSPACE_ROOT / "scripts" / "trusted_source_scan.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve their module
+    spec.loader.exec_module(module)
+    return module
+
+
+_TRUSTED_SRC = """
+extern crate creusot_std;
+use creusot_std::prelude::*;
+
+#[trusted]
+#[ensures(result == 10u32)]
+pub fn lie() -> u32 { 5 }
+
+pub fn victim() -> u32 { lie() }
+
+// #[trusted] fn commented_out() {}
+pub fn commented_out() {}
+
+#[trusted]
+mod foo {
+    pub fn inner() -> u32 { 1 }
+    pub mod deeper { pub fn deepest() {} }
+}
+
+struct Mutex<T>(T);
+impl<T> Mutex<T> {
+    #[trusted]
+    pub fn new(v: T) -> Self { Mutex(v) }
+    pub fn get(&self) -> &T { &self.0 }
+}
+
+trait UseSelf { fn func(&self) -> bool; }
+impl UseSelf for () { fn func(&self) -> bool { true } }
+impl UseSelf for i32 {
+    #[trusted]
+    fn func(&self) -> bool { *self == 1 }
+}
+
+extern_spec! {
+    #[trusted]
+    fn victim() -> u32;
+}
+"""
+
+
+class TestTrustedSourceScan:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "lie",
+            "creusot_test::lie",
+            "foo::inner",
+            "foo::deeper::deepest",
+            "Mutex::<T>::new",
+            "<i32 as UseSelf>::func",
+        ],
+    )
+    def test_source_declared_items_resolve(self, path):
+        scan = _load_trusted_scan()
+        assert scan.resolve_trusted_def_path(path, _TRUSTED_SRC)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "victim",  # #[trusted] only inside an extern_spec! body
+            "commented_out",  # #[trusted] only in a comment
+            "Mutex::<T>::get",  # sibling of a trusted method
+            "<() as UseSelf>::func",  # same name, untrusted impl
+            "<Foo as UseSelf>::func",  # no such impl
+            "inner",  # wrong module qualifier
+            "f::{closure#0}",  # closures never resolve
+            "does_not_exist",
+        ],
+    )
+    def test_undeclared_items_do_not_resolve(self, path):
+        scan = _load_trusted_scan()
+        assert not scan.resolve_trusted_def_path(path, _TRUSTED_SRC)
+
+    def test_ambiguous_name_with_untrusted_candidate_does_not_resolve(self):
+        scan = _load_trusted_scan()
+        source = "mod a { #[trusted] pub fn g() {} }\nmod a { pub fn g() {} }\n"
+        assert not scan.resolve_trusted_def_path("a::g", source)
+
+    def test_count_must_match_named_items(self):
+        scan = _load_trusted_scan()
+        assert scan.unresolved_trusted_def_paths(["lie"], _TRUSTED_SRC, 1) == []
+        assert scan.unresolved_trusted_def_paths([], _TRUSTED_SRC, 1)
+        assert scan.unresolved_trusted_def_paths(["lie", "lie"], _TRUSTED_SRC, 2)
+
+    def test_extract_skips_proof_assert_and_summary_lines(self):
+        scan = _load_trusted_scan()
+        output = (
+            "trust-wp: lie trusted (skipped)\n"
+            "trust-wp: proof_assert in creusot_test::assume trusted (skipped)\n"
+            "trust-wp: (1 trusted, skipped)\n"
+        )
+        assert scan.extract_trusted_def_paths(output) == ["lie"]
+
+
+class TestSummaryPatternsIgnoreWireFields:
+    def test_trusted_wire_field_is_not_a_skipped_summary_count(self):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "status": "pass",
+                "message": "ok\nTRUST_WP_RESULT:v1 verified=2 trusted=1 skipped=0",
+                "verification_tier": "tier2",
+                "telemetry": _complete_telemetry(verified=2),
+            }
+        )
+        assert "skipped summary count" not in reasons
+
+    def test_textual_skipped_summary_still_violates(self):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "status": "pass",
+                "message": "trust-wp: 2 verified, 0 failed, 1 skipped",
+                "verification_tier": "tier2",
+                "telemetry": _complete_telemetry(verified=2),
+            }
+        )
+        assert "skipped summary count" in reasons
+
+
+class TestSourceTrustedTierAndGate:
+    NAME = "tests/should_succeed/specification/trusted_parity_fixture.rs"
+
+    def _message(self, trusted_paths, verified=2, **wire):
+        lines = ["trust-wp: victim verified ✓"] if verified else []
+        lines += [f"trust-wp: {p} trusted (skipped)" for p in trusted_paths]
+        lines.append(f"trust-wp: ({len(trusted_paths)} trusted, skipped)")
+        lines.append(
+            f"trust-wp: {verified} verified, 0 failed, 0 errors, {len(trusted_paths)} trusted"
+        )
+        lines.append(
+            _wire_line(verified=verified, trusted=len(trusted_paths), base_exit_code=2, **wire)
+        )
+        return "\n".join(lines)
+
+    def _tier(self, message, paths=None):
+        return harness.classify_verification_tier(
+            self.NAME, "pass", message, None, _TRUSTED_SRC, trusted_def_paths=paths
+        )
+
+    def test_source_declared_trusted_pass_is_distinct_tier(self):
+        assert self._tier(self._message(["lie", "foo::inner"])) == "tier2-source-trusted"
+
+    def test_undeclared_trusted_item_stays_tier3(self):
+        assert self._tier(self._message(["lie", "victim"])) == "tier3"
+
+    def test_derive_generated_trusted_item_stays_tier3(self):
+        assert self._tier(self._message(["<ETuple as std::default::Default>::default"])) == "tier3"
+
+    def test_other_soundness_marker_still_tier3(self):
+        message = self._message(["lie"], vacuous=1) + "\n1 vacuous"
+        assert self._tier(message) == "tier3"
+
+    def test_unnamed_trusted_counter_stays_tier3(self):
+        message = "trust-wp: victim verified ✓\n" + _wire_line(verified=1, trusted=1)
+        assert self._tier(message) == "tier3"
+
+    def test_no_positive_proof_is_not_source_trusted_tier2(self):
+        assert self._tier(self._message(["lie"], verified=0)) != "tier2-source-trusted"
+
+    def _gate(self, tmp_path, monkeypatch, **result):
+        module = _load_compare_baselines()
+        ref = tmp_path / "reference" / "creusot" / self.NAME
+        ref.parent.mkdir(parents=True)
+        ref.write_text(_TRUSTED_SRC)
+        # Creusot's inventory for the fixture: only ``victim`` bears a goal
+        # (a trusted callee is a stub; ``lie`` has no VC of its own).
+        ref.with_suffix(".coma").write_text(
+            "module M_victim\n"
+            "  let rec lie (return (x: UInt32.t)) = any\n"
+            "    [ return (result: UInt32.t) -> {[@expl:lie ensures] UInt32.t'int result = 10} (! return {result}) ]\n"
+            "  \n"
+            "  let rec victim (return (x: UInt32.t)) = (! bb0\n"
+            "    [ bb0 = s0 [ s0 = UInt32.add {(1: UInt32.t)} {(2: UInt32.t)} (fun (_x: UInt32.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]\n"
+            "    [ & _ret: UInt32.t = Any.any_l () ]) [ return (result: UInt32.t) -> (! return {result}) ]\n"
+            "end\n"
+        )
+        monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+        base = {"name": self.NAME, "status": "pass"}
+        base.update(result)
+        return module._true_100_violation_reasons(base)
+
+    def test_gate_accepts_source_declared_trusted(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            message=self._message(["lie", "Mutex::<T>::new"]),
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["lie", "Mutex::<T>::new"],
+            telemetry=_complete_telemetry(verified=2, trusted=2, base_exit_code=2),
+            driver_report=["trust-wp: victim verified ✓"],
+        )
+        assert reasons == []
+
+    def test_gate_rejects_undeclared_trusted(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            message="Verification succeeded",
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["victim"],
+            telemetry=_complete_telemetry(verified=2, trusted=1, base_exit_code=2),
+        )
+        assert any("not declared #[trusted] in source: victim" in r for r in reasons)
+        assert "telemetry.trusted=1" in reasons
+
+    def test_gate_rejects_count_mismatch(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            message="Verification succeeded",
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["lie"],
+            telemetry=_complete_telemetry(verified=2, trusted=2, base_exit_code=2),
+        )
+        assert "telemetry.trusted=2" in reasons
+
+    def test_gate_rejects_trusted_with_plain_tier3(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            message="Verification succeeded",
+            verification_tier="tier3",
+            trusted_def_paths=["lie"],
+            telemetry=_complete_telemetry(verified=2, trusted=1, base_exit_code=2),
+        )
+        assert "telemetry.trusted=1" in reasons
+
+    def test_gate_rejects_missing_source(self, tmp_path, monkeypatch):
+        module = _load_compare_baselines()
+        monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+        reasons = module._true_100_violation_reasons(
+            {
+                "name": "tests/should_succeed/missing.rs",
+                "status": "pass",
+                "message": "Verification succeeded",
+                "verification_tier": "tier2-source-trusted",
+                "trusted_def_paths": ["lie"],
+                "telemetry": _complete_telemetry(verified=2, trusted=1),
+            }
+        )
+        assert any("source for trusted resolution not found" in r for r in reasons)
+
+    def test_gate_does_not_accept_other_counters_on_source_trusted(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            message="Verification succeeded",
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["lie"],
+            telemetry=_complete_telemetry(verified=2, trusted=1, assumed=1),
+        )
+        assert "telemetry.assumed=1" in reasons
+
+    def test_summary_reports_source_trusted_separately(self):
+        results = [
+            harness.TestResult(
+                name=self.NAME, status="pass", message="m", duration_ms=1,
+                verification_tier="tier2-source-trusted",
+            )
+        ]
+        summary = harness.summarize_results(results)
+        assert summary["tier2_source_trusted"] == 1
+        assert summary["tier2_verified"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Review probes: a driver crash is never a rejection (F1), counter exemptions
+# are tied to their credit channel (F2a), trust counters block the NO_REPLAY
+# verified mode (N1).
+# ---------------------------------------------------------------------------
+
+
+class TestReviewOf2480c85:
+    # F1: driver crash after a frontend marker is never a rejection.
+    def test_f1_marker_on_warning_then_sigsegv_is_error(self):
+        output = (
+            "warning: proof_assert!(false) inside a loop is an unsatisfied proof obligation\n"
+            "error: could not compile `probe` (lib)\n\nCaused by:\n"
+            "  process didn't exit successfully: `trust-wp-driver ...` "
+            "(signal: 11, SIGSEGV: invalid memory reference)\n"
+        )
+        assert _sf(output, exit_code=101) == ("error", None, None)
+
+    def test_f1_marker_on_note_then_exit_101_is_error(self):
+        output = (
+            "note: the HashMap/BTreeMap Entry API\n"
+            "error: could not compile `probe` (lib)\nCaused by:\n"
+            "  process didn't exit successfully (exit status: 101)\n"
+        )
+        assert _sf(output, exit_code=101) == ("error", None, None)
+
+    def test_f1_guard_span_err_frontend_refusal_still_credited(self):
+        output = (
+            "error: used the `#[trusted]` attribute\n --> src/lib.rs:6:1\n"
+            "error: used the `#[trusted]` attribute\n --> src/lib.rs:12:1\n"
+            "error: aborting due to 2 previous errors\n\n"
+            "error: could not compile `creusot_test` (lib) due to 2 previous errors\n"
+        )
+        status, _reason, credit = _sf(output, exit_code=101)
+        assert status == "pass"
+        assert credit.startswith("frontend: ") and "driver exit 101" not in credit
+
+    # F2a: counter exemptions are tied to the matching credit channel.
+    def _sf_gate(self, **result):
+        module = _load_compare_baselines()
+        base = {"name": "tests/should_fail/probe.rs", "status": "pass"}
+        base.update(result)
+        return module._should_fail_true_100_violation_reasons(base)
+
+    def test_f2a_solver_credit_with_parse_errors_is_flagged(self):
+        reasons = self._sf_gate(
+            message="Correctly rejected (wire failed=1)",
+            telemetry=_complete_telemetry(failed=1, parse_errors=3, base_exit_code=1),
+        )
+        assert "telemetry.parse_errors=3" in reasons
+
+    def test_f2a_termination_credit_does_not_exempt_parse_errors(self):
+        reasons = self._sf_gate(
+            message="Correctly rejected (termination check failed)",
+            telemetry=_complete_telemetry(termination_errors=1, parse_errors=2),
+        )
+        assert reasons == ["telemetry.parse_errors=2"]
+
+    @pytest.mark.parametrize(
+        "credit,key",
+        [
+            ("termination check failed (termination_errors=1)", "termination_errors"),
+            ("logic recursion check failed", "logic_recursion_errors"),
+            ("parse_errors=1", "parse_errors"),
+        ],
+    )
+    def test_f2a_matching_channel_is_exempt(self, credit, key):
+        reasons = self._sf_gate(
+            message=f"Correctly rejected ({credit})",
+            telemetry=_complete_telemetry(**{key: 1, "base_exit_code": 2}),
+        )
+        assert reasons == []
+
+    # F2b: missing telemetry only for compile:/frontend: without exit-101.
+    def test_f2b_parse_errors_credit_without_telemetry_is_flagged(self):
+        reasons = self._sf_gate(message="Correctly rejected (parse_errors=1)", telemetry=None)
+        assert "telemetry missing or malformed" in reasons
+
+    def test_f2b_exit_101_frontend_credit_without_telemetry_is_flagged(self):
+        reasons = self._sf_gate(
+            message="Correctly rejected (frontend: used the `#[trusted]` attribute (driver exit 101))",
+            telemetry=None,
+        )
+        assert "telemetry missing or malformed" in reasons
+
+    def test_f2b_termination_credit_without_telemetry_is_flagged(self):
+        reasons = self._sf_gate(
+            message="Correctly rejected (termination check failed)", telemetry=None
+        )
+        assert "telemetry missing or malformed" in reasons
+
+    @pytest.mark.parametrize(
+        "credit", ["compile: error[E0499]", "frontend: used the `#[trusted]` attribute"]
+    )
+    def test_f2b_guard_compile_and_frontend_may_lack_telemetry(self, credit):
+        assert self._sf_gate(message=f"Correctly rejected ({credit})", telemetry=None) == []
+
+    # N1: trust counters block the NO_REPLAY verified mode.
+    @pytest.mark.parametrize(
+        "counter",
+        ["trusted", "skipped", "assumed", "vacuous", "unverified_axioms",
+         "verified_with_axiom_deps", "evidence_gaps"],
+    )
+    def test_n1_no_replay_verified_requires_zero_trust_counters(self, counter):
+        output = "trust-wp: f verified ✓\n" + _wire_line(verified=1, **{counter: 2})
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=0, test_name="tests/should_succeed/bug/387.rs"
+        )
+        # D-21: a trust counter on a non-allowlisted NO_REPLAY test is
+        # neither a verified pass nor a translate-only credit.
+        assert status != "pass"
+        assert mode is None
+
+    def test_n1_guard_clean_verified_no_replay_is_still_verified(self):
+        output = "trust-wp: f verified ✓\n" + _wire_line(verified=1)
+        assert harness.classify_no_replay_result_with_mode(
+            output, exit_code=0, test_name="tests/should_succeed/bug/387.rs"
+        )[2] == "verified"
+
+    # N2: allowlist matches by exact path, like the gate.
+    def test_n2_allowlist_prefix_lookalike_is_not_allowed(self):
+        output = "trust-wp: user FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        status, _skip, _mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=1, test_name="tests/should_succeed/spec_tests_extra.rs"
+        )
+        assert status != "pass"
+
+    def test_n2_guard_exact_allowlisted_path_still_allowed(self):
+        output = "trust-wp: test_specs FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=1, test_name="tests/should_succeed/spec_tests.rs"
+        )
+        assert (status, mode) == ("pass", "translate_only")
+
+
+class TestTranslateOnlyAllowlistBug511:
+    def test_bug_511_zero_obligation_parse_only_is_accepted_at_gate(self):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "name": "tests/should_succeed/bug/511.rs",
+                "status": "pass",
+                "message": "Parse-only (NO_REPLAY): syntax-only test",
+                "verification_tier": "tier3",
+                "driver_report": [],
+                "telemetry": _complete_telemetry(),
+            }
+        )
+        assert reasons == []
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "tests/should_succeed/bug/387.rs",
+            "tests/should_succeed/syntax/10_mutual_rec_types.rs",
+            "tests/should_succeed/closures/03_generic_bound.rs",
+            "tests/should_succeed/closures/04_generic_closure.rs",
+            "tests/should_succeed/closures/05_map.rs",
+            "tests/should_succeed/traits/04.rs",
+            "tests/should_succeed/closures/01_basic.rs",
+            "tests/should_succeed/syntax/04_assoc_prec.rs",
+            "tests/should_succeed/lang/float_ops.rs",
+        ],
+    )
+    def test_skipped_obligation_no_replay_tests_are_not_allowlisted(self, name):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "name": name,
+                "status": "pass",
+                "message": "Parse-only (NO_REPLAY): syntax-only test",
+                "verification_tier": "tier3",
+                "telemetry": _complete_telemetry(),
+            }
+        )
+        assert "NO_REPLAY parse-only pass" in reasons
+
+
+class TestProofAssertInconclusiveIsNotAProofPass:
+    """An inconclusive proof_assert (solver unknown) is an unproved assertion."""
+
+    SOURCE = "#[trusted]\nfn calls_closure() {}\npub fn f() { proof_assert!(true) }\n"
+    NAME = "tests/should_succeed/closures/pa_inconclusive_fixture.rs"
+
+    def _message(self, inconclusive):
+        return (
+            "trust-wp: f verified ✓\n"
+            "trust-wp: calls_closure trusted (skipped)\n"
+            "trust-wp: (1 trusted, skipped)\n"
+            "trust-wp: 3 verified, 0 failed, 0 errors, 1 trusted\n"
+            f"trust-wp: proof_assert: 5 verified, 0 failed, 0 errors, {inconclusive} inconclusive\n"
+            + _wire_line(verified=3, trusted=1, proof_assert_verified=5,
+                         proof_assert_inconclusive=inconclusive, base_exit_code=2)
+        )
+
+    def test_inconclusive_blocks_source_trusted_tier(self):
+        tier = harness.classify_verification_tier(
+            self.NAME, "pass", self._message(1), None, self.SOURCE
+        )
+        assert tier == "tier3"
+
+    def test_source_trusted_tier_without_inconclusive(self):
+        tier = harness.classify_verification_tier(
+            self.NAME, "pass", self._message(0), None, self.SOURCE
+        )
+        assert tier == "tier2-source-trusted"
+
+    def test_inconclusive_blocks_plain_tier2(self):
+        message = "Verification succeeded\n" + _wire_line(
+            verified=2, proof_assert_verified=1, proof_assert_inconclusive=1
+        )
+        assert harness.classify_verification_tier(
+            "tests/should_succeed/x.rs", "pass", message, None, "fn f() {}"
+        ) == "tier3"
+
+    def test_gate_flags_inconclusive_counter(self):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "name": "tests/should_succeed/x.rs",
+                "status": "pass",
+                "message": "Verification succeeded",
+                "verification_tier": "tier2",
+                "telemetry": _complete_telemetry(verified=2, proof_assert_inconclusive=1),
+            }
+        )
+        assert "telemetry.proof_assert_inconclusive=1" in reasons
+
+
+class TestWithheldRefutationIsNeverASuccess:
+    """The harness-side mirror of withheld refutations (D-27).
+
+    Withholding moves verdicts out of ``failed`` into ``unknown``. The risk it
+    creates is not a false accept — it is somebody downstream reading
+    ``unknown`` as success. Gate-clean is ``status == "pass"`` AND tier in
+    {tier1, tier2, tier2-source-trusted}; these pin that an inconclusive
+    reaches neither half.
+    """
+
+    NAME = "tests/should_succeed/x.rs"
+    SOURCE = "#[ensures(result == x)]\nfn f(x: u32) -> u32 { x }"
+    WITHHELD = (
+        "trust-wp: f unknown (refutation withheld: goal set carries a "
+        "fail-closed `false` trust-wp injected for a construct it could not "
+        "model)\ntrust-wp: 0 verified, 0 failed, 1 errors"
+    )
+
+    def test_a_withheld_refutation_is_not_tier1_or_tier2(self):
+        for status in ("unknown", "error", "fail"):
+            tier = harness.classify_verification_tier(
+                self.NAME, status, self.WITHHELD, None, self.SOURCE
+            )
+            assert tier == "tier3", (status, tier)
+
+    def test_a_withheld_refutation_is_not_gate_clean(self):
+        # Gate-clean needs BOTH halves. An inconclusive fails the tier half
+        # even if some future classifier change were to call it a pass.
+        gate_clean_tiers = {"tier1", "tier2", "tier2-source-trusted"}
+        tier = harness.classify_verification_tier(
+            self.NAME, "error", self.WITHHELD, None, self.SOURCE
+        )
+        assert tier not in gate_clean_tiers
+
+    def test_a_verified_crate_is_still_gradeable(self):
+        # The control: withholding a refutation must not make PROVING harder.
+        message = "Verification succeeded\n" + _wire_line(verified=2)
+        assert (
+            harness.classify_verification_tier(
+                self.NAME, "pass", message, None, self.SOURCE
+            )
+            in {"tier1", "tier2"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Creusot goal coverage: a proof-grade pass must have examined every item
+# Creusot generates goals for. Outputs below are recorded driver runs on the
+# adversarial review's probes.
+# ---------------------------------------------------------------------------
+
+
+def _load_goal_coverage():
+    spec = importlib.util.spec_from_file_location(
+        "creusot_goal_coverage_t", WORKSPACE_ROOT / "scripts" / "creusot_goal_coverage.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_CORPUS_SS = WORKSPACE_ROOT / "reference" / "creusot" / "tests" / "should_succeed"
+
+_ST_OVERFLOW_SRC = """extern crate creusot_std;
+use creusot_std::prelude::*;
+
+#[trusted]
+#[ensures(result == 5u32)]
+fn five() -> u32 {
+    5
+}
+
+#[ensures(result == 5u32)]
+pub fn ok() -> u32 {
+    five()
+}
+
+pub fn bad(x: u32) -> u32 {
+    x + 1
+}
+"""
+
+# Hand-authored in the exact shape Creusot emits for st_overflow.rs (compare
+# erasure.coma M_test_foo): a trusted callee is a stub, `x + 1` is a prelude
+# `UInt32.add` call whose precondition is the overflow goal.
+_ST_OVERFLOW_OK_COMA = """module M_ok
+  use creusot.int.UInt32
+  use creusot.prelude.Any
+  
+  let rec five (return (x: UInt32.t)) = any
+    [ return (result: UInt32.t) -> {[@stop_split] [@expl:five ensures] UInt32.t'int result = 5} (! return {result}) ]
+  
+  meta "compute_max_steps" 1000000
+  
+  let rec ok (return (x: UInt32.t)) = (! bb0
+    [ bb0 = s0 [ s0 = five (fun (_x: UInt32.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]
+    [ & _ret: UInt32.t = Any.any_l () ])
+    [ return (result: UInt32.t) -> {[@stop_split] [@expl:ok ensures] UInt32.t'int result = 5}
+      (! return {result}) ]
+end
+"""
+_ST_OVERFLOW_BAD_COMA = """module M_bad
+  use creusot.int.UInt32
+  use creusot.prelude.Any
+  
+  meta "compute_max_steps" 1000000
+  
+  let rec bad (x: UInt32.t) (return (x'0: UInt32.t)) = (! bb0
+    [ bb0 = s0
+      [ s0 = UInt32.add {x} {(1: UInt32.t)} (fun (_x: UInt32.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]
+    [ & _ret: UInt32.t = Any.any_l () | & x: UInt32.t = x ])
+    [ return (result: UInt32.t) -> (! return {result}) ]
+end
+"""
+
+_ST_OVERFLOW_OUT = (
+    "trust-wp: five trusted (skipped)\n"
+    "trust-wp: ok verified ✓\n\n"
+    "trust-wp: (1 trusted, skipped)\n"
+    "trust-wp: 1 verified, 0 failed, 0 errors, 1 trusted\n"
+)
+
+_ST_CLOSURE_PRE_SRC = """extern crate creusot_std;
+use creusot_std::prelude::*;
+
+pub fn multi_use<T>(x: &T) {
+    let c = #[requires(false)]
+    || {
+        let _ = x;
+        0
+    };
+
+    uses_fn(c);
+}
+
+#[trusted]
+#[requires(f.precondition(()))]
+#[ensures(exists<f2: &F, r> *f2 == f && f2.postcondition((), r))]
+fn uses_fn<F: Fn() -> u32>(f: F) {
+    f();
+}
+"""
+
+_ST_CLOSURE_PRE_OUT = (
+    "trust-wp: multi_use::{closure#0} verified ✓ (vacuous: explicit #[requires(false)])\n"
+    "  at src/lib.rs:9:5: 9:7\n"
+    "trust-wp: uses_fn trusted (skipped)\n\n"
+    "trust-wp: (1 trusted, skipped)\n"
+    "trust-wp: 1 verified, 0 failed, 0 errors, 1 trusted\n"
+)
+
+_ST_TRUSTED_PRE_SRC = """extern crate creusot_std;
+use creusot_std::prelude::*;
+
+#[trusted]
+#[requires(x > 10u32)]
+#[ensures(result == x)]
+fn id_big(x: u32) -> u32 {
+    x
+}
+
+#[ensures(result == 3u32)]
+pub fn caller() -> u32 {
+    id_big(3u32)
+}
+"""
+
+_ST_CONTROL_SRC = """extern crate creusot_std;
+use creusot_std::prelude::*;
+
+#[trusted]
+#[ensures(result == 5u32)]
+fn five() -> u32 {
+    5
+}
+
+#[ensures(result == 6u32)]
+pub fn bad() -> u32 {
+    five()
+}
+"""
+
+
+class TestCreusotGoalInventory:
+    def test_100doors_goal_kinds(self):
+        gc = _load_goal_coverage()
+        items = gc.goal_inventory("tests/should_succeed/100doors.rs")
+        assert [i.item for i in items] == ["f"]
+        # 2 for-invariants + 1 outer + 2 inner loop invariants; index + index_mut
+        # requires; two `door - 1` subs and one `door += pass` add.
+        assert dict(items[0].goal_kinds) == {"loop invariant": 5, "index bounds": 2, "overflow": 3}
+
+    def test_closure_08_multi_use_carries_callee_requires(self):
+        gc = _load_goal_coverage()
+        items = {i.item: i for i in gc.goal_inventory("tests/should_succeed/closures/08_multiple_calls.rs")}
+        # the closure body proves nothing; the obligation is uses_fn's requires
+        assert set(items) == {"multi_use"}
+        assert items["multi_use"].goal_kinds["callee requires"] == 1
+
+    def test_span_mode_calls_and_refinement(self):
+        gc = _load_goal_coverage()
+        items = {i.item: i for i in gc.goal_inventory("tests/should_succeed/spans.rs")}
+        assert items["quux"].goal_kinds["callee requires"] == 1  # `decr [%#sspans'0] {i}`
+        assert items["impl_Tr_for_S::foo refinement"].refines
+        assert items["baz"].goal_kinds["logic goal"] == 1
+
+    def test_stub_only_items_have_no_goals(self):
+        gc = _load_goal_coverage()
+        names = {i.item for i in gc.goal_inventory("tests/should_succeed/specification/erasure.rs")}
+        assert {"test_foo", "test_foo2"} <= names
+        assert not names & {"quux2", "takes_ref", "takes_ref_test", "takes_ref_test2"}
+
+    def test_missing_coma_is_none(self):
+        gc = _load_goal_coverage()
+        assert gc.goal_inventory("tests/should_succeed/bug/265.rs") is None
+
+    # --- unlabelled ``{false} any`` abort obligations (D-19) -----------------
+    # Creusot emits ``Terminator::Abort`` -- the panic edge of a Rust
+    # ``assert!``/``unreachable!`` and every MIR block Rust proves dead -- as an
+    # UNLABELLED ``<bb> = {false} any`` assertion (backend/program.rs). The
+    # labelled-brace walk counts none of it; an inventory that stopped there
+    # would report zero goals for such a row and grant the zero-goal credit on
+    # a false premise.
+
+    def test_abort_block_is_counted_as_an_unreachable_goal(self):
+        gc = _load_goal_coverage()
+        # match_int.rs: three `assert!` -> three `{false} any` blocks in `f`.
+        items = {i.item: i for i in gc.goal_inventory("tests/should_succeed/match_int.rs")}
+        assert items["f"].goal_kinds["unreachable"] == 3
+
+    def test_abort_counts_per_corpus_row(self):
+        gc = _load_goal_coverage()
+        for test, expected in [
+            ("tests/should_succeed/bug/1248.rs", 16),
+            ("tests/should_succeed/match_int.rs", 3),
+            ("tests/should_succeed/lang/branch_borrow_2.rs", 1),
+            ("tests/should_succeed/lang/unary_op.rs", 1),
+        ]:
+            items = gc.goal_inventory(test)
+            got = sum(i.goal_kinds.get("unreachable", 0) for i in items)
+            assert got == expected, (test, got, expected)
+
+    def test_outcome_position_false_is_a_branch_condition_not_a_goal(self):
+        """``br0 -> {false} (! bb)`` is the branch condition of a switch on the
+        literal ``false`` discriminant -- a handler precondition of an abstract
+        ``any``, which nothing discharges. loop.rs and one_side_update.rs carry
+        ONLY that form (and zero ``assert!``), so both stay zero-goal."""
+        gc = _load_goal_coverage()
+        for test in ("tests/should_succeed/loop.rs", "tests/should_succeed/one_side_update.rs"):
+            text = gc.coma_path_for_test(test).read_text(encoding="utf-8")
+            assert "{false}" in text  # the token IS present ...
+            items = gc.goal_inventory(test)
+            assert sum(i.goal_kinds.get("unreachable", 0) for i in items) == 0  # ... and is not a goal
+            assert items == []
+
+    def test_extspec_closure_abort_is_still_not_a_goal(self):
+        """bug/1312's ``unreachable!()`` sits in a contract-free closure emitted
+        ``[@coma:extspec]`` (no black_box barrier): its body is inlined at call
+        sites, so the obligation is the CALLER's and the closure has none of its
+        own. Creusot discharges ``vc_closure0`` in 0.026s with the `{false}`
+        present and no precondition ruling out ``None`` -- which it could not do
+        if that assertion were part of the closure's own VC."""
+        gc = _load_goal_coverage()
+        text = gc.coma_path_for_test("tests/should_succeed/bug/1312.rs").read_text(encoding="utf-8")
+        assert "[@coma:extspec]" in text and "= {false} any" in text
+        assert gc.goal_inventory("tests/should_succeed/bug/1312.rs") == []
+
+    def test_abort_regex_shape(self):
+        gc = _load_goal_coverage()
+        counted = "  let rec f (return (x: ())) = (! bb0 [ bb0 = (! bb1) | bb1 = {false} any ])"
+        not_counted = "  let rec g (return (x: ())) = (! bb0 [ bb0 = any [ br0 -> {false} (! bb1) ] ])"
+        mod_c = gc.parse_coma("module M_f" + chr(10) + counted + chr(10) + "end")[0]
+        mod_n = gc.parse_coma("module M_g" + chr(10) + not_counted + chr(10) + "end")[0]
+        assert gc.module_goal_items(mod_c)[0].goal_kinds["unreachable"] == 1
+        assert gc.module_goal_items(mod_n) == []
+
+    @pytest.mark.parametrize(
+        "module,path,disamb,expected",
+        [
+            ("M_impl_Tr_for_S__foo", "<S as Tr>::foo", False, True),
+            ("M_impl_Tr_for_S__foo", "<T as Tr>::foo", False, False),
+            ("M_impl_List_T__len", "List::<T>::len", False, True),
+            ("M_impl_List_T__len", "creusot_test::List::<T>::len", False, True),
+            ("M_i128__test_add", "i128::test_add", False, True),
+            ("M_impl_laws", "impl_laws", False, True),
+            ("M_trait_Trait__goo", "Trait::goo", False, True),
+            ("M_impl_Model_for_ref_T__model", "<&T as Model>::model", False, True),
+            ("M_impl_Clone_for_List_tup2_K_V__clone", "<List<(K, V)> as std::clone::Clone>::clone", False, True),
+            (
+                "M_custom_variant__impl_WellFounded_for_CustomVariant__no_infinite_decreasing_sequence",
+                "<custom_variant::CustomVariant as creusot_std::WellFounded>::no_infinite_decreasing_sequence",
+                False,
+                True,
+            ),
+            ("M_custom_variant_0", "custom_variant", True, True),
+            ("M_custom_variant_0", "custom_variant", False, False),
+            ("M_test_6", "test", False, False),
+            ("M_f", "g", False, False),
+            ("M_f", "f::{closure#0}", False, False),
+        ],
+    )
+    def test_def_path_mapping(self, module, path, disamb, expected):
+        gc = _load_goal_coverage()
+        from collections import Counter
+
+        item = gc.GoalItem(module, gc.module_item_name(module), None, False, [], Counter(x=1), disamb)
+        assert gc.coma_item_matches_path(item, path, disamb) is expected
+
+    def test_closure_mapping_is_index_exact_unless_asked(self):
+        gc = _load_goal_coverage()
+        from collections import Counter
+
+        item = gc.GoalItem("M_f", "f::{closure#1}", 1, False, [], Counter(x=1))
+        assert gc.coma_item_matches_path(item, "f::{closure#1}")
+        assert not gc.coma_item_matches_path(item, "f::{closure#0}")
+        assert gc.coma_item_matches_path(item, "f::{closure#0}", ignore_closure_index=True)
+        assert not gc.coma_item_matches_path(item, "f", ignore_closure_index=True)
+        assert not gc.coma_item_matches_path(item, "g::{closure#0}", ignore_closure_index=True)
+
+
+class TestCreusotGoalCoverage:
+    def test_loop_invariant_goal_needs_loop_evidence(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/100doors.rs"
+        cov = gc.compute_goal_coverage(name, "trust-wp: f verified ✓\n")
+        assert [u["item"] for u in cov["uncovered"]] == ["f"]
+        assert "loop-invariant evidence" in cov["uncovered"][0]["reason"]
+        cov = gc.compute_goal_coverage(name, "trust-wp: f verified ✓ (loop invariant)\n")
+        assert cov["uncovered"] == []
+
+    def test_negative_report_for_same_item_is_uncovered(self):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(
+            "tests/should_succeed/100doors.rs",
+            "trust-wp: f verified ✓ (loop invariant)\ntrust-wp: f unknown (timeout)\n",
+        )
+        assert cov["uncovered"] and cov["uncovered"][0]["reason"].startswith("reported unknown")
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "trust-wp: f verified* (depends on 1 unverified axiom(s))",
+            "trust-wp: f vacuous (contradictory premises)",
+            "trust-wp: creusot_test::f law postcondition unverified (non-strict axiom exposure)",
+            "trust-wp: f assumed (axiom-only function: 1 universal postcondition(s) with trivial body)",
+        ],
+    )
+    def test_non_clean_verdicts_do_not_cover(self, line):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(
+            "tests/should_succeed/100doors.rs", f"trust-wp: f verified ✓ (loop invariant)\n{line}\n"
+        )
+        assert cov["uncovered"] and cov["uncovered"][0]["reason"].startswith("reported ")
+
+    def test_proof_assert_line_covers_only_assertion_items(self):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(
+            "tests/should_succeed/100doors.rs", "trust-wp: proof_assert in creusot_test::f verified ✓\n"
+        )
+        assert cov["uncovered"]
+
+    def test_creusot_closure_index_is_not_driver_index(self):
+        """bug/962: Creusot names the only user closure ``closure2``."""
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/962.rs"
+        out = "trust-wp: disjoint_captures verified ✓\ntrust-wp: disjoint_captures::{closure#0} verified ✓\n"
+        assert gc.compute_goal_coverage(name, out)["uncovered"] == []
+
+    def test_nested_closures_count_toward_the_flat_module(self):
+        """closures/10_tyinv: Creusot defines closure0 and closure1 flat in M_f."""
+        gc = _load_goal_coverage()
+        out = "\n".join(
+            [
+                # recorded driver output
+                "trust-wp: f::{closure#0} verified ✓",
+                "trust-wp: verifying proof_assert in creusot_test::f::{closure#0} (0 contract preconditions)",
+                "trust-wp: proof_assert in creusot_test::f::{closure#0} verified ✓",
+                "trust-wp: f::{closure#0}::{closure#1} verified ✓",
+                "trust-wp: verifying proof_assert in creusot_test::f::{closure#0}::{closure#1} (0 contract preconditions)",
+                "trust-wp: proof_assert in creusot_test::f::{closure#0}::{closure#1} verified ✓",
+                "trust-wp: f verified ✓",
+            ]
+        )
+        cov = gc.compute_goal_coverage("tests/should_succeed/closures/10_tyinv.rs", out)
+        assert cov["uncovered"] == []
+        without_nested = "\n".join(l for l in out.split("\n") if "{closure#1}" not in l)
+        cov = gc.compute_goal_coverage("tests/should_succeed/closures/10_tyinv.rs", without_nested)
+        assert {u["item"] for u in cov["uncovered"]} == {"f::{closure#0}", "f::{closure#1}"}
+
+    def test_closure_count_mismatch_is_uncovered(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/962.rs"
+        out = (
+            "trust-wp: disjoint_captures verified ✓\n"
+            "trust-wp: disjoint_captures::{closure#0} verified ✓\n"
+            "trust-wp: disjoint_captures::{closure#1} verified ✓\n"
+        )
+        cov = gc.compute_goal_coverage(name, out)
+        assert [u["item"] for u in cov["uncovered"]] == ["disjoint_captures::{closure#2}"]
+        assert "closure pairing ambiguous" in cov["uncovered"][0]["reason"]
+
+    def test_closure_with_negative_report_is_uncovered(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/962.rs"
+        out = "trust-wp: disjoint_captures verified ✓\ntrust-wp: disjoint_captures::{closure#0} unknown (timeout)\n"
+        cov = gc.compute_goal_coverage(name, out)
+        assert [u["item"] for u in cov["uncovered"]] == ["disjoint_captures::{closure#2}"]
+
+    def test_explicit_requires_false_vacuity_covers_loop_goal_only_if_coma_says_false(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/1562.rs"
+        out = "trust-wp: List::<T>::foo verified ✓ (vacuous: explicit #[requires(false)])\n"
+        assert gc.compute_goal_coverage(name, out)["uncovered"] == []
+        # 100doors' f has no false precondition: the same detail is not loop evidence
+        out = "trust-wp: f verified ✓ (vacuous: explicit #[requires(false)])\n"
+        cov = gc.compute_goal_coverage("tests/should_succeed/100doors.rs", out)
+        assert cov["uncovered"]
+
+    def test_recorded_closure_08_row_is_uncovered(self):
+        """F3: the credited corpus row never examined multi_use's goal."""
+        gc = _load_goal_coverage()
+        out = "trust-wp: multi_use::{closure#0} verified ✓\ntrust-wp: uses_fn trusted (skipped)\n"
+        cov = gc.compute_goal_coverage("tests/should_succeed/closures/08_multiple_calls.rs", out)
+        assert [u["item"] for u in cov["uncovered"]] == ["multi_use"]
+
+    def test_recorded_erasure_row_leaves_overflow_items_uncovered(self):
+        gc = _load_goal_coverage()
+        out = "\n".join(
+            [
+                "trust-wp: foo3 trusted (skipped)",
+                "trust-wp: test_ptr trusted (skipped)",
+                "trust-wp: test_ptr2 verified ✓ (vacuous: explicit #[requires(false)])",
+                "trust-wp: test_ptr_mut trusted (skipped)",
+                "trust-wp: test_ptr_mut2 verified ✓ (vacuous: explicit #[requires(false)])",
+                "trust-wp: specs verified ✓ (loop invariant vacuous: explicit #[requires(false)])",
+            ]
+        )
+        cov = gc.compute_goal_coverage("tests/should_succeed/specification/erasure.rs", out)
+        uncovered = {u["item"]: u for u in cov["uncovered"]}
+        assert uncovered["test_foo"]["goal_kinds"] == {"overflow": 2}
+        assert "test_foo2" in uncovered
+
+
+class TestReviewProbesGoalCoverageGate:
+    """The review's probes (F1/F2) must be REJECTED; controls stay rejected."""
+
+    def _gate(self, tmp_path, monkeypatch, name, source, coma, **result):
+        module = _load_compare_baselines()
+        ref = tmp_path / "reference" / "creusot" / name
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text(source)
+        if coma is not None:
+            ref.with_suffix(".coma").write_text(coma)
+        monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+        gc = _load_goal_coverage()
+        base = {"name": name, "status": "pass"}
+        base.update(result)
+        base.setdefault("driver_report", gc.driver_report_lines(base.get("message", "")))
+        return module._true_100_violation_reasons(base)
+
+    def test_st_closure_pre_rejected(self, tmp_path, monkeypatch):
+        # Creusot's coma for this probe differs from closures/08 only inside the
+        # closure's precondition predicate, which does not change the inventory.
+        coma = (_CORPUS_SS / "closures" / "08_multiple_calls.coma").read_text()
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/st_closure_pre.rs",
+            _ST_CLOSURE_PRE_SRC,
+            coma,
+            message=_ST_CLOSURE_PRE_OUT + _wire_line(verified=1, trusted=1, base_exit_code=2),
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["uses_fn"],
+            telemetry=_complete_telemetry(verified=1, trusted=1, base_exit_code=2),
+        )
+        assert any(
+            r.startswith("uncovered Creusot goal item multi_use [") and "callee requires" in r
+            for r in reasons
+        ), reasons
+
+    def test_st_overflow_rejected(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/st_overflow.rs",
+            _ST_OVERFLOW_SRC,
+            _ST_OVERFLOW_OK_COMA + _ST_OVERFLOW_BAD_COMA,
+            message=_ST_OVERFLOW_OUT + _wire_line(verified=1, trusted=1, base_exit_code=2),
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["five"],
+            telemetry=_complete_telemetry(verified=1, trusted=1, base_exit_code=2),
+        )
+        assert "uncovered Creusot goal item bad [overflow×1]: not reported by trust-wp" in reasons
+
+    def test_source_trusted_pass_with_every_item_covered_is_accepted(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/st_overflow_ok_only.rs",
+            _ST_OVERFLOW_SRC,
+            _ST_OVERFLOW_OK_COMA,
+            message=_ST_OVERFLOW_OUT + _wire_line(verified=1, trusted=1, base_exit_code=2),
+            verification_tier="tier2-source-trusted",
+            trusted_def_paths=["five"],
+            telemetry=_complete_telemetry(verified=1, trusted=1, base_exit_code=2),
+        )
+        assert reasons == []
+
+    def test_st_trusted_pre_still_rejected(self, tmp_path, monkeypatch):
+        out = (
+            "trust-wp: id_big trusted (skipped)\n"
+            "trust-wp: caller FAILED ✗ (postcondition)\n"
+            "trust-wp: (1 trusted, skipped)\n"
+            "trust-wp: 0 verified, 1 failed, 0 errors, 1 trusted\n"
+        )
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/st_trusted_pre.rs",
+            _ST_TRUSTED_PRE_SRC,
+            None,
+            status="error",
+            message=out + _wire_line(failed=1, trusted=1, base_exit_code=1),
+            verification_tier="tier3",
+            trusted_def_paths=["id_big"],
+            telemetry=_complete_telemetry(failed=1, trusted=1, base_exit_code=1),
+        )
+        assert "status='error' (expected 'pass')" in reasons
+        assert "telemetry.trusted=1" in reasons
+
+    def test_st_control_still_rejected(self, tmp_path, monkeypatch):
+        out = (
+            "trust-wp: five trusted (skipped)\n"
+            "trust-wp: bad FAILED ✗ (postcondition)\n"
+            "trust-wp: (1 trusted, skipped)\n"
+            "trust-wp: 0 verified, 1 failed, 0 errors, 1 trusted\n"
+        )
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/st_control.rs",
+            _ST_CONTROL_SRC,
+            None,
+            status="error",
+            message=out + _wire_line(failed=1, trusted=1, base_exit_code=1),
+            verification_tier="tier3",
+            trusted_def_paths=["five"],
+            telemetry=_complete_telemetry(failed=1, trusted=1, base_exit_code=1),
+        )
+        assert "status='error' (expected 'pass')" in reasons
+
+    def test_tier2_pass_without_driver_report_violates(self, tmp_path, monkeypatch):
+        module = _load_compare_baselines()
+        reasons = module._true_100_violation_reasons(
+            {
+                "name": "tests/should_succeed/100doors.rs",
+                "status": "pass",
+                "message": "Verification succeeded",
+                "verification_tier": "tier2",
+                "telemetry": _complete_telemetry(verified=1),
+            }
+        )
+        assert "goal coverage: driver_report not recorded" in reasons
+
+    def test_tier2_pass_without_coma_inventory_violates(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/no_coma.rs",
+            "// UISKIP\n" + _ST_OVERFLOW_SRC,
+            None,
+            message="trust-wp: ok verified ✓\n",
+            verification_tier="tier2",
+            telemetry=_complete_telemetry(verified=1),
+        )
+        assert "no Creusot .coma goal inventory for this test" in reasons
+
+    def test_nonzero_base_exit_code_on_tier2_violates(self, tmp_path, monkeypatch):
+        reasons = self._gate(
+            tmp_path,
+            monkeypatch,
+            "tests/should_succeed/zz_review_probe/exit2.rs",
+            _ST_OVERFLOW_SRC,
+            _ST_OVERFLOW_OK_COMA,
+            message="trust-wp: ok verified ✓\n",
+            verification_tier="tier2",
+            telemetry=_complete_telemetry(verified=1, base_exit_code=2),
+        )
+        assert "telemetry.base_exit_code=2 on a pass" in reasons
+
+    def test_source_trusted_exit_code_exemption_requires_only_trusted(self, tmp_path, monkeypatch):
+        module = _load_compare_baselines()
+        tel = _complete_telemetry(verified=1, trusted=1, base_exit_code=2, warnings=1)
+        assert module._base_exit_code_reasons({"telemetry": tel}, True) == [
+            "telemetry.base_exit_code=2 on a pass"
+        ]
+        tel = _complete_telemetry(verified=1, trusted=1, base_exit_code=2)
+        assert module._base_exit_code_reasons({"telemetry": tel}, True) == []
+        assert module._base_exit_code_reasons({"telemetry": tel}, False) == [
+            "telemetry.base_exit_code=2 on a pass"
+        ]
+        tel = _complete_telemetry(verified=1, trusted=1, base_exit_code=101)
+        assert module._base_exit_code_reasons({"telemetry": tel}, True)
+
+    def test_source_trusted_exit_code_exemption_reads_a_verified_assertion(self):
+        # bug/negative_int_pats: its `f` states no contract and proves seven
+        # assertions beside the source's `#[trusted] any`. A verified assertion
+        # is the verified evidence; a trusted item with nothing verified is not.
+        module = _load_compare_baselines()
+        tel = _complete_telemetry(proof_assert_verified=7, trusted=1, base_exit_code=2)
+        assert module._base_exit_code_reasons({"telemetry": tel}, True) == []
+        tel = _complete_telemetry(trusted=1, base_exit_code=2)
+        assert module._base_exit_code_reasons({"telemetry": tel}, True) == [
+            "telemetry.base_exit_code=2 on a pass"
+        ]
+        tel = _complete_telemetry(
+            proof_assert_verified=7, proof_assert_failed=1, trusted=1, base_exit_code=2
+        )
+        assert module._base_exit_code_reasons({"telemetry": tel}, True) == [
+            "telemetry.base_exit_code=2 on a pass"
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Goal-coverage tightening (review notes N1-N3 on the goal-coverage gate).
+# Each "loose" case below must be uncovered; the controls must stay covered.
+# ---------------------------------------------------------------------------
+
+
+def _goal_module(name: str, comment: str | None = None, fn: str = "m") -> str:
+    header = f"module {name}" + (f" (* {comment} *)" if comment else "")
+    return (
+        f"{header}\n"
+        "  use creusot.prelude.Any\n"
+        "  \n"
+        f"  let rec {fn} (return (x: bool)) = (! bb0\n"
+        "    [ bb0 = s0 [ s0 = return {_ret} ] ]\n"
+        "    [ & _ret: bool = Any.any_l () ])\n"
+        f"    [ return (result: bool) -> {{[@stop_split] [@expl:{fn} ensures] result}} (! return {{result}}) ]\n"
+        "end\n"
+    )
+
+
+def _synthetic_coverage(tmp_path, modules, out):
+    gc = _load_goal_coverage()
+    name = "tests/should_succeed/zz_tighten/synthetic.rs"
+    coma = tmp_path / name[:-3]
+    coma = coma.with_suffix(".coma")
+    coma.parent.mkdir(parents=True, exist_ok=True)
+    coma.write_text("\n".join(modules))
+    cov = gc.compute_goal_coverage(name, out, corpus_root=tmp_path)
+    return {c["item"] for c in cov["covered"]}, {u["item"]: u["reason"] for u in cov["uncovered"]}
+
+
+class TestGoalCoverageSelfTypeExact:
+    """N1: impl self types and trait names are matched exactly."""
+
+    def test_generic_args_distinguish_impls(self, tmp_path):
+        covered, uncovered = _synthetic_coverage(
+            tmp_path,
+            [
+                _goal_module("M_impl_Tr_for_Foo_A__m", "<Foo<A> as Tr>"),
+                _goal_module("M_impl_Tr_for_Foo_B__m", "<Foo<B> as Tr>"),
+                _goal_module("M_impl_Tr_for_Foo_bar__m", "<Foo_bar as Tr>"),
+            ],
+            "trust-wp: <Foo<A> as Tr>::m verified ✓\n",
+        )
+        assert covered == {"impl_Tr_for_Foo_A::m"}
+        assert set(uncovered) == {"impl_Tr_for_Foo_B::m", "impl_Tr_for_Foo_bar::m"}
+
+    def test_reference_pointee_is_compared(self, tmp_path):
+        covered, uncovered = _synthetic_coverage(
+            tmp_path,
+            [_goal_module("M_impl_Tr_for_ref_Bar__m", "<&Bar as Tr>")],
+            "trust-wp: <&Foo as Tr>::m verified ✓\n",
+        )
+        assert not covered and set(uncovered) == {"impl_Tr_for_ref_Bar::m"}
+
+    def test_trait_name_is_exact(self, tmp_path):
+        covered, uncovered = _synthetic_coverage(
+            tmp_path,
+            [_goal_module("M_impl_Tr_Ext_for_Foo__m", "<Foo as Tr_Ext>")],
+            "trust-wp: <Foo as Tr>::m verified ✓\n",
+        )
+        assert not covered and set(uncovered) == {"impl_Tr_Ext_for_Foo::m"}
+
+    def test_trait_args_compared_through_the_module_comment(self, tmp_path):
+        # Creusot drops trait args from the module name; its header comment keeps them.
+        covered, _ = _synthetic_coverage(
+            tmp_path,
+            [_goal_module("M_impl_Tr_for_S__m", "<S as Tr<u8>>")],
+            "trust-wp: <S as Tr<u16>>::m verified ✓\n",
+        )
+        assert not covered
+        covered, _ = _synthetic_coverage(
+            tmp_path,
+            [_goal_module("M_impl_Tr_for_S__m", "<S as Tr<u8>>")],
+            "trust-wp: <S as Tr<u8>>::m verified ✓\n",
+        )
+        assert covered == {"impl_Tr_for_S::m"}
+
+    def test_ambiguous_report_covers_none(self, tmp_path):
+        # two inherent impls whose flattened names differ only by Creusot's
+        # ``_N`` disambiguator: a path matching both covers neither
+        covered, uncovered = _synthetic_coverage(
+            tmp_path,
+            [
+                _goal_module("M_impl_Memory__m", "Memory"),
+                _goal_module("M_impl_Memory_0__m", "Memory"),
+            ],
+            "trust-wp: Memory::m verified ✓\n",
+        )
+        assert not covered
+        assert all("ambiguous" in why for why in uncovered.values()), uncovered
+
+    def test_own_result_ref_does_not_cover_refmut(self):
+        gc = _load_goal_coverage()
+        out = "trust-wp: OwnResult::<&T, E>::copied verified ✓\ntrust-wp: OwnResult::<&T, E>::cloned verified ✓\n"
+        cov = gc.compute_goal_coverage("tests/should_succeed/result/own.rs", out)
+        covered = {c["item"] for c in cov["covered"]}
+        assert covered == {"impl_OwnResult_ref_T_E::copied", "impl_OwnResult_ref_T_E::cloned"}
+
+    @pytest.mark.parametrize(
+        "module,path,expected",
+        [
+            ("M_impl_Tr_for_Foo_A__m", "<Foo<A> as Tr>::m", True),
+            ("M_impl_Tr_for_Foo_A__m", "<Foo<B> as Tr>::m", False),
+            ("M_impl_Tr_for_Foo_A__m", "<Foo as Tr>::m", False),
+            ("M_impl_Tr_for_Foo_bar__m", "<Foo<A> as Tr>::m", False),
+            ("M_impl_Tr_Ext_for_Foo_A__m", "<Foo<A> as Tr>::m", False),
+            ("M_impl_Model_for_ref_T__model", "<&Bar as Model>::model", False),
+            ("M_impl_Model_for_ref_T__model", "<&mut T as Model>::model", False),
+            ("M_impl_OwnResult_refmut_T_E__copied", "OwnResult::<&T, E>::copied", False),
+            ("M_impl_OwnResult_refmut_T_E__copied", "OwnResult::<&mut T, E>::copied", True),
+            ("M_impl_OwnResult_Option_T_E__transpose", "OwnResult::<std::option::Option<T>, E>::transpose", True),
+            ("M_impl_FakeFnOnce_for_AddsTwo__call", "<AddsTwo<'a> as FakeFnOnce>::call", True),
+            ("M_impl_MyHashMap_K_V_0__new", "MyHashMap::<K, V>::new", True),
+            ("M_impl_MyHashMap_K_V_0__new", "MyHashMap::<K>::new", False),
+            ("M_impl_Foo_for_unit__g", "<() as Foo>::g", True),
+            ("M_impl_T_for_tup2_T1_T2__x", "<(T1, T2) as T<B>>::x", True),
+            ("M_impl_T_for_tup2_T1_T2__x", "<(T1, T3) as T<B>>::x", False),
+        ],
+    )
+    def test_exact_mapping(self, module, path, expected):
+        gc = _load_goal_coverage()
+        from collections import Counter
+
+        item = gc.GoalItem(module, gc.module_item_name(module), None, False, [], Counter(x=1))
+        assert gc.coma_item_matches_path(item, path) is expected
+
+    def test_corpus_controls_stay_covered(self):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(
+            "tests/should_succeed/hashmap_list.rs", "trust-wp: MyHashMap::<K, V>::new verified ✓\n"
+        )
+        assert "impl_MyHashMap_K_V_0::new" in {c["item"] for c in cov["covered"]}
+        cov = gc.compute_goal_coverage(
+            "tests/should_succeed/traits/18_trait_laws.rs",
+            "trust-wp: <() as Symmetric>::reflexive verified ✓\n",
+        )
+        assert "impl_Symmetric_for_unit::reflexive" in {c["item"] for c in cov["covered"]}
+
+
+_DOORS_OK = "trust-wp: f verified ✓ (loop invariant)\n"
+
+
+class TestGoalCoverageUnrecognisedLinesAreNegative:
+    """N2: every non-positive per-item line is negative; summaries are excluded explicitly."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "trust-wp: f evidence gap (loop invariant: no certificate)",
+            "trust-wp: f postcondition evidence gap (withheld)",
+            "trust-wp: f panicked during verification: boom",
+            "trust-wp: f panicked during proof_assert: boom",
+            "trust-wp: f ay solver panic during verification: boom",
+            "trust-wp: f unverified (termination — structural variant decrease lacks solver evidence)",
+            "trust-wp: f trait refinement ASSUMED (not proven) (#2121)",
+            "trust-wp: f loop induction verified ✓, postcondition incomplete (proof-trusted) — deferring to function-level path",
+            "trust-wp: f error while verifying loop call obligations: x",
+            "trust-wp: f some status nobody has seen before",
+            "trust-wp: warning: f: MIR context extraction failed: detail",
+            "trust-wp:   (proof_assert in creusot_test::f: MIR body extraction failed, using preconditions only)",
+            "trust-wp: note: recursive logic function `creusot_test::f` has no #[variant(...)]; recursion accepted without termination proof",
+            "trust-wp: f verified ✓ (a detail the gate does not know)",
+        ],
+    )
+    def test_item_line_is_negative(self, line):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage("tests/should_succeed/100doors.rs", _DOORS_OK + line + "\n")
+        assert [u["item"] for u in cov["uncovered"]] == ["f"], cov
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "trust-wp: 1 proof_assert assumption(s) injected without proof",
+            "trust-wp: 1 logic function postcondition(s) unverified — callers may depend on unproven axioms",
+            "trust-wp: warning: all 3 function(s) assumed without SMT proof — no contracts were verified",
+            "trust-wp: error: failed to parse proof_assert 'x > 0': bad",
+            "trust-wp: warning: failed to parse ensures 'x': bad",
+            "trust-wp: (a crate-level line nobody has seen before)",
+        ],
+    )
+    def test_crate_level_negative_uncovers_everything(self, line):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage("tests/should_succeed/100doors.rs", _DOORS_OK + line + "\n")
+        assert [u["item"] for u in cov["uncovered"]] == ["f"], cov
+
+    def test_termination_only_verdict_does_not_cover(self):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage("tests/should_succeed/100doors.rs", "trust-wp: f verified ✓ (termination)\n")
+        assert cov["uncovered"]
+
+    def test_summaries_and_announcements_are_excluded(self):
+        gc = _load_goal_coverage()
+        out = _DOORS_OK + "\n".join(
+            [
+                "trust-wp: g is a logic function (postcondition will be verified)",
+                "trust-wp: <Q as creusot_std::Invariant>::invariant is a logic function (definition registered)",
+                "trust-wp: f loop invariant + call obligations verified ✓ — continuing to post-loop verification",
+                "trust-wp: stopping remaining contract verification after first adaptive-budget failure/error (#3771)",
+                "trust-wp:   (proof_assert: 2 closure existential enrichment(s) applied)",
+                "trust-wp: (1 trusted, skipped)",
+                "trust-wp: 1 verified, 0 failed, 0 errors, 1 trusted",
+                "trust-wp: proof_assert: 0 verified, 0 failed, 0 errors",
+                "",
+            ]
+        )
+        assert gc.compute_goal_coverage("tests/should_succeed/100doors.rs", out)["uncovered"] == []
+
+
+class TestGoalCoverageTraitLogicGrantLines:
+    """The discharge of a trait logic method's grant (D-110) is announced per
+    impl; it is not a Creusot goal, so it neither covers nor uncovers one."""
+
+    NAME = "tests/should_succeed/bug/464.rs"  # impl invariant [logic goal, postcondition] + refines
+    OWN = (
+        "trust-wp: creusot_test::<Struct as Trait>::invariant verified \u2713\n"
+        "trust-wp: <Struct as Trait>::invariant refinement verified \u2713\n"
+    )
+    GRANT = (
+        "trust-wp: creusot_test::Trait::invariant is a trait logic method declaration "
+        "(postcondition owed by each implementation)\n"
+        "trust-wp: <Struct as Trait>::invariant establishes the postcondition of trait logic "
+        "method `Trait::invariant`\n"
+    )
+
+    def test_the_grant_lines_beside_the_item_s_own_verdicts_cover_it(self):
+        gc = _load_goal_coverage()
+        assert gc.compute_goal_coverage(self.NAME, self.OWN)["uncovered"] == []
+        assert gc.compute_goal_coverage(self.NAME, self.GRANT + self.OWN)["uncovered"] == []
+
+    def test_the_grant_lines_alone_cover_nothing(self):
+        gc = _load_goal_coverage()
+        uncovered = gc.compute_goal_coverage(self.NAME, self.GRANT)["uncovered"]
+        assert {u["item"] for u in uncovered} == {
+            "impl_Trait_for_Struct::invariant",
+            "impl_Trait_for_Struct::invariant refinement",
+        }, uncovered
+
+    def test_a_grant_the_impl_does_not_discharge_uncovers_it(self):
+        gc = _load_goal_coverage()
+        failed = (
+            "trust-wp: <Struct as Trait>::invariant unknown (postcondition of trait logic "
+            "method `Trait::invariant` not proved)\n"
+        )
+        uncovered = gc.compute_goal_coverage(self.NAME, self.OWN + failed)["uncovered"]
+        assert "impl_Trait_for_Struct::invariant" in {u["item"] for u in uncovered}, uncovered
+
+
+class TestGoalCoverageAssertionCounts:
+    """N3: proof_assert verdicts are counted per item against Creusot's assertion goals."""
+
+    @staticmethod
+    def _pa(fn, n, verified=None):
+        verified = n if verified is None else verified
+        lines = [f"trust-wp: verifying proof_assert in creusot_test::{fn} (0 contract preconditions)"] * n
+        lines += [f"trust-wp: proof_assert in creusot_test::{fn} verified ✓"] * verified
+        return "\n".join(lines) + "\n"
+
+    def test_assertion_only_item_needs_every_assertion(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/1674.rs"  # f: 2 assertions
+        assert gc.compute_goal_coverage(name, self._pa("f", 1))["uncovered"]
+        assert gc.compute_goal_coverage(name, self._pa("f", 3))["uncovered"]
+        assert gc.compute_goal_coverage(name, self._pa("f", 2, verified=1))["uncovered"]
+        assert gc.compute_goal_coverage(name, self._pa("f", 2))["uncovered"] == []
+
+    def test_mixed_item_needs_its_proof_asserts_too(self):
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/bug/463.rs"  # test: assertion 1 + callee requires 1
+        closure = "trust-wp: test::{closure#0} verified ✓\n"
+        cov = gc.compute_goal_coverage(name, closure + "trust-wp: test verified ✓\n")
+        uncovered = {u["item"]: u["reason"] for u in cov["uncovered"]}
+        assert set(uncovered) == {"test"} and "proof_assert count" in uncovered["test"], uncovered
+        ok = closure + "trust-wp: test verified ✓\n" + self._pa("test", 1)
+        assert gc.compute_goal_coverage(name, ok)["uncovered"] == []
+
+    def test_closure_assertions_count_across_the_module(self):
+        gc = _load_goal_coverage()
+        full = "\n".join(
+            [
+                "trust-wp: f::{closure#0} verified ✓",
+                "trust-wp: verifying proof_assert in creusot_test::f::{closure#0} (0 contract preconditions)",
+                "trust-wp: proof_assert in creusot_test::f::{closure#0} verified ✓",
+                "trust-wp: f::{closure#0}::{closure#1} verified ✓",
+                "trust-wp: verifying proof_assert in creusot_test::f::{closure#0}::{closure#1} (0 contract preconditions)",
+                "trust-wp: proof_assert in creusot_test::f::{closure#0}::{closure#1} verified ✓",
+                "trust-wp: f verified ✓",
+            ]
+        )
+        name = "tests/should_succeed/closures/10_tyinv.rs"
+        assert gc.compute_goal_coverage(name, full)["uncovered"] == []
+        missing = "\n".join(l for l in full.split("\n") if l != "trust-wp: proof_assert in creusot_test::f::{closure#0}::{closure#1} verified ✓")
+        cov = gc.compute_goal_coverage(name, missing)
+        assert {u["item"] for u in cov["uncovered"]} == {"f::{closure#0}", "f::{closure#1}"}
+
+
+def test_goal_coverage_numeric_suffix_is_not_a_disambiguation_of_an_exact_module():
+    """lang/const: ``fn add_one`` and ``fn add_one_2``; ``add_one`` must not
+    also denote M_add_one_2 (neither widening nor a spurious ambiguity)."""
+    gc = _load_goal_coverage()
+    name = "tests/should_succeed/lang/const.rs"
+    only_add_one = gc.compute_goal_coverage(name, "trust-wp: add_one verified ✓\n")
+    covered = {c["item"] for c in only_add_one["covered"]}
+    assert "add_one" in covered and "add_one_2" not in covered
+
+
+# ---------------------------------------------------------------------------
+# should_fail validated-refutation rule over STORED driver outputs (D-28)
+# ---------------------------------------------------------------------------
+
+_SF_REFUTATION_FIXTURES = HARNESS_DIR / "fixtures" / "should_fail_refutation"
+
+# Rows whose stored output carries ONLY an unvalidated FAILED ✗ / failed
+# counter (ay_result=trust-wp-structural-provenance, sat model_validated=false,
+# or none/unknown). Each must be ``unknown`` — never a credited rejection.
+_SF_UNVALIDATED_ONLY = (
+    "alloc_max_size",
+    "bug/222",
+    "bug/436_0",
+    "bug/492",
+    "bug/692",
+    "bug/695",
+    "bug/specialize",
+    "const_default",
+    "final_borrows",
+    "lints/contractless_external_function",
+    "opaque_unproveable",
+    "type_invariants/partial_instance",
+    "unsound_dyn",
+)
+
+# Credited by a validated model (ay_result=sat model_validated=true) matching
+# a counted failure: must stay pass with the named credit.
+_SF_VALIDATED = {
+    "bug/878": "validated counterexample: creusot_test::test proof_assert",
+    "impl_trait": "validated counterexample: creusot_test::main proof_assert",
+    "terminates/incorrect_variant": (
+        "validated counterexample: incorrect_recursion::variant_decrease[1] "
+        "recursive_variant"
+    ),
+    "bug/01_resolve_unsoundness": (
+        "validated counterexample: make_vec_of_size loop_preservation"
+    ),
+    "bug/869": "validated counterexample: creusot_test::unsound proof_assert",
+    "terminates/invalid_variant_type": "validated counterexample: foo loop_variant_nonneg",
+    "traits/17_impl_refinement": (
+        "validated counterexample: <() as ReqFalse>::need_false::trait precondition "
+        "implies impl precondition trait_refinement"
+    ),
+    "type_invariants/borrows": "validated counterexample: NonZero::new function_contract",
+    "zst": "validated counterexample: creusot_test::zst_pointers_may_be_equal proof_assert",
+}
+
+
+def _load_sf_refutation_fixture(stem: str) -> dict:
+    path = _SF_REFUTATION_FIXTURES / (stem.replace("/", "__") + ".json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _classify_sf_fixture(stem: str):
+    fixture = _load_sf_refutation_fixture(stem)
+    assert fixture["name"] == f"tests/should_fail/{stem}.rs"
+    return harness.classify_should_fail_result_with_credit(
+        fixture["exit_code"] == 0,
+        fixture["output"],
+        fixture["source"],
+        fixture["name"],
+        exit_code=fixture["exit_code"],
+    )
+
+
+class TestShouldFailValidatedRefutationFixtures:
+    @pytest.mark.parametrize("stem", _SF_UNVALIDATED_ONLY)
+    def test_unvalidated_failed_is_not_a_rejection(self, stem):
+        assert _classify_sf_fixture(stem) == ("unknown", None, None)
+
+    @pytest.mark.parametrize("stem", sorted(_SF_VALIDATED))
+    def test_validated_refutation_stays_credited(self, stem):
+        assert _classify_sf_fixture(stem) == ("pass", None, _SF_VALIDATED[stem])
+
+    def test_frontend_refusal_stays_credited(self):
+        assert _classify_sf_fixture("ghost/non_ghost") == (
+            "pass",
+            None,
+            "frontend: called non-ghost function ... in ghost context",
+        )
+
+    def test_fixture_set_is_exactly_the_audited_rows(self):
+        stems = {
+            p.stem.replace("__", "/") for p in _SF_REFUTATION_FIXTURES.glob("*.json")
+        }
+        assert stems == set(_SF_UNVALIDATED_ONLY) | set(_SF_VALIDATED) | {
+            "ghost/non_ghost"
+        }
+
+
+# ---------------------------------------------------------------------------
+# Triage family "no item-level verified report": P3 (NO_REPLAY translate-only
+# coverage-inventory exemption, never a tier upgrade) and P4 (status-level
+# lenient passes). Replays of the stored lane outputs are RED before the fix.
+# ---------------------------------------------------------------------------
+
+_LOGIC_VCGEN_OUTPUT = (
+    "trust-wp: creusot_test::bor_1_2 verified ✓\n"
+    "trust-wp: creusot_test::f postcondition FAILED (logic postcondition)\n"
+    "trust-wp: creusot_test::g postcondition unverified (body contains parameterized closure — #985)\n"
+    "trust-wp: 2 logic function postcondition(s) unverified — callers may depend on unproven axioms\n"
+    "trust-wp: 1 verified, 0 failed, 0 errors, 2 unverified axiom(s), 2 warnings\n"
+    + _wire_line(base_exit_code=2, verified=1, warnings=2, unverified_axioms=2)
+)
+_TRAIT_LAWS_OUTPUT = (
+    "trust-wp: creusot_test::uses_op postcondition FAILED (logic postcondition)\n"
+    "trust-wp: creusot_test::<() as Symmetric>::reflexive law postcondition unverified (non-strict axiom exposure)\n"
+    "trust-wp: creusot_test::impl_laws verified ✓\n"
+    "trust-wp: 1 verified, 0 failed, 0 errors, 2 unverified axiom(s), 2 warnings\n"
+    + _wire_line(base_exit_code=2, verified=1, warnings=2, unverified_axioms=2)
+)
+
+
+def _closures11_output(base_exit_code: int, trusted: int) -> str:
+    return (
+        "trust-wp: captures_and_call::{closure#0} verified ✓\n"
+        "trust-wp: proof_assert in creusot_test::captures_and_call::{closure#0} verified ✓\n"
+        "trust-wp: proof_assert in creusot_test::captures_and_call inconclusive (incomplete) — function has no contracts\n"
+        f"trust-wp: 3 verified, 0 failed, 0 errors{', 1 trusted' if trusted else ''}\n"
+        "trust-wp: proof_assert: 5 verified, 0 failed, 0 errors, 1 inconclusive\n"
+        + _wire_line(
+            base_exit_code=base_exit_code,
+            verified=3,
+            trusted=trusted,
+            proof_assert_verified=5,
+            proof_assert_inconclusive=1,
+        )
+    )
+
+
+def _corpus_source(name: str) -> str:
+    return (WORKSPACE_ROOT / "reference" / "creusot" / name).read_text()
+
+
+class TestP4LenientPassHardening:
+    def test_logic_postcondition_failed_is_not_a_pass(self):
+        from harness_classify_succeed import classify_failure
+
+        name = "tests/should_succeed/lang/logic_vcgen.rs"
+        status, _ = classify_failure(_LOGIC_VCGEN_OUTPUT, _corpus_source(name), 2, name)
+        assert status == "unknown"
+
+    def test_trait_law_logic_postcondition_failed_is_not_a_pass(self):
+        from harness_classify_succeed import classify_failure
+
+        name = "tests/should_succeed/traits/18_trait_laws.rs"
+        status, _ = classify_failure(_TRAIT_LAWS_OUTPUT, _corpus_source(name), 2, name)
+        assert status == "unknown"
+
+    def test_proof_assert_inconclusive_blocks_gap_only_exit(self):
+        from harness_classify_succeed import _is_soundness_gap_only_exit
+
+        assert not _is_soundness_gap_only_exit(_closures11_output(2, 1), 2)
+        # control: the same shape without the inconclusive counter qualifies
+        clean = _closures11_output(2, 1).replace("proof_assert_inconclusive=1", "proof_assert_inconclusive=0")
+        assert _is_soundness_gap_only_exit(clean, 2)
+
+    def test_closures11_stored_shape_is_not_a_pass(self):
+        from harness_classify_succeed import classify_failure
+
+        name = "tests/should_succeed/closures/11_proof_assert_in_closure.rs"
+        status, _ = classify_failure(_closures11_output(2, 1), _corpus_source(name), 2, name)
+        assert status != "pass"
+
+    def test_inconclusive_only_wire_line_on_clean_exit_is_unknown(self):
+        from harness_classify_signals import _wire_line_shows_pa_only_failure
+        from harness_classify_succeed import classify_failure
+
+        output = _closures11_output(0, 0)
+        assert _wire_line_shows_pa_only_failure(output)
+        name = "tests/should_succeed/closures/11_proof_assert_in_closure.rs"
+        assert classify_failure(output, _corpus_source(name), 0, name) == ("unknown", None)
+
+    def test_proof_assert_failure_still_fails(self):
+        from harness_classify_succeed import classify_failure
+
+        output = _closures11_output(0, 0).replace("proof_assert_failed=0", "proof_assert_failed=1")
+        name = "tests/should_succeed/closures/11_proof_assert_in_closure.rs"
+        assert classify_failure(output, _corpus_source(name), 0, name)[0] == "fail"
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "trust-wp: creusot_test::f postcondition FAILED (logic postcondition)",
+            "trust-wp: creusot_test::<() as Symmetric>::reflexive law postcondition unverified (x)",
+        ],
+    )
+    def test_tier_markers_do_not_need_the_axiom_summary(self, line):
+        from harness_verification_tier import _has_fail_closed_trust_or_axiom_marker
+
+        assert _has_fail_closed_trust_or_axiom_marker(line + "\ntrust-wp: 1 verified, 0 failed, 0 errors\n")
+
+    def test_tier_marker_control(self):
+        from harness_verification_tier import _has_fail_closed_trust_or_axiom_marker
+
+        assert not _has_fail_closed_trust_or_axiom_marker(
+            "trust-wp: creusot_test::f verified ✓\ntrust-wp: 1 verified, 0 failed, 0 errors\n"
+        )
+
+
+class TestP3NoReplayCoverageExemption:
+    FAILED_653 = "trust-wp: omg FAILED ✗ (postcondition)\n"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "tests/should_succeed/bug/653.rs",
+            "tests/should_succeed/spec_tests.rs",
+            "tests/should_succeed/syntax/05_pearlite.rs",
+        ],
+    )
+    def test_allowlisted_rows_are_exempt_but_never_proof_grade(self, name):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(name, self.FAILED_653)
+        assert cov["inventory"] == gc.NO_REPLAY_EXEMPT_INVENTORY
+        assert cov["covered"] == [] and cov["uncovered"] == []
+        assert cov["not_discharged_by_creusot"], cov
+        assert all(e["reason"] == gc.NO_REPLAY_EXEMPT_REASON for e in cov["not_discharged_by_creusot"])
+        assert gc.goal_coverage_violations(cov), "the exemption must never clear the gate"
+
+    def test_gate_refuses_tier2_on_an_exempt_row(self):
+        module = _load_compare_baselines()
+        reasons = module.goal_coverage_reasons(
+            {
+                "name": "tests/should_succeed/bug/653.rs",
+                "driver_report": ["trust-wp: omg verified ✓"],
+                "telemetry": _complete_telemetry(verified=1),
+            }
+        )
+        assert any("NO_REPLAY translate-only" in r for r in reasons), reasons
+
+    def test_non_allowlisted_no_replay_row_keeps_full_inventory(self):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage("tests/should_succeed/bug/387.rs", "")
+        assert cov["inventory"] == "coma"
+        assert cov["uncovered"], "bug/387 has Creusot goals and must stay inventoried"
+
+    def test_exemption_is_exact_path_and_requires_marker(self, tmp_path):
+        gc = _load_goal_coverage()
+        src = _corpus_source("tests/should_succeed/bug/653.rs")
+        coma = (WORKSPACE_ROOT / "reference/creusot/tests/should_succeed/bug/653.coma").read_text()
+        # same file under a longer path: not exempt
+        for rel in ("tests/should_succeed/x/bug/653", "tests/should_succeed/bug/6530"):
+            (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / f"{rel}.rs").write_text(src)
+            (tmp_path / f"{rel}.coma").write_text(coma)
+            assert not gc.is_no_replay_translate_only_exempt(f"{rel}.rs", tmp_path)
+            assert gc.compute_goal_coverage(f"{rel}.rs", "", corpus_root=tmp_path)["inventory"] == "coma"
+        # allowlisted path without the NO_REPLAY marker: not exempt
+        rel = "tests/should_succeed/bug/653"
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f"{rel}.rs").write_text(src.replace("NO_REPLAY", "REPLAY"))
+        (tmp_path / f"{rel}.coma").write_text(coma)
+        assert not gc.is_no_replay_translate_only_exempt(f"{rel}.rs", tmp_path)
+        cov = gc.compute_goal_coverage(f"{rel}.rs", "", corpus_root=tmp_path)
+        assert cov["inventory"] == "coma" and cov["uncovered"]
+
+    def test_non_coma_inventory_is_a_violation(self):
+        gc = _load_goal_coverage()
+        assert gc.goal_coverage_violations({"inventory": "error", "covered": [], "uncovered": []})
+
+    def test_coverage_allowlist_matches_classifier_allowlist(self):
+        gc = _load_goal_coverage()
+        assert tuple(gc.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == tuple(
+            harness.harness_classify._NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+        )
+
+
+# ---------------------------------------------------------------------------
+# NO_REPLAY credit policy (D-21)
+# ---------------------------------------------------------------------------
+
+_NO_REPLAY_CORPUS_TESTS = (
+    "bug/387",
+    "bug/511",
+    "bug/653",
+    "closures/01_basic",
+    "closures/03_generic_bound",
+    "closures/04_generic_closure",
+    "closures/05_map",
+    "lang/float_ops",
+    "spec_tests",
+    "syntax/04_assoc_prec",
+    "syntax/05_pearlite",
+    "syntax/10_mutual_rec_types",
+    "traits/04",
+)
+# Every goal (B) unprovable or (C) contentless.
+_NO_REPLAY_ELIGIBLE = ("bug/653", "spec_tests", "bug/511", "syntax/05_pearlite")
+# At least one (A) provable goal: never translate-only.
+_NO_REPLAY_A_GOAL = tuple(t for t in _NO_REPLAY_CORPUS_TESTS if t not in _NO_REPLAY_ELIGIBLE)
+_DIRTY_FRONTEND_COUNTERS = (
+    "panics",
+    "parse_errors",
+    "termination_errors",
+    "logic_recursion_errors",
+    "erasure_errors",
+)
+
+
+def _ss(name: str) -> str:
+    return f"tests/should_succeed/{name}.rs"
+
+
+class TestNoReplayCreditPolicy:
+    """Pins the per-test NO_REPLAY credit decision (D-21)."""
+
+    def test_policy_covers_exactly_the_no_replay_corpus(self):
+        base = WORKSPACE_ROOT / "reference/creusot/tests/should_succeed"
+        found = sorted(
+            str(p.relative_to(base))[: -len(".rs")]
+            for p in base.rglob("*.rs")
+            if re.search(r"//\s*NO_REPLAY", p.read_text(encoding="utf-8", errors="replace"))
+        )
+        # A new NO_REPLAY corpus test forces an explicit per-goal decision.
+        assert found == sorted(_NO_REPLAY_CORPUS_TESTS)
+
+    def test_allowlists_are_exactly_the_eligible_tests(self):
+        gc = _load_goal_coverage()
+        cb = _load_compare_baselines()
+        assert set(harness.harness_classify._NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == set(_NO_REPLAY_ELIGIBLE)
+        assert tuple(gc.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == tuple(
+            harness.harness_classify._NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+        )
+        assert tuple(cb.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == tuple(gc.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST)
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_eligible_is_credited_translate_only_with_clean_frontend(self, name):
+        output = "trust-wp: f FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=1, test_name=_ss(name)
+        )
+        assert (status, mode) == ("pass", "translate_only")
+
+    @pytest.mark.parametrize("counter", _DIRTY_FRONTEND_COUNTERS)
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_eligible_is_not_credited_with_dirty_frontend(self, name, counter):
+        output = _wire_line(failed=1, base_exit_code=1, **{counter: 1})
+        status, _skip = harness.classify_no_replay_result(output, exit_code=1, test_name=_ss(name))
+        assert status != "pass"
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_eligible_is_not_credited_without_wire_line(self, name):
+        status, _skip = harness.classify_no_replay_result(
+            "trust-wp: f FAILED ✗\n", exit_code=1, test_name=_ss(name)
+        )
+        assert status != "pass"
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_A_GOAL)
+    @pytest.mark.parametrize(
+        "output,exit_code",
+        [
+            (_wire_line(failed=1, base_exit_code=1), 1),  # refuted
+            (_wire_line(base_exit_code=2), 2),  # examined nothing
+            (_wire_line(), 0),  # clean exit, verified nothing
+            (_wire_line(verified=1, trusted=1), 0),  # proof rests on trust
+            (_wire_line(errors=1, demoted=1, base_exit_code=2), 2),  # unknown
+        ],
+    )
+    def test_a_goal_test_is_never_credited_translate_only(self, name, output, exit_code):
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=exit_code, test_name=_ss(name)
+        )
+        assert status != "pass" and mode is None
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_A_GOAL)
+    def test_a_goal_test_parse_only_row_violates_gate_and_keeps_inventory(self, name):
+        cb = _load_compare_baselines()
+        gc = _load_goal_coverage()
+        reasons = cb._true_100_violation_reasons(
+            {
+                "name": _ss(name),
+                "status": "pass",
+                "message": "Parse-only (NO_REPLAY): syntax-only test",
+                "verification_tier": "tier3",
+                "telemetry": _complete_telemetry(),
+            }
+        )
+        assert "NO_REPLAY parse-only pass" in reasons
+        assert not gc.is_no_replay_translate_only_exempt(_ss(name))
+        assert gc.compute_goal_coverage(_ss(name), "")["inventory"] == "coma"
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_A_GOAL)
+    def test_a_goal_test_can_still_earn_a_verified_pass(self, name):
+        output = "trust-wp: f verified ✓\n" + _wire_line(verified=1)
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=0, test_name=_ss(name)
+        )
+        assert (status, mode) == ("pass", "verified")
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "tests/should_succeed/bug/6530.rs",
+            "tests/should_succeed/bug/653_x.rs",
+            "tests/should_succeed/spec_tests_2.rs",
+            "tests/should_succeed/syntax/05_pearlite2.rs",
+            "tests/should_succeed/x/bug/653.rs",
+            "tests/should_succeed/x/spec_tests.rs",
+            "tests/should_fail/bug/653.rs",
+            "tests/should_fail/spec_tests.rs",
+            "bug/653.rs",
+            "spec_tests.rs",
+        ],
+    )
+    def test_same_name_prefix_is_never_credited(self, name):
+        output = "trust-wp: f FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        status, _skip = harness.classify_no_replay_result(output, exit_code=1, test_name=name)
+        assert status != "pass"
+        cb = _load_compare_baselines()
+        assert not cb._is_translate_only_allowed(name)
+        reasons = cb._true_100_violation_reasons(
+            {
+                "name": name,
+                "status": "pass",
+                "message": "Parse-only (NO_REPLAY): syntax-only test",
+                "verification_tier": "tier3",
+                "telemetry": _complete_telemetry(failed=1, base_exit_code=1),
+            }
+        )
+        assert "NO_REPLAY parse-only pass" in reasons
+
+    def test_non_no_replay_source_under_allowlisted_name_is_never_credited(self, tmp_path):
+        # Runner: without the marker the NO_REPLAY classifier is not reached and
+        # a refuted run is not a pass.
+        output = "trust-wp: omg FAILED ✗ (postcondition)\n" + _wire_line(failed=1, base_exit_code=1)
+        source = _corpus_source(_ss("bug/653")).replace("NO_REPLAY", "REPLAY")
+        status, _message, *_rest = harness_runner._classify_outcome(
+            harness, tmp_path, _ss("bug/653"), source, False, output, 1
+        )
+        assert status != "pass"
+        # Gate/coverage: the marker is re-read from the corpus source.
+        gc = _load_goal_coverage()
+        for name in _NO_REPLAY_ELIGIBLE:
+            rel = _ss(name)
+            dst = tmp_path / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(_corpus_source(rel).replace("NO_REPLAY", "REPLAY"))
+            assert not gc.is_no_replay_translate_only_exempt(rel, tmp_path)
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_credited_row_is_tier3_parse_only_and_passes_gate(self, tmp_path, name):
+        output = "trust-wp: f FAILED ✗\n" + _wire_line(failed=1, base_exit_code=1)
+        source = _corpus_source(_ss(name))
+        status, message, *_rest = harness_runner._classify_outcome(
+            harness, tmp_path, _ss(name), source, False, output, 1
+        )
+        tier = harness.classify_verification_tier(_ss(name), status, message, None, source)
+        assert status == "pass"
+        assert message.startswith(harness.NO_REPLAY_PASS_PREFIX)
+        assert tier == "tier3"
+        cb = _load_compare_baselines()
+        assert cb._true_100_violation_reasons(
+            {
+                "name": _ss(name),
+                "status": "pass",
+                "message": message,
+                "verification_tier": tier,
+                "driver_report": ["trust-wp: f FAILED ✗"],
+                "telemetry": _complete_telemetry(failed=1, base_exit_code=1),
+            }
+        ) == []
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_credited_row_is_reported_not_proved(self, name):
+        gc = _load_goal_coverage()
+        cov = gc.compute_goal_coverage(_ss(name), "trust-wp: f verified ✓\n")
+        assert cov["inventory"] == "creusot-not-proved (NO_REPLAY translate-only)"
+        assert cov["covered"] == []
+        assert gc.goal_coverage_violations(cov)
+        cb = _load_compare_baselines()
+        reasons = cb.goal_coverage_reasons(
+            {
+                "name": _ss(name),
+                "driver_report": ["trust-wp: f verified ✓"],
+                "telemetry": _complete_telemetry(verified=1),
+            }
+        )
+        assert any("NO_REPLAY translate-only" in r for r in reasons), reasons
+
+    @pytest.mark.parametrize("name", ["syntax/04_assoc_prec", "syntax/05_pearlite"])
+    def test_shims_never_rewrite_no_replay_contracts(self, name):
+        from harness_project import apply_test_specific_shims
+
+        rel = _ss(name)
+        original = _corpus_source(rel)
+        shimmed = apply_test_specific_shims(Path("reference/creusot") / rel, original)
+        contract_re = re.compile(r"#\s*\[\s*(?:requires|ensures)\s*\(.*")
+        assert contract_re.findall(shimmed) == contract_re.findall(original)
+
+
+# ---------------------------------------------------------------------------
+# Translate-only credit never hides a verified refutable goal (D-21)
+# ---------------------------------------------------------------------------
+
+_PEARL = _ss("syntax/05_pearlite")
+# Recorded real driver outputs.
+_REAL_NO_REPLAY_OUTPUTS = {
+    "syntax/05_pearlite": (
+        "trust-wp: has_len_3 is a logic function (definition registered)\n"
+        "trust-wp: solver verified ✓\n"
+        "trust-wp: struct_in_pearlite unknown (incomplete)\n"
+        "trust-wp: struct_order FAILED ✗ (postcondition)\n"
+        "trust-wp: 1 verified, 1 failed, 1 errors\n"
+        + _wire_line(verified=1, failed=1, errors=1, base_exit_code=1),
+        1,
+    ),
+    "bug/653": (
+        "trust-wp: omg FAILED ✗ (postcondition)\ntrust-wp: 0 verified, 1 failed, 0 errors\n"
+        + _wire_line(failed=1, base_exit_code=1),
+        1,
+    ),
+    "spec_tests": (
+        "trust-wp: test_specs FAILED ✗ (postcondition)\ntrust-wp: 0 verified, 1 failed, 0 errors\n"
+        + _wire_line(failed=1, base_exit_code=1),
+        1,
+    ),
+    "bug/511": (_wire_line(base_exit_code=2), 2),
+}
+
+
+def _no_replay_outcome(name: str, output: str, exit_code: int, tmp_path):
+    source = _corpus_source(name)
+    status, message, *_rest = harness_runner._classify_outcome(
+        harness, tmp_path, name, source, False, output, exit_code
+    )
+    tier = harness.classify_verification_tier(name, status, message, None, source)
+    return status, message, tier
+
+
+def _gate_row(name, output, status="pass", message="Parse-only (NO_REPLAY): syntax-only test", tier="tier3"):
+    from harness_classify_succeed import _extract_wire_line_pairs
+
+    gc = _load_goal_coverage()
+    return {
+        "name": name,
+        "status": status,
+        "message": message,
+        "verification_tier": tier,
+        "driver_report": gc.driver_report_lines(output),
+        "telemetry": _extract_wire_line_pairs(output),
+    }
+
+
+class TestNoReplayGoalTable:
+    def test_one_table_backs_every_allowlist(self):
+        gc = _load_goal_coverage()
+        cb = _load_compare_baselines()
+        assert tuple(gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE) == tuple(gc.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST)
+        assert tuple(gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE) == tuple(
+            harness.harness_classify._NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+        )
+        assert tuple(cb.NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST) == tuple(gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE)
+        assert cb.no_replay_translate_only_refusals.__module__ == "creusot_goal_coverage"
+
+    @pytest.mark.parametrize("name", _NO_REPLAY_ELIGIBLE)
+    def test_table_matches_reference_coma(self, name):
+        gc = _load_goal_coverage()
+        rows = gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE[name]
+        classes = {item: cls for item, cls, _ in rows}
+        assert len(classes) == len(rows)
+        assert set(classes.values()) <= {"B", "C", "trusted-strip"}
+        modules = {m.name[len("M_"):] for m in gc.coma_modules(_ss(name))}
+        # Every .coma module is in the table and classified B or C.
+        assert modules == {i for i, c in classes.items() if c != "trusted-strip"}
+        # Every goal-bearing item is in the table; every B item bears a goal.
+        goal_items = {g.item for g in gc.goal_inventory(_ss(name))}
+        assert goal_items <= set(classes)
+        assert {i for i, c in classes.items() if c == "B"} <= goal_items
+        source = _corpus_source(_ss(name))
+        for item, cls in classes.items():
+            if cls == "trusted-strip":
+                assert re.search(r"#\[trusted\]\s*(?:#\[[^\]]*\]\s*)*pub fn " + item + r"\b", source)
+            if cls == "C" and item in goal_items:
+                # A C item's only goal is literally `true`.
+                coma = (WORKSPACE_ROOT / "reference/creusot" / _ss(name)).with_suffix(".coma").read_text()
+                assert re.search(r"goal vc_" + item + r": true\b", coma)
+
+    def test_pearlite_classes(self):
+        gc = _load_goal_coverage()
+        classes = {i: c for i, c, _ in gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE["syntax/05_pearlite"]}
+        assert classes["struct_in_pearlite"] == "B" and classes["struct_order"] == "B"
+        assert classes["has_len_3"] == "C" and classes["solver"] == "trusted-strip"
+        assert {i: c for i, c, _ in gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE["bug/653"]} == {"omg": "B"}
+        assert {i: c for i, c, _ in gc.NO_REPLAY_TRANSLATE_ONLY_GOAL_TABLE["spec_tests"]} == {"test_specs": "B"}
+
+
+class TestNoReplayVerifiedRefutableGoalRefused:
+    """Reviewer's forged-output probes against the translate-only credit (D-21)."""
+
+    @pytest.mark.parametrize("name", sorted(_REAL_NO_REPLAY_OUTPUTS))
+    def test_real_outputs_are_tier3_translate_only_and_pass_gate(self, tmp_path, name):
+        output, exit_code = _REAL_NO_REPLAY_OUTPUTS[name]
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=exit_code, test_name=_ss(name)
+        )
+        assert (status, mode) == ("pass", "translate_only")
+        status, message, tier = _no_replay_outcome(_ss(name), output, exit_code, tmp_path)
+        assert (status, tier) == ("pass", "tier3") and message.startswith(harness.NO_REPLAY_PASS_PREFIX)
+        cb = _load_compare_baselines()
+        assert cb._true_100_violation_reasons(_gate_row(_ss(name), output, message=message)) == []
+
+    def test_p1_pearlite_struct_in_pearlite_verified_is_error(self, tmp_path):
+        output = (
+            "trust-wp: solver verified ✓\n"
+            "trust-wp: struct_in_pearlite verified ✓\n"
+            "trust-wp: struct_order FAILED ✗ (postcondition)\n"
+            + _wire_line(verified=2, failed=1, base_exit_code=1)
+        )
+        status, reason = harness.classify_no_replay_result(output, exit_code=1, test_name=_PEARL)
+        assert status == "error"
+        assert "struct_in_pearlite" in reason and "refutable" in reason
+        status, message, tier = _no_replay_outcome(_PEARL, output, 1, tmp_path)
+        assert (status, tier) == ("error", "tier3")
+        assert "struct_in_pearlite" in message.splitlines()[0]
+        cb = _load_compare_baselines()
+        reasons = cb._true_100_violation_reasons(_gate_row(_PEARL, output))
+        assert any("struct_in_pearlite" in r and "refutable" in r for r in reasons), reasons
+
+    def test_p2_every_goal_verified_at_exit_0_is_error_not_tier2(self, tmp_path):
+        output = (
+            "trust-wp: solver verified ✓\n"
+            "trust-wp: struct_in_pearlite verified ✓\n"
+            "trust-wp: struct_order verified ✓\n"
+            + _wire_line(verified=3)
+        )
+        status, reason, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=0, test_name=_PEARL
+        )
+        assert (status, mode) == ("error", None)
+        assert "struct_in_pearlite" in reason and "struct_order" in reason
+        status, message, tier = _no_replay_outcome(_PEARL, output, 0, tmp_path)
+        assert status == "error" and not message.startswith(harness.NO_REPLAY_VERIFIED_PREFIX)
+
+    @pytest.mark.parametrize(
+        "name,item", [("bug/653", "omg"), ("spec_tests", "test_specs")]
+    )
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    def test_verified_b_item_on_old_allowlist_is_error(self, name, item, exit_code):
+        output = f"trust-wp: {item} verified ✓\n" + _wire_line(
+            verified=1, base_exit_code=exit_code
+        )
+        status, reason, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=exit_code, test_name=_ss(name)
+        )
+        assert (status, mode) == ("error", None)
+        assert item in reason
+        cb = _load_compare_baselines()
+        reasons = cb._true_100_violation_reasons(_gate_row(_ss(name), output))
+        assert any(item in r and "refutable" in r for r in reasons), reasons
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "trust-wp: proof_assert in struct_in_pearlite verified ✓",
+            "trust-wp: struct_order verified ✓ (termination)",
+            "trust-wp: struct_order verified ✓ (loop invariant)",
+            "trust-wp: struct_in_pearlite refinement verified ✓",
+            "trust-wp: struct_in_pearlite verified ✓ (logic postcondition)",
+            "trust-wp: field1_is_true verified ✓",
+            "trust-wp: caller::{closure#0} verified ✓",
+            "trust-wp: crate::struct_order verified ✓",
+        ],
+    )
+    def test_any_positive_line_on_b_or_unlisted_item_is_refused(self, line):
+        output = line + "\n" + _wire_line(failed=1, base_exit_code=1)
+        status, reason = harness.classify_no_replay_result(output, exit_code=1, test_name=_PEARL)
+        assert status == "error" and reason, (line, reason)
+        cb = _load_compare_baselines()
+        assert any("refused" in r for r in cb._true_100_violation_reasons(_gate_row(_PEARL, output)))
+
+    def test_c_and_trusted_strip_items_may_verify(self):
+        output = (
+            "trust-wp: solver verified ✓\n"
+            "trust-wp: caller verified ✓\n"
+            "trust-wp: struct_order FAILED ✗\n"
+            + _wire_line(verified=2, failed=1, base_exit_code=1)
+        )
+        assert harness.classify_no_replay_result(output, exit_code=1, test_name=_PEARL)[0] == "pass"
+
+    def test_wire_verified_beyond_allowed_lines_is_refused(self):
+        # verified=2 but only one attributable positive line: the second proof
+        # has no named item and may be a refutable goal.
+        output = "trust-wp: solver verified ✓\n" + _wire_line(verified=2, failed=1, base_exit_code=1)
+        status, reason = harness.classify_no_replay_result(output, exit_code=1, test_name=_PEARL)
+        assert status == "error" and "exceeds" in reason
+        cb = _load_compare_baselines()
+        assert any("exceeds" in r for r in cb._true_100_violation_reasons(_gate_row(_PEARL, output)))
+
+    @pytest.mark.parametrize(
+        "output,exit_code",
+        [
+            (_wire_line(base_exit_code=2), 2),  # all-zero: nothing examined (S4)
+            (_wire_line(errors=3, base_exit_code=2), 2),  # errors only (S4)
+        ],
+    )
+    def test_s4_weak_runs_stay_translate_only_credit(self, output, exit_code):
+        status, _skip, mode = harness.classify_no_replay_result_with_mode(
+            output, exit_code=exit_code, test_name=_PEARL
+        )
+        assert (status, mode) == ("pass", "translate_only")
+
+    # D-150: the recorded run of the real row since `#[trusted]` was honoured —
+    # `solver` is `#[trusted]` in the corpus source, so its trusted counter is
+    # the source's own trust base.
+    _PEARL_TRUSTED = (
+        "trust-wp: has_len_3 is a logic function (definition registered)\n"
+        "trust-wp: solver trusted (skipped)\n"
+        "trust-wp: struct_in_pearlite unknown (incomplete)\n"
+        "trust-wp: struct_order FAILED ✗ (postcondition)\n"
+        "trust-wp: (1 trusted, skipped)\n"
+        "trust-wp: 0 verified, 1 failed, 1 errors, 1 trusted\n"
+        + _wire_line(failed=1, errors=1, trusted=1, base_exit_code=1)
+    )
+
+    def test_source_declared_trusted_item_on_translate_only_row_is_clean(self):
+        cb = _load_compare_baselines()
+        row = _gate_row(_PEARL, self._PEARL_TRUSTED)
+        row["trusted_def_paths"] = ["solver"]
+        assert cb._true_100_violation_reasons(row) == []
+
+    def test_translate_only_trusted_item_the_source_does_not_declare_is_refused(self):
+        # The isolating twin: the same run, but the trusted item is one the
+        # source does NOT mark `#[trusted]`.
+        cb = _load_compare_baselines()
+        output = self._PEARL_TRUSTED.replace("solver trusted", "struct_order trusted")
+        row = _gate_row(_PEARL, output)
+        row["trusted_def_paths"] = ["struct_order"]
+        reasons = cb._true_100_violation_reasons(row)
+        assert "telemetry.trusted=1" in reasons, reasons
+
+    def test_translate_only_trusted_counter_without_named_items_is_refused(self):
+        cb = _load_compare_baselines()
+        row = _gate_row(_PEARL, self._PEARL_TRUSTED.replace("trusted=1", "trusted=2"))
+        row["trusted_def_paths"] = ["solver"]
+        reasons = cb._true_100_violation_reasons(row)
+        assert "telemetry.trusted=2" in reasons, reasons
+
+    def test_gate_refuses_translate_only_row_without_driver_report(self):
+        cb = _load_compare_baselines()
+        output, _ = _REAL_NO_REPLAY_OUTPUTS["bug/653"]
+        row = _gate_row(_ss("bug/653"), output)
+        del row["driver_report"]
+        assert any("driver report absent" in r for r in cb._true_100_violation_reasons(row))
+
+    def test_gate_refuses_verified_no_replay_message_on_allowlisted_row(self):
+        cb = _load_compare_baselines()
+        output = "trust-wp: omg verified ✓\n" + _wire_line(verified=1)
+        row = _gate_row(
+            _ss("bug/653"), output, message="Verified (NO_REPLAY): verified with clean telemetry", tier="tier2"
+        )
+        reasons = cb._true_100_violation_reasons(row)
+        assert "NO_REPLAY verified pass on a translate-only allowlisted test" in reasons
+
+
+# ---------------------------------------------------------------------------
+# The no-obligation tier (D-19). A crate whose Creusot .coma carries no goal at
+# all may be credited a pass, but never at a proof-grade tier -- otherwise the
+# tier counts mix "proved everything Creusot proves" with "there was nothing to
+# prove". The gate counts such a row clean only through zero-goal parity
+# (D-88, TestZeroGoalParityGate), never through the tier label.
+# ---------------------------------------------------------------------------
+
+
+class TestNoObligationTier:
+    # Every row below is a real corpus row; its classification is checked
+    # against the reference .coma, not against a fixture.
+    ZERO_OBLIGATION = "tests/should_succeed/lang/empty.rs"  # `pub fn f() { return; }`
+    GOAL_BEARING = "tests/should_succeed/100doors.rs"
+    NO_COMA = "tests/should_succeed/bug/265.rs"
+    UISKIP = "tests/should_succeed/termination/custom_variant.rs"  # `// UISKIP` header, no .coma
+
+    def test_zero_obligation_pass_is_not_tier2(self):
+        tier = harness.classify_verification_tier(
+            self.ZERO_OBLIGATION, "pass", "Verification succeeded", None, "pub fn f() {}"
+        )
+        assert tier == "tier0-no-obligation"
+
+    def test_zero_obligation_pass_is_not_tier1(self):
+        # verification surface in the source would otherwise give rule 9 tier1
+        tier = harness.classify_verification_tier(
+            self.ZERO_OBLIGATION, "pass", "some other pass text", None,
+            "#[requires(true)] pub fn f() {}",
+        )
+        assert tier == "tier0-no-obligation"
+
+    def test_goal_bearing_row_keeps_tier2(self):
+        tier = harness.classify_verification_tier(
+            self.GOAL_BEARING, "pass", "Verification succeeded", None, "pub fn f() {}"
+        )
+        assert tier == "tier2"
+
+    def test_a_test_creusot_translated_to_nothing_has_no_obligation(self):
+        # No .coma because Creusot's output is empty (D-157): no obligation.
+        gc = _load_goal_coverage()
+        assert gc.goal_inventory(self.NO_COMA) is None
+        assert gc.creusot_emitted_nothing(self.NO_COMA)
+        tier = harness.classify_verification_tier(
+            self.NO_COMA, "pass", "Verification succeeded", None, "pub fn f() {}"
+        )
+        assert tier == "tier0-no-obligation"
+
+    def test_a_missing_coma_creusot_never_ran_is_unaffected(self):
+        # A test the ui runner skips, and a name that is no corpus file, prove
+        # nothing about obligations: fail closed, keep the old tier.
+        gc = _load_goal_coverage()
+        for name in (self.UISKIP, "tests/should_succeed/bug/no_such_test.rs"):
+            assert gc.goal_inventory(name) is None
+            assert not gc.creusot_emitted_nothing(name)
+            tier = harness.classify_verification_tier(
+                name, "pass", "Verification succeeded", None, "pub fn f() {}"
+            )
+            assert tier == "tier2", name
+
+    def test_fail_closed_markers_still_win(self):
+        # A zero-obligation row that still leans on a trusted item stays tier3,
+        # the more conservative answer; the new tier never rescues it.
+        tier = harness.classify_verification_tier(
+            self.ZERO_OBLIGATION, "pass",
+            "trust-wp: g trusted (skipped)\ntrust-wp: 1 verified, 0 failed, 0 errors, 1 trusted",
+            None, "pub fn f() {}",
+        )
+        assert tier == "tier3"
+
+    def test_non_pass_is_still_tier3(self):
+        tier = harness.classify_verification_tier(
+            self.ZERO_OBLIGATION, "error", "boom", None, "pub fn f() {}"
+        )
+        assert tier == "tier3"
+
+    def test_zero_goal_rows_reach_no_proof_grade_tier(self):
+        """Rows whose reference .coma carries zero goal items; a pass on any of
+        them may reach neither tier1 nor tier2."""
+        gc = _load_goal_coverage()
+        rows = [
+            "bug/1921", "bug/195", "bug/570", "bug/691", "bug/793",
+            "clones/04", "constrained_types", "traits/07",
+            "traits/15_impl_interfaces",
+        ]
+        for row in rows:
+            name = f"tests/should_succeed/{row}.rs"
+            assert gc.goal_inventory(name) == [], row
+            tier = harness.classify_verification_tier(
+                name, "pass", "Verification succeeded", None, "pub fn f() {}"
+            )
+            assert tier == "tier0-no-obligation", row
+
+    def test_gate_refuses_the_tier_label_alone(self):
+        # The label is where the gate looks, never what it credits: a row
+        # carrying the label but not trust-wp's own evidence (no driver report
+        # here) stays a violation, and outside the should_succeed lane the
+        # label is never credited at all.
+        module = _load_compare_baselines()
+        row = {
+            "name": "tests/should_succeed/lang/empty.rs",
+            "status": "pass",
+            "message": "Verification succeeded",
+            "verification_tier": "tier0-no-obligation",
+            "telemetry": _complete_telemetry(verified=1),
+        }
+        for lane in ("should_succeed", "examples", None):
+            reasons = module._true_100_violation_reasons(row, lane)
+            assert any("tier0-no-obligation" in r for r in reasons), lane
+        assert any(
+            "driver report absent" in r
+            for r in module._true_100_violation_reasons(row, "should_succeed")
+        )
+
+    def test_tier_histogram_has_a_bucket_for_it(self):
+        # A tier absent from the histogram vanishes from every summary, and the
+        # row is then counted nowhere at all.
+        result = harness.TestResult(
+            name=self.ZERO_OBLIGATION,
+            status="pass",
+            message="Verification succeeded",
+            duration_ms=1,
+        )
+        result.verification_tier = "tier0-no-obligation"
+        summary = harness.summarize_results([result])
+        tiers = summary["should_succeed"]["verification_tiers"]
+        assert tiers["tier0-no-obligation"] == 1
+        # and it is NOT folded into the proof-grade counters
+        assert summary["should_succeed"]["tier2_verified"] == 0
+        assert tiers["tier2"] == 0 and tiers["tier0"] == 0
+
+
+class TestZeroGoalParityGate:
+    """Zero-goal parity (D-88): a should_succeed row graded tier0-no-obligation
+    is gate-clean iff (a) Creusot's .coma, read by the gate itself, has no goal
+    item and (b) trust-wp's own record shows no failure, gap, refusal or
+    unexplained exit. Every row name below is a real corpus row whose
+    inventory is read from the reference .coma, not from a fixture."""
+
+    ZERO = "tests/should_succeed/lang/empty.rs"  # `pub fn f() { return; }`
+    ZERO_CONTRACT = "tests/should_succeed/bug/195.rs"  # `#[requires(p == p)]`, empty body
+    GOALS = "tests/should_succeed/result/result.rs"
+    NO_COMA = "tests/should_succeed/bug/265.rs"
+    UISKIP = "tests/should_succeed/termination/custom_variant.rs"  # `// UISKIP` header, no .coma
+    VERIFIED_OUTPUT = (
+        "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+        "trust-wp: example verified \u2713\n\n"
+        "trust-wp: 1 verified, 0 failed, 0 errors\n"
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s\n"
+    )
+    # Wire counters that disqualify. Spelled out rather than derived from the
+    # module under test, so widening the credited set cannot pass silently.
+    DISQUALIFYING = (
+        "failed", "errors", "warnings", "assumed", "trusted", "skipped",
+        "verified_with_axiom_deps", "unverified_axioms", "vacuous",
+        "proof_assert_inconclusive", "proof_assert_failed", "proof_assert_errors",
+        "evidence_gaps", "panics", "demoted", "parse_errors", "termination_errors",
+        "logic_recursion_errors", "erasure_errors",
+    )
+    POSITIVE = ("verified", "proof_assert_verified", "verified_native_only")
+
+    @staticmethod
+    def _row(name, output, status="pass", tier="tier0-no-obligation", message=None):
+        from harness_classify_succeed import _extract_wire_line_pairs
+
+        gc = _load_goal_coverage()
+        return {
+            "name": name,
+            "status": status,
+            "message": output if message is None else message,
+            "verification_tier": tier,
+            "driver_report": gc.driver_report_lines(output),
+            "telemetry": _extract_wire_line_pairs(output),
+        }
+
+    def _clean(self, **wire):
+        wire.setdefault("base_exit_code", 2)
+        return self._row(
+            self.ZERO,
+            ZERO_GOAL_CLEAN_OUTPUT.replace(ZERO_GOAL_WIRE_LINE, _wire_line(**wire)),
+        )
+
+    def _verified(self, **wire):
+        wire = {"verified": 1, "base_exit_code": 0, **wire}
+        return self._row(
+            self.ZERO_CONTRACT,
+            self.VERIFIED_OUTPUT + _wire_line(**wire),
+            message="Verification succeeded",
+        )
+
+    @staticmethod
+    def _gate(row, lane="should_succeed"):
+        cb = _load_compare_baselines()
+        found = cb.find_true_100_violations({"results": [row]}, lane)
+        return found[0][1] if found else []
+
+    # -- the oracle's side is read here, and is the real one --------------------
+
+    def test_the_rows_used_here_are_what_they_claim(self):
+        gc = _load_goal_coverage()
+        assert gc.goal_inventory(self.ZERO) == []
+        assert gc.goal_inventory(self.ZERO_CONTRACT) == []
+        assert gc.goal_inventory(self.GOALS)
+        assert gc.goal_inventory(self.NO_COMA) is None
+        assert gc.goal_inventory(self.UISKIP) is None
+
+    # -- the four quadrants -----------------------------------------------------
+
+    def test_quadrant_no_goals_examined_nothing_is_clean(self):
+        assert self._gate(self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)) == []
+
+    def test_quadrant_no_goals_verified_something_is_clean(self):
+        # What trust-wp verified is not a Creusot goal: extra, never owed.
+        assert self._gate(self._verified()) == []
+
+    def test_quadrant_goals_examined_nothing_is_dropped_obligations(self):
+        # The isolating twin of the first quadrant: the SAME trust-wp output,
+        # and only the oracle differs.
+        labelled = self._row(self.GOALS, ZERO_GOAL_CLEAN_OUTPUT)
+        reasons = self._gate(labelled)
+        assert any("goal item(s)" in r and "dropped" in r for r in reasons), reasons
+        # The shape the harness actually stores for it (status error, tier3)
+        # stays a violation and now says why.
+        stored = self._row(self.GOALS, ZERO_GOAL_CLEAN_OUTPUT, status="error", tier="tier3")
+        reasons = self._gate(stored)
+        assert any("obligations dropped" in r for r in reasons), reasons
+
+    def test_quadrant_goals_verified_something_is_graded_normally(self):
+        # The inventory, not the stored label, selects goal coverage over parity.
+        row = self._verified()
+        row["name"] = self.GOALS
+        reasons = self._gate(row)
+        assert any("uncovered Creusot goal item" in r for r in reasons), reasons
+        row["verification_tier"] = "tier2"
+        assert self._gate(row) == reasons
+        assert not any("zero-goal parity" in r for r in reasons), reasons
+
+    def test_a_source_declared_trusted_item_keeps_parity(self):
+        # D-158: traits/14_assoc_in_logic's run, credited because its source
+        # declares `#[trusted] test`...
+        row = self._row(ZERO_GOAL_SOURCE_TRUSTED_ROW, ZERO_GOAL_SOURCE_TRUSTED_OUTPUT)
+        assert self._gate(row) == []
+        # ...and the isolating twins: the same run under a zero-goal row whose
+        # source declares no `test`, a trusted item the source does not name,
+        # and a counter the named items do not account for.
+        reasons = self._gate(self._row(self.ZERO, ZERO_GOAL_SOURCE_TRUSTED_OUTPUT))
+        assert any("not declared #[trusted]" in r for r in reasons), reasons
+        assert any("telemetry.trusted=1" in r for r in reasons), reasons
+        stray = self._row(
+            ZERO_GOAL_SOURCE_TRUSTED_ROW,
+            ZERO_GOAL_SOURCE_TRUSTED_OUTPUT.replace("trust-wp: test trusted", "trust-wp: other trusted"),
+        )
+        assert any("not declared #[trusted]" in r for r in self._gate(stray))
+        miscounted = self._row(
+            ZERO_GOAL_SOURCE_TRUSTED_ROW,
+            ZERO_GOAL_SOURCE_TRUSTED_OUTPUT.replace(" trusted=1 ", " trusted=2 "),
+        )
+        assert any("trusted count 2 != 1" in r for r in self._gate(miscounted))
+
+    def test_a_trusted_item_beside_any_other_counter_keeps_no_parity(self):
+        out = ZERO_GOAL_SOURCE_TRUSTED_OUTPUT.replace(" warnings=0 ", " warnings=1 ")
+        reasons = self._gate(self._row(ZERO_GOAL_SOURCE_TRUSTED_ROW, out))
+        assert any("telemetry.warnings=1" in r for r in reasons), reasons
+
+    def test_a_test_creusot_translated_to_nothing_is_clean(self):
+        # D-157: an absent .coma is Creusot's empty translation, so the first
+        # quadrant's credit holds for it too.
+        assert self._gate(self._row(self.NO_COMA, ZERO_GOAL_CLEAN_OUTPUT)) == []
+
+    def test_a_missing_coma_creusot_never_ran_is_never_credited(self):
+        # The isolating twin: the same run, for a test the ui runner skips.
+        reasons = self._gate(self._row(self.UISKIP, ZERO_GOAL_CLEAN_OUTPUT))
+        assert any("no Creusot .coma" in r for r in reasons), reasons
+
+    def test_creusot_emitted_nothing_reads_the_runner_s_contract(self, tmp_path):
+        # One source, one file system change at a time: the header, the .coma,
+        # the source itself.
+        gc = _load_goal_coverage()
+        name = "tests/should_succeed/t.rs"
+        source = tmp_path / name
+        source.parent.mkdir(parents=True)
+        source.write_text("extern crate creusot_std;\npub fn f() {}\n")
+        assert gc.creusot_emitted_nothing(name, tmp_path)
+        assert gc.zero_goal_oracle_refusals(name, tmp_path) == []
+        source.write_text("// UISKIP\nextern crate creusot_std;\npub fn f() {}\n")
+        assert not gc.creusot_emitted_nothing(name, tmp_path)
+        assert gc.zero_goal_oracle_refusals(name, tmp_path)
+        source.write_text("extern crate creusot_std;\npub fn f() {}\n")
+        coma = tmp_path / "tests/should_succeed/t.coma"
+        coma.write_text("(* nothing *)\n")
+        assert not gc.creusot_emitted_nothing(name, tmp_path)
+        assert gc.zero_goal_oracle_refusals(name, tmp_path)  # a .coma is read, and this one is broken
+        coma.unlink()
+        source.unlink()
+        assert not gc.creusot_emitted_nothing(name, tmp_path)
+        assert gc.zero_goal_oracle_refusals(name, tmp_path)
+        assert not gc.creusot_emitted_nothing("tests/should_fail/t.rs", tmp_path)
+
+    def test_an_empty_inventory_from_a_broken_coma_is_refused(self, tmp_path):
+        # Zero goals is the credit, so a .coma that parses to fewer modules
+        # than it declares (truncated) or to none cannot vouch for it.
+        gc = _load_goal_coverage()
+        real = (_CORPUS_SS / "lang" / "empty.coma").read_text()
+        cases = {
+            "truncated": real.replace("\nend", ""),
+            "no module": "(* nothing *)\n",
+        }
+        for label, text in cases.items():
+            root = tmp_path / label
+            coma = root / "tests" / "should_succeed" / "lang" / "empty.coma"
+            coma.parent.mkdir(parents=True)
+            coma.write_text(text)
+            assert gc.goal_inventory(self.ZERO, root) == [], label
+            reasons = gc.zero_goal_parity_refusals(
+                self.ZERO, status="pass",
+                telemetry=_complete_telemetry(base_exit_code=2),
+                report_lines=[], message=ZERO_GOAL_CLEAN_OUTPUT, corpus_root=root,
+            )
+            assert any("module" in r for r in reasons), (label, reasons)
+        root = tmp_path / "intact"
+        coma = root / "tests" / "should_succeed" / "lang" / "empty.coma"
+        coma.parent.mkdir(parents=True)
+        coma.write_text(real)
+        assert gc.zero_goal_parity_refusals(
+            self.ZERO, status="pass", telemetry=_complete_telemetry(base_exit_code=2),
+            report_lines=[], message=ZERO_GOAL_CLEAN_OUTPUT, corpus_root=root,
+        ) == []
+
+    def test_the_stored_coverage_summary_is_never_read(self):
+        # (a) is read from the .coma by the gate, in both directions.
+        lying = self._row(self.GOALS, ZERO_GOAL_CLEAN_OUTPUT)
+        lying["goal_coverage"] = {"inventory": "coma", "goal_items": 0, "covered": [], "uncovered": []}
+        assert self._gate(lying)
+        honest = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)
+        honest["goal_coverage"] = {"inventory": "coma", "goal_items": 3, "covered": [], "uncovered": [{}]}
+        assert self._gate(honest) == []
+
+    # -- (b): every disqualifying telemetry field --------------------------------
+
+    def test_the_counter_split_covers_every_wire_field(self):
+        cb = _load_compare_baselines()
+        gc = _load_goal_coverage()
+        assert set(gc.ZERO_GOAL_POSITIVE_COUNTERS) == set(self.POSITIVE)
+        assert set(self.DISQUALIFYING) | set(self.POSITIVE) | {"base_exit_code"} == set(
+            cb.TELEMETRY_FIELD_NAMES
+        )
+
+    def test_each_disqualifying_counter_refuses_an_examined_nothing_row(self):
+        for key in self.DISQUALIFYING:
+            reasons = self._gate(self._clean(**{key: 1}))
+            assert any(f"telemetry.{key}=1" in r for r in reasons), (key, reasons)
+
+    def test_each_disqualifying_counter_refuses_a_verified_row(self):
+        for key in self.DISQUALIFYING:
+            reasons = self._gate(self._verified(**{key: 1}))
+            assert any(f"telemetry.{key}=1" in r for r in reasons), (key, reasons)
+
+    def test_positive_counters_alone_do_not_disqualify(self):
+        for key in self.POSITIVE:
+            row = self._verified(**{"verified": 0, key: 1})
+            reasons = self._gate(row)
+            assert not any(f"telemetry.{key}" in r for r in reasons), (key, reasons)
+
+    # -- (b): the exit code is the driver's answer for what was examined ---------
+
+    def test_exit_code_must_match_what_was_examined(self):
+        assert self._gate(self._clean(base_exit_code=0))  # examined nothing, yet 0
+        assert self._gate(self._verified(base_exit_code=2))  # verified, yet 2
+        for code in (1, 3, 101):
+            assert self._gate(self._clean(base_exit_code=code)), code
+            assert self._gate(self._verified(base_exit_code=code)), code
+
+    def test_status_must_be_pass(self):
+        for status in ("error", "fail", "unknown", "skip"):
+            row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT, status=status)
+            assert self._gate(row), status
+
+    def test_telemetry_and_report_must_be_recorded(self):
+        row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)
+        del row["telemetry"]
+        assert any("wire telemetry absent" in r for r in self._gate(row))
+        row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)
+        del row["driver_report"]
+        assert any("driver report absent" in r for r in self._gate(row))
+
+    # -- (b): no negative, refusal, trust or failure report line -----------------
+
+    def test_negative_and_refusal_report_lines_refuse(self):
+        lines = (
+            # verbatim from bug/02_derive, the one zero-goal row this refuses
+            "trust-wp: <Lit as std::clone::Clone>::clone refinement not checked: impl of "
+            "external trait method `std::clone::Clone::clone` declares no requires "
+            "(precondition direction holds); postcondition direction has no trait-level contract",
+            "trust-wp: error: unsupported construct",
+            "trust-wp: warning: failed to parse contract",
+            "trust-wp: f trusted (skipped)",
+            "trust-wp: f unknown (timeout)",
+            "trust-wp: 0 verified, 1 failed, 0 errors",
+            "trust-wp: 1 verified, 0 failed, 0 errors, 1 trusted",
+            "trust-wp: verifying proof_assert in f (0 contract preconditions)",
+        )
+        for line in lines:
+            output = ZERO_GOAL_CLEAN_OUTPUT.replace(
+                ZERO_GOAL_WIRE_LINE, line + "\n" + ZERO_GOAL_WIRE_LINE
+            )
+            assert self._gate(self._row(self.ZERO, output)), line
+
+    # -- (b): a refusal that stopped compilation is not "nothing to examine" -----
+
+    def test_frontend_refusal_with_the_same_wire_line_refuses(self):
+        # What the pre-D-88 harness stored for the refused twin: status pass,
+        # tier0-no-obligation. The gate must refuse it on its own evidence.
+        refused = self._row(self.ZERO, ZERO_GOAL_REFUSED_OUTPUT)
+        assert refused["telemetry"] == self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)["telemetry"]
+        reasons = self._gate(refused)
+        assert any("rustc reported an error" in r for r in reasons), reasons
+        assert any("`Finished`" in r for r in reasons), reasons
+
+    def test_exit_two_needs_the_raw_build_output(self):
+        # An examined-nothing row whose stored message is a summary string
+        # carries no evidence that the crate compiled.
+        row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT, message="Verification succeeded")
+        assert any("`Finished`" in r for r in self._gate(row))
+
+    def test_truncated_output_refuses(self):
+        row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)
+        row["message_truncated"] = True
+        assert any("truncated" in r for r in self._gate(row))
+        gc = _load_goal_coverage()
+        row = self._row(
+            self.ZERO,
+            ZERO_GOAL_CLEAN_OUTPUT.replace(
+                "    Finished", f"{gc.STORED_OUTPUT_TRUNCATED_MARKER}\n    Finished"
+            ),
+        )
+        assert any("truncated" in r for r in self._gate(row))
+
+    def test_truncation_marker_is_the_harness_marker(self):
+        from harness_output import TRUNCATED_OUTPUT_MARKER
+
+        assert _load_goal_coverage().STORED_OUTPUT_TRUNCATED_MARKER == TRUNCATED_OUTPUT_MARKER
+
+    def test_a_translate_only_credit_is_not_called_dropped(self, tmp_path):
+        # D-21: an allowlisted NO_REPLAY row whose run examined nothing is a
+        # translate-only credit although its .coma has (refutable) goals;
+        # Creusot does not discharge them either, so nothing was dropped.
+        output = _wire_line(base_exit_code=2)
+        name = _ss("bug/653")
+        assert _load_goal_coverage().goal_inventory(name)
+        status, message, tier = _no_replay_outcome(name, output, 2, tmp_path)
+        row = _gate_row(name, output, status=status, message=message, tier=tier)
+        assert self._gate(row, None) == []
+        assert self._gate(row, "should_succeed") == []
+
+    # -- scope ------------------------------------------------------------------
+
+    def test_parity_is_a_should_succeed_rule_only(self):
+        row = self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)
+        assert self._gate(row, "should_succeed") == []
+        for lane in ("examples", None, "some_future_lane"):
+            assert any("tier0-no-obligation" in r for r in self._gate(row, lane)), lane
+
+    def test_the_report_names_parity_rows_separately(self, tmp_path, capsys):
+        cb = _load_compare_baselines()
+        payload = {"results": [self._row(self.ZERO, ZERO_GOAL_CLEAN_OUTPUT)]}
+        path = tmp_path / "cur.json"
+        path.write_text(json.dumps(payload))
+        cb.compare_results(str(path), str(path), "should_succeed")
+        out = capsys.readouterr().out
+        assert "ZERO-GOAL PARITY (1;" in out and self.ZERO in out
+        assert "TRUE-100 VIOLATIONS" not in out
+
+    # -- the inventory's recall is the credit (D-89) ----------------------------
+    #
+    # A `[@coma:extspec]` closure has no barrier, so Coma inlines its body at
+    # every call: an overflow or `hist_inv post` inside it is the CALLER's
+    # goal. `_body_goal_kinds` never looks through an extspec callee (it is
+    # not in `callees`), so a .coma whose goals all sit in called extspec
+    # closures inventories as EMPTY. Harmless while goals were what got
+    # credited; here zero is, so `inventory_recall_gaps` names each such call
+    # and parity refuses on it.
+
+    def test_a_goal_inside_a_called_extspec_closure_is_not_zero_goals(self, tmp_path):
+        # The real row: `multi_arg` calls `|a, b| a + b` (Int32.add) and
+        # `move_closure` calls a closure doing `*a += 1` under a `closure
+        # hist_inv post`: goals in Creusot's .coma, none in the inventory.
+        # Graded by the harness's own classifier and tier (NO_REPLAY verified
+        # path; rule 5c turns it tier0-no-obligation) for a clean run that
+        # verified only `uses_closure`. Latent today: the source's
+        # `#[trusted] new_ref` keeps the real run's trusted counter nonzero.
+        name = _ss("closures/01_basic")
+        text = (_CORPUS_SS / "closures" / "01_basic.coma").read_text()
+        assert "[@coma:extspec]" in text and "Int32.add" in text
+        assert "closure0 {x} {_4.f0} {_4.f1}" in text  # multi_arg calls it
+        output = (
+            "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+            "trust-wp: uses_closure verified \u2713\n\n"
+            "trust-wp: 1 verified, 0 failed, 0 errors\n"
+            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s\n"
+            + _wire_line(verified=1, base_exit_code=0)
+        )
+        status, message, tier = _no_replay_outcome(name, output, 0, tmp_path)
+        assert (status, tier) == ("pass", "tier0-no-obligation"), (status, message, tier)
+        row = _gate_row(name, output, status=status, message=message, tier=tier)
+        assert self._gate(row), "parity credited a row whose .coma carries closure goals"
+
+    def test_the_same_goal_through_a_called_extspec_closure_refuses(self, tmp_path):
+        # Isolating pair over one oracle row: the SAME overflow goal, once in
+        # the fn's own body and once in an extspec closure the body calls.
+        gc = _load_goal_coverage()
+        name = _ss("bug/258")
+        real = (_CORPUS_SS / "bug" / "258.coma").read_text()
+        anchor = (
+            "  let rec err (_to: UInt64.t) (return (x: ())) = (! bb0\n"
+            "    [ bb0 = return {_ret} ] [ & _ret: () = Any.any_l () ])"
+        )
+        assert anchor in real
+        locals_ = " [ & _ret: () = Any.any_l () | & _r: UInt64.t = Any.any_l () ])"
+        in_body = (
+            "  let rec err (_to: UInt64.t) (return (x: ())) = (! bb0\n"
+            "    [ bb0 = s0 [ s0 = UInt64.add {_to} {(1: UInt64.t)} "
+            "(fun (_x: UInt64.t) -> [ &_r <- _x ] s1) | s1 = return {_ret} ] ]" + locals_
+        )
+        in_closure = (
+            "  let rec closure0 [@coma:extspec] (self: ()) (a: UInt64.t) (return (x: UInt64.t)) = bb0\n"
+            "    [ bb0 = s0 [ s0 = UInt64.add {a} {(1: UInt64.t)} "
+            "(fun (_x: UInt64.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]\n"
+            "    [ & _ret: UInt64.t = Any.any_l () | & a: UInt64.t = a ]\n"
+            "    [ return (result: UInt64.t) -> return {result} ]\n"
+            "  \n"
+            "  let rec err (_to: UInt64.t) (return (x: ())) = (! bb0\n"
+            "    [ bb0 = s0 [ s0 = closure0 {()} {_to} "
+            "(fun (_x: UInt64.t) -> [ &_r <- _x ] s1) | s1 = return {_ret} ] ]" + locals_
+        )
+
+        def refusals(label: str, body: str) -> list[str]:
+            root = tmp_path / label
+            coma = root / "tests" / "should_succeed" / "bug" / "258.coma"
+            coma.parent.mkdir(parents=True)
+            coma.write_text(real.replace(anchor, body))
+            row = self._row(name, ZERO_GOAL_CLEAN_OUTPUT)
+            return gc.zero_goal_parity_refusals(
+                name,
+                status=row["status"],
+                telemetry=row["telemetry"],
+                report_lines=row["driver_report"],
+                message=row["message"],
+                corpus_root=root,
+            )
+
+        assert refusals("no goal", anchor) == []
+        assert refusals("in body", in_body)
+        assert refusals("in closure", in_closure), "the closure-borne overflow goal was not seen"
+
+    def test_a_self_recursive_call_precondition_is_a_goal(self, tmp_path):
+        # Creusot emits a recursive call as a plain call of the fn itself
+        # (cell/02_fib.coma: `fib_memo {mem} {_26}` in fib_memo's own body),
+        # so the callee's header `requires` is a goal at that call.
+        # `_body_goal_kinds` skips `callee is d`. Isolating pair: the SAME
+        # `requires b` call, owed once by a caller of a stub and once by the
+        # fn itself.
+        gc = _load_goal_coverage()
+        name = _ss("bug/258")
+        head = "module M_f\n  use creusot.prelude.Any\n  \n"
+        call = (
+            "(! bb0\n    [ bb0 = s0 [ s0 = f {b} (fun (_x: ()) -> [ &_ret <- _x ] s1) "
+            "| s1 = return {_ret} ] ]\n"
+            "    [ & _ret: () = Any.any_l () | & b: bool = b ]) "
+            "[ return (result: ()) -> (! return {result}) ]\nend\n"
+        )
+        requires = "{[@stop_split] [@expl:f requires] b}"
+        other_caller = (
+            head
+            + f"  let rec f (b: bool) (return (x: ())) = {requires} "
+            "any [ return (result: ()) -> (! return {result}) ]\n  \n"
+            "  let rec g (b: bool) (return (x: ())) = " + call
+        )
+        self_caller = head + f"  let rec f (b: bool) (return (x: ())) = {requires}\n    " + call
+
+        def refusals(label: str, text: str) -> list[str]:
+            root = tmp_path / label
+            coma = root / "tests" / "should_succeed" / "bug" / "258.coma"
+            coma.parent.mkdir(parents=True)
+            coma.write_text(text)
+            row = self._row(name, ZERO_GOAL_CLEAN_OUTPUT)
+            return gc.zero_goal_parity_refusals(
+                name,
+                status=row["status"],
+                telemetry=row["telemetry"],
+                report_lines=row["driver_report"],
+                message=row["message"],
+                corpus_root=root,
+            )
+
+        assert refusals("other caller", other_caller)
+        assert refusals("self caller", self_caller), "the recursive call's requires was not seen"
+
+    @staticmethod
+    def _oracle(tmp_path, label, text, rel="bug/258"):
+        """Half (a) over a .coma written in place of the real ``rel`` one."""
+        gc = _load_goal_coverage()
+        root = tmp_path / label
+        coma = root / "tests" / "should_succeed" / f"{rel}.coma"
+        coma.parent.mkdir(parents=True)
+        coma.write_text(text)
+        assert gc.goal_inventory(_ss(rel), root) == [], label  # the inventory reads zero
+        return gc.zero_goal_oracle_refusals(_ss(rel), root)
+
+    SELF_HEAD = "module M_f\n  use creusot.prelude.Any\n  \n"
+    SELF_CALL = (
+        "(! bb0\n    [ bb0 = s0 [ s0 = f {b} (fun (_x: ()) -> [ &_ret <- _x ] s1) "
+        "| s1 = return {_ret} ] ]\n"
+        "    [ & _ret: () = Any.any_l () | & b: bool = b ]) "
+        "[ return (result: ()) -> (! return {result}) ]\nend\n"
+    )
+
+    def test_a_self_call_owes_only_a_precondition_it_has(self, tmp_path):
+        # Isolates the header half of the self-recursion refusal: the SAME
+        # recursive call, with and without a header precondition. Without one
+        # the call owes nothing (a recursive fn with no requires and no variant).
+        requires = "{[@stop_split] [@expl:f requires] b}"
+        with_pre = self.SELF_HEAD + f"  let rec f (b: bool) (return (x: ())) = {requires}\n    " + self.SELF_CALL
+        without = self.SELF_HEAD + "  let rec f (b: bool) (return (x: ())) = " + self.SELF_CALL
+        refused = self._oracle(tmp_path, "with", with_pre)
+        assert any("f calls itself" in r and "f requires" in r for r in refused), refused
+        assert self._oracle(tmp_path, "without", without) == []
+
+    def test_the_real_recursive_call_is_named(self):
+        # cell/02_fib.coma is the shape's source: its inventory is not empty
+        # (fib_memo has other goals), so this pins the recall scan on real text.
+        gc = _load_goal_coverage()
+        gaps = gc.inventory_recall_gaps(gc.coma_modules(_ss("cell/02_fib")))
+        assert len(gaps) == 1, gaps
+        assert gaps[0].startswith("M_fib_memo: fib_memo calls itself") and "fib_memo requires" in gaps[0]
+
+    def test_an_uncalled_extspec_closure_owes_nothing(self, tmp_path):
+        # bug/1312 returns its closure (`impl Fn`), so its `{false} any`
+        # unreachable goal is nobody's: the real row stays creditable. The
+        # isolating twin calls that SAME closure from foo99 and is refused.
+        gc = _load_goal_coverage()
+        name = _ss("bug/1312")
+        real = (_CORPUS_SS / "bug" / "1312.coma").read_text()
+        assert gc.goal_inventory(name) == [] and gc.zero_goal_oracle_refusals(name) == []
+        uncalled = "s0 = [ &_my_closure <- () ] s1"
+        called = "s0 = closure0 {()} {x} (fun (_x: Int32.t) -> [ &_my_closure <- () ] s1)"
+        assert uncalled in real
+        assert self._oracle(tmp_path, "uncalled", real, "bug/1312") == []
+        refused = self._oracle(tmp_path, "called", real.replace(uncalled, called), "bug/1312")
+        assert any("foo99 calls [@coma:extspec] closure0" in r and "unreachable" in r for r in refused), refused
+
+    EXT_MODULE = (
+        "module M_err\n  use creusot.prelude.Any\n  use creusot.int.UInt64\n  \n"
+        "  let rec closure1 [@coma:extspec] (self: ()) (a: UInt64.t) (return (x: UInt64.t)) = bb0\n"
+        "    [ bb0 = s0 [ s0 = UInt64.add {a} {(1: UInt64.t)} "
+        "(fun (_x: UInt64.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]\n"
+        "    [ & _ret: UInt64.t = Any.any_l () | & a: UInt64.t = a ]\n"
+        "    [ return (result: UInt64.t) -> return {result} ]\n"
+        "  \n"
+        "  let rec closure0 [@coma:extspec] (self: ()) (a: UInt64.t) (return (x: UInt64.t)) = bb0\n"
+        "    [ bb0 = s0 [ s0 = INNER (fun (_x: UInt64.t) -> [ &_ret <- _x ] s1) | s1 = return {_ret} ] ]\n"
+        "    [ & _ret: UInt64.t = Any.any_l () | & a: UInt64.t = a ]\n"
+        "    [ return (result: UInt64.t) -> return {result} ]\n"
+        "  \n"
+        "  let rec err (_to: UInt64.t) (return (x: ())) = (! bb0\n"
+        "    [ bb0 = s0 [ s0 = OUTER (fun (_x: UInt64.t) -> [ &_r <- _x ] s1) | s1 = return {_ret} ] ]"
+        " [ & _ret: () = Any.any_l () | & _r: UInt64.t = Any.any_l () ])"
+        " [ return (result: ()) -> (! return {result}) ]\nend\n"
+    )
+
+    def test_goals_reach_the_caller_through_a_chain_of_extspec_closures(self, tmp_path):
+        # err calls closure0, which owes nothing of its own but calls closure1,
+        # whose overflow goal Coma inlines into closure0 and so into err.
+        # Isolating: the SAME err -> closure0 call is clean when closure0 does
+        # not call closure1, and the goal-bearing closure1 alone is nobody's.
+        chain = self.EXT_MODULE.replace("INNER", "closure1 {()} {a}").replace("OUTER", "closure0 {()} {_to}")
+        broken = self.EXT_MODULE.replace("INNER", "any").replace("OUTER", "closure0 {()} {_to}")
+        uncalled = self.EXT_MODULE.replace("INNER", "any").replace("OUTER", "any")
+        refused = self._oracle(tmp_path, "chain", chain)
+        assert any("err calls [@coma:extspec] closure0" in r and "through closure1" in r for r in refused), refused
+        assert self._oracle(tmp_path, "broken", broken) == []
+        assert self._oracle(tmp_path, "uncalled", uncalled) == []
+
+    def test_an_extspec_header_precondition_is_the_callers_goal(self, tmp_path):
+        # closures/14_move_resolve's shape: the closure's only goal is its
+        # header type invariant, which the call inlines like its body.
+        header = "{[@stop_split] [@expl:closure 'a' type invariant] true}\n    bb0"
+        called = (
+            self.EXT_MODULE.replace("INNER", "any").replace("OUTER", "closure0 {()} {_to}")
+            .replace(
+                "(self: ()) (a: UInt64.t) (return (x: UInt64.t)) = bb0\n    [ bb0 = s0 [ s0 = any",
+                "(self: ()) (a: UInt64.t) (return (x: UInt64.t)) =\n    " + header + "\n    [ bb0 = s0 [ s0 = any",
+            )
+        )
+        assert header in called
+        refused = self._oracle(tmp_path, "called", called)
+        assert any("closure0" in r and "type invariant" in r for r in refused), refused
+        assert self._oracle(tmp_path, "uncalled", called.replace("closure0 {()} {_to}", "any")) == []
+
+    def test_the_real_extspec_rows_are_named(self):
+        gc = _load_goal_coverage()
+        gaps = gc.inventory_recall_gaps(gc.coma_modules(_ss("closures/01_basic")))
+        assert [g.split(":")[0] for g in gaps] == ["M_multi_arg", "M_move_closure", "M_move_mut"], gaps
+        # 14_move_resolve's `g` calls a closure whose only goal is its header
+        # type invariant.
+        gaps = gc.inventory_recall_gaps(gc.coma_modules(_ss("closures/14_move_resolve")))
+        assert len(gaps) == 1 and "g_T calls [@coma:extspec] closure0" in gaps[0], gaps
+        assert "type invariant" in gaps[0], gaps
+
+    # -- a declaration the inventory drops is not an empty one -----------------
+
+    def test_a_declaration_the_inventory_does_not_read_refuses(self, tmp_path):
+        # Each text sits beside lang/empty's `f` and carries a goal that
+        # `parse_coma` would drop without a word, so the inventory still reads
+        # zero. The `(return)` let rec is lang/const's `set_VALUE` shape.
+        real = (_CORPUS_SS / "lang" / "empty.coma").read_text()
+        anchor = "  let rec f (return (x: ())) ="
+        assert real.count(anchor) == 1
+        body = " = (! bb0 [ bb0 = {[@expl:assertion] false} return {_ret} ] [ & _ret: () = Any.any_l () ])"
+        clean = " = (! bb0 [ bb0 = return {_ret} ] [ & _ret: () = Any.any_l () ])"
+        cases = {
+            "unparsed let rec": "  let rec set_X (return) = bb0\n    [ bb0 = {[@expl:Add overflow] false} return ]\n",
+            "let rec group": f"  let rec g (return (x: ())){clean}\n  with h (return (x: ())){body}\n",
+            "plain let": f"  let g (return (x: ())){body}\n",
+            "val": "  val g (x: int) : int requires { x > 0 }\n",
+            "lemma": "  lemma l : false\n",
+            "unnamed goal": "  goal : false\n",
+            "unknown line": "  frobnicate {[@expl:assertion] false}\n",
+        }
+        for label, decl in cases.items():
+            refused = self._oracle(tmp_path, label, real.replace(anchor, decl + "  \n" + anchor), "lang/empty")
+            assert refused and not any("goal item(s)" in r for r in refused), (label, refused)
+        before_decl = real.replace("module M_f\n", "module M_f\n    {[@expl:assertion] false}\n")
+        assert self._oracle(tmp_path, "before any declaration", before_decl, "lang/empty")
+        outside = "goal g : false\n" + real
+        assert self._oracle(tmp_path, "outside any module", outside, "lang/empty")
+        # Controls: the real file, and `with` continuing a type group (replace.coma).
+        assert self._oracle(tmp_path, "real", real, "lang/empty") == []
+        types = "  type t_A = A t_B\n  with t_B = B t_A\n  \n"
+        assert self._oracle(tmp_path, "type group", real.replace(anchor, types + anchor), "lang/empty") == []
+
+    def test_every_real_empty_inventory_parses_whole(self):
+        # The declaration check costs no real row: every should_succeed .coma
+        # whose inventory is empty parses whole at this reference.
+        gc = _load_goal_coverage()
+        empty = [
+            _ss(str(p.relative_to(_CORPUS_SS))[:-3])
+            for p in sorted(_CORPUS_SS.rglob("*.rs"))
+            if gc.goal_inventory(_ss(str(p.relative_to(_CORPUS_SS))[:-3])) == []
+        ]
+        assert empty
+        assert [n for n in empty if gc._coma_integrity_refusal(n, gc.CORPUS_ROOT)] == []
+
+    # -- the inventory's recall, one step further sideways ----------------------
+    #
+    # Three more goals Creusot really has that the inventory never counts. Each
+    # is a zero that is not zero (a parity credit), and the first also credits a
+    # real row through goal coverage today. The controls beside each RED case
+    # are ordinary tests, so a broken control cannot hide inside an xfail.
+
+    @staticmethod
+    def _oracle_any(tmp_path, label, text, rel):
+        """(inventory item names, half-(a) refusals) over ``text`` written in
+        place of the real ``rel`` .coma, with no claim about either."""
+        gc = _load_goal_coverage()
+        root = tmp_path / label
+        coma = root / "tests" / "should_succeed" / f"{rel}.coma"
+        coma.parent.mkdir(parents=True)
+        coma.write_text(text)
+        items = gc.goal_inventory(_ss(rel), root)
+        return [item.item for item in items], gc.zero_goal_oracle_refusals(_ss(rel), root)
+
+    @staticmethod
+    def _elim_empty_module():
+        # bug/761.rs: `pub fn elim_empty(x: Empty) { match x {} }`. Creusot emits
+        # it as a BODY carrying a type-invariant goal and an `unreachable`
+        # (`{false} any`) goal. Every Creusot-generated `elim_*` destructor in
+        # the corpus is an `= any` stub, so the `elim_` skip in
+        # `module_goal_items`, which only ever sees body defs, reaches user fns.
+        real = (_CORPUS_SS / "bug" / "761.coma").read_text()
+        module = real[real.index("module M_elim_empty") :]
+        if not ("let rec elim_empty (x: ())" in module and "s1 = {false} any" in module):
+            pytest.fail("bug/761.coma no longer has the elim_empty body this case reads")
+        return module
+
+    BUG_761_OUTPUT = (
+        "    Checking creusot_test v0.1.0 (<TMPDIR>/test_project)\n"
+        "trust-wp: try_option verified ✓\n"
+        "trust-wp: try_result verified ✓\n\n"
+        "trust-wp: 2 verified, 0 failed, 0 errors\n"
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s\n"
+    )
+
+    def test_a_user_fn_not_named_elim_is_counted(self, tmp_path):
+        # Control for the two elim_ RED cases: the SAME module with the fn
+        # renamed is one goal item, so half (a) refuses it.
+        module = self._elim_empty_module().replace("elim_empty", "drop_empty")
+        items, refused = self._oracle_any(tmp_path, "renamed", module, "bug/258")
+        assert items == ["drop_empty"] and refused, (items, refused)
+
+    def test_a_user_fn_named_elim_is_not_zero_goals(self, tmp_path):
+        items, refused = self._oracle_any(tmp_path, "elim", self._elim_empty_module(), "bug/258")
+        assert items or refused, "parity credits a .coma whose only fn, elim_empty, carries two goals"
+
+    def test_the_real_elim_row_is_not_gate_clean(self):
+        # The stored lane's bug/761 row, rebuilt: try_option and try_result
+        # verified, elim_empty never examined, graded tier2. elim_empty is a
+        # user body with goals, so the gate must not credit the row.
+        gc = _load_goal_coverage()
+        name = _ss("bug/761")
+        self._elim_empty_module()
+        # elim_empty is a USER body with real goals; the inventory must count it.
+        if sorted(item.item for item in gc.goal_inventory(name)) != ["elim_empty", "try_option", "try_result"]:
+            pytest.fail("bug/761's inventory changed; re-read this case")
+        row = self._row(
+            name,
+            self.BUG_761_OUTPUT + _wire_line(verified=2, base_exit_code=0),
+            tier="tier2",
+            message="Verification succeeded",
+        )
+        assert self._gate(row), "the gate credits bug/761 without elim_empty's goals"
+
+    CHAR_ANCHOR = "    [ bb0 = return {_ret} ] [ & _ret: () = Any.any_l () ])"
+
+    def _char_call(self, call):
+        # lang/empty's `f`, its body now a u8 -> char cast. The prelude gives
+        # Char.of_int AND Char.of_BV256 (the #[bitwise_proof] spelling,
+        # integer_ops.coma's test_to_char_bw) an `arithmetic overflow`
+        # precondition, and the inventory must count both.
+        real = (_CORPUS_SS / "lang" / "empty.coma").read_text()
+        if self.CHAR_ANCHOR not in real:
+            pytest.fail("lang/empty.coma changed; re-read this case")
+        body = (
+            f"    [ bb0 = s0 [ s0 = {call} (fun (_x: Char.t) -> [ &_1 <- _x ] s1) "
+            "| s1 = return {_ret} ] ] [ & _ret: () = Any.any_l () | & _1: Char.t = Any.any_l () ])"
+        )
+        uses = "  use creusot.prelude.Any\n  use creusot.prelude.Char\n  use creusot.int.UInt8BW\n"
+        return real.replace(self.CHAR_ANCHOR, body).replace("  use creusot.prelude.Any\n", uses)
+
+    def test_a_char_of_int_cast_is_a_goal(self, tmp_path):
+        # Control: the same cast through Char.of_int is counted.
+        text = self._char_call("Char.of_int {UInt8.t'int (97: UInt8.t)}")
+        items, refused = self._oracle_any(tmp_path, "of_int", text, "lang/empty")
+        assert items == ["f"] and refused, (items, refused)
+
+    def test_a_char_of_bv256_cast_is_a_goal(self, tmp_path):
+        text = self._char_call("Char.of_BV256 {UInt8BW.to_BV256 (255: UInt8BW.t)}")
+        items, refused = self._oracle_any(tmp_path, "of_BV256", text, "lang/empty")
+        assert items or refused, "parity credits a .coma whose only goal is a Char.of_BV256 precondition"
+
+    DECL_ANCHOR = "  let rec f (return (x: ())) ="
+    DECL_G = (
+        "let rec g (return (x: ())) = (! bb0 [ bb0 = {[@expl:assertion] false} return {_ret} ] "
+        "[ & _ret: () = Any.any_l () ]) [ return (result: ()) -> (! return {result}) ]\n"
+    )
+
+    def test_a_declaration_at_its_own_indent_is_read(self, tmp_path):
+        # Control: g at the printer's two-space indent is read, and counted.
+        real = (_CORPUS_SS / "lang" / "empty.coma").read_text()
+        text = real.replace(self.DECL_ANCHOR, "  " + self.DECL_G + self.DECL_ANCHOR)
+        items, refused = self._oracle_any(tmp_path, "indented", text, "lang/empty")
+        assert items == ["f"] and refused, (items, refused)
+
+    def test_a_declaration_at_column_zero_is_not_dropped(self, tmp_path):
+        # `_declaration_refusal` refuses a two-space line that is no declaration
+        # and a line before the first one, but a line at column 0 (or 1, or a
+        # tab) after a declaration joins that declaration as a continuation, so
+        # the same g is dropped without a word.
+        real = (_CORPUS_SS / "lang" / "empty.coma").read_text()
+        text = real.replace(self.DECL_ANCHOR, self.DECL_G + self.DECL_ANCHOR)
+        items, refused = self._oracle_any(tmp_path, "column0", text, "lang/empty")
+        assert items or refused, "parity credits a .coma whose goal-bearing g sits at column 0"

@@ -54,6 +54,29 @@ impl Error for TrustFormulaDecodeError {}
 /// bindings, int/bool literals, old/result/var refs, and the arithmetic and
 /// boolean operators admitted by native replay.
 pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFormulaDecodeError> {
+    decode_trust_formula_v1_declared_claim(payload).map(|claim| claim.body)
+}
+
+/// A `TrustFormulaV1` claim as the decoder reads it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustFormulaV1Claim {
+    /// The top-level `variables`, then the `result` declaration, as
+    /// `(name, sort)`: the only free names `body` can have. A `result` record
+    /// without a `name` declares `result`.
+    pub declarations: Vec<(String, ExprSort)>,
+    /// The goal.
+    pub body: PureExpr,
+}
+
+/// Decode a `TrustFormulaV1` claim together with its top-level declarations.
+///
+/// A consumer that attaches meaning to the claim's names reads them here, so
+/// it sees the names the goal is stated over exactly as the decoder does,
+/// defaults included.
+pub fn decode_trust_formula_v1_declared_claim(
+    payload: &str,
+) -> Result<TrustFormulaV1Claim, TrustFormulaDecodeError> {
     let value = parse_unique_json(payload)
         .map_err(|err| TrustFormulaDecodeError::new(format!("invalid JSON: {err}")))?;
     let object = value
@@ -74,6 +97,7 @@ pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFor
     }
 
     let mut env: HashMap<String, ExprSort> = HashMap::new();
+    let mut declarations = Vec::new();
     if let Some(variables) = object.get("variables") {
         let variables: &[Value] = variables
             .as_array()
@@ -81,6 +105,7 @@ pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFor
             .ok_or_else(|| TrustFormulaDecodeError::new("variables must be an array"))?;
         for (index, variable) in variables.iter().enumerate() {
             let binding = decode_binding(variable, &format!("variables[{index}]"))?;
+            declarations.push((binding.name.clone(), binding.sort.clone()));
             insert_binding(&mut env, binding)?;
         }
     }
@@ -88,6 +113,7 @@ pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFor
     let result_name = if let Some(result) = object.get("result") {
         let binding = decode_result_binding(result)?;
         let result_name = binding.name.clone();
+        declarations.push((binding.name.clone(), binding.sort.clone()));
         insert_binding(&mut env, binding)?;
         Some(result_name)
     } else {
@@ -99,7 +125,7 @@ pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFor
         .ok_or_else(|| TrustFormulaDecodeError::new("missing required field `body`"))?;
     let body = decode_expr(body, &env, result_name.as_deref(), "body")?;
     validate_native_replay_definedness(&body)?;
-    Ok(body)
+    Ok(TrustFormulaV1Claim { declarations, body })
 }
 
 /// Parse a proof-bearing claim with one unambiguous interpretation.
@@ -109,7 +135,46 @@ pub fn decode_trust_formula_v1_claim(payload: &str) -> Result<PureExpr, TrustFor
 /// checker, and evidence consumer cannot disagree about which schema, body, or
 /// operator the payload commits to.
 fn parse_unique_json(payload: &str) -> Result<Value, serde_json::Error> {
-    serde_json::from_str::<UniqueJsonValue>(payload).map(|value| value.0)
+    // The formula consumer has a bounded deeper acyclic-body fragment. Check
+    // lexical JSON nesting before asking serde to parse beyond its default
+    // depth; the original duplicate-key visitor still reads every object.
+    check_json_nesting(payload).map_err(de::Error::custom)?;
+    let mut decoder = serde_json::Deserializer::from_str(payload);
+    decoder.disable_recursion_limit();
+    let value = UniqueJsonValue::deserialize(&mut decoder)?;
+    decoder.end()?;
+    Ok(value.0)
+}
+
+fn check_json_nesting(payload: &str) -> Result<(), &'static str> {
+    const MAX_JSON_DEPTH: usize = 260;
+    let mut depth = 0_usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in payload.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' => {
+                    depth = depth.checked_add(1).ok_or("JSON nesting overflow")?;
+                    if depth > MAX_JSON_DEPTH {
+                        return Err("JSON nesting exceeds native formula depth budget");
+                    }
+                }
+                b'}' | b']' => depth = depth.checked_sub(1).ok_or("unbalanced JSON nesting")?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 struct UniqueJsonValue(Value);
@@ -288,9 +353,7 @@ fn decode_expr(
     if let Some(value) = object.get("int") {
         let value: &Value = value;
         reject_unknown_fields(object, path, &["int"])?;
-        return value.as_i64().map(PureExpr::Int).ok_or_else(|| {
-            TrustFormulaDecodeError::new(format!("{path}.int must be a signed 64-bit integer"))
-        });
+        return decode_int_literal(value, path);
     }
     if let Some(value) = object.get("var") {
         let value: &Value = value;
@@ -375,6 +438,22 @@ fn decode_expr(
             "{path}.op `{unsupported}` is outside the trust-formula v1 native int/bool fragment"
         ))),
     }
+}
+
+fn decode_int_literal(value: &Value, path: &str) -> Result<PureExpr, TrustFormulaDecodeError> {
+    value
+        .as_i64()
+        .map(PureExpr::Int)
+        .or_else(|| {
+            value
+                .as_u64()
+                .map(crate::formula::int_bounds::unsigned_literal_expr)
+        })
+        .ok_or_else(|| {
+            TrustFormulaDecodeError::new(format!(
+                "{path}.int must be an exact signed or unsigned 64-bit integer"
+            ))
+        })
 }
 
 fn validate_div_mod_defined(
@@ -584,10 +663,20 @@ fn decode_quantifier_expr(
             "{path}.name shadows existing binding `{name}`"
         )));
     }
-    let sort = decode_sort(
-        required_str(object.get("sort"), &format!("{path}.sort"))?,
-        path,
-    )?;
+    let written_sort = required_str(object.get("sort"), &format!("{path}.sort"))?;
+    let sort = decode_sort(written_sort, path)?;
+    // A binder ranges over its sort, and native replay models the range of
+    // `int`, `bool` and a reference (a pointer) only: a type parameter could
+    // be any type, a sequence is not an integer, and either was read as one.
+    if !matches!(
+        sort,
+        ExprSort::Int | ExprSort::Bool | ExprSort::Ref(_) | ExprSort::MutRef(_)
+    ) {
+        return Err(TrustFormulaDecodeError::new(format!(
+            "{path}.sort `{written_sort}` is a quantifier sort native replay does not model: a \
+             binder ranges over `int`, `bool` or a reference"
+        )));
+    }
     let body = object
         .get("body")
         .ok_or_else(|| TrustFormulaDecodeError::new(format!("{path}.body is required")))?;
@@ -649,6 +738,18 @@ fn decode_let_expr(
         .get("body")
         .ok_or_else(|| TrustFormulaDecodeError::new(format!("{path}.body is required")))?;
     let value = decode_expr(value, env, result_name, &format!("{path}.value"))?;
+    // The declaration types every read of the name in the body; the value is
+    // what those reads denote. A value of another sort would be read at the
+    // declared sort by the body and at its own by whatever inlines it.
+    match decoded_sort(&value) {
+        Some(value_sort) if value_sort == sort => {}
+        found => {
+            return Err(TrustFormulaDecodeError::new(format!(
+                "{path} declares `{name}` at sort `{sort}` but binds it to a value of sort `{}`",
+                found.map_or_else(|| "unknown".to_string(), |found| found.to_string())
+            )));
+        }
+    }
     let mut scoped_env = env.clone();
     insert_binding(
         &mut scoped_env,
@@ -667,6 +768,47 @@ fn decode_let_expr(
             &format!("{path}.body"),
         )?),
     })
+}
+
+/// The sort of an expression this decoder produced: every name it emits
+/// carries its declared sort, so the sort follows from the syntax. `None` for
+/// a shape the decoder never emits.
+fn decoded_sort(expr: &PureExpr) -> Option<ExprSort> {
+    match expr {
+        PureExpr::Bool(_) => Some(ExprSort::Bool),
+        PureExpr::Int(_) => Some(ExprSort::Int),
+        PureExpr::Var(_, sort) => sort.clone(),
+        PureExpr::Old(inner) => decoded_sort(inner),
+        PureExpr::Let { body, .. } => decoded_sort(body),
+        PureExpr::UnOp(UnOp::Not, _) | PureExpr::Forall { .. } | PureExpr::Exists { .. } => {
+            Some(ExprSort::Bool)
+        }
+        PureExpr::UnOp(UnOp::Neg | UnOp::BitNot, _) => Some(ExprSort::Int),
+        PureExpr::BinOp(_, op, _) => Some(match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or
+            | BinOp::Implies => ExprSort::Bool,
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::DivTrunc
+            | BinOp::RemTrunc
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::BitAnd
+            | BinOp::BitXor
+            | BinOp::BitOr => ExprSort::Int,
+        }),
+        _ => None,
+    }
 }
 
 fn decode_bin_op(op: &str) -> BinOp {

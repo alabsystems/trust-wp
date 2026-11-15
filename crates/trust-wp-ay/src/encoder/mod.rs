@@ -66,6 +66,7 @@
 use std::collections::{HashMap, HashSet};
 
 mod adt_axioms;
+mod axiom_consistency;
 mod axioms;
 mod closure_axioms;
 pub(crate) mod closure_inline;
@@ -93,7 +94,7 @@ mod pure_encoding;
 // The native QF_BV proof lane recognises the driver's shift-amount marker
 // so it can emit the range obligation as a native BV check (ledger
 // int-shift-full).
-pub(crate) use self::pure_encoding::parse_shift_amount_in_range_name;
+pub(crate) use self::pure_encoding::{parse_int_bitop_name, parse_shift_amount_in_range_name};
 pub(crate) mod quantifier;
 pub(crate) mod quantifier_ctor_elim;
 #[cfg(test)]
@@ -274,6 +275,22 @@ pub(crate) struct ViewReturnFn {
     pub(crate) return_sort: Sort,
 }
 
+/// A deferred consequence of a native-constructor equality; see
+/// `AYEncoder::constructor_alias_fact_buffer`.
+pub(crate) enum ConstructorAliasFact {
+    Equality {
+        label: &'static str,
+        lhs: Term,
+        rhs: Term,
+    },
+    Registration {
+        datatype: ay_dpll::api::DatatypeSort,
+        constructor_name: String,
+        alias: Term,
+        args: Vec<Term>,
+    },
+}
+
 pub struct AYEncoder {
     /// The ay solver instance — the primary SMT interface.
     ///
@@ -393,6 +410,19 @@ pub struct AYEncoder {
     /// exempt EXACTLY these from a native, model-validated fresh SAT check. See
     /// `replay_native_base_exempting_bridge_foralls`.
     enum_payload_bridge_forall_terms: Vec<Term>,
+    /// Assertions emitted on the GOAL side of a query (negated postcondition
+    /// phase, an active negated-goal label, or an explicit
+    /// [`AYEncoder::with_goal_assertions`] region). The encoder-axiom
+    /// consistency guard never counts these as axioms.
+    goal_side_assertion_terms: std::collections::HashSet<Term>,
+    /// Assertions emitted in the precondition phase (the function's `requires`).
+    /// Excluded from the encoder-axiom consistency guard's axiom set.
+    precondition_assertion_terms: std::collections::HashSet<Term>,
+    /// Nesting depth of [`AYEncoder::with_goal_assertions`].
+    goal_assertion_depth: u32,
+    /// Encoder-axiom consistency verdicts, keyed by the exact axiom set.
+    axiom_consistency_cache:
+        std::collections::HashMap<Vec<Term>, axiom_consistency::AxiomConsistency>,
     /// Stable receiver-to-datatype bridge constants for native selector fallback.
     ///
     /// Generic/erased receivers can be declared with an uninterpreted ay sort
@@ -407,6 +437,14 @@ pub struct AYEncoder {
     /// are recorded per bridge symbol so each newly observed pair gets
     /// `bridge(new) == bridge(old) => new == old`. (#2699)
     injective_bridge_ground_terms: HashMap<String, Vec<Term>>,
+    /// Consequences of a native-constructor equality `Ctor(args) == alias`
+    /// collected while that equality is being ENCODED. They are only true when
+    /// the equality holds, and the equality may be encoded under negation (a
+    /// goal) or inside a disjunction, so they are never asserted bare: the
+    /// `Eq` encoder flushes them as `equality_term => fact`. `None` outside an
+    /// `Eq` encode (facts requested there are dropped — completeness only).
+    /// (s25 vacuous whole-value equality soundness)
+    constructor_alias_fact_buffer: Option<Vec<ConstructorAliasFact>>,
     /// Closure body inlining state (#1584, #2151 Phase 2).
     closure_state: ClosureState,
     /// Open Seq-returning `View::view` bodies that can be instantiated directly

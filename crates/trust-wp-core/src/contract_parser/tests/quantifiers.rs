@@ -156,7 +156,7 @@ fn test_quantifier_sort_preservation_seq() {
 #[test]
 fn test_quantifier_sort_preservation_vec_generic() {
     // Vec<T> maps to ExprSort::Seq (#968)
-    let expr = parse_contract("forall<v: Vec<i32>> v.len() > 0").unwrap();
+    let expr = parse_contract("forall<v: Vec<T>> v.len() > 0").unwrap();
     assert!(
         matches!(
             &expr,
@@ -316,7 +316,8 @@ fn test_quantifier_sort_hash_set_iter_shared_ref() {
 #[test]
 fn test_quantifier_sort_multi_var_mixed() {
     // Multi-variable quantifier with mixed sorts (#968)
-    // forall<x: i32, b: bool> body → nested Forall with per-variable sorts
+    // forall<x: i32, b: bool> body → nested Forall with per-variable sorts,
+    // `x`'s range the premise of the inner one
     let expr = parse_ok("forall<x: i32, b: bool> x > 0 ==> b");
     if let PureExpr::Forall {
         var: ref x_var,
@@ -326,6 +327,9 @@ fn test_quantifier_sort_multi_var_mixed() {
     } = expr
     {
         assert_eq!(x_var, "x");
+        let PureExpr::BinOp(_, BinOp::Implies, inner) = &**inner else {
+            panic!("Expected x's range as a premise, got {inner:?}");
+        };
         assert!(
             matches!(&**inner, PureExpr::Forall { var, var_sort: Some(ExprSort::Bool), .. } if var == "b"),
             "Inner var should have Bool sort, got {inner:?}"
@@ -423,7 +427,7 @@ fn test_forall_no_trigger() {
     // Ensure backwards compatibility - no trigger means empty vec
     let expr = parse_ok("forall<x: Int> x > 0");
     if let PureExpr::Forall { ref triggers, .. } = expr {
-        assert!(triggers.is_empty());
+        assert_eq!(triggers.as_slice(), [] as [Vec<PureExpr>; 0]);
     } else {
         panic!("Expected Forall, got {expr:?}");
     }
@@ -722,8 +726,8 @@ fn test_parse_quantifier_unit_type() {
 
 #[test]
 fn test_parse_quantifier_tuple_type() {
-    // exists<p: (i32, i32)> expr — tuple type in quantifier binding (#613)
-    let expr = parse_contract("exists<p: (i32, i32)> true").unwrap();
+    // exists<p: (T, U)> expr — tuple type in quantifier binding (#613)
+    let expr = parse_contract("exists<p: (T, U)> true").unwrap();
     assert!(matches!(
         &expr,
         PureExpr::Exists { var, .. } if var == "p"
@@ -736,4 +740,182 @@ fn test_parse_quantifier_spanned() {
     let regular = parse_ok(input);
     let spanned = parse_spanned_ok(input);
     assert_eq!(regular, spanned.expr);
+}
+
+/// A machine-integer binder ranges over its type's values, where its `Int`
+/// sort has every integer: the range is a premise of `forall` and a conjunct
+/// of `exists` (quantifier_binder_machine_int_read_unbounded_granted.rs). A
+/// bound past `i64` is a product of 32-bit powers.
+#[test]
+fn a_machine_integer_binder_is_read_in_its_type_s_range() {
+    for (input, expected) in [
+        (
+            "forall<x: u8> x@ < 256",
+            "forall<x: Int> 0 <= x && x < 256 ==> x@ < 256",
+        ),
+        (
+            "exists<x: u8> x@ > 300",
+            "exists<x: Int> 0 <= x && x < 256 && x@ > 300",
+        ),
+        (
+            "forall<x: u64> x >= 0",
+            "forall<x: Int> 0 <= x && x < 4294967296 * 4294967296 + 0 ==> x >= 0",
+        ),
+        (
+            "forall<x: i64> x >= 0",
+            "forall<x: Int> -9223372036854775807 - 1 <= x && x < 2147483648 * 4294967296 + 0 ==> x >= 0",
+        ),
+    ] {
+        let parsed = parse_ok(input);
+        let (PureExpr::Forall { body, .. } | PureExpr::Exists { body, .. }) = &parsed else {
+            panic!("{input} reads {parsed}");
+        };
+        let expected = parse_ok(expected);
+        let (PureExpr::Forall { body: want, .. } | PureExpr::Exists { body: want, .. }) = &expected
+        else {
+            panic!("{expected}");
+        };
+        if input.starts_with("forall<x: i64>") {
+            // `i64::MIN` is one literal here, two terms in the expectation.
+            let PureExpr::BinOp(range, BinOp::Implies, _) = &**body else {
+                panic!("{input} reads {parsed}");
+            };
+            let PureExpr::BinOp(low, BinOp::And, _) = &**range else {
+                panic!("{input} reads {parsed}");
+            };
+            assert!(
+                matches!(&**low, PureExpr::BinOp(min, BinOp::Le, _) if **min == PureExpr::Int(i64::MIN)),
+                "{input} reads {parsed}"
+            );
+            continue;
+        }
+        assert_eq!(body, want, "{input}");
+        assert_eq!(parse_spanned_ok(input).expr, parsed, "{input} (spanned)");
+    }
+    for unchanged in [
+        "forall<x: Int> x@ < 256",
+        "forall<x: T> true",
+        "forall<b: bool> b",
+    ] {
+        let parsed = parse_ok(unchanged);
+        let PureExpr::Forall { body, .. } = &parsed else {
+            panic!("{unchanged} reads {parsed}");
+        };
+        assert!(
+            !matches!(&**body, PureExpr::BinOp(_, BinOp::Implies, _)),
+            "{unchanged} reads {parsed}"
+        );
+    }
+}
+
+/// A 128-bit binder's bounds (2^127, 2^128) are no `i128`; they are built
+/// without computing one, where a shift or negation overflowed and the macro
+/// panicked (quantifier_binder_128_bit_machine_int_range_overflows.rs). Every
+/// bound is compared exactly with an arbitrary-precision integer.
+#[test]
+fn a_128_bit_binder_s_range_is_built_without_overflow() {
+    use num_bigint::BigInt;
+
+    fn value(expr: &PureExpr) -> BigInt {
+        match expr {
+            PureExpr::Int(n) => BigInt::from(*n),
+            PureExpr::BinOp(a, BinOp::Add, b) => value(a) + value(b),
+            PureExpr::BinOp(a, BinOp::Mul, b) => value(a) * value(b),
+            other => panic!("not a constant: {other}"),
+        }
+    }
+    for (input, low, high) in [
+        (
+            "forall<x: u128> x >= 0",
+            BigInt::from(0),
+            BigInt::from(1) << 128,
+        ),
+        (
+            "forall<x: i128> x >= 0",
+            -(BigInt::from(1) << 127usize),
+            BigInt::from(1) << 127,
+        ),
+        (
+            "forall<x: u64> x >= 0",
+            BigInt::from(0),
+            BigInt::from(1) << 64,
+        ),
+        (
+            "forall<x: i64> x >= 0",
+            -(BigInt::from(1) << 63usize),
+            BigInt::from(1) << 63,
+        ),
+    ] {
+        let parsed = parse_ok(input);
+        let PureExpr::Forall { body, .. } = &parsed else {
+            panic!("{input} reads {parsed}");
+        };
+        let PureExpr::BinOp(range, BinOp::Implies, _) = &**body else {
+            panic!("{input} reads {parsed}");
+        };
+        let PureExpr::BinOp(at_least, BinOp::And, below) = &**range else {
+            panic!("{input} reads {parsed}");
+        };
+        let (PureExpr::BinOp(got_low, BinOp::Le, _), PureExpr::BinOp(_, BinOp::Lt, got_high)) =
+            (&**at_least, &**below)
+        else {
+            panic!("{input} reads {parsed}");
+        };
+        assert_eq!((value(got_low), value(got_high)), (low, high), "{input}");
+    }
+}
+
+/// A reference binder to a machine integer ranges over referents in the
+/// type's range, and a `&mut` over final values in it too
+/// (quantifier_binder_reference_to_machine_int_read_unbounded_granted.rs,
+/// v11_final_denotation_controls.rs).
+#[test]
+fn a_reference_binder_to_a_machine_integer_is_read_in_its_referent_s_range() {
+    // Each expectation spells its binder `Int`, which states no range, over
+    // the sort the machine integer's reference maps to.
+    for (input, expected) in [
+        (
+            "forall<r: &u8> (*r)@ < 256",
+            "forall<r: &Int> 0 <= *r && *r < 256 ==> (*r)@ < 256",
+        ),
+        (
+            "exists<r: &u16> *r == 5",
+            "exists<r: &Int> (0 <= *r && *r < 65536) && *r == 5",
+        ),
+        (
+            "forall<q: &mut u32> *q < ^q",
+            "forall<q: &mut Int> (0 <= *q && *q < 4294967296) && (0 <= ^q && ^q < 4294967296) ==> *q < ^q",
+        ),
+    ] {
+        let parsed = parse_ok(input);
+        assert_eq!(parsed, parse_ok(expected), "{input}");
+        assert_eq!(parse_spanned_ok(input).expr, parsed, "{input} (spanned)");
+    }
+}
+
+/// A binder whose type holds a machine integer other than as the type itself
+/// or a reference's referent maps to a sort that keeps no range for it: the
+/// quantifier is the refusal marker, which every lane refuses where it reads
+/// the clause (quantifier_binder_seq_of_machine_int_read_unbounded_granted.rs).
+/// It is no parse error: the proc macros would fail the user's build.
+#[test]
+fn a_binder_holding_a_machine_integer_elsewhere_is_refused() {
+    use crate::logic::identity::is_refused_logic_fn_marker;
+    for input in [
+        "forall<r: &&u8> true",
+        "forall<s: Seq<u8>> true",
+        "exists<p: (u8, bool)> true",
+        "forall<v: Vec<usize>> true",
+        "forall<a: Int, s: Seq<u8>> true",
+    ] {
+        let parsed = parse_ok(input);
+        assert!(
+            parsed.any_recursive(|node| matches!(
+                node,
+                PureExpr::LogicFnCall { name, .. } if is_refused_logic_fn_marker(name)
+            )),
+            "{input} reads {parsed}"
+        );
+        assert_eq!(parse_spanned_ok(input).expr, parsed, "{input} (spanned)");
+    }
 }

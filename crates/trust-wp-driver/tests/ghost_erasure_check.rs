@@ -14,21 +14,21 @@
 //! - `should_fail_erasure_attribute_mismatch` rejects invalid `#[erasure]`
 //! - `should_fail_permission_identity` rejects unvalidated ghost permission use
 
-use std::{path::Path, process::Command};
+use std::path::Path;
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ghost_erasure_check_tests");
-    Command::new("cargo")
+    nested_cargo("check")
         .current_dir(fixture_dir("ghost_erasure_check"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for ghost erasure fixture")
+        .expect("failed to run targo check for ghost erasure fixture")
 }
 
 fn assert_fixture_fails_with(bin: &str, expected: &str) {

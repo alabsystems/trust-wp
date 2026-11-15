@@ -323,6 +323,90 @@ def compute_lane_pair_freshness(
     return freshness
 
 
+def _baseline_commit_relation(workspace: Path, commit: str) -> dict[str, object]:
+    """Validate a baseline's ancestry and its committed publication boundary."""
+    relation: dict[str, object] = {
+        "is_ancestor": False,
+        "age_commits": None,
+        "source_equivalent_to_head": False,
+    }
+    if re.fullmatch(r"[0-9a-f]{7,40}", commit) is None:
+        relation["reason"] = "baseline metadata does not name an immutable commit"
+        return relation
+
+    def git(*args: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *args], cwd=workspace, capture_output=True, timeout=5
+        )
+
+    try:
+        root = git("rev-parse", "--show-toplevel")
+        if root.returncode != 0 or Path(os.fsdecode(root.stdout).strip()).resolve() != workspace.resolve():
+            relation["reason"] = "baseline workspace is not a git checkout root"
+            return relation
+        objects = git("rev-parse", f"--disambiguate={commit}")
+        object_ids = objects.stdout.decode("ascii").split()
+        if (
+            objects.returncode != 0
+            or len(object_ids) != 1
+            or re.fullmatch(r"[0-9a-f]{40}", object_ids[0]) is None
+            or not object_ids[0].startswith(commit)
+        ):
+            relation["reason"] = "baseline metadata does not name one unambiguous commit object"
+            return relation
+        resolved = git("rev-parse", "--verify", f"{commit}^{{commit}}")
+        head = git("rev-parse", "--verify", "HEAD^{commit}")
+        if resolved.returncode != 0 or head.returncode != 0:
+            relation["reason"] = "baseline commit or HEAD is missing or ambiguous"
+            return relation
+        resolved_commit = resolved.stdout.decode("ascii").strip()
+        evaluated_head = head.stdout.decode("ascii").strip()
+        if resolved_commit != object_ids[0] or not resolved_commit.startswith(commit):
+            relation["reason"] = "baseline metadata prefix does not bind the resolved commit object"
+            return relation
+        relation["resolved_commit"] = resolved_commit
+        relation["evaluated_head"] = evaluated_head
+        ancestor = git("merge-base", "--is-ancestor", resolved_commit, evaluated_head)
+        if ancestor.returncode != 0:
+            relation["reason"] = "baseline commit is not a confirmed ancestor of HEAD"
+            return relation
+        distance = git("rev-list", "--count", f"{resolved_commit}..{evaluated_head}")
+        if distance.returncode != 0:
+            relation["reason"] = "baseline commit distance could not be evaluated"
+            return relation
+        age = int(distance.stdout.strip())
+        if age < 0:
+            raise ValueError("negative commit distance")
+        relation["is_ancestor"] = True
+        relation["age_commits"] = age
+        if age != 1:
+            return relation
+        parents = git("rev-list", "--parents", "-n", "1", evaluated_head)
+        if parents.returncode != 0:
+            relation["reason"] = "publication parents could not be evaluated"
+            return relation
+        if parents.stdout.decode("ascii").split() != [evaluated_head, resolved_commit]:
+            relation["reason"] = "HEAD is not a direct single-parent publication commit"
+            return relation
+        changed = git(
+            "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+            "--no-textconv", "--ignore-submodules=none",
+            resolved_commit, evaluated_head, "--",
+        )
+        if changed.returncode != 0:
+            relation["reason"] = "publication tree diff could not be evaluated"
+            return relation
+        paths = [os.fsdecode(path) for path in changed.stdout.split(b"\0") if path]
+        relation["publication_changed_paths"] = paths
+        # D-274: only the exact canonical census files may accompany publication.
+        # The broader output-artifact filter is inappropriate for source equality.
+        if paths and set(paths).issubset(_OUTPUT_ARTIFACT_CANONICAL_FILES):
+            relation["source_equivalent_to_head"] = True
+    except (subprocess.TimeoutExpired, OSError, UnicodeError, ValueError):
+        relation["reason"] = "baseline commit relation could not be evaluated"
+    return relation
+
+
 def check_baseline_freshness(
     workspace: Path,
     max_age_commits: int | None = None,
@@ -399,13 +483,18 @@ def check_baseline_freshness(
             result["lanes"][lane_name] = lane_info
             continue
 
-        age = harness._commit_distance_to_head(workspace, commit)
+        relation = _baseline_commit_relation(workspace, commit)
+        lane_info.update(relation)
+        age = relation["age_commits"]
         lane_info["age_commits"] = age
 
-        if age is None:
+        if not relation["is_ancestor"] or age is None:
             _apply("invalid")
         elif age > max_age_commits:
-            _apply("stale")
+            if max_age_commits == 0 and relation["source_equivalent_to_head"]:
+                lane_info["status"] = "fresh"
+            else:
+                _apply("stale")
         else:
             lane_info["status"] = "fresh"
 

@@ -35,6 +35,39 @@ pub(in crate::mir_analysis) struct SubstitutionExtractionContext<'a, 'tcx> {
     pub(in crate::mir_analysis::extract) trait_specs: &'a HashMap<DefId, StdSpec>,
     pub(in crate::mir_analysis::extract) extern_specs: &'a HashMap<String, StdSpec>,
     pub(in crate::mir_analysis::extract) closure_capture_names: Option<Vec<String>>,
+    /// `&mut` borrow sites that Creusot's `NotFinalPlaces` analysis classifies
+    /// as FINAL reborrows (the parent borrow is not moved, borrowed or written
+    /// after the reborrow). Only these may be identified with the carrier of
+    /// the place they reborrow; every other reborrow through a `&mut` deref is
+    /// bound to a fresh per-site carrier (fresh id, no final link), matching
+    /// Creusot's `borrow_mut`. An absent site is treated as NON-final.
+    pub(in crate::mir_analysis::extract) final_reborrow_sites: HashSet<Location>,
+    /// Per statement or call, the places it reads through a dereference whose
+    /// memory a write may have changed before it (D-185), with what is known
+    /// of that memory (`DerefStoreStaleness::current_state`).
+    /// A read absent here reads memory no write reaches, so its entry value is
+    /// its current one.
+    pub(in crate::mir_analysis::extract) written_deref_reads: HashMap<
+        Location,
+        Vec<(
+            rustc_middle::mir::Place<'tcx>,
+            crate::mir_analysis::deref_store_staleness::CurrentState,
+        )>,
+    >,
+    /// Per header of a loop the cutoff lies in, the locals that loop may
+    /// change, which the walk re-binds to their loop-head symbols on entering
+    /// the header (D-187, [`super::super::loop_merges::loop_head_rebinds`]).
+    pub(in crate::mir_analysis::extract) loop_head_rebinds: HashMap<BasicBlock, Vec<Local>>,
+    /// The parameters whose own name inside every value this walk records is
+    /// their entry value, which the `proof_assert` lane names apart from
+    /// their value at the cutoff (D-241,
+    /// [`crate::mir_analysis::params_with_renamable_entry`]). Only these are
+    /// re-bound to the functional update of their value by a field store; any
+    /// other parameter keeps the identity reset (#1500), because a copy of
+    /// its entry value is still read at its binding at the cutoff and the
+    /// update would hand the copy the value stored after it. Empty for a walk
+    /// with no program point or with a region.
+    pub(in crate::mir_analysis::extract) renamable_params: HashSet<Local>,
 }
 
 /// Cutoff parameters for substitution extraction.

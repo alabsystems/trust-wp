@@ -87,7 +87,12 @@ fn infer_expr_sort_impl(expr: &PureExpr, cache_mode: &mut InferExprSortMode<'_>)
     let sort = match expr {
         PureExpr::Bool(_) => Sort::Bool,
         PureExpr::Int(_) => Sort::Int,
-        PureExpr::Float(_) => Sort::Real,
+        // An unsuffixed contract literal defaults to `f64` here; an equality
+        // with an `f32` peer re-encodes it in the peer's format.
+        PureExpr::Float(bits) => crate::encoder::pure_encoding::ieee::float_sort(
+            bits.width()
+                .unwrap_or(trust_wp_core::formula::FloatWidth::F64),
+        ),
         PureExpr::Var(_, Some(sort)) => expr_sort_to_ay_sort(sort),
         PureExpr::Var(_, None) => {
             unsoundness::increment(unsoundness::UnsoundnessCategory::SortFallbackToIntFromVar);

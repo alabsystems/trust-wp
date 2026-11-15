@@ -560,7 +560,6 @@ fn current_sort_to_expr_sort(sort: &Sort) -> Option<ExprSort> {
     match sort {
         Sort::Int => Some(ExprSort::Int),
         Sort::Bool => Some(ExprSort::Bool),
-        Sort::Real => Some(ExprSort::Float),
         other => ay_sort_to_expr_sort(other),
     }
 }
@@ -680,8 +679,28 @@ fn bind_view_aliases(
     let current_sort_hint = ay_sort_to_expr_sort(current_sort);
     let current_view_name = DerivedKind::View.format_name(&names.current);
     let old_current_view_name = DerivedKind::Old.format_name(&current_view_name);
-    let current_view_term =
-        encoder.encode_pure(&PureExpr::Var(current_view_name.clone(), current_sort_hint))?;
+    // A registered user `View::view` for the carrier fixes the view sort
+    // (e.g. `impl View for T { type ViewTy = Mapping<Int, Int> }`). Declaring
+    // `t_current_view` at the carrier sort `T` here made the later
+    // `View(Var(t_current))` encode (which resolves the registered `Mapping`
+    // return sort) fail with a sort conflict (mapping_test::incr). When a
+    // registered view sort exists and the view var is not yet declared,
+    // declare it at that sort; the identity fallback is kept only when no
+    // user view is registered for the carrier.
+    let registered_view_sort = if encoder.var_sort(&current_view_name).is_none() {
+        encoder.registered_view_return_sort(&PureExpr::Var(
+            names.current.clone(),
+            current_sort_hint.clone(),
+        ))
+    } else {
+        None
+    };
+    let current_view_term = match &registered_view_sort {
+        Some(sort) => encoder.get_or_declare_var(&current_view_name, sort.clone())?,
+        None => {
+            encoder.encode_pure(&PureExpr::Var(current_view_name.clone(), current_sort_hint))?
+        }
+    };
     let view_sort = encoder
         .var_sort(&current_view_name)
         .cloned()

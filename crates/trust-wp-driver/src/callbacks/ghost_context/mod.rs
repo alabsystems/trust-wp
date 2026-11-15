@@ -94,6 +94,7 @@ pub(super) fn build_ghost_context_for_function(
     ghost_blocks: &[GhostBlock],
     focus_vars: &HashSet<String>,
     cutoff_span: Option<Span>,
+    cutoff_location: Option<rustc_middle::mir::Location>,
 ) -> GhostContextFacts {
     let tcx = ctx.tcx;
     let user_specs = ctx.user_specs;
@@ -106,13 +107,13 @@ pub(super) fn build_ghost_context_for_function(
         };
     }
 
-    let Some(body_with_facts) = try_get_body_with_context(contract.local_def_id) else {
+    let Some(body_with_facts) = try_get_body_with_context(tcx, contract.local_def_id) else {
         return GhostContextFacts {
             alias_facts: Vec::new(),
             semantic_facts: Vec::new(),
         };
     };
-    let mir_body = get_mir_body(body_with_facts);
+    let mir_body = get_mir_body(&body_with_facts);
 
     let selected_cutoff_block_lo = cutoff_span.and_then(|cutoff| {
         ghost_blocks
@@ -159,7 +160,38 @@ pub(super) fn build_ghost_context_for_function(
 
     let mut ghost_context = Vec::new();
     let mut semantic_facts_raw = Vec::new();
+    let fact_scope = cutoff_location
+        .is_some()
+        .then(|| crate::mir_analysis::fact_scope::FactScope::new(mir_body));
     for (block, contains_cutoff) in matching_blocks {
+        // A ghost block before the assertion speaks of the values its names
+        // had when it finished: its facts hold at the assertion only where
+        // the block's end dominates it, and never over a name written on a
+        // path between (D-190, FactScope::stale_names_after_region). The
+        // block holding the assertion is read by the walk up to it instead.
+        let stale_since_block: HashSet<String> = if contains_cutoff || cutoff_span.is_none() {
+            HashSet::new()
+        } else {
+            let stale = fact_scope
+                .as_ref()
+                .zip(cutoff_location)
+                .and_then(|(scope, at)| scope.stale_names_after_region(block.span, at));
+            let Some(stale) = stale else {
+                debug!(
+                    "ghost_context: block {:?} does not hold at the assertion; its facts are \
+                     not stated",
+                    block.span
+                );
+                continue;
+            };
+            stale
+        };
+        let holds_after_block = |fact: &PureExpr| {
+            !fact
+                .free_vars()
+                .iter()
+                .any(|name| stale_since_block.contains(name))
+        };
         let exported_capture_names = if contains_cutoff {
             None
         } else {
@@ -223,8 +255,10 @@ pub(super) fn build_ghost_context_for_function(
                 substitutions.exprs.keys().collect::<Vec<_>>()
             );
             if let Some(allowed_names) = exported_capture_names.as_ref() {
+                // fact-source: ghost_block_capture_filter
                 retain_substitutions_for_names(&mut substitutions, allowed_names);
             }
+            // fact-source: ghost_final_deref_derivation
             derive_final_deref_ghost_substitutions(&mut substitutions);
             debug!(
                 "ghost_context: after final-deref derivation: {:?}",
@@ -242,6 +276,7 @@ pub(super) fn build_ghost_context_for_function(
                     .map(|e| format!("{e}"))
                     .collect::<Vec<_>>()
             );
+            // fact-source: ghost_block_facts
             block_assumptions.extend(filter_stale_mutation_alias_facts(new_assumptions));
         } else {
             debug!("ghost_context: extract_name_substitutions_until_span_in_region returned None");
@@ -282,6 +317,7 @@ pub(super) fn build_ghost_context_for_function(
                     retain_substitutions_for_names(&mut closure_subs, allowed_names);
                 }
                 derive_final_deref_ghost_substitutions(&mut closure_subs);
+                // fact-source: ghost_block_facts
                 block_assumptions.extend(filter_stale_mutation_alias_facts(
                     substitution_assumptions(&closure_subs),
                 ));
@@ -305,12 +341,14 @@ pub(super) fn build_ghost_context_for_function(
                 extern_specs,
             )
             .assumptions;
+            // fact-source: ghost_block_facts
             semantic_facts_raw.extend(
                 closure_semantic_facts
                     .into_iter()
                     .map(|fact| rewrite_ghost_closure_capture_vars(&fact, &capture_names))
                     .map(normalize_ghost_context_fact)
-                    .filter(|fact| assumption_targets_focus_vars(fact, focus_vars)),
+                    .filter(|fact| assumption_targets_focus_vars(fact, focus_vars))
+                    .filter(|fact| holds_after_block(fact)),
             );
         }
 
@@ -322,6 +360,7 @@ pub(super) fn build_ghost_context_for_function(
                 .map(|e| format!("{e}"))
                 .collect::<Vec<_>>()
         );
+        block_assumptions.retain(|fact| holds_after_block(fact));
         let focus_selected = select_focus_connected_assumptions(&block_assumptions, focus_vars);
         debug!(
             "ghost_context: focus_selected ({}): {:?}",
@@ -331,6 +370,7 @@ pub(super) fn build_ghost_context_for_function(
                 .map(|e| format!("{e}"))
                 .collect::<Vec<_>>()
         );
+        // fact-source: ghost_context_handoff
         ghost_context.extend(focus_selected);
     }
 
@@ -352,6 +392,7 @@ pub(super) fn build_ghost_context_for_function(
                     .map(|e| format!("{e}"))
                     .collect::<Vec<_>>()
             );
+            // fact-source: function_level_return_tuple_facts
             ghost_context.extend(return_tuple_facts);
         }
     }
@@ -438,7 +479,7 @@ fn infer_scalar_tuple_projection_arg_sort(expr: &PureExpr) -> Option<ExprSort> {
     match expr {
         PureExpr::Bool(_) => Some(ExprSort::Bool),
         PureExpr::Int(_) => Some(ExprSort::Int),
-        PureExpr::Float(_) => Some(ExprSort::Float),
+        PureExpr::Float(bits) => bits.width().map(ExprSort::Float),
         PureExpr::Var(_, sort) => sort.clone(),
         PureExpr::BinOp(_, op, _) => match op {
             BinOp::Eq
@@ -455,6 +496,8 @@ fn infer_scalar_tuple_projection_arg_sort(expr: &PureExpr) -> Option<ExprSort> {
             | BinOp::Mul
             | BinOp::Div
             | BinOp::Mod
+            | BinOp::DivTrunc
+            | BinOp::RemTrunc
             | BinOp::Shl
             | BinOp::Shr
             | BinOp::BitAnd
@@ -471,6 +514,13 @@ fn infer_scalar_tuple_projection_arg_sort(expr: &PureExpr) -> Option<ExprSort> {
         | PureExpr::Final(inner)
         | PureExpr::View(inner)
         | PureExpr::Deref(inner) => infer_scalar_tuple_projection_arg_sort(inner),
+        // A machine bit operation at its type (D-242) is an integer, as the
+        // bare operator it wraps is.
+        PureExpr::LogicFnCall { name, .. }
+            if trust_wp_core::formula::internal::machine_bitop::parse(name).is_some() =>
+        {
+            Some(ExprSort::Int)
+        }
         PureExpr::LogicFnCall { name, .. } => tuple_logic_fn_arity(name)
             .and_then(|arity| u8::try_from(arity).ok().map(ExprSort::Tuple)),
         PureExpr::Forall { .. } | PureExpr::Exists { .. } => Some(ExprSort::Bool),
@@ -499,7 +549,7 @@ fn infer_scalar_method_call_sort(method: &str) -> Option<ExprSort> {
 fn is_scalar_view_identity_sort(sort: &ExprSort) -> bool {
     matches!(
         sort,
-        ExprSort::Int | ExprSort::Bool | ExprSort::Float | ExprSort::Unit
+        ExprSort::Int | ExprSort::Bool | ExprSort::Float(_) | ExprSort::Unit
     )
 }
 

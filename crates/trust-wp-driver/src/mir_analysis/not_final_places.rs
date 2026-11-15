@@ -12,15 +12,14 @@
 //! Direction: Backward. Bottom: empty (all final).
 //! Key rule: writing to `x` kills `*x` (one deref deeper becomes final).
 
-use std::collections::{hash_map, HashMap};
+use std::collections::{hash_map, HashMap, HashSet};
 
 use rustc_abi::FieldIdx;
 use rustc_index::{bit_set::MixedBitSet, IndexVec};
 use rustc_middle::{
     mir::{
         visit::{MutatingUseContext, NonMutatingUseContext, NonUseContext, PlaceContext, Visitor},
-        Body, Local, Location, Place, PlaceRef, Statement, Terminator, TerminatorEdges,
-        TerminatorKind,
+        Body, Local, Location, Place, PlaceRef, Statement, Terminator, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -128,6 +127,10 @@ pub struct NotFinalPlaces<'a, 'tcx> {
     places_per_local: HashMap<Local, MixedBitSet<PlaceId>>,
     /// Per-place metadata.
     infos: IndexVec<PlaceId, PlaceInfo<'tcx>>,
+    /// Locations whose effect the analysis skips: ghost-only MIR that Creusot's
+    /// `cleanup_spec_closures` removes before running this analysis (e.g. the
+    /// phantom `&mut` borrow a `snapshot!` capture forms). Empty by default.
+    ignored: HashSet<Location>,
 }
 
 impl<'a, 'tcx> NotFinalPlaces<'a, 'tcx> {
@@ -136,6 +139,18 @@ impl<'a, 'tcx> NotFinalPlaces<'a, 'tcx> {
     /// Visits all places in the body to populate the place ID mapping,
     /// then precomputes subplace/conflicting relationships and deref counts.
     pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>) -> Self {
+        Self::new_ignoring(tcx, body, HashSet::new())
+    }
+
+    /// Like [`Self::new`], but the statements/terminators at `ignored` have no
+    /// effect on the dataflow. Only pass locations that are ghost code Creusot
+    /// erases before this analysis and that cannot write through, move, or keep
+    /// alive any borrow (otherwise a reborrow could be misclassified as final).
+    pub fn new_ignoring(
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        ignored: HashSet<Location>,
+    ) -> Self {
         // Phase 1: Visit all places in the body to build the place ID map.
         struct VisitAllPlaces<'a, 'tcx> {
             tcx: TyCtxt<'tcx>,
@@ -240,6 +255,7 @@ impl<'a, 'tcx> NotFinalPlaces<'a, 'tcx> {
             places_ids,
             places_per_local,
             infos,
+            ignored,
         }
     }
 
@@ -321,15 +337,19 @@ impl<'a, 'tcx> Analysis<'tcx> for NotFinalPlaces<'a, 'tcx> {
         statement: &Statement<'tcx>,
         location: Location,
     ) {
+        if self.ignored.contains(&location) {
+            return;
+        }
         PlaceVisitor { info: self, trans }.visit_statement(statement, location);
     }
 
-    fn apply_primary_terminator_effect<'mir>(
+    // The edges are `get_terminator_edges`' default, `terminator.edges()`.
+    fn apply_primary_terminator_effect(
         &self,
         trans: &mut Self::Domain,
-        terminator: &'mir Terminator<'tcx>,
+        terminator: &Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) {
         let mut visitor = PlaceVisitor { info: self, trans };
         // At function return, all locals are "written" (go out of scope),
         // which makes their 1-deref-deeper sub-borrows final.
@@ -339,7 +359,6 @@ impl<'a, 'tcx> Analysis<'tcx> for NotFinalPlaces<'a, 'tcx> {
             }
         }
         visitor.visit_terminator(terminator, location);
-        terminator.edges()
     }
 }
 

@@ -49,7 +49,7 @@ fn test_lookup_vec_iter_mut() {
 fn test_lookup_vec_into_iter() {
     let spec = lookup_std_spec("<alloc::vec::Vec as core::iter::IntoIterator>::into_iter").unwrap();
     assert!(spec.requires.is_empty());
-    assert_ensures_contains(&spec, "result@.ext_eq(self@)", "Vec::into_iter");
+    assert_ensures_contains(&spec, "self@ == result@", "Vec::into_iter");
     assert_param_names(&spec, &["self"], "Vec::into_iter");
 }
 
@@ -74,7 +74,7 @@ fn test_lookup_vec_into_iter_all_paths() {
     for path in paths {
         let spec = lookup_std_spec(path);
         assert!(spec.is_some(), "Vec::into_iter path not found: {path}");
-        assert_ensures_contains(spec.as_ref().unwrap(), "result@.ext_eq(self@)", path);
+        assert_ensures_contains(spec.as_ref().unwrap(), "self@ == result@", path);
         assert_param_names(spec.as_ref().unwrap(), &["self"], path);
     }
 }
@@ -357,6 +357,24 @@ fn test_lookup_ref_slice_into_iter() {
         assert!(
             spec.ensures.iter().any(|e| e.contains("completed")),
             "&[T] into_iter spec should seed completed state: {path}"
+        );
+    }
+}
+
+/// `count` and `position` keep a running `usize` under the caller's overflow
+/// checks; the call site discharges the refusal only for an iterator whose
+/// length is a `usize` by construction.
+#[test]
+fn test_lookup_iterator_count_and_position_owe_their_overflow() {
+    for path in [
+        "core::iter::traits::iterator::Iterator::count",
+        "core::iter::traits::iterator::Iterator::position",
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should have a spec"));
+        assert_eq!(
+            spec.requires,
+            ["__trust_wp_std_site_unmodelled_panic_unless_length_fits_Self()"],
+            "{path} owes its overflow panic"
         );
     }
 }

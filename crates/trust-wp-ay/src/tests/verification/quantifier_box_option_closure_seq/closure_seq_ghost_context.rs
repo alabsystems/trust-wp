@@ -68,7 +68,7 @@ fn test_closure_capture_projection_via_verify_request() {
     // success.
     let vr = result.unwrap();
     assert!(
-        matches!(vr, VerificationResult::Failed(_)),
+        crate::tests::rejected(&vr),
         "without postcondition_mut, x_final == 101 should fail (got: {vr:?})"
     );
 }

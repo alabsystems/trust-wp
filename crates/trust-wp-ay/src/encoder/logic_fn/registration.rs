@@ -270,7 +270,19 @@ impl AYEncoder {
 
         let smt_name = trust_wp_core::logic::logic_fn_smt_name(logic_fn.name());
 
-        // Skip if already registered with its axiom
+        // Skip if already registered with its axiom — but only for the SAME
+        // definition: a different definition reaching an asserted symbol is a
+        // symbol collision and must not silently reuse the other's axiom.
+        if let Some(owner) = self.decls.logic_fn_symbol_owner(&smt_name) {
+            if owner != logic_fn.full_path() {
+                return Err(EncodingError::solver_error(format!(
+                    "logic function `{}` reaches solver symbol `{smt_name}` already owned by `{owner}`",
+                    logic_fn.full_path()
+                )));
+            }
+        }
+        self.decls
+            .record_logic_fn_symbol_owner(&smt_name, logic_fn.full_path());
         if self.has_logic_fn_axiom_asserted(&smt_name) {
             return Ok(());
         }

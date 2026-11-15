@@ -27,6 +27,7 @@ use super::super::{
         MutBorrowTraversalState, PendingIndexMut, SliceReborrow,
     },
     entry::make_typed_deref_expr,
+    field_writes,
     nested_transfer::{args_touch_nested_slots, try_nested_transfer_advancement},
     place_utils::resolve_reborrow_param_local,
     spec_advancement::{find_mutation_receiver, try_spec_advancement, try_spec_result_binding},
@@ -43,16 +44,39 @@ use crate::mir_analysis::translate::{
 /// `extract_mut_borrow_from_block`.
 pub(in super::super) fn process_terminator<'tcx>(
     ctx: &MutBorrowBlockContext<'_, 'tcx>,
+    bb: BasicBlock,
     terminator: &Terminator<'tcx>,
     state: MutBorrowTraversalState,
     accum: &mut MutBorrowAccumulators,
 ) -> BlockResult {
+    let mut state = state;
+    havoc_params_written_by_handoff(ctx, bb, terminator, &mut state, accum);
     match &terminator.kind {
         TerminatorKind::Return => {
-            // Return - capture final deref values and nested-slot contents
+            // Return - capture final deref values and nested-slot contents.
+            // A param whose borrow is returned on THIS path gets its tracked
+            // pointee value wrapped in the lent marker: that value is not the
+            // prophecy of a borrow the caller keeps writing through.
+            if let Some(returned) = state
+                .borrow_taint
+                .get(&rustc_middle::mir::RETURN_PLACE)
+                .cloned()
+            {
+                for param in returned {
+                    if let Some(value) = state.deref_exprs.get(&param).cloned() {
+                        state.deref_exprs.insert(
+                            param,
+                            PureExpr::LogicFnCall {
+                                name: super::super::lent::LENT_ON_PATH_MARKER.to_string(),
+                                args: vec![value],
+                            },
+                        );
+                    }
+                }
+            }
             Some((state.deref_exprs, state.field_deref_exprs, state.slot_exprs))
         }
-        TerminatorKind::Goto { target } => {
+        TerminatorKind::Goto { target, .. } => {
             super::super::extract_mut_borrow_from_block(ctx, *target, state, accum)
         }
         TerminatorKind::Assert { target, .. } => {
@@ -61,9 +85,8 @@ pub(in super::super) fn process_terminator<'tcx>(
         TerminatorKind::SwitchInt { discr, targets } => {
             process_switch_int(ctx, discr, targets, state, accum)
         }
-        // Drop terminators appear after by-value closure calls (FnOnce, Fn by value)
-        // and other move operations. The drop is a runtime cleanup — it doesn't
-        // affect the logical value of mutable borrows. Follow the target block.
+        // A drop whose glue may write was re-read above; any other drop
+        // changes no borrow's value.
         TerminatorKind::Drop { target, .. } => {
             super::super::extract_mut_borrow_from_block(ctx, *target, state, accum)
         }
@@ -78,6 +101,57 @@ pub(in super::super) fn process_terminator<'tcx>(
         | TerminatorKind::UnwindTerminate(_)
         | TerminatorKind::Unreachable => None,
         _ => None,
+    }
+}
+
+/// D-140 in this lane: drop glue that may write stores through what the
+/// dropped or handed value holds AFTER every store the body made, so the
+/// final value of each parameter whose borrow that value may hold is not the
+/// body's last store (`fn f(g: G<'_>) { *g.0 = 0 }` ends with `G::drop`
+/// storing 5 through `g.0`). Each tracked parameter the hand-off reaches
+/// (`drop_glue_writes::locals_reached_by_handoff`, the reach every other lane
+/// re-binds, with the dropped value and the call's arguments kept) is
+/// havocked. A parameter a call is handed as a `&mut` keeps what the call
+/// lane gives it: its final value is the callee's `^`, which covers whatever
+/// the callee's glue writes.
+fn havoc_params_written_by_handoff<'tcx>(
+    ctx: &MutBorrowBlockContext<'_, 'tcx>,
+    bb: BasicBlock,
+    terminator: &Terminator<'tcx>,
+    state: &mut MutBorrowTraversalState,
+    accum: &mut MutBorrowAccumulators,
+) {
+    let Some(reached) = crate::mir_analysis::extract::drop_glue_writes::locals_reached_by_handoff(
+        ctx.tcx, ctx.body, bb, terminator,
+    ) else {
+        return;
+    };
+    let bound_by_callee: std::collections::HashSet<Local> = match &terminator.kind {
+        TerminatorKind::Call { args, .. } => args
+            .iter()
+            .filter_map(|arg| match &arg.node {
+                Operand::Copy(place) | Operand::Move(place)
+                    if matches!(
+                        place.ty(ctx.body, ctx.tcx).ty.kind(),
+                        TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+                    ) =>
+                {
+                    field_writes::tracked_root(ctx, state, accum, place.local)
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    };
+    let mut roots: Vec<Local> = reached
+        .into_iter()
+        .filter_map(|local| field_writes::tracked_root(ctx, state, accum, local))
+        .filter(|root| !bound_by_callee.contains(root))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    for root in roots {
+        field_writes::havoc_param(ctx, state, accum, root);
     }
 }
 
@@ -98,6 +172,7 @@ fn process_switch_int<'tcx>(
         locals: &state.local_exprs,
         deref_exprs: &state.deref_exprs,
         field_deref_exprs: &state.field_deref_exprs,
+        carrier_read_locals: Some(&state.carrier_read_locals),
     };
     let condition = translate_operand(discr, &lookup)?;
 
@@ -147,6 +222,24 @@ fn process_switch_int<'tcx>(
     // Without this, `assert!(a[i] == x)` in a &mut function body
     // causes the entire mut_borrow extraction to bail, falling through
     // to the pure function path which lacks state advancement.
+    //
+    // A `None` is also what the walk returns for an arm it cannot follow
+    // (a non-boolean switch, a loop, a call it does not model), and such an
+    // arm may return: taking the other arm's state as the final value there
+    // states the other arm's writes on executions that never made them
+    // (mut_borrow_arm_walk_refused_is_not_divergence.rs). Only an arm every
+    // path of which diverges may be dropped; otherwise the walk refuses.
+    let arm_unfollowed = |result: &BlockResult, arm: BasicBlock| {
+        result.is_none()
+            && !crate::mir_analysis::extract::block_must_diverge(
+                ctx.body,
+                arm,
+                &mut std::collections::HashSet::new(),
+            )
+    };
+    if arm_unfollowed(&then_result, then_bb) || arm_unfollowed(&else_result, else_bb) {
+        return None;
+    }
     merge_branch_results(ctx, &condition, then_result, else_result)
 }
 
@@ -240,7 +333,7 @@ pub(in super::super) fn default_slot_content(
         .arg_names
         .get(param_idx)
         .cloned()
-        .unwrap_or_else(|| format!("_param_{}", slot.as_u32()));
+        .unwrap_or_else(|| format!("$param_{}", slot.as_u32()));
     let sort = ty_to_expr_sort_enriched(ctx.tcx, ctx.body.local_decls[slot].ty);
     PureExpr::Var(name, sort)
 }
@@ -268,6 +361,30 @@ fn process_call<'tcx>(
         Some(bb) => *bb,
         None => return None, // Diverging call — cannot continue
     };
+
+    // A tracked borrow passed inside a composite argument (not itself a
+    // `&mut`, e.g. a struct or tuple holding the borrow) reaches the callee
+    // without any lane below modelling it: havoc its parameter (s34).
+    let mut escaped_roots = Vec::new();
+    for arg in args {
+        let (Operand::Copy(place) | Operand::Move(place)) = &arg.node else {
+            continue;
+        };
+        let ty = place.ty(ctx.body, ctx.tcx).ty;
+        if matches!(
+            ty.kind(),
+            TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+        ) || !super::super::type_analysis::type_eventually_contains_mut_ref(ctx.tcx, ty)
+        {
+            continue;
+        }
+        if let Some(root) = field_writes::tracked_root(ctx, &state, accum, place.local) {
+            escaped_roots.push(root);
+        }
+    }
+    for root in escaped_roots {
+        field_writes::havoc_param(ctx, &mut state, accum, root);
+    }
 
     if call_may_mutate_params(ctx.tcx, args, ctx.body, func) {
         return process_mutating_call(ctx, func, args, destination, target_bb, state, accum);
@@ -339,16 +456,17 @@ fn process_call<'tcx>(
             // identity. The default ExprLookup for HashMap<Local, PureExpr>
             // returns None for get_deref_expr, preventing pointee collapse.
             translate_operand(ref_arg, &state.local_exprs).unwrap_or_else(|| {
-                PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort.clone())
+                PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort.clone())
             })
         } else {
             let lookup = DerefLookup {
                 locals: &state.local_exprs,
                 deref_exprs: &state.deref_exprs,
                 field_deref_exprs: &state.field_deref_exprs,
+                carrier_read_locals: Some(&state.carrier_read_locals),
             };
             translate_operand(ref_arg, &lookup).unwrap_or_else(|| {
-                PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort.clone())
+                PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort.clone())
             })
         }
     } else {
@@ -360,11 +478,12 @@ fn process_call<'tcx>(
             locals: &state.local_exprs,
             deref_exprs: &state.deref_exprs,
             field_deref_exprs: &state.field_deref_exprs,
+            carrier_read_locals: Some(&state.carrier_read_locals),
         };
         try_spec_result_binding(ctx, func, args, &lookup).unwrap_or_else(|| {
             // Fallback: opaque variable. The opaque var ensures
             // the local is defined if referenced later.
-            PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort)
+            PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort)
         })
     };
     state.local_exprs.insert(dest_local, dest_expr);
@@ -405,7 +524,7 @@ fn process_mutating_call<'tcx>(
                         .arg_names
                         .get(param_idx)
                         .cloned()
-                        .unwrap_or_else(|| format!("_param_{}", src.as_u32()));
+                        .unwrap_or_else(|| format!("$param_{}", src.as_u32()));
                     make_typed_deref_expr(ctx.tcx, ctx.body, src, &name)
                 });
                 (dst, content, deref)
@@ -413,7 +532,12 @@ fn process_mutating_call<'tcx>(
             .collect();
         for (dst, content, deref) in moved {
             state.slot_exprs.insert(dst, content);
-            state.deref_exprs.insert(dst, deref);
+            if accum.havoc_params.is_empty() {
+                state.deref_exprs.insert(dst, deref);
+            } else {
+                // Some pointee is havocked; never re-seed a stale referent.
+                state.deref_exprs.remove(&dst);
+            }
             accum.nested_transfer_slots.insert(dst);
         }
 
@@ -423,7 +547,7 @@ fn process_mutating_call<'tcx>(
         let dest_sort = ty_to_expr_sort_enriched(ctx.tcx, ctx.body.local_decls[dest_local].ty);
         state.local_exprs.insert(
             dest_local,
-            PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort),
+            PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort),
         );
 
         return super::super::extract_mut_borrow_from_block(ctx, target_bb, state, accum);
@@ -448,11 +572,39 @@ fn process_mutating_call<'tcx>(
         &state.deref_exprs,
         &state.field_deref_exprs,
         &state.reborrow_map,
+        &state.carrier_read_locals,
     );
     if let Some(adv) = advancement {
+        // The `^self` equation advances the receiver only. Every other `&mut`
+        // argument reaches the callee too, and nothing the advancement read
+        // says what it is left with: `keep(v, &mut *p)` under `^v == *v`
+        // leaves `^p` the callee's to decide, and `v.push(p)` moves `p` into
+        // the vector, whose holder decides it. Those parameters are havocked
+        // like the arguments of a call no spec advances.
+        let mut other_roots = Vec::new();
+        for arg in args.iter().skip(1) {
+            let (Operand::Copy(place) | Operand::Move(place)) = &arg.node else {
+                continue;
+            };
+            if !matches!(
+                ctx.body.local_decls[place.local].ty.kind(),
+                TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+            ) {
+                continue;
+            }
+            if let Some(root) = field_writes::tracked_root(ctx, &state, accum, place.local) {
+                if root != adv.receiver_local {
+                    other_roots.push(root);
+                }
+            }
+        }
+        for root in other_roots {
+            field_writes::havoc_param(ctx, &mut state, accum, root);
+        }
         // Apply state advancement: update deref_exprs for the
         // mutated receiver.
         state.deref_exprs.insert(adv.receiver_local, adv.new_state);
+        field_writes::refresh_carrier_aliases(&mut state, adv.receiver_local);
 
         // Bind the call destination to an opaque variable (the
         // return value of the mutation call, e.g., () for push).
@@ -460,7 +612,7 @@ fn process_mutating_call<'tcx>(
         let dest_sort = ty_to_expr_sort_enriched(ctx.tcx, ctx.body.local_decls[dest_local].ty);
         state.local_exprs.insert(
             dest_local,
-            PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort),
+            PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort),
         );
 
         return super::super::extract_mut_borrow_from_block(ctx, target_bb, state, accum);
@@ -492,6 +644,7 @@ fn process_mutating_call<'tcx>(
     // v_current` assertion for these params, letting
     // `call_assumptions` + `resolve_assertions` be the sole
     // constraints on the final value.
+    let mut continued_roots = Vec::new();
     for arg in args {
         let local = match &arg.node {
             Operand::Copy(place) | Operand::Move(place) => place.local,
@@ -502,19 +655,19 @@ fn process_mutating_call<'tcx>(
             ty.kind(),
             TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
         ) {
-            // Trace through reborrow chain to find the original param.
-            let param_local =
-                resolve_reborrow_param_local(local, ctx.mut_borrow_params, &state.reborrow_map);
-            if let Some(pl) = param_local {
-                // Record the param name for the ay layer (#2124 Phase 5).
-                let param_idx = pl.as_usize().saturating_sub(1);
-                if param_idx < ctx.arg_names.len() {
-                    accum
-                        .mutation_continued_params
-                        .insert(ctx.arg_names[param_idx].clone());
-                }
+            // Trace through EVERY tracking lane (whole, field and carrier
+            // reborrows, slices, pending IndexMut) to the original param. A
+            // field reborrow used to be missed here, leaving the identity
+            // final-value premise for a mutated param (s34).
+            if let Some(pl) = field_writes::tracked_root(ctx, &state, accum, local) {
+                continued_roots.push(pl);
             }
         }
+    }
+    for pl in continued_roots {
+        // Record the param as mutation-continued (#2124 Phase 5) and drop
+        // every tracked referent a later read could observe stale (s34).
+        field_writes::havoc_param(ctx, &mut state, accum, pl);
     }
 
     // Bind the call destination to an opaque variable.
@@ -522,7 +675,7 @@ fn process_mutating_call<'tcx>(
     let dest_sort = ty_to_expr_sort_enriched(ctx.tcx, ctx.body.local_decls[dest_local].ty);
     state.local_exprs.insert(
         dest_local,
-        PureExpr::Var(format!("_call_{}", dest_local.as_u32()), dest_sort),
+        PureExpr::Var(format!("$_call_{}", dest_local.as_u32()), dest_sort),
     );
 
     super::super::extract_mut_borrow_from_block(ctx, target_bb, state, accum)
@@ -554,7 +707,7 @@ fn register_range_index_mut_reborrow<'tcx>(
 
     let range_expr = {
         let sort = ty_to_expr_sort_enriched(ctx.tcx, ctx.body.local_decls[index_local].ty);
-        PureExpr::Var(format!("call_{}", index_local.as_u32()), sort)
+        PureExpr::Var(format!("$call_{}", index_local.as_u32()), sort)
     };
     let start_expr = PureExpr::MethodCall {
         receiver: Arc::new(range_expr),
@@ -615,6 +768,7 @@ fn try_index_mut_continuation<'tcx>(
         locals: &state.local_exprs,
         deref_exprs: &state.deref_exprs,
         field_deref_exprs: &state.field_deref_exprs,
+        carrier_read_locals: Some(&state.carrier_read_locals),
     };
     let Some(index_expr) = translate_operand(&args[1].node, &lookup) else {
         return false;
@@ -625,7 +779,7 @@ fn try_index_mut_continuation<'tcx>(
     let param_name = if param_idx < ctx.arg_names.len() {
         ctx.arg_names[param_idx].clone()
     } else {
-        format!("_param_{}", receiver_local.as_u32())
+        format!("$param_{}", receiver_local.as_u32())
     };
 
     // Record pending IndexMut metadata on the destination local.

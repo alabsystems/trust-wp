@@ -66,8 +66,13 @@ fn retain_closure_postcondition_mut_companions(
                             .iter()
                             .map(|tag| (*tag).to_string())
                             .collect::<Vec<_>>();
-                        let insert_pos = mut_tags.len() - 1;
-                        mut_tags.insert(insert_pos, sort_tags[0].to_string());
+                        // Both operands were unguarded: the position
+                        // underflows on an empty tag list and `sort_tags[0]`
+                        // panics on the same input. Inserting at 0 is the
+                        // correct degenerate position.
+                        let insert_pos = mut_tags.len().saturating_sub(1);
+                        let first_tag = sort_tags.first()?.to_string();
+                        mut_tags.insert(insert_pos, first_tag);
                         return Some(format!(
                             "closure_postcondition_mut_{}_{}",
                             post_arity + 1,
@@ -96,6 +101,109 @@ fn retain_closure_postcondition_mut_companions(
         .collect();
 
     needed_names.extend(companion_names);
+}
+
+/// The driver-provided type annotation of a method receiver, looking through
+/// `old`, `*`/`^` and outer references (method-call autoderef).
+pub(crate) fn logic_receiver_annotation(
+    expr: &trust_wp_core::formula::PureExpr,
+) -> Option<trust_wp_core::formula::ExprSort> {
+    use trust_wp_core::formula::{ExprSort, PureExpr};
+    let mut sort = match expr {
+        PureExpr::Var(_, sort) => sort.clone()?,
+        PureExpr::Old(inner) => return logic_receiver_annotation(inner),
+        PureExpr::Deref(inner) | PureExpr::Final(inner) => logic_receiver_annotation(inner)?,
+        _ => return None,
+    };
+    while let ExprSort::Ref(inner) | ExprSort::MutRef(inner) = sort {
+        sort = *inner;
+    }
+    Some(sort)
+}
+
+/// Resolve a colliding logic-function call NAME using only the receiver's
+/// driver type annotation (no solver sorts). `None` when `name` does not
+/// collide; `Some(Err(..))` when it collides but no single definition is
+/// certain.
+pub(crate) fn resolve_colliding_call_by_annotation(
+    name: &str,
+    receiver: Option<&trust_wp_core::formula::PureExpr>,
+    arity: usize,
+) -> Option<Result<String, String>> {
+    use trust_wp_core::formula::{resolve_sort_name, ExprSort};
+    if trust_wp_core::logic::identity::is_refused_logic_fn_marker(name) {
+        return Some(Err(format!("unresolved logic function call `{name}`")));
+    }
+    let registry = trust_wp_core::logic::identity::logic_fn_identity_registry()?;
+    let family = registry.unresolved_family_for_call(name)?;
+    let receiver_name = receiver
+        .and_then(logic_receiver_annotation)
+        .and_then(|sort| match sort {
+            ExprSort::Datatype(id) => Some(resolve_sort_name(id)),
+            _ => None,
+        });
+    if receiver.is_none() {
+        return Some(Err(format!(
+            "call to colliding logic function `{name}` without a receiver"
+        )));
+    }
+    Some(trust_wp_core::logic::identity::resolve_family_by_receiver(
+        family,
+        arity,
+        |sort| match (sort, receiver_name.as_deref()) {
+            (ExprSort::Datatype(id), Some(receiver_name)) => {
+                resolve_sort_name(*id) == receiver_name
+            }
+            _ => false,
+        },
+    ))
+}
+
+/// Whether a call name that no identity resolution touched may bind a logic
+/// definition by exact name. With an identity registry installed every local
+/// definition is named by its unique id, so only an id may bind; a bare short
+/// name (`u.view()` on a type with no local `view`) binds nothing. Without a
+/// registry (no local logic definitions were assigned ids) exact names bind.
+pub(crate) fn bare_logic_fn_name_bindable(name: &str) -> bool {
+    name.starts_with(trust_wp_core::logic::identity::LOGIC_FN_ID_PREFIX)
+        || trust_wp_core::logic::identity::logic_fn_identity_registry()
+            .is_none_or(|registry| registry.is_empty())
+}
+
+/// The logic function a call denotes: exact name for non-colliding names, the
+/// receiver-resolved definition for a colliding short name (never the first
+/// match). `args` are the call arguments INCLUDING the receiver.
+pub(crate) fn logic_fn_for_call<'a>(
+    logic_fns: &'a [LogicFnDef],
+    name: &str,
+    args: &[trust_wp_core::formula::PureExpr],
+) -> Option<&'a LogicFnDef> {
+    match resolve_colliding_call_by_annotation(name, args.first(), args.len()) {
+        Some(Ok(id)) => logic_fns.iter().find(|logic_fn| logic_fn.name() == id),
+        Some(Err(_)) => None,
+        // Every local definition carries a unique id: a bare name here can only
+        // be a method/short name no resolution bound, and must bind nothing.
+        None if crate::logic::bare_logic_fn_name_bindable(name) => logic_fns
+            .iter()
+            .find(|logic_fn| logic_fn.name() == name && logic_fn.params().len() == args.len()),
+        None => None,
+    }
+}
+
+/// Add every member id of a colliding short-name family named by an
+/// unresolved call in `names` (the encoder resolves such calls on the
+/// receiver, so all candidates must stay available).
+fn expand_identity_families(names: &mut HashSet<String>) {
+    let Some(registry) = trust_wp_core::logic::identity::logic_fn_identity_registry() else {
+        return;
+    };
+    let extra: Vec<String> = names
+        .iter()
+        .filter_map(|name| registry.unresolved_family_for_call(name))
+        .flatten()
+        .map(|member| member.id.clone())
+        .collect();
+    names.extend(extra);
 }
 
 /// Filters logic function definitions to only those needed for a verification goal.
@@ -144,6 +252,7 @@ pub(crate) fn filter_logic_fns_for_goal(
 
     while changed {
         changed = false;
+        expand_identity_families(&mut needed_names);
         for logic_fn in logic_fns {
             if expanded.contains(logic_fn.full_path()) {
                 continue;
@@ -203,6 +312,7 @@ pub(crate) fn filter_logic_fn_indices_for_goal(
 
     while changed {
         changed = false;
+        expand_identity_families(&mut needed_names);
         for logic_fn in logic_fns {
             if expanded.contains(logic_fn.full_path()) {
                 continue;
@@ -252,6 +362,7 @@ pub(crate) fn filter_logic_fn_indices_for_goal(
         for ens in logic_fn.ensures() {
             collect_logic_fn_names(ens, &mut ensures_names);
         }
+        expand_identity_families(&mut ensures_names);
         if ensures_names
             .iter()
             .any(|n| declared_logic_names.contains(n.as_str()) && needed_names.contains(n))

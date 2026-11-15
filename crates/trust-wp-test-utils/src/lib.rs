@@ -44,6 +44,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 mod freshness;
+pub mod unit_dirs;
 
 const TRYBUILD_CHILD_TEST_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_CHILD";
 const TRYBUILD_WRAPPER_ENV: &str = "TRUST_WP_TRYBUILD_EXPLICIT_UNVERIFIED_WRAPPER";
@@ -172,6 +173,56 @@ fn unbrokered_outer_targo() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     Ok(Some(cargo))
+}
+
+/// Subcommands that compile, and so need a lane when the tool is targo.
+///
+/// A bare `targo build`/`check`/`test` is refused on purpose, and `targo
+/// --unverified` is refused for anything that is not a compilation command
+/// (`metadata`, `clean`, ...), so the lane flag depends on the verb. The list
+/// matches the one the explicit-unverified trybuild wrapper below spells.
+const COMPILATION_SUBCOMMANDS: &[&str] = &[
+    "build", "check", "fix", "clippy", "miri", "test", "run", "bench", "doc", "rustc", "rustdoc",
+    "install", "package", "publish",
+];
+
+/// The build tool a nested fixture build runs: `$CARGO` when the caller set it
+/// (targo exports it to every process it spawns), else `targo` from `PATH`.
+///
+/// Never a bare `cargo`: on a Trust machine that name is not the Trust
+/// toolchain's build tool, and a silent fallback to it would compile fixtures
+/// with a different compiler than the one under test.
+#[must_use]
+pub fn build_tool() -> PathBuf {
+    build_tool_from(std::env::var_os("CARGO").as_deref())
+}
+
+fn build_tool_from(cargo: Option<&OsStr>) -> PathBuf {
+    cargo
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("targo"), PathBuf::from)
+}
+
+/// A `Command` for `<build tool> [--unverified] <subcommand>`.
+///
+/// When the build tool is targo, a compilation subcommand gets the explicit
+/// `--unverified` lane: these fixture builds exercise trust-wp's own verifier
+/// (through `RUSTC_WRAPPER`) and make no Trust proof claim. Any other
+/// `$CARGO` (the explicit-unverified trybuild wrapper, which spells the lane
+/// itself) is run as given. Callers add the remaining arguments.
+#[must_use]
+pub fn nested_cargo(subcommand: &str) -> Command {
+    nested_cargo_with(&build_tool(), subcommand)
+}
+
+fn nested_cargo_with(tool: &Path, subcommand: &str) -> Command {
+    let mut command = Command::new(tool);
+    let is_targo = tool.file_stem().and_then(OsStr::to_str) == Some("targo");
+    if is_targo && COMPILATION_SUBCOMMANDS.contains(&subcommand) {
+        command.arg("--unverified");
+    }
+    command.arg(subcommand);
+    command
 }
 
 fn executable_path_is_named(path: &Path, expected: &str) -> bool {
@@ -421,7 +472,7 @@ fn is_workspace_root(candidate: &Path) -> bool {
 
 /// Returns the path to the cargo-trust-wp binary.
 ///
-/// The binary is expected to be in `target/debug/` after `cargo build`.
+/// The binary is expected to be in `target/debug/` after `targo --unverified build`.
 /// When `CARGO_TARGET_DIR` is set, the active target directory is used instead.
 /// This function returns the expected path without checking for existence; the
 /// caller is responsible for building the binary before use.
@@ -431,7 +482,7 @@ pub fn cargo_trust_wp_bin() -> PathBuf {
 
 /// Returns the path to the trust-wp-rustc binary.
 ///
-/// The binary is expected to be in `target/debug/` after `cargo build`.
+/// The binary is expected to be in `target/debug/` after `targo --unverified build`.
 /// When `CARGO_TARGET_DIR` is set, the active target directory is used instead.
 /// This function returns the expected path without checking for existence; the
 /// caller is responsible for building the binary before use.
@@ -443,8 +494,8 @@ pub fn trust_wp_rustc_bin() -> PathBuf {
 ///
 /// Unlike [`trust_wp_rustc_bin`], this function ensures the binary exists and is
 /// newer than the driver workspace sources by running
-/// `cargo build -p trust-wp-driver --bin trust-wp-rustc` when the binary is
-/// missing or stale.
+/// `targo --unverified build -p trust-wp-driver --bin trust-wp-rustc` (through
+/// [`nested_cargo`]) when the binary is missing or stale.
 ///
 /// # Panics
 ///
@@ -452,14 +503,14 @@ pub fn trust_wp_rustc_bin() -> PathBuf {
 pub fn trust_wp_rustc_path() -> PathBuf {
     let path = trust_wp_rustc_bin();
     if freshness::trust_wp_rustc_needs_build(&path).expect("check trust-wp-rustc freshness") {
-        let status = Command::new("cargo")
+        let status = nested_cargo("build")
             .current_dir(workspace_root())
-            .args(["build", "-p", "trust-wp-driver", "--bin", "trust-wp-rustc"])
+            .args(["-p", "trust-wp-driver", "--bin", "trust-wp-rustc"])
             .status()
-            .expect("failed to run cargo build");
+            .expect("failed to run the build tool (targo)");
         assert!(
             status.success(),
-            "cargo build -p trust-wp-driver --bin trust-wp-rustc failed"
+            "targo --unverified build -p trust-wp-driver --bin trust-wp-rustc failed"
         );
     }
     assert!(
@@ -712,7 +763,8 @@ pub fn copy_cargo_trust_wp_bin(bin_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(dst)
 }
 
-/// Runs a dir-based integration test fixture through `cargo check` with trust-wp-rustc.
+/// Runs a dir-based integration test fixture through `targo --unverified check`
+/// with trust-wp-rustc.
 ///
 /// # Arguments
 ///
@@ -727,19 +779,20 @@ pub fn run_dir_fixture(
     trust_wp_args: Option<&str>,
 ) -> std::process::Output {
     let target_dir = workspace_root().join("target").join(target_dir_suffix);
-    let mut cmd = Command::new("cargo");
+    let mut cmd = nested_cargo("check");
     cmd.current_dir(fixture_dir(fixture_name))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin]);
+        .args(["--quiet", "--bin", bin]);
     if let Some(args) = trust_wp_args {
         cmd.env("TRUST_WP_ARGS", args);
     }
     cmd.output()
-        .expect("failed to run cargo check for dir fixture")
+        .expect("failed to run targo check for dir fixture")
 }
 
-/// Runs an inline-source integration test fixture through `cargo check` with trust-wp-rustc.
+/// Runs an inline-source integration test fixture through `targo --unverified
+/// check` with trust-wp-rustc.
 ///
 /// Creates a temporary Cargo project with the given source, compiles it through
 /// trust-wp-rustc, and cleans up the temp directory afterward.
@@ -797,16 +850,150 @@ pub fn run_inline_fixture(
 
     let target_dir = root.join("target").join(target_dir_suffix);
 
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(&fixture_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", trust_wp_args)
-        .args(["check", "--quiet"])
+        .arg("--quiet")
         .output()
-        .expect("failed to run cargo check for inline fixture");
+        .expect("failed to run targo check for inline fixture");
     let _ = fs::remove_dir_all(&fixture_dir);
     output
+}
+
+/// Assert a trybuild glob actually names UI-test cases, and return how many.
+///
+/// WHY THIS EXISTS. A trybuild suite is not loud about having nothing to do.
+/// `TestCases` runs in its `Drop`, so a glob that matches no file reports
+/// success, and a suite whose whole scratch-project build fails dies in
+/// `prepare`/`write` BEFORE the per-case loop ever starts — in neither case
+/// does any case's `.stderr` get compared. Both were live here: 44 cases across
+/// `trust-wp`'s `compile_fail_tests` and `trust-wp-macros`'
+/// `compile_fail`/`compile_pass` were never evaluated, and the 17 `compile_pass`
+/// cases are the only guard that ordinary contract syntax still COMPILES for an
+/// ordinary user. Call this BEFORE the trybuild body — before the
+/// explicit-unverified child gate too, so the parent process asserts it as well.
+///
+/// `floor` is the case count the suite is known to have. It is a floor rather
+/// than a note in a comment so that DELETING cases is as loud as matching zero
+/// of them; adding cases means raising it deliberately, which is the point.
+///
+/// `require_stderr` additionally demands a sibling `.stderr` for every case, the
+/// shape a `compile_fail` suite needs: a case whose expectation file is missing
+/// is only reported as `wip`, which reads like a chore rather than a hole.
+///
+/// # Panics
+///
+/// Panics if `pattern` is not `<relative-dir>/*.rs`, if the directory is
+/// unreadable, if fewer than `floor` cases are present, if `require_stderr` is
+/// set and some case has no `.stderr`, or if `TRYBUILD=overwrite` is in the
+/// environment — that setting makes every `compile_fail` case pass by
+/// REWRITING its expectation, which is teeth loss disguised as a green run.
+pub fn assert_trybuild_cases(pattern: &str, floor: usize, require_stderr: bool) -> usize {
+    assert!(floor > 0, "a trybuild suite floor of 0 asserts nothing");
+    if let Some(mode) = std::env::var_os("TRYBUILD") {
+        assert!(
+            mode != OsStr::new("overwrite"),
+            "TRYBUILD=overwrite rewrites every expectation instead of checking it; \
+             refusing to run {pattern} as if it were a test"
+        );
+    }
+
+    let suffix = "/*.rs";
+    let relative = pattern.strip_suffix(suffix).unwrap_or_else(|| {
+        panic!("trybuild case pattern {pattern} is not of the form <dir>{suffix}")
+    });
+    // trybuild resolves its glob against the CALLING crate's manifest dir, so
+    // this must too. `env!("CARGO_MANIFEST_DIR")` would name
+    // trust-wp-test-utils; the RUNTIME variable is the one cargo sets to the
+    // package under test, with the test process's working directory (also the
+    // crate root) as the fallback.
+    let root = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(
+        || std::env::current_dir().expect("read the test's working directory"),
+        PathBuf::from,
+    );
+    let directory = root.join(relative);
+
+    let mut cases = Vec::new();
+    let entries = fs::read_dir(&directory).unwrap_or_else(|error| {
+        panic!(
+            "read trybuild case directory {}: {error}",
+            directory.display()
+        )
+    });
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .path();
+        if path.extension().and_then(OsStr::to_str) == Some("rs") {
+            cases.push(path);
+        }
+    }
+    cases.sort();
+
+    assert!(
+        cases.len() >= floor,
+        "{pattern} names {} case(s) but this suite is known to have {floor}; \
+         a trybuild suite that matches fewer files than it should still PASSES, \
+         which is how these cases went dark. Found: {:?}",
+        cases.len(),
+        cases
+            .iter()
+            .filter_map(|path| path.file_name().and_then(OsStr::to_str))
+            .collect::<Vec<_>>(),
+    );
+
+    if require_stderr {
+        let missing: Vec<String> = cases
+            .iter()
+            .filter(|path| !path.with_extension("stderr").exists())
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{pattern}: compile-fail case(s) with no .stderr expectation: {missing:?}"
+        );
+    }
+
+    eprintln!(
+        "trust-wp trybuild suite {pattern}: {} case(s) to evaluate",
+        cases.len()
+    );
+    cases.len()
+}
+
+/// The lines `targo` itself writes to stderr about the lane a [`nested_cargo`]
+/// build runs in. They are unconditional (`--quiet` does not silence them) and
+/// spell the lane `unverified`, so a test that reads a nested build's stderr
+/// for the driver's verdicts must drop them first: a bare
+/// `contains("verified")` would otherwise always hold, and
+/// `!contains("verified")` never.
+const FRONTEND_LANE_NOTICES: &[&str] = &[
+    "warning: UNVERIFIED: `targo ",
+    "warning: nested explicit-unverified Targo propagation is unavailable",
+];
+
+/// A [`nested_cargo`] build's stderr, lossily decoded, without the build
+/// tool's own lane notices; everything the compiler and the driver wrote is
+/// kept.
+#[must_use]
+pub fn fixture_stderr(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !FRONTEND_LANE_NOTICES
+            .iter()
+            .any(|notice| line.starts_with(notice))
+        {
+            kept.push_str(line);
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -814,6 +1001,117 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn argv(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn build_tool_is_cargo_env_else_targo_never_bare_cargo() {
+        assert_eq!(build_tool_from(None), PathBuf::from("targo"));
+        assert_eq!(
+            build_tool_from(Some(OsStr::new(""))),
+            PathBuf::from("targo")
+        );
+        assert_eq!(
+            build_tool_from(Some(OsStr::new("/opt/trust/bin/targo"))),
+            PathBuf::from("/opt/trust/bin/targo")
+        );
+    }
+
+    #[test]
+    fn nested_cargo_names_the_unverified_lane_only_for_targo_compilation() {
+        let targo = Path::new("/opt/trust/bin/targo");
+        assert_eq!(
+            argv(&nested_cargo_with(targo, "check")),
+            ["--unverified", "check"]
+        );
+        assert_eq!(
+            argv(&nested_cargo_with(targo, "build")),
+            ["--unverified", "build"]
+        );
+        // targo refuses `--unverified` on a non-compilation command.
+        assert_eq!(argv(&nested_cargo_with(targo, "metadata")), ["metadata"]);
+        assert_eq!(argv(&nested_cargo_with(targo, "clean")), ["clean"]);
+        assert_eq!(
+            argv(&nested_cargo_with(Path::new("targo"), "check")),
+            ["--unverified", "check"]
+        );
+        // A `$CARGO` that is not targo (the trybuild wrapper) spells its own lane.
+        let wrapper = Path::new("/tmp/h/targo-explicit-unverified");
+        assert_eq!(argv(&nested_cargo_with(wrapper, "check")), ["check"]);
+        assert_eq!(
+            nested_cargo_with(targo, "check").get_program(),
+            targo.as_os_str()
+        );
+    }
+
+    #[test]
+    fn fixture_stderr_drops_only_the_frontend_lane_notices() {
+        let stderr = "warning: nested explicit-unverified Targo propagation is unavailable on this platform; the outer explicit command remains authorized\n\
+                      warning: UNVERIFIED: `targo check` was explicitly authorized with Trust verification disabled; this run emits no proof claim\n\
+                      error: ensures: failed to parse contract\n\
+                      trust-wp: f verified\n";
+        let output = std::process::Output {
+            status: Command::new("true").status().unwrap(),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            fixture_stderr(&output),
+            "error: ensures: failed to parse contract\ntrust-wp: f verified\n"
+        );
+        let notices_only = std::process::Output {
+            stderr: stderr
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+            ..output
+        };
+        assert!(String::from_utf8_lossy(&notices_only.stderr).contains("verified"));
+        assert!(!fixture_stderr(&notices_only).contains("verified"));
+    }
+
+    /// Every nested build in the driver's integration tests goes through
+    /// [`nested_cargo`]. A bare `Command::new("cargo")` is not the Trust
+    /// toolchain's build tool on a Trust machine, and under targo it names no
+    /// lane. Four suites added while the others were being converted
+    /// (contract_oracle, reference_level_contracts, state_elaboration,
+    /// trait_credit_pairs) spawned it, which is why this is checked rather
+    /// than trusted.
+    #[test]
+    fn driver_tests_spawn_nested_builds_through_nested_cargo() {
+        let tests = workspace_root().join("crates/trust-wp-driver/tests");
+        let mut offenders = Vec::new();
+        let mut scanned = 0;
+        for entry in fs::read_dir(&tests).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            scanned += 1;
+            let source = fs::read_to_string(&path).unwrap();
+            for (index, line) in source.lines().enumerate() {
+                if line.contains("Command::new(\"cargo\")") {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+        assert!(
+            scanned > 0,
+            "no driver tests found under {}",
+            tests.display()
+        );
+        assert!(
+            offenders.is_empty(),
+            "spawn nested builds with trust_wp_test_utils::nested_cargo: {offenders:#?}"
+        );
+    }
 
     #[test]
     fn test_workspace_root_exists() {

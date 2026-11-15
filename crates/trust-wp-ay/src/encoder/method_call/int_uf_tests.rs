@@ -158,12 +158,12 @@ fn encode_int_method_uf_keeps_bound_capacity_opaque_inside_quantifiers() {
     );
 }
 
-// ── CE-census 2026-08-20 pin: std iterator-carrier len non-negativity ──
+// ── Pin: std iterator-carrier len non-negativity ──
 
 /// `len` on an FMapIter-sorted receiver falls back to the composite Int
 /// method UF; the result still denotes an FMap cardinality, so the LEN
 /// law's `result >= 0` clause (trust-wp-std/src/logic/fmap.rs `FMap::LEN`)
-/// must attach. Unfixed: `len(iter) < 0` is satisfiable and
+/// must attach. Without it `len(iter) < 0` is satisfiable and
 /// loop_variant_nonneg gets a fabricated counterexample
 /// (ghost/fmap_iter merge_fmaps).
 #[test]

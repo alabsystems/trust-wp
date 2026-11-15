@@ -27,12 +27,13 @@ fn and_implies_left(a: bool, b: bool) {
 
 /// Function with arithmetic proof assertion.
 ///
-/// The precondition `x >= 0 && y >= 0` implies `x + y >= 0`.
+/// The precondition `x >= 0 && y >= 0` implies `x@ + y@ >= 0`. Over `i32`
+/// itself `x + y` is the oracle's wrapping add (D-232), which a sum past
+/// `i32::MAX` takes negative.
 #[requires(x >= 0)]
 #[requires(y >= 0)]
 fn sum_is_non_negative(x: i32, y: i32) {
-    // This should verify: (x >= 0 && y >= 0) => (x + y >= 0)
-    proof_assert!(x + y >= 0);
+    proof_assert!(x@ + y@ >= 0);
 }
 
 fn main() {

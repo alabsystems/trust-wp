@@ -4,10 +4,10 @@
 
 //! Unit tests for [`crate::encoder::state::closure::ClosureState`].
 //!
-//! Coverage gap: `insert_param_mapping`, `insert_body`, `def_id_for_param`,
-//! `get_body`, and `single_body` had zero direct tests despite being
-//! `pub(crate)`. The `single_body` method has non-trivial logic
-//! (`len() == 1` guard).
+//! `insert_param_mapping`, `insert_body`, `def_id_for_param` and `get_body`
+//! are `pub(crate)` and exercised directly here. There is deliberately no
+//! "the only registered body" shortcut: a receiver resolves by name or not
+//! at all.
 
 use ntest::timeout;
 use trust_wp_core::formula::PureExpr;
@@ -22,6 +22,7 @@ fn make_body_info(body_val: i64) -> ClosureBodyInfo {
         capture_names: vec![],
         ensures_exprs: None,
         requires_exprs: None,
+        env_arity: None,
     }
 }
 
@@ -106,38 +107,6 @@ fn param_mapping_overwrites_previous_entry() {
     assert_eq!(state.def_id_for_param("p").unwrap(), "new_def");
 }
 
-// --- single_body ---
-
-#[test]
-#[timeout(30000)]
-fn single_body_returns_body_when_exactly_one() {
-    let mut state = ClosureState::new();
-    state.insert_body("only".to_string(), make_body_info(7));
-
-    let info = state.single_body().expect("should return single body");
-    assert_eq!(info.body, Some(PureExpr::Int(7)));
-}
-
-#[test]
-#[timeout(30000)]
-fn single_body_returns_none_when_empty() {
-    let state = ClosureState::new();
-    assert!(state.single_body().is_none());
-}
-
-#[test]
-#[timeout(30000)]
-fn single_body_returns_none_when_multiple_bodies() {
-    let mut state = ClosureState::new();
-    state.insert_body("a".to_string(), make_body_info(1));
-    state.insert_body("b".to_string(), make_body_info(2));
-
-    assert!(
-        state.single_body().is_none(),
-        "multiple bodies should return None"
-    );
-}
-
 // --- round-trip: param_mapping → get_body ---
 
 #[test]
@@ -167,6 +136,7 @@ fn body_with_ensures_exprs_preserves_them() {
         capture_names: vec!["cap".to_string()],
         ensures_exprs: Some(vec![PureExpr::Bool(false)]),
         requires_exprs: None,
+        env_arity: None,
     };
     state.insert_body("ens".to_string(), info);
 
@@ -191,6 +161,7 @@ fn body_info_preserves_missing_body_for_ensures_only_registration() {
         capture_names: vec![],
         ensures_exprs: Some(vec![PureExpr::Bool(true)]),
         requires_exprs: None,
+        env_arity: None,
     };
     state.insert_body("ensures_only".to_string(), info);
 

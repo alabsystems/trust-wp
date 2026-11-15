@@ -14,9 +14,15 @@ use trust_wp::{ensures, invariant, requires, variant};
 ///   preservation    the invariant survives one arbitrary iteration
 ///   postcondition   invariant + loop exit imply the `#[ensures]`
 ///   termination     `#[variant]` strictly decreases and stays non-negative
-#[requires(n >= 0 && n <= 100_000)]
+///
+/// Arithmetic inside the loop is checked too: `total += i` must not overflow
+/// `i32` on any iteration the invariant admits. `total >= 0` alone admits
+/// `total == i32::MAX`, so the invariant also carries a bound on `total`.
+/// Since ay reasons linearly, the bound is linear in `i` — and then the
+/// largest `n` it closes is `46_340`, because `46_340 * 46_340 <= i32::MAX`.
+#[requires(n >= 0 && n <= 46_340)]
 #[ensures(result >= 0)]
-#[invariant(total >= 0 && i >= 0)]
+#[invariant(total >= 0 && i >= 0 && i <= n && total <= 46_340 * i)]
 #[variant(n - i)]
 pub fn sum_to(n: i32) -> i32 {
     let mut total = 0;
@@ -31,19 +37,23 @@ pub fn sum_to(n: i32) -> i32 {
 /// The invariant is the induction hypothesis, so it has to be strong enough to
 /// prove *itself* — not merely true.
 ///
-/// `acc >= 1` survives `acc *= 2` because doubling is linear. Try changing the
-/// body to `acc *= j` and re-running: preservation fails, because
-/// `acc >= 1 && j >= 0` does not give `acc * j >= 1` when `j` is 0.
-#[requires(k >= 0 && k <= 30)]
-#[ensures(result >= 1)]
-#[invariant(acc >= 1 && j >= 0)]
-#[variant(k - j)]
-pub fn power_of_two(k: i32) -> i32 {
+/// `acc >= 1` survives `acc *= 2` because doubling is linear, but it does not
+/// keep `acc * 2` inside `i32`: on its own it admits `acc == i32::MAX` at the
+/// loop head, and the overflow obligation for `acc *= 2` fails. `acc <= 2 * limit`
+/// closes it: the loop only doubles while `acc < limit`, so the doubled value
+/// stays below `2 * limit`, and the precondition keeps `2 * limit` in range.
+/// Try deleting that conjunct and re-running.
+#[requires(limit >= 1 && limit <= 1_000_000_000)]
+#[ensures(result >= limit)]
+#[invariant(acc >= 1 && acc <= 2 * limit)]
+#[variant(2 * limit - acc)]
+pub fn next_power_of_two(limit: i32) -> i32 {
     let mut acc = 1;
-    let mut j = 0;
-    while j < k {
+    loop {
+        if acc >= limit {
+            break;
+        }
         acc *= 2;
-        j += 1;
     }
     acc
 }

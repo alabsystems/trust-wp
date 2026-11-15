@@ -149,7 +149,10 @@ pub mod specs {
     //   3. Overflow: result == op - RANGE
     //
     // For mul: the mathematical result can be multiple RANGEs away, so
-    // the `mod` encoding is still needed. ay handles `mod` correctly
+    // the Euclidean `mod` encoding is still needed. It is spelled
+    // `.rem_euclid(RANGE)`: the dividend `self * rhs - MIN` is negative for
+    // signed operands of opposite sign, and pearlite `%` is TRUNCATING
+    // (Creusot `int.ComputerDivision.mod`), which would be wrong there. ay handles `mod` correctly
     // in the mul context because the user postconditions for wrapping_mul
     // also use `mod` (no disjunction needed).
     //
@@ -180,7 +183,7 @@ pub mod specs {
     ///
     /// Returns `self * rhs` with wrapping on overflow.
     pub const WRAPPING_MUL: &str = r#"
-        ensures: result@ == (self@ * rhs@ - Self::MIN@) % (Self::MAX@ - Self::MIN@ + 1) + Self::MIN@
+        ensures: result@ == (self@ * rhs@ - Self::MIN@).rem_euclid(Self::MAX@ - Self::MIN@ + 1) + Self::MIN@
     "#;
 
     // ── wrapping negation ────────────────────────────────────────
@@ -205,19 +208,23 @@ pub mod specs {
 
     // ── checked division ─────────────────────────────────────────
     //
-    // Division specs omit the signed MIN/-1 overflow case because trust-wp
-    // models integer arithmetic over unbounded Int at the logic level.
-    // In that model, `a / b` for nonzero `b` is always total, so the
-    // only failure mode is division by zero.  The saturating/wrapping/
-    // overflowing variants are therefore equivalent to plain division
-    // with a `rhs != 0` precondition.  See #1039 for rationale.
+    // SOUNDNESS: signed `Self::MIN / -1` (and `% -1`, `div_euclid(-1)`,
+    // `rem_euclid(-1)`) overflows the machine type. Rust PANICS for the plain
+    // operators and the euclid methods, returns `None` for `checked_*`,
+    // wraps to `MIN` / `0` for `wrapping_*` / `overflowing_*`, and saturates
+    // to `MAX` for `saturating_div`. The Int quotient `MIN / -1 == -MIN` is
+    // out of range, so every spec below states that case explicitly
+    // (mirroring creusot-std num.rs `spec_div_rem!` and the `checked_div`
+    // family, except `saturating_div`, where Rust's `MAX` is used; creusot-std
+    // says `MIN`, which contradicts `core`). For unsigned types
+    // `Self::MIN@ == 0` and `rhs@ == -1` is unsatisfiable, so the case is inert.
 
     /// Contract for `{integer}::checked_div`
     ///
     /// Returns `Some(self / rhs)` when rhs != 0, `None` on division by zero.
     ///
-    /// This matches the currently modeled integer semantics in trust-wp where
-    /// `a / b` for nonzero `b` is total at the logic level.
+    /// `None` iff the divisor is zero or the signed division overflows
+    /// (`Self::MIN / -1`), as in Rust and creusot-std.
     ///
     /// Uses implication-style postconditions instead of match-style because
     /// the ay solver handles direct implications more effectively than ITE
@@ -225,15 +232,52 @@ pub mod specs {
     /// to derive `is_some(result)` from an ITE chain, while the implication
     /// style gives the solver direct facts. (#1296)
     pub const CHECKED_DIV: &str = r#"
-        ensures: rhs@ != 0 ==> result.is_some()
-        ensures: rhs@ != 0 ==> result.unwrap()@ == self@ / rhs@
-        ensures: rhs@ == 0 ==> result.is_none()
+        ensures: (rhs@ != 0 && !(self@ == Self::MIN@ && rhs@ == -1)) ==> result.is_some()
+        ensures: (rhs@ != 0 && !(self@ == Self::MIN@ && rhs@ == -1)) ==> result.unwrap()@ == self@ / rhs@
+        ensures: (rhs@ == 0 || (self@ == Self::MIN@ && rhs@ == -1)) ==> result.is_none()
     "#;
 
     /// Contract for `{integer}::div` (`/` operator)
+    ///
+    /// Panics on division by zero and on signed `Self::MIN / -1` overflow
+    /// (creusot-std num.rs `spec_div_rem!`).
     pub const DIV: &str = r#"
         requires: rhs@ != 0
+        requires: !(self@ == Self::MIN@ && rhs@ == -1)
         ensures: result@ == self@ / rhs@
+    "#;
+
+    /// Contract for `{integer}::rem` (`%` operator, `Rem::rem`)
+    ///
+    /// Rust's integer remainder truncates: the result takes the sign of the
+    /// dividend (`(-7i32).rem(2) == -1`). Pearlite `%` is Creusot's
+    /// `int.ComputerDivision.mod`, i.e. the same truncating remainder
+    /// (`BinOp::RemTrunc`); the Euclidean remainder is `rem_euclid`.
+    pub const REM: &str = r#"
+        requires: rhs@ != 0
+        requires: !(self@ == Self::MIN@ && rhs@ == -1)
+        ensures: result@ == self@ % rhs@
+    "#;
+
+    /// Contract for `{integer}::rem_euclid`
+    ///
+    /// Rust's `rem_euclid` is the Euclidean remainder (`0 <= r < |rhs|`),
+    /// which is exactly `Int::rem_euclid` (`BinOp::Mod`).
+    pub const REM_EUCLID: &str = r#"
+        requires: rhs@ != 0
+        requires: !(self@ == Self::MIN@ && rhs@ == -1)
+        ensures: result@ == self@.rem_euclid(rhs@)
+    "#;
+
+    /// Contract for `{integer}::div_euclid`
+    ///
+    /// The Euclidean quotient `q` satisfies `self == rhs * q + r` with
+    /// `r = self.rem_euclid(rhs)`, so `self - r` is an exact multiple of
+    /// `rhs` and any division of it (here the truncating pearlite `/`) is `q`.
+    pub const DIV_EUCLID: &str = r#"
+        requires: rhs@ != 0
+        requires: !(self@ == Self::MIN@ && rhs@ == -1)
+        ensures: result@ == (self@ - self@.rem_euclid(rhs@)) / rhs@
     "#;
 
     // ── saturating multiplication and division ───────────────────
@@ -249,20 +293,24 @@ pub mod specs {
 
     /// Contract for `{integer}::saturating_div`
     ///
-    /// Returns `self / rhs`. Panics if rhs == 0.
+    /// Returns `self / rhs`. Panics if rhs == 0. Signed `Self::MIN / -1`
+    /// saturates to `Self::MAX` (`core`'s `saturating_div`).
     pub const SATURATING_DIV: &str = r#"
         requires: rhs@ != 0
-        ensures: result@ == self@ / rhs@
+        ensures: !(self@ == Self::MIN@ && rhs@ == -1) ==> result@ == self@ / rhs@
+        ensures: (self@ == Self::MIN@ && rhs@ == -1) ==> result@ == Self::MAX@
     "#;
 
     // ── wrapping division ────────────────────────────────────────
 
     /// Contract for `{integer}::wrapping_div`
     ///
-    /// Returns `self / rhs`. Panics if rhs == 0.
+    /// Returns `self / rhs`. Panics if rhs == 0. Signed `Self::MIN / -1`
+    /// wraps to `Self::MIN`.
     pub const WRAPPING_DIV: &str = r#"
         requires: rhs@ != 0
-        ensures: result@ == self@ / rhs@
+        ensures: !(self@ == Self::MIN@ && rhs@ == -1) ==> result@ == self@ / rhs@
+        ensures: (self@ == Self::MIN@ && rhs@ == -1) ==> result@ == Self::MIN@
     "#;
 
     // ── overflowing arithmetic ───────────────────────────────────
@@ -292,7 +340,7 @@ pub mod specs {
 
     /// Contract for `{integer}::overflowing_mul`
     pub const OVERFLOWING_MUL: &str = r#"
-        ensures: result.0@ == (self@ * rhs@ - Self::MIN@) % (Self::MAX@ - Self::MIN@ + 1) + Self::MIN@
+        ensures: result.0@ == (self@ * rhs@ - Self::MIN@).rem_euclid(Self::MAX@ - Self::MIN@ + 1) + Self::MIN@
         ensures: result.1 == (self@ * rhs@ < Self::MIN@ || self@ * rhs@ > Self::MAX@)
     "#;
 
@@ -328,26 +376,25 @@ pub mod specs {
 
     // ── checked / wrapping remainder ─────────────────────────────
     //
-    // Like division, remainder specs model integer arithmetic over unbounded
-    // Int at the logic level (#1039). `a % b` for nonzero `b` is total in
-    // that model, so the only failure mode is `b == 0`. The signed
-    // `MIN % -1` overflow case is omitted for the same reason as
-    // `CHECKED_DIV`. Mirrors creusot-std's primitive remainder specs.
+    // Signed `Self::MIN % -1` overflows: `checked_rem` returns `None`, and
+    // `wrapping_rem` returns `0`, which equals the Int remainder `MIN % -1`,
+    // so `WRAPPING_REM` needs no special case.
 
     /// Contract for `{integer}::checked_rem`
     ///
-    /// Returns `Some(self % rhs)` when rhs != 0, `None` on division by zero.
+    /// Returns `Some(self % rhs)` when rhs != 0 and the signed remainder does
+    /// not overflow, `None` otherwise.
     /// Uses implication-style postconditions for solver tractability. (#1296)
     pub const CHECKED_REM: &str = r#"
-        ensures: rhs@ != 0 ==> result.is_some()
-        ensures: rhs@ != 0 ==> result.unwrap()@ == self@ % rhs@
-        ensures: rhs@ == 0 ==> result.is_none()
+        ensures: (rhs@ != 0 && !(self@ == Self::MIN@ && rhs@ == -1)) ==> result.is_some()
+        ensures: (rhs@ != 0 && !(self@ == Self::MIN@ && rhs@ == -1)) ==> result.unwrap()@ == self@ % rhs@
+        ensures: (rhs@ == 0 || (self@ == Self::MIN@ && rhs@ == -1)) ==> result.is_none()
     "#;
 
     /// Contract for `{integer}::wrapping_rem`
     ///
-    /// Returns `self % rhs`. Panics if `rhs == 0`. Like `WRAPPING_DIV`, the
-    /// signed `MIN % -1` overflow case is omitted (#1039).
+    /// Returns `self % rhs`. Panics if `rhs == 0`. Signed `MIN % -1` wraps
+    /// to `0`, which is the Int remainder, so no special case is needed.
     pub const WRAPPING_REM: &str = r#"
         requires: rhs@ != 0
         ensures: result@ == self@ % rhs@
@@ -481,8 +528,10 @@ pub mod specs {
     ///
     /// Returns the smallest power of two greater than or equal to
     /// `self`. Only defined on unsigned integer types. Panics on
-    /// overflow.
+    /// overflow (overflow checks on), i.e. when `self` exceeds the largest
+    /// power of two of the type, `Self::MAX / 2 + 1`.
     pub const NEXT_POWER_OF_TWO: &str = r#"
+        requires: 2 * self@ <= Self::MAX@ + 2
         ensures: result@ >= 1
         ensures: result@ >= self@
         ensures: self@ <= 1 ==> result@ == 1
@@ -621,7 +670,7 @@ mod tests {
     #[test]
     fn test_div_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::DIV);
-        assert_eq!(spec.requires.len(), 1);
+        assert_eq!(spec.requires.len(), 2);
         assert_eq!(spec.ensures.len(), 1);
     }
 
@@ -636,14 +685,14 @@ mod tests {
     fn test_saturating_div_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::SATURATING_DIV);
         assert_eq!(spec.requires.len(), 1);
-        assert_eq!(spec.ensures.len(), 1);
+        assert_eq!(spec.ensures.len(), 2);
     }
 
     #[test]
     fn test_wrapping_div_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::WRAPPING_DIV);
         assert_eq!(spec.requires.len(), 1);
-        assert_eq!(spec.ensures.len(), 1);
+        assert_eq!(spec.ensures.len(), 2);
     }
 
     #[test]
@@ -815,7 +864,7 @@ mod tests {
     #[test]
     fn test_next_power_of_two_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::NEXT_POWER_OF_TWO);
-        assert!(spec.requires.is_empty());
+        assert_eq!(spec.requires, ["2 * self@ <= Self::MAX@ + 2"]);
         assert_eq!(spec.ensures.len(), 3);
         assert!(spec.ensures.iter().any(|e| e.contains("result@ >= 1")));
         assert!(spec.ensures.iter().any(|e| e.contains("result@ >= self@")));

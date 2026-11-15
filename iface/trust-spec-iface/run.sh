@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# Build and test the INTERFACE-v1 reference crate with the Trust toolchain's
+# cargo, targo ($CARGO when set), through its explicit unverified lane: this
+# run makes no Trust proof claim. trust-wp's rustc_private wrapper is not
+# meant for this crate (see ../.cargo/config.toml).
 set -euo pipefail
 cd "$(dirname "$0")"
-CARGO="${CARGO:-/opt/homebrew/bin/cargo}"
-[ -x "$CARGO" ] || CARGO=cargo
-# RUSTUP_TOOLCHAIN=stable: cargo invokes `rustc` (the rustup shim) with cwd
-# outside this directory for registry deps, where rust-toolchain.toml's stable
-# pin does not apply — without the env pin those units resolve the rustup
-# default toolchain and the build dies with E0514 mixed-compiler artifacts.
-exec env RUSTC_WRAPPER= RUSTFLAGS= RUSTUP_TOOLCHAIN=stable "$CARGO" "${1:-test}" --release "${@:2}"
+CARGO="${CARGO:-$(command -v targo 2>/dev/null || true)}"
+if [ -z "$CARGO" ]; then
+  echo "run.sh: targo (the Trust toolchain's cargo) is not on PATH; install the Trust toolchain or set CARGO" >&2
+  exit 127
+fi
+exec env RUSTC_WRAPPER= "$CARGO" --unverified "${1:-test}" --release --locked "${@:2}"

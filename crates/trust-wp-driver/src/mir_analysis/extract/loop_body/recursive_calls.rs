@@ -15,7 +15,7 @@ use rustc_middle::{
         BasicBlock, Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind,
         TerminatorKind,
     },
-    ty::{GenericArgsRef, TyCtxt, TyKind},
+    ty::{GenericArgs, TyCtxt, TyKind},
 };
 use trust_wp_core::formula::{
     internal::tuple_lowering::tuple_field_logic_fn_name, ExprSort, PureExpr, UnOp,
@@ -99,6 +99,8 @@ pub(crate) fn extract_recursive_call_args<'tcx>(
         }
     }
 
+    let lent = lent_locals(body, tcx);
+
     // Walk CFG from entry block, following edges and scoping assignments per-path.
     let mut sites = Vec::new();
     let visited = HashSet::new();
@@ -111,9 +113,93 @@ pub(crate) fn extract_recursive_call_args<'tcx>(
         self_def_id,
         &mut sites,
         tcx,
+        &lent,
     );
 
     sites
+}
+
+/// The locals whose own memory the body borrows `&mut` or raw anywhere (not a
+/// reborrow through a `Deref`), or borrows shared while their type may reach
+/// interior mutability.
+///
+/// The walk binds a local at its projection-free assignments and binds a
+/// non-recursive call's destination, nothing else. Through such a loan the
+/// local also changes at a store through a reference (`let r = &mut m;
+/// *r = 5`), inside a callee handed the loan (`set5(&mut m)`), and where drop
+/// glue writes it, at a `Drop` or inside a callee (`{ let _g = G(&mut m); }`,
+/// D-140); a recursive call handed it would be checked against the value from
+/// before (recursive_variant_reads_local_before_drop_glue_write.rs,
+/// recursive_variant_reads_local_before_borrow_write.rs). The walk forgets
+/// these locals at each such point (`forget_at_terminator`), and a read of a
+/// forgotten local is a fresh value. Without `tcx` (the walk's unit tests)
+/// the interior-mutability clause is not asked.
+fn lent_locals<'tcx>(body: &Body<'tcx>, tcx: Option<TyCtxt<'tcx>>) -> HashSet<Local> {
+    use rustc_middle::mir::{BorrowKind, RawPtrKind};
+    let mut lent = HashSet::new();
+    for data in body.basic_blocks.iter() {
+        for stmt in &data.statements {
+            let StatementKind::Assign((_, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            let (place, may_write) = match rvalue {
+                Rvalue::Ref(_, kind, place) => (place, matches!(kind, BorrowKind::Mut { .. })),
+                Rvalue::RawPtr(kind, place) => (place, !matches!(kind, RawPtrKind::Const)),
+                _ => continue,
+            };
+            if place.is_indirect() {
+                continue;
+            }
+            let interior = !may_write
+                && tcx.is_some_and(|tcx| {
+                    super::local_type_may_reach_interior_mutability(tcx, body, place.local)
+                });
+            if may_write || interior {
+                lent.insert(place.local);
+            }
+        }
+    }
+    lent
+}
+
+/// Forget what the terminator of `bb` may write behind the walk, after the
+/// call's arguments were read: every lent local when a callee is handed an
+/// argument it may write through (a `&mut`, a raw pointer, a value holding
+/// one, interior mutability), else what `locals_changed_by_handoff` names, the
+/// substitution walk's own answer at a `Drop` or a call whose drop glue may
+/// write (D-140). Without `tcx` every lent local is forgotten.
+fn forget_at_terminator<'tcx>(
+    body: &Body<'tcx>,
+    bb: BasicBlock,
+    tcx: Option<TyCtxt<'tcx>>,
+    lent: &HashSet<Local>,
+    local_exprs: &mut HashMap<Local, PureExpr>,
+) {
+    let terminator = body.basic_blocks[bb].terminator();
+    if !matches!(
+        terminator.kind,
+        TerminatorKind::Call { .. } | TerminatorKind::Drop { .. }
+    ) {
+        return;
+    }
+    let lends = |tcx: TyCtxt<'tcx>| {
+        matches!(&terminator.kind, TerminatorKind::Call { func, args, .. }
+        if crate::mir_analysis::extract::drop_glue_writes::call_may_write_through_args(
+            tcx, body, func, args,
+        ))
+    };
+    let changed = match tcx {
+        Some(tcx) if !lends(tcx) => {
+            crate::mir_analysis::extract::drop_glue_writes::locals_changed_by_handoff(
+                tcx, body, bb, terminator,
+            )
+            .unwrap_or_default()
+        }
+        _ => lent.clone(),
+    };
+    for local in changed {
+        local_exprs.remove(&local);
+    }
 }
 
 /// Recursive CFG walker for extracting recursive call arguments.
@@ -130,6 +216,7 @@ fn extract_recursive_calls_from_block<'tcx>(
     self_def_id: DefId,
     sites: &mut Vec<RecursiveCallSite>,
     tcx: Option<rustc_middle::ty::TyCtxt<'tcx>>,
+    lent: &HashSet<Local>,
 ) {
     if !visited.insert(bb) {
         return;
@@ -139,11 +226,27 @@ fn extract_recursive_calls_from_block<'tcx>(
 
     // Process statements in this block.
     for stmt in &bb_data.statements {
-        if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-            if place.projection.is_empty() {
-                let expr = translate_recursive_rvalue(rvalue, &local_exprs, body, tcx);
-                if let Some(expr) = expr {
+        if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
+            // A write the walk cannot translate, or one into a projection of
+            // the local (a field, or a store through a reference it holds),
+            // leaves the local's old value stale: it is unbound, not kept. A
+            // store through a reference may write any lent local.
+            let expr = place
+                .projection
+                .is_empty()
+                .then(|| translate_recursive_rvalue(rvalue, &local_exprs, body, tcx))
+                .flatten();
+            match expr {
+                Some(expr) => {
                     local_exprs.insert(place.local, expr);
+                }
+                None => {
+                    local_exprs.remove(&place.local);
+                }
+            }
+            if place.is_indirect() {
+                for local in lent {
+                    local_exprs.remove(local);
                 }
             }
         }
@@ -170,14 +273,18 @@ fn extract_recursive_calls_from_block<'tcx>(
                     .enumerate()
                     .map(|(idx, arg)| {
                         translate_recursive_call_arg(&arg.node, &local_exprs, body, tcx)
-                            .unwrap_or_else(|| PureExpr::Var(format!("arg{idx}"), None))
+                            .unwrap_or_else(|| {
+                                crate::mir_analysis::fresh_fallback_arg_var(idx, None)
+                            })
                     })
                     .collect();
                 sites.push(RecursiveCallSite {
                     call_args: translated,
                     path_conditions: path_conditions.clone(),
                 });
-            } else if destination.projection.is_empty() {
+            } else if !destination.projection.is_empty() {
+                local_exprs.remove(&destination.local);
+            } else {
                 // For non-recursive calls, record the destination local with
                 // the same `call_{N}` naming convention used by the main VC
                 // extraction pipeline. This ensures that call_assumptions
@@ -190,9 +297,10 @@ fn extract_recursive_calls_from_block<'tcx>(
                 };
                 local_exprs.insert(
                     dest_local,
-                    PureExpr::Var(format!("call_{}", dest_local.as_u32()), sort),
+                    PureExpr::Var(format!("$call_{}", dest_local.as_u32()), sort),
                 );
             }
+            forget_at_terminator(body, bb, tcx, lent, &mut local_exprs);
             // Continue to the call's return target (if any).
             if let Some(target_bb) = target {
                 extract_recursive_calls_from_block(
@@ -204,6 +312,7 @@ fn extract_recursive_calls_from_block<'tcx>(
                     self_def_id,
                     sites,
                     tcx,
+                    lent,
                 );
             }
         }
@@ -228,11 +337,13 @@ fn extract_recursive_calls_from_block<'tcx>(
                     self_def_id,
                     sites,
                     tcx,
+                    lent,
                 );
             }
         }
         // Linear successors: pass local_exprs along.
-        TerminatorKind::Goto { target } | TerminatorKind::Drop { target, .. } => {
+        TerminatorKind::Goto { target, .. } | TerminatorKind::Drop { target, .. } => {
+            forget_at_terminator(body, bb, tcx, lent, &mut local_exprs);
             extract_recursive_calls_from_block(
                 body,
                 *target,
@@ -242,6 +353,7 @@ fn extract_recursive_calls_from_block<'tcx>(
                 self_def_id,
                 sites,
                 tcx,
+                lent,
             );
         }
         TerminatorKind::Assert {
@@ -268,6 +380,7 @@ fn extract_recursive_calls_from_block<'tcx>(
                 self_def_id,
                 sites,
                 tcx,
+                lent,
             );
         }
         // FalseEdge/FalseUnwind: follow the real target.
@@ -282,6 +395,7 @@ fn extract_recursive_calls_from_block<'tcx>(
                 self_def_id,
                 sites,
                 tcx,
+                lent,
             );
         }
         // Terminal: no successors, no recursive calls possible.
@@ -328,6 +442,16 @@ fn translate_recursive_rvalue<'tcx>(
         Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _)
         | Rvalue::Ref(_, _, place)
         | Rvalue::CopyForDeref(place) => translate_structural_place(tcx, body, place, local_exprs),
+        // A float cast rounds, saturates or maps NaN: it is never its
+        // operand, and the typed translator above already gave it its IEEE
+        // meaning or refused it.
+        Rvalue::Cast(
+            rustc_middle::mir::CastKind::FloatToInt
+            | rustc_middle::mir::CastKind::IntToFloat
+            | rustc_middle::mir::CastKind::FloatToFloat,
+            _,
+            _,
+        ) => None,
         Rvalue::Cast(_, operand, _) => {
             translate_recursive_call_arg(operand, local_exprs, body, Some(tcx))
         }
@@ -384,7 +508,9 @@ fn ty_is_transparent_box_carrier(tcx: TyCtxt<'_>, ty: rustc_middle::ty::Ty<'_>) 
         return false;
     };
     let path = tcx.def_path_str(adt_def.did());
+    // `Box<T>`'s field 0 is its `BoxRaw<T>`, whose field 0 is the `NonNull<T>`.
     matches!(path.as_str(), "alloc::boxed::Box" | "std::boxed::Box")
+        || path.ends_with("boxed::BoxRaw")
         || path.ends_with("ptr::unique::Unique")
         || path.ends_with("ptr::non_null::NonNull")
         || path.ends_with("ptr::Unique")
@@ -406,20 +532,20 @@ fn call_targets_self<'tcx>(
     resolve_trait_impl_method(tcx, callee, args).is_some_and(|resolved| resolved == self_def_id)
 }
 
-fn extract_fn_def_with_args<'tcx>(func: &Operand<'tcx>) -> Option<(DefId, GenericArgsRef<'tcx>)> {
-    let Operand::Constant(box constant) = func else {
+fn extract_fn_def_with_args<'tcx>(func: &Operand<'tcx>) -> Option<(DefId, GenericArgs<'tcx>)> {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     let TyKind::FnDef(def_id, args) = constant.const_.ty().kind() else {
         return None;
     };
-    Some((*def_id, *args))
+    Some((*def_id, args.skip_binder()))
 }
 
 fn resolve_trait_impl_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: DefId,
-    args: GenericArgsRef<'tcx>,
+    args: GenericArgs<'tcx>,
 ) -> Option<DefId> {
     let assoc = tcx.opt_associated_item(callee_def_id)?;
     if !matches!(assoc.container, rustc_middle::ty::AssocContainer::Trait) {
@@ -446,7 +572,9 @@ fn resolve_trait_impl_method<'tcx>(
             continue;
         }
         for item in tcx.associated_items(impl_def_id).in_definition_order() {
-            if item.name() == method_name
+            // An async trait method's synthesized return type is an
+            // associated item with no name.
+            if item.opt_name() == Some(method_name)
                 && matches!(tcx.def_kind(item.def_id), rustc_hir::def::DefKind::AssocFn)
             {
                 return Some(item.def_id);

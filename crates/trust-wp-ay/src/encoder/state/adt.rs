@@ -57,8 +57,14 @@ impl AdtState {
     }
 
     /// Insert an ADT declaration if not already present.
+    /// The first declaration registered under `name` is kept; a later one
+    /// can only mark it as possibly holding a `&mut` (D-126).
     pub(crate) fn insert_decl_if_absent(&mut self, name: String, decl: AdtDecl) {
-        self.decls.entry(name).or_insert(decl);
+        let may_hold_a_borrow = decl.may_hold_a_borrow;
+        self.decls
+            .entry(name)
+            .and_modify(|kept| kept.may_hold_a_borrow |= may_hold_a_borrow)
+            .or_insert(decl);
     }
 
     pub(crate) fn decls_iter(&self) -> impl Iterator<Item = &AdtDecl> {

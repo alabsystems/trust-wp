@@ -17,7 +17,7 @@ use trust_wp_core::{
 };
 
 use super::super::{
-    prepare::{prepare_refinement_clauses, PreparedRefinementClauses},
+    prepare::{prepare_refinement_clauses, PreparedRefinementClauses, RefinementPrepareError},
     TraitRefinementRequest,
 };
 use crate::{
@@ -62,13 +62,14 @@ fn find_adt_path_by_short_name<'tcx>(
 
 #[derive(Default)]
 struct PrepareRefinementCallbacks {
-    prepared: Option<PreparedRefinementClauses>,
+    prepared: Option<Result<PreparedRefinementClauses, RefinementPrepareError>>,
     ran: bool,
     trait_requires: Vec<String>,
     trait_ensures: Vec<String>,
     base_requires: Vec<String>,
     base_ensures: Vec<String>,
     invariant_short_names: Vec<String>,
+    clauses_are_the_trait_s: bool,
 }
 
 impl Callbacks for PrepareRefinementCallbacks {
@@ -149,6 +150,8 @@ impl Callbacks for PrepareRefinementCallbacks {
             trait_contract: &trait_contract,
             base_requires: &base_requires,
             base_ensures: &base_ensures,
+            impl_requires_text: &self.base_requires,
+            impl_ensures_text: &self.base_ensures,
             type_invariant_defs: &type_invariant_defs,
             logic_fns_opt: None,
             mode_overrides_opt: None,
@@ -157,10 +160,12 @@ impl Callbacks for PrepareRefinementCallbacks {
             def_path: "test::InvariantRefinementImpl::keep",
             loc: "test.rs:1",
             verbose: false,
+            precondition_only: false,
+            clauses_are_the_trait_s: self.clauses_are_the_trait_s,
+            timeout: None,
         };
 
-        self.prepared =
-            Some(prepare_refinement_clauses(tcx, &req).expect("prepare refinement clauses"));
+        self.prepared = Some(prepare_refinement_clauses(tcx, &req));
         self.ran = true;
         Compilation::Stop
     }
@@ -195,6 +200,39 @@ fn collect_prepared_refinement_clauses_with_contracts_and_invariants(
     base_ensures: &[&str],
     invariant_short_names: &[&str],
 ) -> PreparedRefinementClauses {
+    try_prepare_refinement_clauses(
+        source,
+        trait_requires,
+        trait_ensures,
+        base_requires,
+        base_ensures,
+        invariant_short_names,
+    )
+    .expect("prepare refinement clauses")
+}
+
+fn try_prepare_refinement_clauses(
+    source: &str,
+    trait_requires: &[&str],
+    trait_ensures: &[&str],
+    base_requires: &[&str],
+    base_ensures: &[&str],
+    invariant_short_names: &[&str],
+) -> Result<PreparedRefinementClauses, RefinementPrepareError> {
+    try_prepare_refinement_clauses_as(
+        source,
+        [trait_requires, trait_ensures, base_requires, base_ensures],
+        invariant_short_names,
+        false,
+    )
+}
+
+fn try_prepare_refinement_clauses_as(
+    source: &str,
+    [trait_requires, trait_ensures, base_requires, base_ensures]: [&[&str]; 4],
+    invariant_short_names: &[&str],
+    clauses_are_the_trait_s: bool,
+) -> Result<PreparedRefinementClauses, RefinementPrepareError> {
     let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_dir = std::env::temp_dir().join(format!(
         "trust_wp_trait_refinement_prepare_{}_{}",
@@ -227,6 +265,7 @@ fn collect_prepared_refinement_clauses_with_contracts_and_invariants(
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
+        clauses_are_the_trait_s,
         ..PrepareRefinementCallbacks::default()
     };
     run_compiler(&args, &mut callbacks);
@@ -377,12 +416,12 @@ impl InvariantRefinement for InvariantRefinementImpl {
         prepared.trait_requires
     );
     assert!(
-        has_invariant_call(&prepared.trait_requires, "value", "Sum10"),
+        has_invariant_call(&prepared.trait_requires, "__trust_wp_p1", "Sum10"),
         "trait side should gain a type-invariant clause on the trait parameter: {:?}",
         prepared.trait_requires
     );
     assert!(
-        has_invariant_call(&prepared.impl_requires, "value", "Sum10"),
+        has_invariant_call(&prepared.impl_requires, "__trust_wp_p1", "Sum10"),
         "impl side should gain a normalized invariant clause matching the trait name: {:?}",
         prepared.impl_requires
     );
@@ -403,10 +442,68 @@ impl InvariantRefinement for InvariantRefinementImpl {
     );
 }
 
+/// An inherited contract's clauses are the trait's one text on both sides:
+/// they are premises and never goals, and naming a logic function does not
+/// refuse them. The goals types add (argument and result invariants) stay.
+/// The same clauses declared by the impl are refused on the logic function.
+#[test]
+fn test_prepare_refinement_clauses_inherited_clauses_are_premises_only() {
+    let source = r#"
+#![allow(dead_code)]
+
+pub struct Sum10(i32, i32);
+
+pub trait InvariantRefinement {
+    fn keep(&self, value: Sum10) -> Sum10;
+}
+
+pub struct InvariantRefinementImpl;
+
+impl InvariantRefinement for InvariantRefinementImpl {
+    fn keep(&self, x: Sum10) -> Sum10 {
+        x
+    }
+}
+"#;
+    let clauses: [&[&str]; 4] = [&["k(value)"], &["k(result)"], &["k(x)"], &["k(result)"]];
+
+    let prepared = try_prepare_refinement_clauses_as(source, clauses, &["Sum10"], true)
+        .expect("an inherited contract is not refused on the names it spells");
+    assert_eq!(prepared.premise_only_impl_requires, 1);
+    assert_eq!(prepared.premise_only_trait_ensures, 1);
+    assert!(
+        has_invariant_call(
+            &prepared.impl_requires[prepared.premise_only_impl_requires..],
+            "__trust_wp_p1",
+            "Sum10"
+        ),
+        "the argument invariant stays a precondition goal: {:?}",
+        prepared.impl_requires
+    );
+    assert!(
+        has_invariant_call(
+            &prepared.trait_ensures[prepared.premise_only_trait_ensures..],
+            "result",
+            "Sum10"
+        ),
+        "the result invariant stays a postcondition goal: {:?}",
+        prepared.trait_ensures
+    );
+
+    let declared = try_prepare_refinement_clauses_as(source, clauses, &["Sum10"], false);
+    assert!(
+        matches!(declared, Err(RefinementPrepareError::ScopeDependent { .. })),
+        "declared clauses naming a logic function are refused: {:?}",
+        declared.as_ref().err()
+    );
+}
+
 /// #2606 regression: refinement preparation must rewrite raw `invariant()`
 /// clauses to type-qualified methods before solving.
+/// User-written `.invariant()` is a method call whose resolution depends on
+/// the traits in scope: the refinement check refuses it.
 #[test]
-fn test_prepare_refinement_clauses_rewrites_user_written_invariant_methods() {
+fn test_prepare_refinement_clauses_refuses_user_written_invariant_methods() {
     let source = r#"
 #![allow(dead_code)]
 
@@ -425,88 +522,21 @@ impl InvariantRefinement for InvariantRefinementImpl {
 }
 "#;
 
-    let prepared = collect_prepared_refinement_clauses_with_contracts(
-        source,
-        &["value.invariant()"],
-        &["result.invariant()"],
-        &["x.invariant()"],
-        &["result.invariant()"],
-    );
-
-    assert!(
-        has_invariant_call(&prepared.trait_requires, "value", "Sum10"),
-        "trait requires should rewrite to the Sum10-qualified invariant method: {:?}",
-        prepared.trait_requires
-    );
-    assert!(
-        has_typed_invariant_call(&prepared.trait_requires, "value", "Sum10"),
-        "trait requires should preserve the typed receiver sort for invariant dispatch: {:?}",
-        prepared.trait_requires
-    );
-    assert!(
-        has_invariant_call(&prepared.trait_ensures, "result", "Sum10"),
-        "trait ensures should rewrite to the Sum10-qualified invariant method: {:?}",
-        prepared.trait_ensures
-    );
-    assert!(
-        has_typed_invariant_call(&prepared.trait_ensures, "result", "Sum10"),
-        "trait ensures should preserve the typed result sort for invariant dispatch: {:?}",
-        prepared.trait_ensures
-    );
-    assert!(
-        has_invariant_call(&prepared.impl_requires, "value", "Sum10"),
-        "impl requires should rewrite before normalization and keep the trait parameter name: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        has_typed_invariant_call(&prepared.impl_requires, "value", "Sum10"),
-        "impl requires should preserve the normalized typed receiver sort: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        has_invariant_call(&prepared.impl_ensures, "result", "Sum10"),
-        "impl ensures should rewrite to the Sum10-qualified invariant method: {:?}",
-        prepared.impl_ensures
-    );
-    assert!(
-        has_typed_invariant_call(&prepared.impl_ensures, "result", "Sum10"),
-        "impl ensures should preserve the typed result sort for invariant dispatch: {:?}",
-        prepared.impl_ensures
-    );
+    let refused =
+        try_prepare_refinement_clauses(source, &["true"], &[], &["x.invariant()"], &[], &["Sum10"]);
     assert!(
         matches!(
-            prepared.result_expr.as_ref(),
-            Some(PureExpr::Var(name, Some(ExprSort::Datatype(_)))) if name == "result"
+            refused,
+            Err(RefinementPrepareError::ScopeDependent { side: "impl requires", ref name })
+                if name == "method call `.invariant(..)`"
         ),
-        "post-refinement requests need a typed `result` binding to avoid fallback demotion: {:?}",
-        prepared.result_expr
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.trait_requires, "value"),
-        "trait requires should not retain a generic invariant() call: {:?}",
-        prepared.trait_requires
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.trait_ensures, "result"),
-        "trait ensures should not retain a generic invariant() call: {:?}",
-        prepared.trait_ensures
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.impl_requires, "value"),
-        "impl requires should not retain a generic invariant() call after normalization: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.impl_ensures, "result"),
-        "impl ensures should not retain a generic invariant() call: {:?}",
-        prepared.impl_ensures
+        "user-written .invariant() must be refused: {:?}",
+        refused.as_ref().err()
     );
 }
 
-/// #1296 regression: trait refinement must also rewrite structural `inv(...)`
-/// contracts, not just direct invariant methods.
 #[test]
-fn test_prepare_refinement_clauses_rewrites_structural_inv_calls() {
+fn test_prepare_refinement_clauses_refuses_user_written_inv_calls() {
     let source = r#"
 #![allow(dead_code)]
 
@@ -526,7 +556,7 @@ impl InvariantRefinement for InvariantRefinementImpl {
 }
 "#;
 
-    let prepared = collect_prepared_refinement_clauses_with_contracts_and_invariants(
+    let refused = try_prepare_refinement_clauses(
         source,
         &["inv(value)"],
         &["inv(result)"],
@@ -534,57 +564,17 @@ impl InvariantRefinement for InvariantRefinementImpl {
         &["inv(result)"],
         &["NonZero", "Sum10"],
     );
-
     assert!(
-        has_structural_match_on_var(&prepared.trait_requires, "value"),
-        "trait requires should rewrite to a structural match on the trait parameter: {:?}",
-        prepared.trait_requires
-    );
-    assert!(
-        has_structural_match_on_var(&prepared.trait_ensures, "result"),
-        "trait ensures should rewrite to a structural match on result: {:?}",
-        prepared.trait_ensures
-    );
-    assert!(
-        has_structural_match_on_var(&prepared.impl_requires, "value"),
-        "impl requires should normalize and rewrite to a structural match on the trait name: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        !has_structural_match_on_var(&prepared.impl_requires, "x"),
-        "impl requires should not retain the impl-only parameter name after normalization: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        has_structural_match_on_var(&prepared.impl_ensures, "result"),
-        "impl ensures should rewrite to a structural match on result: {:?}",
-        prepared.impl_ensures
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.trait_requires, "value"),
-        "trait requires should not retain a generic inv/value.invariant call: {:?}",
-        prepared.trait_requires
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.trait_ensures, "result"),
-        "trait ensures should not retain a generic inv/result.invariant call: {:?}",
-        prepared.trait_ensures
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.impl_requires, "value"),
-        "impl requires should not retain a generic inv/result.invariant call after normalization: {:?}",
-        prepared.impl_requires
-    );
-    assert!(
-        !has_plain_invariant_call(&prepared.impl_ensures, "result"),
-        "impl ensures should not retain a generic inv/result.invariant call: {:?}",
-        prepared.impl_ensures
+        matches!(
+            refused,
+            Err(RefinementPrepareError::ScopeDependent { side: "trait requires", ref name })
+                if name == "call `inv(..)`"
+        ),
+        "user-written inv(..) must be refused: {:?}",
+        refused.as_ref().err()
     );
 }
 
-/// #2611 regression: `&mut` invariant clauses must keep trait-name
-/// normalization in both the dereferenced precondition and final-value
-/// postcondition shapes.
 #[test]
 fn test_prepare_refinement_clauses_normalizes_mut_ref_invariant_pre_and_post_clauses() {
     let source = r#"
@@ -613,12 +603,12 @@ impl InvariantRefinement for InvariantRefinementImpl {
         prepared.trait_requires
     );
     assert!(
-        has_deref_invariant_call(&prepared.trait_requires, "value", "Sum10"),
+        has_deref_invariant_call(&prepared.trait_requires, "__trust_wp_p1", "Sum10"),
         "trait side should gain a dereferenced invariant clause on the trait parameter: {:?}",
         prepared.trait_requires
     );
     assert!(
-        has_deref_invariant_call(&prepared.impl_requires, "value", "Sum10"),
+        has_deref_invariant_call(&prepared.impl_requires, "__trust_wp_p1", "Sum10"),
         "impl side should normalize the dereferenced invariant clause to the trait name: {:?}",
         prepared.impl_requires
     );
@@ -628,12 +618,12 @@ impl InvariantRefinement for InvariantRefinementImpl {
         prepared.impl_requires
     );
     assert!(
-        has_final_invariant_call(&prepared.trait_ensures, "value", "Sum10"),
+        has_final_invariant_call(&prepared.trait_ensures, "__trust_wp_p1", "Sum10"),
         "trait side should gain a final-value invariant clause for the mutable parameter: {:?}",
         prepared.trait_ensures
     );
     assert!(
-        has_final_invariant_call(&prepared.impl_ensures, "value", "Sum10"),
+        has_final_invariant_call(&prepared.impl_ensures, "__trust_wp_p1", "Sum10"),
         "impl side should normalize the final-value invariant clause to the trait name: {:?}",
         prepared.impl_ensures
     );
@@ -689,6 +679,9 @@ impl Callbacks for PrepareRangeParityCallbacks {
             trait_contract: &trait_contract,
             base_requires: &base_requires,
             base_ensures: &[],
+            // Range clauses are built from rustc types, not from text.
+            impl_requires_text: &[],
+            impl_ensures_text: &[],
             type_invariant_defs: &type_invariant_defs,
             logic_fns_opt: None,
             mode_overrides_opt: None,
@@ -697,6 +690,9 @@ impl Callbacks for PrepareRangeParityCallbacks {
             def_path: "test::RangeRefinementImpl::keep",
             loc: "test.rs:1",
             verbose: false,
+            precondition_only: false,
+            clauses_are_the_trait_s: false,
+            timeout: None,
         };
 
         self.prepared =
@@ -774,22 +770,42 @@ impl RangeRefinement for RangeRefinementImpl {
         prepared.trait_requires
     );
     assert!(
-        has_view_var_bound(&prepared.trait_requires, "value", BinOp::Ge, &i32_min),
+        has_view_var_bound(
+            &prepared.trait_requires,
+            "__trust_wp_p1",
+            BinOp::Ge,
+            &i32_min
+        ),
         "trait side should gain the signed lower-bound clause: {:?}",
         prepared.trait_requires
     );
     assert!(
-        has_view_var_bound(&prepared.trait_requires, "value", BinOp::Le, &i32_max),
+        has_view_var_bound(
+            &prepared.trait_requires,
+            "__trust_wp_p1",
+            BinOp::Le,
+            &i32_max
+        ),
         "trait side should gain the signed upper-bound clause: {:?}",
         prepared.trait_requires
     );
     assert!(
-        has_view_var_bound(&prepared.impl_requires, "value", BinOp::Ge, &i32_min),
+        has_view_var_bound(
+            &prepared.impl_requires,
+            "__trust_wp_p1",
+            BinOp::Ge,
+            &i32_min
+        ),
         "impl side should keep the lower-bound clause after parameter normalization: {:?}",
         prepared.impl_requires
     );
     assert!(
-        has_view_var_bound(&prepared.impl_requires, "value", BinOp::Le, &i32_max),
+        has_view_var_bound(
+            &prepared.impl_requires,
+            "__trust_wp_p1",
+            BinOp::Le,
+            &i32_max
+        ),
         "impl side should keep the upper-bound clause after parameter normalization: {:?}",
         prepared.impl_requires
     );

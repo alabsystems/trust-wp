@@ -142,6 +142,7 @@ fn recursive_open_probe_skip_matches_qualified_and_method_calls_only_when_refere
             mutation_continued_params: None,
             body_div_obligations: &body_div_obligations,
             fresh_base_recheck: None,
+            literal_false_base_recheck: None,
             slice_length_stable_vars: None,
             base_recheck_pathology: std::cell::Cell::new(false),
         };
@@ -166,6 +167,7 @@ fn recursive_open_probe_skip_matches_qualified_and_method_calls_only_when_refere
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -258,6 +260,7 @@ fn store_preferred_evidence_for_test() {
             claim_identity: None,
             problem_hash: None,
             native_problem_json: None,
+            slice_generation: current_preferred_evidence_slice_generation(),
         });
     });
 }
@@ -327,6 +330,7 @@ fn test_closure_fn_to_fnmut_precheck_rejects_non_identity_res_state() {
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -361,6 +365,7 @@ fn test_closure_fn_to_fnmut_precheck_allows_identity_res_state() {
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -416,6 +421,7 @@ fn test_type_invariant_obligation_detection() {
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -499,6 +505,7 @@ fn test_triangular_sum_postcondition_consequence_for_inclusive_range_start_one()
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -571,6 +578,7 @@ fn test_triangular_sum_postcondition_consequence_uses_loop_exit_result_bridge() 
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -655,6 +663,7 @@ fn test_mut_borrow_final_disequality_consequence_for_inc_max_3_network() {
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -700,6 +709,7 @@ fn test_mut_borrow_final_disequality_consequence_fails_closed_for_unordered_valu
         mutation_continued_params: None,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -966,6 +976,7 @@ fn test_obligation_slice_context_empty() {
         mutation_continued_params: None,
         body_div_obligations: &[],
         fresh_base_recheck: None,
+        literal_false_base_recheck: None,
         slice_length_stable_vars: None,
         base_recheck_pathology: std::cell::Cell::new(false),
     };

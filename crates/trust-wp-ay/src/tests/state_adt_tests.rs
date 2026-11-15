@@ -138,6 +138,21 @@ fn insert_decl_if_absent_does_not_overwrite() {
     assert_eq!(decl.adt_name, "first", "or_insert should keep first entry");
 }
 
+/// A later declaration under a kept name can only add the mark that a value
+/// may hold a `&mut`, never remove it (D-126).
+#[test]
+#[timeout(30000)]
+fn insert_decl_if_absent_keeps_the_borrow_mark_of_either() {
+    let mut state = AdtState::new();
+    state.insert_decl_if_absent("A".to_string(), make_simple_decl("A"));
+    state.insert_decl_if_absent(
+        "A".to_string(),
+        make_simple_decl("A").with_may_hold_a_borrow(true),
+    );
+    state.insert_decl_if_absent("A".to_string(), make_simple_decl("A"));
+    assert!(state.decl_for_name("A").unwrap().may_hold_a_borrow);
+}
+
 // --- decl_for_name bare-name fallback ---
 
 #[test]

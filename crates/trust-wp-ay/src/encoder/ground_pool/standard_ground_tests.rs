@@ -166,12 +166,11 @@ fn test_standard_ground_seq_len_nonneg() {
 /// scope 0. `check_sat()` flushes `assert_standard_ground_instances()`
 /// every time the encoder is at scope 0, and a single VC reaches scope 0
 /// multiple times (axiom-free probe, ground-pool flush, tiered probe,
-/// full solve, retry). Before this fix, each cycle re-asserted the same
+/// full solve, retry). Without dedup each cycle re-asserts the same
 /// `len(s) >= 0`, `reverse(seq_empty) = seq_empty`, and `len(concat) =
-/// len(s1) + len(s2)` facts, inflating the assertion count by ~3-6x per
-/// VC and contributing to the 100doors inner-loop preservation hitting
-/// ay #8596 false_term preprocessing pathology. See
-/// `designs/2026-05-19-100doors-vec-sort-leakage.md`.
+/// len(s1) + len(s2)` facts, inflating the assertion count several-fold per
+/// VC and driving the 100doors inner-loop preservation query into ay's
+/// false_term preprocessing pathology (ay #8596).
 #[test]
 #[timeout(30000)]
 fn test_standard_ground_seq_axioms_deduped_across_check_sat_cycles() {
@@ -1486,7 +1485,7 @@ fn test_standard_ground_fset_difference_contains_matches_alias_receiver() {
 /// unbudgeted count would be ~600+ (each insert produces 3 base assertions
 /// plus 2 per matching contains entry plus 2 per matching lookup entry).
 /// The effective budget caps the total at 80 when the shared remaining budget
-/// is larger than the historical family cap. (#2707)
+/// is larger than the FMap per-family cap. (#2707)
 #[test]
 #[timeout(30000)]
 fn test_fmap_internal_budget_insert_contains_capped_at_80() {
@@ -1578,7 +1577,7 @@ fn test_fmap_internal_budget_insert_contains_capped_at_80() {
 /// assertions (3 contains + 2 lookup per merge-contains pair). With 5 merges
 /// and 20 contains entries per merge, the unbudgeted count would be ~500.
 /// The effective budget caps the total at 80 when the shared remaining budget
-/// is larger than the historical family cap. (#2707)
+/// is larger than the FMap per-family cap. (#2707)
 #[test]
 #[timeout(30000)]
 fn test_fmap_internal_budget_merge_contains_capped_at_80() {

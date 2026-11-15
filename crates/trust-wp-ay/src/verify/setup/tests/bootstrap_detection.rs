@@ -66,3 +66,6 @@ mod filter_type_invariants_unqualified;
 mod predeclare_collected_vars;
 #[cfg(test)]
 mod quantifier_detection;
+
+#[cfg(test)]
+mod fset_recursive_body;

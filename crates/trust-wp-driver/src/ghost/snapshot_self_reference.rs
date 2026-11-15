@@ -99,7 +99,7 @@ fn has_recursive_snapshot_mut_borrow_inner<'tcx>(
                 })
                 || adt_def.variants().iter().any(|variant| {
                     variant.fields.iter().any(|field| {
-                        let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                        let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                         has_recursive_snapshot_mut_borrow_inner(
                             tcx,
                             root_def_id,
@@ -147,7 +147,7 @@ fn type_contains_adt_def_inner<'tcx>(
                     .any(|arg_ty| type_contains_adt_def_inner(tcx, arg_ty, root_def_id, visiting))
                 || adt_def.variants().iter().any(|variant| {
                     variant.fields.iter().any(|field| {
-                        let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                        let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                         type_contains_adt_def_inner(tcx, field_ty, root_def_id, visiting)
                     })
                 })

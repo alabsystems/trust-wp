@@ -51,7 +51,7 @@ fn sample_nullary_enum_adt_decls() -> trust_wp_core::logic::AdtDecls {
 
 /// User-defined enum constructor in a return expression should encode
 /// natively when ADT metadata is registered, without requiring a prior
-/// match declaration. (#1982, Slice 5)
+/// match declaration. (#1982)
 ///
 /// Scenario: enum Shape { Circle(i32), Square(i32) }
 ///   requires: (none)
@@ -94,7 +94,7 @@ fn test_nullary_enum_constructor_without_match_via_adt_decls() {
     )
     .unwrap_or_else(|err| panic!("Verification should not error: {err:?}"));
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
+    // KNOWN-CLASS PIN (upstream proof-trusted certification gap): the verdict
     // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
@@ -105,7 +105,7 @@ fn test_nullary_enum_constructor_without_match_via_adt_decls() {
 }
 
 /// Two distinct enum constructors should not be equal even when both carry
-/// the same payload. (#1982, Slice 5)
+/// the same payload. (#1982)
 ///
 /// Scenario: enum Shape { Circle(i32), Square(i32) }
 ///   requires: (none)

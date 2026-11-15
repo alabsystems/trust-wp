@@ -20,9 +20,15 @@ mod traversal;
 use super::pure_expr::PureExpr;
 
 impl PureExpr {
-    /// Transform a postcondition for mutable borrow verification.
+    /// Rewrite every `*x` outside `old(..)` of a `&mut` param to `^x`,
+    /// unconditionally: the pre-Creusot dialect's reading.
     ///
-    /// In user-facing syntax, postconditions like `*x == old(*x) + 1` mean:
+    /// No contract clause is read through this: a clause is in that dialect
+    /// only when it names a `&mut` param inside `old(..)`, which
+    /// [`crate::formula::elaborate::postcondition_states`] decides for every
+    /// lane before it rewrites. What is read through this is a body term's
+    /// value in the final state (a returned projection's prophecy). In that
+    /// dialect, `*x == old(*x) + 1` means:
     /// - `*x` refers to the final value (when the borrow ends)
     /// - `old(*x)` refers to the initial value (at function entry)
     ///
@@ -75,6 +81,22 @@ impl PureExpr {
         mut_ref_params: &std::collections::HashSet<String>,
     ) -> PureExpr {
         mut_refs::transform_postcondition_for_mut_refs(self, mut_ref_params)
+    }
+
+    /// [`Self::transform_postcondition_for_mut_refs`] that keeps `*p` a
+    /// current (entry) read for every param in `keep_current` (params whose
+    /// borrow is lent into the return value).
+    #[must_use]
+    pub fn transform_postcondition_for_mut_refs_keeping_current(
+        &self,
+        mut_ref_params: &std::collections::HashSet<String>,
+        keep_current: &std::collections::HashSet<String>,
+    ) -> PureExpr {
+        mut_refs::transform_postcondition_for_mut_refs_keeping_current(
+            self,
+            mut_ref_params,
+            keep_current,
+        )
     }
 
     /// Transform a postcondition for `FnMut` closure captures.

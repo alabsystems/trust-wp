@@ -37,8 +37,10 @@ pub(crate) fn ty_to_expr_sort(ty: rustc_middle::ty::Ty<'_>) -> Option<ExprSort> 
         // Generic type parameter → opaque uninterpreted sort. Prevents collapse
         // to Int which causes sort_fallback demotions and silent unsoundness. (#2062)
         TyKind::Param(param) => Some(ExprSort::TypeParam(intern_sort_name(param.name.as_str()))),
-        // Float types → SMT Real (exact rational arithmetic, no IEEE 754). (#1802)
-        TyKind::Float(_) => Some(ExprSort::Float),
+        // An `f32`/`f64` is an IEEE-754 value of its format; an `f16`/`f128`
+        // an element of its format's uninterpreted sort, which no integer
+        // operator reads.
+        TyKind::Float(float_ty) => Some(super::float::float_ty_sort(*float_ty)),
         // `dyn Trait` types → opaque uninterpreted sort. Without `TyCtxt` we
         // cannot resolve the principal trait name, so use a generic placeholder.
         // This prevents sort_fallback_to_int (SortFallbackToInt unsoundness)
@@ -61,10 +63,14 @@ fn is_predcell_ty<'tcx>(
     let TyKind::Adt(adt_def, _) = ty.kind() else {
         return false;
     };
-    tcx.def_path_str(adt_def.did())
-        .rsplit("::")
-        .next()
-        .is_some_and(|name| name == "PredCell")
+    // Provenance: the name is a suffix match; a local `PredCell` must not
+    // receive the spec-library PredCell slice sort.
+    crate::provenance::is_spec_library_item(tcx, adt_def.did())
+        && tcx
+            .def_path_str(adt_def.did())
+            .rsplit("::")
+            .next()
+            .is_some_and(|name| name == "PredCell")
 }
 
 fn predcell_collection_sort<'tcx>(
@@ -83,7 +89,7 @@ fn transparent_wrapper_inner_sort<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     adt_def: rustc_middle::ty::AdtDef<'tcx>,
     def_id: rustc_hir::def_id::DefId,
-    substs: &'tcx rustc_middle::ty::List<rustc_middle::ty::GenericArg<'tcx>>,
+    substs: rustc_middle::ty::GenericArgs<'tcx>,
 ) -> Option<ExprSort> {
     if adt_def.is_box() {
         let inner_ty = substs.types().next()?;
@@ -193,7 +199,7 @@ pub(crate) fn ty_to_expr_sort_enriched<'tcx>(
     match ty.kind() {
         TyKind::Adt(adt_def, substs) => {
             if let Some(inner_sort) =
-                transparent_wrapper_inner_sort(tcx, *adt_def, adt_def.did(), substs)
+                transparent_wrapper_inner_sort(tcx, *adt_def, adt_def.did(), *substs)
             {
                 return Some(inner_sort);
             }
@@ -262,7 +268,7 @@ pub(crate) fn ty_to_expr_sort_enriched<'tcx>(
             }
             match tcx.try_normalize_erasing_regions(
                 TypingEnv::fully_monomorphized(),
-                rustc_middle::ty::Unnormalized::new_wip(ty),
+                rustc_middle::ty::set_aliases_to_non_rigid(tcx, ty),
             ) {
                 Ok(norm_ty) if norm_ty != ty => ty_to_expr_sort_enriched(tcx, norm_ty),
                 _ => Some(ExprSort::TypeParam(intern_sort_name(&ty.to_string()))),

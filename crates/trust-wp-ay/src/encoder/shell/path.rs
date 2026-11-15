@@ -180,8 +180,9 @@ impl AYEncoder {
         result
     }
 
-    /// Run `f` with the encoder in ASSUMPTION position: shift-amount range
-    /// obligations are not collected for expressions encoded inside `f`.
+    /// Run `f` with the encoder in ASSUMPTION position: shift-amount range and
+    /// divisor obligations are not collected for expressions encoded inside
+    /// `f`.
     ///
     /// Assumption-position expressions (preconditions, `LetAssume`
     /// assumptions, path-condition facts) re-state what an already-verified

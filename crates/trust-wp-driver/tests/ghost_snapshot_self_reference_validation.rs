@@ -4,21 +4,21 @@
 
 //! Integration tests for Snapshot self-reference rejection (#2686 / bug/436_2).
 
-use std::{path::Path, process::Command};
+use std::path::Path;
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/ghost_snapshot_self_reference_validation_tests");
-    Command::new("cargo")
+    nested_cargo("check")
         .current_dir(fixture_dir("ghost_snapshot_self_reference_validation"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for snapshot self-reference fixture")
+        .expect("failed to run targo check for snapshot self-reference fixture")
 }
 
 #[test]

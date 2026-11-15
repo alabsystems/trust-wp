@@ -239,19 +239,18 @@ fn test_canonicalize_mut_ref_view_recursion() {
         result.is_ok(),
         "View with canonicalized Var should not cause encoding panic: {result:?}"
     );
-    // `verify_mut_borrow_function` now aliases `old_{name}_current_view` to
-    // `{name}_current_view`, so this identity body verifies successfully.
+    // `verify_mut_borrow_function` aliases `old_{name}_current_view` to
+    // `{name}_current_view`, so this identity body verifies.
     //
-    // KNOWN-CLASS PIN (2026-08-23 mut_ref drift adjudication): since ay's
-    // mandatory strict UNSAT certification (0.7 line), this VC computes UNSAT
-    // but its certificate carries an unverified premiseless trust step
-    // ("step t0 uses unverified trust rule"), so the Verified demotes to
-    // `Unknown(ProofTrusted)` — the sound direction. The encoding property
-    // this test guards is intact; the gap is upstream certificate coverage
-    // (ay docs/ay-asks 2026-08-23 premiseless-Trust census). Retire the
-    // `ProofTrusted` tolerance when the class closes upstream and this VC
-    // certifies again. Every other outcome (Failed/CE, other Unknowns) still
-    // fails the test.
+    // KNOWN-CLASS PIN: under ay's mandatory strict UNSAT certification this
+    // VC computes UNSAT but its certificate carries an unverified premiseless
+    // trust step ("step t0 uses unverified trust rule"), so the Verified
+    // demotes to `Unknown(ProofTrusted)` — the sound direction. The encoding
+    // property this test guards is intact; the gap is upstream certificate
+    // coverage. Retire the `ProofTrusted` tolerance when the class closes
+    // upstream and this VC certifies again. Every other outcome (Failed/CE,
+    // other Unknowns) still fails the test. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     let vr = result.unwrap();
     assert!(
         matches!(
@@ -372,8 +371,9 @@ fn test_canonicalize_mut_ref_match_arm_shadowing() {
 /// }
 /// ```
 ///
-/// Before the fix, bare `Var("ma")` in `result == ma` produced an
-/// unconstrained SMT variable, causing non-deterministic verification.
+/// Without `transform_postcondition_for_mut_refs`, bare `Var("ma")` in
+/// `result == ma` encodes as an unconstrained SMT variable instead of
+/// `ma_current`, and verification is non-deterministic.
 #[test]
 #[timeout(30000)]
 fn test_verify_take_max_reference_equality() {

@@ -40,7 +40,7 @@ pub(super) fn handle_mapping_from_closure<'tcx>(
     } = call_site;
     let dest_ty = body.local_decls[destination.local].ty;
     let result_var = PureExpr::Var(
-        format!("call_{}", destination.local.as_u32()),
+        format!("$call_{}", destination.local.as_u32()),
         ty_to_expr_sort_enriched(tcx, dest_ty),
     );
 
@@ -177,12 +177,33 @@ pub(super) fn handle_map_inv_from_closure<'tcx>(
     } = call_site;
 
     let dest_ty = body.local_decls[destination.local].ty;
+    // Review S1: the symbol names THIS `map_inv` call site, not the
+    // destination local (`call_<dest>` is shared by every call writing that
+    // local, e.g. both branches of an `if`). A collect receiver bound to it
+    // identifies exactly one `map_inv` call.
     let result_var = PureExpr::Var(
-        format!("call_{}", destination.local.as_u32()),
+        format!(
+            "$call_{}_mapinv_bb{}",
+            destination.local.as_u32(),
+            next_bb.as_u32()
+        ),
         ty_to_expr_sort_enriched(tcx, dest_ty),
     );
 
-    record_map_inv_closure_ensures(tcx, body, args, ctx, &local_exprs, &result_var, effects);
+    // A call site whose terminator block cannot be identified records no
+    // info (completeness loss only).
+    if let Some(call_block) = super::super::collect_gate::call_block(body, destination, next_bb) {
+        record_map_inv_closure_ensures(
+            tcx,
+            body,
+            args,
+            ctx,
+            &local_exprs,
+            &result_var,
+            call_block,
+            effects,
+        );
+    }
 
     local_exprs.insert(destination.local, result_var);
     wrap_projected_facts(
@@ -219,6 +240,7 @@ fn record_map_inv_closure_ensures<'tcx>(
     ctx: &BlockExtractionContext<'_>,
     enclosing_local_exprs: &HashMap<Local, PureExpr>,
     result_var: &PureExpr,
+    call_block: BasicBlock,
     effects: &mut CallEffects,
 ) {
     // args[0] = inner iterator, args[1] = mapping closure.
@@ -267,6 +289,7 @@ fn record_map_inv_closure_ensures<'tcx>(
 
     effects.record_map_inv_closure(
         result_var.clone(),
+        call_block,
         produced_len,
         produced_len_guard,
         ensures_exprs,
@@ -295,9 +318,10 @@ fn range_produced_len<'tcx>(
     let rustc_middle::ty::TyKind::Adt(adt_def, _) = recv_ty.kind() else {
         return None;
     };
-    let path = tcx.def_path_str(adt_def.did());
-    if path != "core::ops::range::Range" && path != "core::ops::Range" && path != "std::ops::Range"
-    {
+    // Identity by lang item, never by printed path: `def_path_str` omits the
+    // crate for local items, so a user `mod core { mod ops { struct Range } }`
+    // would print as `core::ops::Range`.
+    if !tcx.is_lang_item(adt_def.did(), rustc_attr_ir::LangItem::Range) {
         return None;
     }
 
@@ -432,5 +456,5 @@ pub(in crate::mir_analysis::extract) fn collect_equality_substitutions(
 
 /// Check if a variable name is a call result variable (e.g., `call_0`, `_call_4`).
 pub(in crate::mir_analysis::extract) fn is_call_result_var(name: &str) -> bool {
-    name.starts_with("call_") || name.starts_with("_call_")
+    name.starts_with("$call_") || name.starts_with("$_call_")
 }

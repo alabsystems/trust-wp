@@ -381,7 +381,7 @@ fn test_zero_param_opaque_lemma_ensures_still_asserted() {
 ///
 /// Models a function with two ensures:
 /// 1. result > x (encodable)
-/// 2. result == Float(NaN) (unencodable — try_real_const rejects NaN)
+/// 2. result == NaN (unencodable: `result` is an integer and NaN a float)
 ///
 /// The first ensures should still be available as a spec axiom.
 #[test]
@@ -391,8 +391,7 @@ fn test_partial_ensures_failure_emits_surviving_axioms() {
 
     let mut encoder = AYEncoder::new_with_quantifiers();
 
-    // Encodable ensures + unencodable ensures (Float NaN)
-    // Updated for #985: closures now encode conservatively, so Float(NaN) is used.
+    // Encodable ensures + an ensures equating an integer with a float.
     let encodable = gt(var("result"), var("x"));
     let unencodable = eq(
         var("result"),
@@ -447,7 +446,7 @@ fn test_all_ensures_fail_still_registers_function() {
 
     let mut encoder = AYEncoder::new_with_quantifiers();
 
-    // Updated for #985: closures now encode conservatively, so Float(NaN/Inf) is used.
+    // Each ensures equates the integer `result` with a float.
     let unencodable_1 = eq(
         var("result"),
         PureExpr::Float(trust_wp_core::formula::FloatBits::from_f64(f64::NAN)),

@@ -19,20 +19,26 @@ pub(self) use trust_wp_core::formula::PureExpr;
 mod call_classification;
 mod data;
 mod entry;
+mod field_writes;
 mod finality;
+mod lent;
 mod nested_transfer;
 mod place_utils;
 mod spec_advancement;
+mod stale_final;
 mod traversal;
 pub(in crate::mir_analysis) mod type_analysis;
 
+pub(in crate::mir_analysis) use call_classification::strip_generics;
 #[cfg(test)]
-use call_classification::strip_generics;
+pub(crate) use data::IndexedWrite;
+pub(crate) use data::MutBorrowBody;
 use data::{BlockResult, MutBorrowAccumulators, MutBorrowBlockContext, MutBorrowTraversalState};
-pub(crate) use data::{IndexedWrite, MutBorrowBody};
 pub(crate) use entry::extract_mut_borrow_body;
 #[cfg(test)]
 use entry::make_typed_deref_expr;
+pub(in crate::mir_analysis) use lent::{is_freeze, may_carry_borrow};
+pub(crate) use stale_final::params_with_stale_call_final_credit;
 use traversal::{process_statements, process_terminator};
 pub(crate) use type_analysis::{
     collect_mut_ref_paths_with_tcx, type_contains_mut_ref_with_tcx,
@@ -62,7 +68,7 @@ fn extract_mut_borrow_from_block<'tcx>(
     process_statements(ctx, &bb_data.statements, &mut state, accum);
 
     // Process terminator (traversal/terminator.rs)
-    process_terminator(ctx, bb_data.terminator(), state, accum)
+    process_terminator(ctx, bb, bb_data.terminator(), state, accum)
 }
 
 #[cfg(test)]

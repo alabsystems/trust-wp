@@ -109,6 +109,8 @@ fn test_loop_ctx_parity_with_mode_overrides() {
             adt_field_ranges: None,
             loop_element_borrow_vars: vec![],
             bridge_facts: vec![],
+            condition_facts: vec![],
+            stated_invariants: None,
         },
     };
     let result_ctx = verify_loop_invariant(&ctx).unwrap();

@@ -41,6 +41,7 @@
 //! - `memory_verification`: Memory verification: pipeline growth, model scaling, pool bounds (#901)
 //! - `memory_lifecycle_proofs`: Memory lifecycle, panic isolation, and resource release proofs (#901)
 //! - `memory_raii_guards`: RAII guard state invariants, encoder state isolation, scaling bounds (#901)
+//! - `opaque_enum_read_before_match`: a refutation over a std Option a premise read before its match split is withheld (D-218)
 //! - `option_result_shared_spec_regressions`: Option/Result shared spec regression tests
 //! - `param_sort_infer_nesting`: Seq sort inference through PureExpr nesting variants (#1552)
 //! - `produces_transitivity`: semantic regression for `produces` transitivity (#934)
@@ -140,6 +141,7 @@ mod memory_verification;
 mod memory_walker_depth_proofs;
 mod method_sort_parity;
 mod mut_ref_variable_measurement;
+mod opaque_enum_read_before_match;
 mod option_result_shared_spec_regressions;
 mod param_sort_infer_nesting;
 #[cfg(feature = "performance-tests")]
@@ -183,3 +185,28 @@ mod unsoundness_pipeline;
 mod verification;
 mod verification_closure;
 mod verify_scaling_proofs;
+
+/// Did the verifier REJECT this obligation?
+///
+/// Two verdicts qualify, and only two: `Failed`, a refutation backed by a
+/// validated counterexample model, and the `Unknown` that
+/// `apply_mandatory_refutation_authority` leaves when it withholds one for
+/// want of that model. Both leave the obligation un-verified and both keep a
+/// non-zero exit; what separates them is only whether a counterexample was
+/// computed, which is a claim about evidence, not about the program.
+///
+/// Everything else is NOT a rejection: `Verified`, and every ordinary
+/// `Unknown` (timeout, vacuity, incompleteness). A test that asserted `Failed`
+/// and now asserts this keeps its teeth — it still fails if the obligation
+/// verifies, and it still fails if the solver merely ran out of budget.
+pub(crate) fn rejected(result: &crate::VerificationResult) -> bool {
+    matches!(result, crate::VerificationResult::Failed(_)) || crate::is_withheld_refutation(result)
+}
+
+/// [`rejected`], for the call sites that keep the encoder's `Result`.
+///
+/// An `Err` is an encoding error, never a rejection: it says trust-wp could
+/// not state the obligation, not that the program violates it.
+pub(crate) fn rejected_ok<E>(result: &Result<crate::VerificationResult, E>) -> bool {
+    result.as_ref().is_ok_and(rejected)
+}

@@ -34,6 +34,7 @@ pub(super) fn inject_post_loop_final_values(
         mutation_continued_params: HashSet::new(),
         nested_slot_resolutions: vec![],
         nested_transfer_params: HashSet::new(),
+        lent_path_resolutions: vec![],
     });
     trace!(
         "injected post-loop deref final values into mut_borrow_body for \

@@ -173,10 +173,13 @@ fn test_chained_comparison_equivalence() {
 
 #[test]
 fn test_cast_equivalence() {
-    let input = "result == p as *const T";
+    let input = "result == p as u8 + (q + 1) as i64";
     let expr = parse_ok(input);
     let spanned = parse_spanned_ok(input);
     assert_eq!(expr, spanned.expr);
+    // A raw-pointer cast is a pending marker in both parsers.
+    let input = "result == p as *const T";
+    assert_eq!(parse_ok(input), parse_spanned_ok(input).expr);
 }
 
 #[test]
@@ -435,7 +438,7 @@ fn test_parse_closure_no_params() {
     );
     let expr = result.unwrap();
     if let PureExpr::Closure { params, body } = &expr {
-        assert!(params.is_empty());
+        assert_eq!(params.as_slice(), []);
         assert_eq!(**body, PureExpr::Bool(true));
     } else {
         panic!("expected Closure, got {expr:?}");
@@ -599,6 +602,39 @@ fn test_parse_body_with_leading_exprs_returns_method_calls() {
         &leading[1],
         PureExpr::MethodCall { method, .. } if method == "lemma_sum_nonneg"
     ));
+}
+
+/// A logic body's `let` that binds nothing keeps its value as a statement:
+/// the calls in it owe their preconditions
+/// (logic_fn_callee_precondition_wildcard_let.rs).
+#[test]
+fn binding_free_let_keeps_its_value_where_statements_are_preserved() {
+    let call = PureExpr::LogicFnCall {
+        name: "f".into(),
+        args: vec![PureExpr::Var("x".into(), None)],
+    };
+    for body in [
+        "let _ = f(x); 0",
+        "{ let _ = f(x); 0 }",
+        "{ let (_, _) = f(x); 0 }",
+    ] {
+        let (leading, trailing) = parse_contract_body_with_leading_exprs(body).unwrap();
+        assert!(leading.is_empty(), "{body}");
+        assert_eq!(
+            trailing,
+            PureExpr::Let {
+                var: "$stmt0".into(),
+                value: std::sync::Arc::new(call.clone()),
+                body: std::sync::Arc::new(PureExpr::Int(0)),
+            },
+            "{body}"
+        );
+    }
+    // A contract, which preserves no statement, still reads through it.
+    assert_eq!(
+        parse_contract("{ let _ = f(x); 0 }").unwrap(),
+        PureExpr::Int(0)
+    );
 }
 
 #[test]

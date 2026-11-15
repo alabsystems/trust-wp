@@ -408,32 +408,17 @@ fn new_encoder_for_track_with_arrays_selects_expected_logic() {
         Logic::QfLia,
         Sort::seq(Sort::Int),
     );
-    // RESTORED EXPECTATION (#133 mass unit adjudication, 2026-08-27).
-    //
-    // History, because this literal has now moved twice. 8f30b1b (2026-08-12)
-    // first asserted `Sort::Uninterpreted("Seq")` as the paired half of
-    // widening the uninterpreted-carrier forcing to `Logic::All | Logic::Uflia`.
-    // f820973 (2026-08-23) reverted that forcing to `Logic::All` only and
-    // deliberately left this pin failing rather than edit a test in the same
-    // commit. 1d95e9f (2026-08-24) then retired the pin to `Sort::seq(Sort::Int)`
-    // — but it was measured in a worktree branched from 375718e, which did NOT
-    // contain 758135f (2026-08-23 22:59, "thread the Seq carrier so the
-    // quantified track keeps checkable proofs"). 758135f is the commit that
-    // made this exact case take the certifiable carrier:
     // `new_encoder_for_track_with_arrays` calls `use_certifiable_seq_carrier()`
     // on the default quantified track, so `get_seq_sort()` here is
-    // `Sort::Uninterpreted("Seq")`. 1d95e9f therefore landed a value it had
-    // never run against, and this case has been red on main ever since.
-    //
-    // The value below is 758135f's deliberate, documented behaviour: ay
-    // withholds strict proof authority from any refutation whose proof mentions
-    // a native `Sort::Seq(_)`, and this track models sequences purely through
-    // trust-wp's own UF/array projectors, so the uninterpreted spelling costs no
-    // reasoning power and keeps the proof externally replayable. Retire only if
-    // that track deliberately returns to the native carrier. The trade stays
-    // pinned two-sided by
+    // `Sort::Uninterpreted("Seq")`, not the native `Sort::seq(Sort::Int)`.
+    // That is deliberate: ay withholds strict proof authority from any
+    // refutation whose proof mentions a native `Sort::Seq(_)`, and this track
+    // models sequences purely through trust-wp's own UF/array projectors, so
+    // the uninterpreted spelling costs no reasoning power and keeps the proof
+    // externally replayable. Retire only if that track deliberately returns to
+    // the native carrier. The trade stays pinned two-sided by
     // `uflia_uninterpreted_seq_carrier_is_required_for_strict_proof_authority`
-    // below, which is carrier-explicit and untouched.
+    // below, which is carrier-explicit.
     assert_case(
         "reg_quantified",
         crate::TrackLevel::Reg,
@@ -456,7 +441,7 @@ fn new_encoder_for_track_with_arrays_selects_expected_logic() {
         true,
         true,
         Logic::Auflia,
-        Sort::seq(Sort::Int),
+        Sort::Uninterpreted("Seq".to_string()),
     );
     assert_case(
         "ptr_always_arrays",

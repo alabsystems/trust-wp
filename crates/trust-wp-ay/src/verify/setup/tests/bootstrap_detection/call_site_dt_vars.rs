@@ -446,7 +446,7 @@ fn build_bootstrap_sort_plan_strengthens_return_call_alias_for_result_match() {
             ),
         ],
     );
-    let return_expr = var("call_3");
+    let return_expr = var("$call_3");
 
     let plan = super::bootstrap::build_bootstrap_sort_plan(
         &encoder,
@@ -464,7 +464,7 @@ fn build_bootstrap_sort_plan_strengthens_return_call_alias_for_result_match() {
         "result should be predeclared as OptionInt for match postconditions"
     );
     assert!(
-        matches!(plan.source_sort("call_3"), Some(ay_dpll::api::Sort::Datatype(dt)) if dt.name == "OptionInt"),
+        matches!(plan.source_sort("$call_3"), Some(ay_dpll::api::Sort::Datatype(dt)) if dt.name == "OptionInt"),
         "synthetic return call alias should share result's OptionInt sort"
     );
     assert!(

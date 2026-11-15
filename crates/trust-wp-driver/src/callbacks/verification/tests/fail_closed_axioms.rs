@@ -34,6 +34,8 @@ use crate::{
 
 fn spec(requires: &[&str], ensures: &[&str]) -> StdSpec {
     StdSpec {
+        inv_requires: Vec::new(),
+        capture_inv_requires: Vec::new(),
         requires: requires.iter().map(|s| (*s).to_string()).collect(),
         ensures: ensures.iter().map(|s| (*s).to_string()).collect(),
         param_names: None,
@@ -41,7 +43,13 @@ fn spec(requires: &[&str], ensures: &[&str]) -> StdSpec {
 }
 
 fn contains_gt_assumption(exprs: &[PureExpr], var: &str, rhs: i64) -> bool {
+    // A call postcondition is scoped under the call's own preconditions
+    // (`pre ==> post`); look through that guard.
     exprs.iter().any(|expr| {
+        let expr = match expr {
+            PureExpr::BinOp(_, BinOp::Implies, post) => post.as_ref(),
+            other => other,
+        };
         matches!(
             expr,
             PureExpr::BinOp(lhs, BinOp::Gt, rhs_expr)
@@ -123,9 +131,9 @@ fn first_closure_proof_assert(
     for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
             let Some(closure_def_id) = (match stmt.kind {
-                StatementKind::Assign(box (
+                StatementKind::Assign((
                     _,
-                    Rvalue::Aggregate(box rustc_middle::mir::AggregateKind::Closure(def_id, _), _),
+                    Rvalue::Aggregate(rustc_middle::mir::AggregateKind::Closure(def_id, _), _),
                 )) => Some(def_id),
                 _ => None,
             }) else {
@@ -261,7 +269,7 @@ impl Callbacks for ProofAssertSetupCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let contracts = find_contract_functions(tcx);
         let logic_fns = extract_logic_fn_defs(tcx);
-        let raw_user_specs = build_user_spec_table(&contracts);
+        let raw_user_specs = build_user_spec_table(tcx, &contracts, &[]);
         let lemma_def_id = contracts
             .iter()
             .find(|contract| path_matches_name(tcx, contract.def_id, "lemma"))
@@ -364,7 +372,7 @@ impl Callbacks for CallSpecEffectsCallbacks {
     #[allow(clippy::elidable_lifetime_names)]
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let contracts = find_contract_functions(tcx);
-        let raw_user_specs = build_user_spec_table(&contracts);
+        let raw_user_specs = build_user_spec_table(tcx, &contracts, &[]);
         let lemma_def_id = contracts
             .iter()
             .find(|contract| path_matches_name(tcx, contract.def_id, "lemma"))
@@ -456,7 +464,7 @@ impl Callbacks for TrustedAssumptionCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let contracts = find_contract_functions(tcx);
         let logic_fns = extract_logic_fn_defs(tcx);
-        let raw_user_specs = build_user_spec_table(&contracts);
+        let raw_user_specs = build_user_spec_table(tcx, &contracts, &[]);
         let lemma_def_id = contracts
             .iter()
             .find(|contract| path_matches_name(tcx, contract.def_id, "lemma"))

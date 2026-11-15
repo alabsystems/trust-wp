@@ -4,9 +4,8 @@
 
 use super::*;
 
-// Note: MIR_BODIES cannot be tested directly because populating it requires
-// running rustc's mir_borrowck query. We verify EXTERN_SPECS behavior and
-// trust that the same clear() logic works for MIR_BODIES.
+// MIR retention has separate real compiler coverage; these tests exercise
+// extraction-local state independently.
 
 #[test]
 fn test_clear_caches_clears_extern_specs() {
@@ -18,6 +17,8 @@ fn test_clear_caches_clears_extern_specs() {
         state.borrow_mut().insert(
             "test::path".to_string(),
             trust_wp_driver::StdSpec {
+                inv_requires: Vec::new(),
+                capture_inv_requires: Vec::new(),
                 requires: vec!["true".to_string()],
                 ensures: vec![],
                 param_names: None,
@@ -44,9 +45,7 @@ fn test_clear_caches_is_idempotent() {
     clear_caches();
 
     // Both caches should be empty
-    let mir_count = MIR_BODIES.with(|state| state.borrow().len());
     let spec_count = EXTERN_SPECS.with(|state| state.borrow().len());
-    assert_eq!(mir_count, 0);
     assert_eq!(spec_count, 0);
 }
 
@@ -84,6 +83,8 @@ fn test_cache_guard_clears_on_construction() {
         state.borrow_mut().insert(
             "stale::entry".to_string(),
             trust_wp_driver::StdSpec {
+                inv_requires: Vec::new(),
+                capture_inv_requires: Vec::new(),
                 requires: vec!["false".to_string()],
                 ensures: vec![],
                 param_names: None,
@@ -111,6 +112,8 @@ fn test_cache_guard_clears_on_drop() {
             state.borrow_mut().insert(
                 "session::data".to_string(),
                 trust_wp_driver::StdSpec {
+                    inv_requires: Vec::new(),
+                    capture_inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["result > 0".to_string()],
                     param_names: None,
@@ -139,6 +142,8 @@ fn test_cache_guard_clears_on_panic_unwind() {
         state.borrow_mut().insert(
             "leaked::from_panic".to_string(),
             trust_wp_driver::StdSpec {
+                inv_requires: Vec::new(),
+                capture_inv_requires: Vec::new(),
                 requires: vec![],
                 ensures: vec![],
                 param_names: None,
@@ -156,6 +161,8 @@ fn test_cache_guard_clears_on_panic_unwind() {
             state.borrow_mut().insert(
                 "new::session".to_string(),
                 trust_wp_driver::StdSpec {
+                    inv_requires: Vec::new(),
+                    capture_inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec![],
                     param_names: None,

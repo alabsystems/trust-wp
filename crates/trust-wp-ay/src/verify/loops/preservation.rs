@@ -24,9 +24,9 @@ use super::{
         Counterexample, VerificationOutcome, VerificationResult,
     },
     encoder_setup::{
-        assert_loop_current_chain_alias_constraints, collect_loop_sort_plan,
-        encode_and_assert_condition, setup_loop_encoder, solve_scoped_loop_obligation_outcome,
-        OutcomeContinuation,
+        assert_condition_facts, assert_loop_current_chain_alias_constraints,
+        collect_loop_sort_plan, encode_and_assert_condition, setup_loop_encoder,
+        solve_scoped_loop_obligation_outcome, OutcomeContinuation,
     },
     expr_helpers::{collect_expr_var_names, expr_references_any_var},
     invariant_transforms::{
@@ -162,6 +162,7 @@ pub(in crate::verify::loops) fn verify_preservation_with_config_outcome(
         }
         base_exprs.extend(config.transition_facts.iter().cloned());
         base_exprs.extend(config.bridge_facts.iter().cloned());
+        base_exprs.extend(config.condition_facts.iter().cloned());
         condition_free_base_exprs.extend(config.transition_facts.iter().cloned());
         condition_free_base_exprs.extend(config.bridge_facts.iter().cloned());
         if super::encoder_setup::is_base_vacuous(&base_exprs) {
@@ -251,9 +252,11 @@ pub(in crate::verify::loops) fn verify_preservation_with_config_outcome(
             timeout: config.timeout,
             transition_facts: config.transition_facts.clone(),
             bridge_facts: config.bridge_facts.clone(),
+            condition_facts: config.condition_facts.clone(),
             adt_decls: config.adt_decls,
             adt_field_ranges: config.adt_field_ranges,
             loop_element_borrow_vars: config.loop_element_borrow_vars.clone(),
+            stated_invariants: config.stated_invariants,
         }
     } else {
         LoopEncoderConfig {
@@ -265,9 +268,11 @@ pub(in crate::verify::loops) fn verify_preservation_with_config_outcome(
             timeout: config.timeout,
             transition_facts: config.transition_facts.clone(),
             bridge_facts: config.bridge_facts.clone(),
+            condition_facts: config.condition_facts.clone(),
             adt_decls: config.adt_decls,
             adt_field_ranges: config.adt_field_ranges,
             loop_element_borrow_vars: config.loop_element_borrow_vars.clone(),
+            stated_invariants: config.stated_invariants,
         }
     };
 
@@ -534,6 +539,7 @@ pub(in crate::verify::loops) fn verify_preservation_with_config_outcome(
                 encode_and_assert_condition(&mut encoder, cond)?;
             }
         }
+        assert_condition_facts(&mut encoder, &preservation_config)?;
 
         // 3. Introduce proxy variables for the slice's relevant body effects.
         let slice_effects = BodyEffects::new(
@@ -834,6 +840,7 @@ pub(in crate::verify::loops) fn verify_preservation_with_config_outcome(
         });
     }
 
+    super::withhold_synthesized_goal_refutations(&mut slice_results, config.stated_invariants);
     Ok(obligation_slices::aggregate_slice_outcomes(slice_results))
 }
 
@@ -3186,7 +3193,7 @@ fn assert_current_universal_skolem_instance(
     {
         substitutions.insert(
             var.clone(),
-            PureExpr::Var(format!("sk_{var}"), var_sort.clone()),
+            PureExpr::Var(format!("sk${var}"), var_sort.clone()),
         );
         current = body;
     }
@@ -3237,7 +3244,7 @@ fn universal_skolem_terms(expr: &PureExpr) -> Vec<PureExpr> {
         ..
     } = current
     {
-        terms.push(PureExpr::Var(format!("sk_{var}"), var_sort.clone()));
+        terms.push(PureExpr::Var(format!("sk${var}"), var_sort.clone()));
         current = body;
     }
     terms
@@ -3271,7 +3278,7 @@ fn skolem_term_for_universal_var(
     var_sort: Option<&ExprSort>,
     target_terms: &[PureExpr],
 ) -> PureExpr {
-    let expected_name = format!("sk_{var}");
+    let expected_name = format!("sk${var}");
     if let Some(term) = target_terms.iter().find(|term| {
         matches!(term, PureExpr::Var(name, _) if name == &expected_name)
             && skolem_term_matches_sort(term, var_sort)
@@ -3931,9 +3938,9 @@ mod tests {
     #[test]
     fn direct_preservation_accepts_seq_iterator_structural_slice() {
         let produced = seq_v("produced");
-        let iter_old_view = view_expr(v("__trust_wp_for_iter_old_17"));
-        let iter_state_view = view_expr(v("__trust_wp_for_iter_state_17"));
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old_view = view_expr(v("$for_iter_old_17"));
+        let iter_state_view = view_expr(v("$for_iter_state_17"));
+        let iter_next = v("$for_iter_state_next_17");
         let iter_next_view = view_expr(iter_next.clone());
         let loop_elem = v("m");
         let slice = eq_expr(
@@ -3946,7 +3953,7 @@ mod tests {
             "produced".to_string(),
             push_back_expr(produced, loop_elem.clone()),
         );
-        direct_effects.insert("__trust_wp_for_iter_state_17".to_string(), iter_next);
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next);
         let transition_facts = vec![eq_expr(
             iter_state_view,
             push_front_expr(iter_next_view, loop_elem),
@@ -4026,16 +4033,13 @@ mod tests {
 
     #[test]
     fn direct_preservation_accepts_range_iterator_end_slice() {
-        let iter_old = v("__trust_wp_for_iter_old_17");
-        let iter_state = v("__trust_wp_for_iter_state_17");
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old = v("$for_iter_old_17");
+        let iter_state = v("$for_iter_state_17");
+        let iter_next = v("$for_iter_state_next_17");
         let slice = eq_expr(end_log_expr(iter_old), end_log_expr(iter_state.clone()));
 
         let mut direct_effects = HashMap::new();
-        direct_effects.insert(
-            "__trust_wp_for_iter_state_17".to_string(),
-            iter_next.clone(),
-        );
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next.clone());
         let transition_facts = vec![eq_expr(end_log_expr(iter_state), end_log_expr(iter_next))];
         let current_invariants = vec![&slice];
 
@@ -4054,9 +4058,9 @@ mod tests {
 
     #[test]
     fn direct_preservation_accepts_range_iterator_start_slice() {
-        let iter_old = v("__trust_wp_for_iter_old_17");
-        let iter_state = v("__trust_wp_for_iter_state_17");
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old = v("$for_iter_old_17");
+        let iter_state = v("$for_iter_state_17");
+        let iter_next = v("$for_iter_state_next_17");
         let state_start = start_log_expr(iter_state.clone());
         let next_start = start_log_expr(iter_next.clone());
         let slice = PureExpr::BinOp(
@@ -4066,7 +4070,7 @@ mod tests {
         );
 
         let mut direct_effects = HashMap::new();
-        direct_effects.insert("__trust_wp_for_iter_state_17".to_string(), iter_next);
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next);
         let transition_facts = vec![eq_expr(next_start, add_expr(state_start, PureExpr::Int(1)))];
         let current_invariants = vec![&slice];
 
@@ -4086,9 +4090,9 @@ mod tests {
     #[test]
     fn direct_preservation_accepts_range_iterator_produced_len_slice() {
         let produced = seq_v("produced");
-        let iter_old = v("__trust_wp_for_iter_old_17");
-        let iter_state = v("__trust_wp_for_iter_state_17");
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old = v("$for_iter_old_17");
+        let iter_state = v("$for_iter_state_17");
+        let iter_next = v("$for_iter_state_next_17");
         let loop_elem = v("__trust_wp_for_loop_elem_17");
         let produced_next = push_back_expr(produced.clone(), loop_elem);
         let produced_len = len_call(produced.clone());
@@ -4107,7 +4111,7 @@ mod tests {
 
         let mut direct_effects = HashMap::new();
         direct_effects.insert("produced".to_string(), produced_next);
-        direct_effects.insert("__trust_wp_for_iter_state_17".to_string(), iter_next);
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next);
         let transition_facts = vec![
             eq_expr(produced_next_len, add_expr(produced_len, PureExpr::Int(1))),
             eq_expr(next_start, add_expr(state_start, PureExpr::Int(1))),
@@ -4130,9 +4134,9 @@ mod tests {
     #[test]
     fn direct_preservation_rejects_range_iterator_len_slice_without_start_step() {
         let produced = seq_v("produced");
-        let iter_old = v("__trust_wp_for_iter_old_17");
-        let iter_state = v("__trust_wp_for_iter_state_17");
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old = v("$for_iter_old_17");
+        let iter_state = v("$for_iter_state_17");
+        let iter_next = v("$for_iter_state_next_17");
         let loop_elem = v("__trust_wp_for_loop_elem_17");
         let produced_next = push_back_expr(produced.clone(), loop_elem);
         let produced_len = len_call(produced.clone());
@@ -4146,7 +4150,7 @@ mod tests {
 
         let mut direct_effects = HashMap::new();
         direct_effects.insert("produced".to_string(), produced_next);
-        direct_effects.insert("__trust_wp_for_iter_state_17".to_string(), iter_next);
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next);
         let transition_facts = vec![eq_expr(
             produced_next_len,
             add_expr(produced_len, PureExpr::Int(1)),
@@ -4169,9 +4173,9 @@ mod tests {
     #[test]
     fn direct_preservation_rejects_seq_iterator_structural_slice_without_matching_transition() {
         let produced = seq_v("produced");
-        let iter_old_view = view_expr(v("__trust_wp_for_iter_old_17"));
-        let iter_state_view = view_expr(v("__trust_wp_for_iter_state_17"));
-        let iter_next = v("__trust_wp_for_iter_state_next_17");
+        let iter_old_view = view_expr(v("$for_iter_old_17"));
+        let iter_state_view = view_expr(v("$for_iter_state_17"));
+        let iter_next = v("$for_iter_state_next_17");
         let iter_next_view = view_expr(iter_next.clone());
         let loop_elem = v("m");
         let slice = eq_expr(
@@ -4181,7 +4185,7 @@ mod tests {
 
         let mut direct_effects = HashMap::new();
         direct_effects.insert("produced".to_string(), push_back_expr(produced, loop_elem));
-        direct_effects.insert("__trust_wp_for_iter_state_17".to_string(), iter_next);
+        direct_effects.insert("$for_iter_state_17".to_string(), iter_next);
         let transition_facts = vec![eq_expr(
             iter_state_view,
             push_front_expr(iter_next_view, v("other_m")),

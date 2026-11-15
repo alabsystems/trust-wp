@@ -454,3 +454,26 @@ fn test_solver_stack_defaults_noop_when_all_preset() {
     let plan = solver_stack_defaults_to_apply(|_| true);
     assert!(plan.is_empty());
 }
+
+/// The certificate diagnostic is a diagnostic: absent the request it must not
+/// arm, so an unset variable and every disabling spelling read as OFF.
+#[test]
+fn test_ay_cert_diagnostics_default_off() {
+    assert!(!ay_cert_diagnostics_requested(None));
+    for raw in ["", "  ", "0", "false", "FALSE", "off", "OFF", "no", "NO"] {
+        assert!(
+            !ay_cert_diagnostics_requested(Some(raw)),
+            "{raw:?} must not arm certificate diagnostics"
+        );
+    }
+}
+
+#[test]
+fn test_ay_cert_diagnostics_requested_when_set() {
+    for raw in ["1", "true", "on", "yes", "clause"] {
+        assert!(
+            ay_cert_diagnostics_requested(Some(raw)),
+            "{raw:?} must arm certificate diagnostics"
+        );
+    }
+}

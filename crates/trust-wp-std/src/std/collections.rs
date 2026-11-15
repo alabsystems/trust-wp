@@ -20,7 +20,20 @@ pub mod specs {
     ";
 
     /// Contract for `HashMap::with_capacity`
+    ///
+    /// Panics ("capacity overflow") when the table it sizes for `capacity`
+    /// does not fit. hashbrown allocates `buckets` slots of `(K, V)` plus one
+    /// control byte each and a group of trailing control bytes, rounded to
+    /// `max(align_of::<(K, V)>(), 16)`; `buckets` is at most 16 below 15
+    /// elements and the next power of two above `8 * capacity / 7` from
+    /// there, so at most `3 * capacity + 16`, and `8 * capacity` must not
+    /// overflow `usize`. The requirement is that bound, which is SUFFICIENT
+    /// and stronger than the exact rule only near `isize::MAX` bytes.
     pub const HASHMAP_WITH_CAPACITY: &str = r"
+        params: capacity
+        requires: capacity@ == 0 || (8 * capacity@ <= usize::MAX@
+            && (3 * capacity@ + 16) * (__trust_wp_std_site_size_of_K_V() + 1)
+                + 2 * __trust_wp_std_site_align_of_K_V() + 46 <= isize::MAX@)
         ensures: result@.len() == 0
     ";
 
@@ -98,9 +111,10 @@ pub mod specs {
     /// pattern when reasoning about `it.collect()` callers. This is what
     /// `roundtrip_hashmap_iter_mut`
     /// (`tests/should_succeed/cc/collections.rs`) needs to relate `^xs@`
-    /// through the iterator into `^result@[k]` after `it.collect()` —
-    /// because `ITERATOR_COLLECT` provides `r@ == it@`, identifying the
-    /// HashMap's view with the IterMut's view at the collect call site.
+    /// through the iterator into `^result@[k]` after `it.collect()`. Note that
+    /// the generic `ITERATOR_COLLECT` no longer identifies `r@` with `it@`:
+    /// that roundtrip is appended only for whitelisted `(Self, B)` pairs
+    /// (`ITERATOR_COLLECT_ROUNDTRIP`), and `hash_map::IterMut` is not one.
     pub const HASHMAP_ITER_MUT: &str = r"
         ensures: self@ == result@
         ensures: forall<k: _> self@.contains(k) == (^self)@.contains(k)
@@ -129,7 +143,14 @@ pub mod specs {
     ";
 
     /// Contract for `HashSet::with_capacity`
+    ///
+    /// A `HashSet<T>` is a `HashMap<T, ()>`, whose slots have the layout of
+    /// `T`: `HASHMAP_WITH_CAPACITY`'s requirement at that layout.
     pub const HASHSET_WITH_CAPACITY: &str = r"
+        params: capacity
+        requires: capacity@ == 0 || (8 * capacity@ <= usize::MAX@
+            && (3 * capacity@ + 16) * (__trust_wp_std_site_size_of_T() + 1)
+                + 2 * __trust_wp_std_site_align_of_T() + 46 <= isize::MAX@)
         ensures: result@.len() == 0
     ";
 
@@ -590,7 +611,11 @@ pub mod specs {
     ";
 
     /// Contract for `VecDeque::with_capacity`
+    ///
+    /// The buffer is a `RawVec`, so it panics exactly as `Vec::with_capacity`.
     pub const VECDEQUE_WITH_CAPACITY: &str = r"
+        params: capacity
+        requires: capacity@ * __trust_wp_std_site_size_of_T() <= isize::MAX@
         ensures: result@.len() == 0
     ";
 
@@ -659,8 +684,12 @@ pub mod specs {
     ";
 
     /// Contract for `VecDeque::drain`
+    ///
+    /// Panics on a range `Vec::drain` panics on; refused for the same reason,
+    /// the full range `..` excepted.
     pub const VECDEQUE_DRAIN: &str = r"
         params: self, range
+        requires: __trust_wp_std_site_unmodelled_panic_unless_full_range_R()
     ";
 
     // ── HashMap Index/IndexMut ─────────────────────────────────────

@@ -856,7 +856,11 @@ mod tests {
     #[timeout(30000)]
     fn m0_carrier_option_families_distinct_per_inner_sort() {
         let mut e = AYEncoder::new_all();
-        let inners = [ExprSort::Int, ExprSort::Bool, ExprSort::Float];
+        let inners = [
+            ExprSort::Int,
+            ExprSort::Bool,
+            ExprSort::Float(trust_wp_core::formula::FloatWidth::F64),
+        ];
         let mut names = std::collections::HashSet::new();
         for inner in inners {
             let mr = e.sort_from_expr_sort(ExprSort::MutRef(Box::new(inner)));

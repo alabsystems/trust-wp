@@ -24,7 +24,6 @@ pub(crate) use collection::result_collection_sort_from_postcondition_with_contex
 #[cfg(test)]
 pub(crate) use datatype::expr_match_datatype_for_result;
 pub(crate) use datatype::{
-    detect_body_constructor_name, option_datatype_from_constructor_expr,
-    result_match_datatype_from_postcondition,
+    option_datatype_from_constructor_expr, result_match_datatype_from_postcondition,
 };
 pub(crate) use shared::expr_contains_result_var;

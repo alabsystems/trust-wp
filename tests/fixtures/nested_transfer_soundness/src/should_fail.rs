@@ -2,15 +2,17 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Soundness regression (adjudicated 2026-07-22, dn33-39 class).
+//! Soundness regression: a per-path write fact must never assert the negation
+//! of a reachable path condition.
 //!
-//! The block extractor's per-path write facts for `*ma += 2` used collapsed
-//! naming; on the no-swap path (`*ma >= *mb >= *mc` at entry) the fact
-//! degenerated to the contradiction `*ma == *ma + 2`, asserting the negation
-//! of that REACHABLE path condition. This program's postcondition
+//! The block extractor's per-path write facts for `*ma += 2` use collapsed
+//! naming; if `apply_nested_transfer_resolutions` did not strip them, on the
+//! no-swap path (`*ma >= *mb >= *mc` at entry) the fact would degenerate to
+//! the contradiction `*ma == *ma + 2`, asserting the negation of that
+//! REACHABLE path condition and discharging the postcondition there
+//! vacuously — the program would falsely verify. This program's postcondition
 //! (`result == (*ma < *mb || *mb < *mc)` at entry, claimed `true`) is false
-//! exactly on that path — e.g. inputs (5, 3, 1) — so it MUST fail. Before
-//! the fix it falsely verified.
+//! exactly on that path — e.g. inputs (5, 3, 1) — so it MUST fail.
 
 #![allow(unexpected_cfgs)]
 

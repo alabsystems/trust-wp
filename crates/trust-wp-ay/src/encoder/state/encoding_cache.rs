@@ -102,6 +102,16 @@ pub(crate) struct EncodingCacheState {
     /// obligation" from "a strict replay ran, but on a sibling". Without it the
     /// fix would be invisible to the very measurement it exists to protect.
     strict_replay_unbound: u32,
+    /// The last strict replay that ay refused for a DETERMINISTIC reason
+    /// (`proof_trusted` / `self_check_rejected`), named by the scope it ran in
+    /// and the SHA-256 of the exact native problem it solved.
+    ///
+    /// Read only to SKIP re-running that identical replay (same scope, same
+    /// problem bytes, timeout included) — never to grant anything. Several
+    /// lanes attach a strict replay to the same accepted UNSAT (the solve-level
+    /// resolve and then `record_preferred_verified_solve_evidence`), so a
+    /// refused slice used to pay for the same refusal twice.
+    strict_replay_deterministic_refusal: Option<(StrictReplayScope, [u8; 32])>,
     structural_ground_consequence_details: Vec<String>,
 }
 
@@ -148,6 +158,7 @@ impl EncodingCacheState {
             strict_proof_replay_observation: None,
             strict_replay_scope: StrictReplayScope::default(),
             strict_replay_unbound: 0,
+            strict_replay_deterministic_refusal: None,
             structural_ground_consequence_details: Vec::new(),
         }
     }
@@ -400,6 +411,20 @@ impl EncodingCacheState {
         self.strict_replay_scope.slice = 0;
         self.strict_proof_replay_observation = None;
         self.strict_replay_unbound = 0;
+        self.strict_replay_deterministic_refusal = None;
+    }
+
+    /// Remember that ay deterministically refused the strict replay of
+    /// `problem_hash` in the CURRENT scope. See the field docs.
+    pub(crate) fn record_strict_replay_deterministic_refusal(&mut self, problem_hash: [u8; 32]) {
+        self.strict_replay_deterministic_refusal = Some((self.strict_replay_scope, problem_hash));
+    }
+
+    /// Whether the identical problem was already deterministically refused in
+    /// the current scope. Any scope change (a new solve, slice or obligation)
+    /// or different problem bytes answer `false`, so the replay runs.
+    pub(crate) fn strict_replay_refused_deterministically(&self, problem_hash: [u8; 32]) -> bool {
+        self.strict_replay_deterministic_refusal == Some((self.strict_replay_scope, problem_hash))
     }
 
     /// Enter the next obligation slice within the current batch.
@@ -432,6 +457,13 @@ impl EncodingCacheState {
     ) {
         let scope = self.strict_replay_scope;
         self.strict_proof_replay_observation = Some((scope, observation));
+    }
+
+    /// ay's reason code on the recorded observation, if any (read-only).
+    pub(crate) fn strict_proof_replay_observation_unknown_reason(&self) -> Option<&str> {
+        self.strict_proof_replay_observation
+            .as_ref()
+            .and_then(|(_, observation)| observation.unknown_reason.as_deref())
     }
 
     /// Take the recorded observation, but ONLY if it belongs to `expected`.

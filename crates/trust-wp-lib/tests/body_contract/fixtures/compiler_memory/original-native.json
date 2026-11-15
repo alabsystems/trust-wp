@@ -1,0 +1,862 @@
+{
+  "schema_version": 8,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          90,
+          64,
+          119,
+          77,
+          9,
+          0,
+          223,
+          209,
+          223,
+          244,
+          62,
+          195,
+          252,
+          119,
+          24,
+          197,
+          243,
+          88,
+          185,
+          170,
+          156,
+          197,
+          63,
+          98,
+          86,
+          198,
+          81,
+          54,
+          234,
+          107,
+          93,
+          245
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.12.0",
+    "source_language": "Rust",
+    "source_languages": [
+      "Rust",
+      "TrustIr"
+    ],
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        90,
+        64,
+        119,
+        77,
+        9,
+        0,
+        223,
+        209,
+        223,
+        244,
+        62,
+        195,
+        252,
+        119,
+        24,
+        197,
+        243,
+        88,
+        185,
+        170,
+        156,
+        197,
+        63,
+        98,
+        86,
+        198,
+        81,
+        54,
+        234,
+        107,
+        93,
+        245
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.12.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 8,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      233,
+      249,
+      85,
+      221,
+      30,
+      21,
+      22,
+      245,
+      233,
+      69,
+      106,
+      132,
+      163,
+      62,
+      1,
+      117,
+      240,
+      225,
+      229,
+      208,
+      169,
+      171,
+      131,
+      219,
+      73,
+      48,
+      42,
+      234,
+      237,
+      123,
+      84,
+      234
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "choose",
+        "symbol": "choose",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            132,
+            26,
+            111,
+            249,
+            47,
+            205,
+            47,
+            138,
+            132,
+            106,
+            11,
+            56,
+            53,
+            30,
+            133,
+            128,
+            78,
+            145,
+            254,
+            52,
+            129,
+            57,
+            55,
+            111,
+            47,
+            225,
+            85,
+            245,
+            222,
+            173,
+            195,
+            223
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:semr_branch_source__choose:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 1,
+          "col": 0
+        },
+        "assertion_id": 2322991278,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "semr_branch_source::choose",
+    "functions": [
+      {
+        "id": 0,
+        "name": "choose",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "Bool"
+              ],
+              [
+                1,
+                "Bool"
+              ],
+              [
+                2,
+                "Bool"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Alloca": {
+                    "ty": "Bool",
+                    "count": null,
+                    "align": null
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 0,
+                    "rhs": 5
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 6,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "Bool",
+                    "operand": 1
+                  }
+                },
+                "results": [
+                  7
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Store": {
+                    "ty": "Bool",
+                    "ptr": 4,
+                    "value": 7,
+                    "volatile": false,
+                    "align": null
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 3,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "Bool",
+                    "operand": 2
+                  }
+                },
+                "results": [
+                  8
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Store": {
+                    "ty": "Bool",
+                    "ptr": 4,
+                    "value": 8,
+                    "volatile": false,
+                    "align": null
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 3,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Load": {
+                    "ty": "Bool",
+                    "ptr": 4,
+                    "volatile": false,
+                    "align": null
+                  }
+                },
+                "results": [
+                  9
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      9
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      }
+    ],
+    "structs": [],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          "Bool",
+          "Bool",
+          "Bool"
+        ],
+        "returns": [
+          "Bool"
+        ],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:semr_branch_source__choose:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:semr_branch_source__choose:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:semr_branch_source__choose:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 1,
+            "start_col": 0,
+            "end_line": 3,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:semr_branch_source__choose:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                250,
+                246,
+                237,
+                58,
+                145,
+                145,
+                246,
+                188,
+                128,
+                241,
+                61,
+                202,
+                156,
+                248,
+                131,
+                1,
+                6,
+                177,
+                32,
+                202,
+                223,
+                103,
+                109,
+                125,
+                10,
+                178,
+                31,
+                173,
+                174,
+                161,
+                172,
+                49
+              ]
+            }
+          }
+        },
+        "site": null
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "Unclassified"
+    },
+    "files": [
+      "src/lib.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": [],
+    "predicates": [],
+    "global_asm": [],
+    "imports": [],
+    "tuple_layouts": [],
+    "completeness": null,
+    "drop_glue": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            90,
+            64,
+            119,
+            77,
+            9,
+            0,
+            223,
+            209,
+            223,
+            244,
+            62,
+            195,
+            252,
+            119,
+            24,
+            197,
+            243,
+            88,
+            185,
+            170,
+            156,
+            197,
+            63,
+            98,
+            86,
+            198,
+            81,
+            54,
+            234,
+            107,
+            93,
+            245
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            233,
+            249,
+            85,
+            221,
+            30,
+            21,
+            22,
+            245,
+            233,
+            69,
+            106,
+            132,
+            163,
+            62,
+            1,
+            117,
+            240,
+            225,
+            229,
+            208,
+            169,
+            171,
+            131,
+            219,
+            73,
+            48,
+            42,
+            234,
+            237,
+            123,
+            84,
+            234
+          ]
+        },
+        "obligations": [
+          0
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              200,
+              107,
+              13,
+              112,
+              128,
+              28,
+              152,
+              230,
+              121,
+              247,
+              117,
+              149,
+              209,
+              153,
+              40,
+              157,
+              181,
+              240,
+              70,
+              182,
+              64,
+              133,
+              36,
+              132,
+              246,
+              141,
+              63,
+              99,
+              155,
+              104,
+              236,
+              88
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                156,
+                216,
+                150,
+                250,
+                185,
+                144,
+                120,
+                8,
+                216,
+                73,
+                51,
+                229,
+                182,
+                115,
+                71,
+                79,
+                100,
+                6,
+                181,
+                190,
+                49,
+                101,
+                244,
+                74,
+                142,
+                171,
+                26,
+                179,
+                187,
+                43,
+                42,
+                60
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 2322991278,
+                "span": {
+                  "file": 0,
+                  "line": 1,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

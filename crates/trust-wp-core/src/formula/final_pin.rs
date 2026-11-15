@@ -165,7 +165,7 @@ mod tests {
     fn local_target_has_no_steps() {
         let local = FinalPinTarget::Local("x".into());
         assert_eq!(local.root_name(), "x");
-        assert!(local.steps().is_empty());
+        assert_eq!(local.steps(), []);
         assert!(!local.requires_variant_guard());
     }
 }

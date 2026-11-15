@@ -28,3 +28,15 @@ path = "src/variant_dropped.rs"
 [[bin]]
 name = "per_loop_invariant_dropped"
 path = "src/per_loop_invariant_dropped.rs"
+
+[[bin]]
+name = "variant_non_decreasing"
+path = "src/variant_non_decreasing.rs"
+
+[[bin]]
+name = "variant_parse_refused"
+path = "src/variant_parse_refused.rs"
+
+[[bin]]
+name = "per_loop_variant_dropped"
+path = "src/per_loop_variant_dropped.rs"

@@ -34,46 +34,16 @@ pub(crate) fn cargo_trust_wp_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Check if a directory contains a cargo wrapper script (as opposed to the real
-/// cargo binary). The wrapper is a small shell script (~5KB) containing the
-/// repository-local cargo wrapper identifier string.
-pub(crate) fn is_cargo_wrapper_dir(dir: &std::path::Path) -> bool {
-    let cargo_path = dir.join("cargo");
-    // Real cargo is a >1MB Mach-O/ELF binary; the wrapper is a ~5KB shell script.
-    // Check file size first (fast), then verify by reading the shebang line.
-    let Ok(metadata) = cargo_path.metadata() else {
-        return false;
-    };
-    if metadata.len() > 50_000 {
-        return false; // Real binary, not a wrapper script.
-    }
-    // Small file — read the first line to confirm it's a shell script.
-    let Ok(content) = fs::read_to_string(&cargo_path) else {
-        return false;
-    };
-    content.contains("cargo wrapper") || content.contains("cargo_wrapper")
-}
-
-/// Build a PATH for E2E child processes with cargo wrapper directories removed.
-///
-/// Filters out the repository-local wrapper bin and any directory
-/// containing a cargo wrapper script (e.g., `~/.local/bin`). Prepends `bin_dir`
-/// so the test's own cargo-trust-wp and trust-wp-rustc binaries take priority.
-/// (#572, #2085)
+/// Build a PATH for E2E child processes: `bin_dir` first, so the test's own
+/// cargo-trust-wp and trust-wp-rustc binaries take priority, then the
+/// caller's PATH. The build tool itself is not looked up here: cargo-trust-wp
+/// drives `$CARGO` (inherited from the targo running this test) or `targo`.
 pub(crate) fn build_e2e_path(bin_dir: PathBuf) -> std::ffi::OsString {
     let mut path_entries = vec![bin_dir];
     if let Some(path) = std::env::var_os("PATH") {
-        path_entries.extend(std::env::split_paths(&path).filter(|p| {
-            let s = p.to_string_lossy();
-            !is_repo_local_wrapper_bin_path(&s) && !is_cargo_wrapper_dir(p)
-        }));
+        path_entries.extend(std::env::split_paths(&path));
     }
     std::env::join_paths(path_entries).expect("join PATH")
-}
-
-fn is_repo_local_wrapper_bin_path(path: &str) -> bool {
-    let wrapper_dir = ["ai", "_template_scripts", "/bin"].concat();
-    path.contains(&wrapper_dir)
 }
 
 pub(crate) fn run_cargo_trust_wp(fixture: &str, filter: &str) -> Output {
@@ -118,7 +88,7 @@ pub(crate) fn run_cargo_trust_wp_with_fixture_edit(
         .stderr(std::process::Stdio::piped());
 
     // Place the child in its own process group so we can kill the entire tree
-    // (cargo-trust-wp → cargo check → trust-wp-rustc) with a single signal.
+    // (cargo-trust-wp → targo check → trust-wp-rustc) with a single signal.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -198,16 +168,20 @@ pub(crate) fn assert_function_status(stderr: &str, function: &str, status: &str)
         if !line.starts_with("trust-wp: ") || !line.contains(marker) {
             return false;
         }
-        // Find function name and check it's not a substring of a longer identifier.
-        // The character after the match must be a non-identifier char (space, ':', etc.)
-        // or the function must be at the end of a token.
-        if let Some(pos) = line.find(function) {
+        // The function name must be a whole identifier: the characters on BOTH
+        // sides of the match must be non-identifier chars (space, ':', '{', …)
+        // or the line boundary. Checking only the trailing side let `increment`
+        // match inside `double_increment verified ✓`, so a fixture's failing
+        // `increment` was masked by a sibling that verified. Every occurrence is
+        // tried, so a qualified path like `Type::increment` still matches.
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let bytes = line.as_bytes();
+        line.match_indices(function).any(|(pos, _)| {
             let after = pos + function.len();
-            after >= line.len()
-                || !line.as_bytes()[after].is_ascii_alphanumeric() && line.as_bytes()[after] != b'_'
-        } else {
-            false
-        }
+            let before_ok = pos == 0 || !is_ident(bytes[pos - 1]);
+            let after_ok = after >= line.len() || !is_ident(bytes[after]);
+            before_ok && after_ok
+        })
     });
     assert!(
         found,

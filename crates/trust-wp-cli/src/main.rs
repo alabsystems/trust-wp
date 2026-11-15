@@ -33,7 +33,8 @@
 //! turns its structured result into an exit code:
 //!
 //! * **crate mode** (`trust-wp` in a directory with a `Cargo.toml`) runs
-//!   `cargo-trust-wp`, which sets `RUSTC_WRAPPER` and shells `cargo check`.
+//!   `cargo-trust-wp`, which sets `RUSTC_WRAPPER` and shells
+//!   `targo --unverified check` (`$CARGO` when set).
 //! * **single-file mode** (`trust-wp file.rs`) runs `trust-wp-rustc` — the
 //!   rustc driver in this very crate (`src/rustc_driver.rs`) — directly, the
 //!   way `scripts/run-trust-wp-rustc.sh` does, so no Cargo project is needed.
@@ -364,7 +365,7 @@ const REJECTED_FLAGS: &[(&str, &str)] = &[
     ),
     (
         "--tests",
-        "trust-wp proves contracts, it does not run tests; use `cargo test` for those",
+        "trust-wp proves contracts, it does not run tests; use `targo --unverified test` for those",
     ),
     (
         "--solver",
@@ -876,7 +877,7 @@ impl EngineMissing {
     pub(crate) fn actionable_fixes(&self) -> impl Iterator<Item = &String> {
         self.fixes
             .iter()
-            .filter(|fix| !fix.contains("trust-wp doctor") && !fix.contains("rustup toolchain"))
+            .filter(|fix| !fix.contains("trust-wp doctor") && !fix.contains("--print sysroot"))
     }
 
     fn report(&self) {
@@ -899,7 +900,38 @@ impl EngineMissing {
     }
 }
 
-/// The trust-wp checkout this front door belongs to.
+/// The build tool crate mode drives through `targo-trust-wp`: `$CARGO` when
+/// set, else `targo`. Never a bare `cargo`, which on a Trust machine is not
+/// the Trust toolchain's build tool.
+pub(crate) fn build_tool() -> PathBuf {
+    tool_or(env::var_os("CARGO").as_deref(), "targo")
+}
+
+/// The compiler whose sysroot the engine runs against: `$RUSTC` when set,
+/// else `trustc`. Never a bare `rustc`.
+pub(crate) fn compiler_tool() -> PathBuf {
+    tool_or(env::var_os("RUSTC").as_deref(), "trustc")
+}
+
+fn tool_or(configured: Option<&OsStr>, default: &str) -> PathBuf {
+    configured
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(default), PathBuf::from)
+}
+
+/// The identity probe for the build tool. For targo it is
+/// `targo --unverified --version`: only the real targo accepts that flag, so a
+/// stock cargo installed under the name `targo` fails it instead of passing.
+pub(crate) fn build_tool_identity(tool: &Path) -> Command {
+    let mut command = Command::new(tool);
+    if tool.file_stem().and_then(OsStr::to_str) == Some("targo") {
+        command.arg("--unverified");
+    }
+    command.arg("--version");
+    command
+}
+
+/// The trust-wp checkout this binary belongs to.
 ///
 /// `$TRUST_WP_HOME` wins; otherwise walk up from this binary (the usual
 /// `target/<profile>/trust-wp` layout); otherwise fall back to the path baked
@@ -1084,20 +1116,18 @@ fn build_fixes(binary: &'static str, env_override: &str) -> Vec<String> {
         || "/path/to/trust-wp".to_string(),
         |root| root.display().to_string(),
     );
-    // Package names, not binary names: the cargo front end's *package* was
-    // renamed to `targo-trust-wp`; `cargo-trust-wp` survives only as a
-    // back-compat [[bin]] alias inside it, so `-p cargo-trust-wp` no longer
-    // resolves.
+    // Package names, not binary names: the cargo front end's *package* is
+    // `targo-trust-wp`; `cargo-trust-wp` is only a back-compat [[bin]] alias
+    // inside it, so `-p cargo-trust-wp` does not resolve.
     let package = if binary == DRIVER_BIN {
         "-p trust-wp-driver --bin trust-wp-rustc"
     } else {
         "-p targo-trust-wp"
     };
     vec![
-        format!("build it:  cd {root} && cargo build --release {package}"),
+        format!("build it:  cd {root} && targo --unverified build --release {package}"),
         format!("point at an existing one:  {env_override}=/path/to/{binary} trust-wp ..."),
-        "check the Trust toolchain is usable:  rustup toolchain list && rustc --print sysroot"
-            .to_string(),
+        "check the Trust toolchain is usable:  trustc --print sysroot".to_string(),
         "run `trust-wp doctor` for a full readiness report".to_string(),
     ]
 }
@@ -1108,8 +1138,17 @@ fn build_fixes(binary: &'static str, env_override: &str) -> Vec<String> {
 /// this workspace ships (`crates/creusot-contracts`) and which the help sells.
 /// Each entry is (crate name as written in `use`, rlib file name, the cargo
 /// package that builds it).
-pub(crate) const CONTRACT_CRATES: [(&str, &str, &str); 2] = [
+pub(crate) const CONTRACT_CRATES: [(&str, &str, &str); 3] = [
     ("trust_wp", "libtrust_wp.rlib", "trust-wp"),
+    // Contract macros expand to absolute `::trust_wp_std::...` paths (the
+    // `__spec_tc` typecheck surface, `logic::Int`, `ghost::Snapshot`, ...).
+    // An absolute path resolves only against the EXTERN PRELUDE, so the crate
+    // has to be injected here even though a user's source almost never names
+    // it: `trust-wp`'s `pub extern crate trust_wp_std;` re-export does NOT put
+    // it in a downstream crate's prelude. Without this entry every contract in
+    // single-file mode dies `E0433: cannot find `trust_wp_std` in the crate
+    // root` — including `examples/simple.rs`.
+    ("trust_wp_std", "libtrust_wp_std.rlib", "trust-wp-std"),
     (
         "creusot_contracts",
         "libcreusot_contracts.rlib",
@@ -1120,19 +1159,20 @@ pub(crate) const CONTRACT_CRATES: [(&str, &str, &str); 2] = [
 /// Locate a compiled contract crate, so a lone `.rs` file can say
 /// `use trust_wp::{ensures, requires};` with no Cargo project around it.
 ///
-/// Returns the rlib and the sibling `deps` directory rustc needs in order to
-/// resolve the proc-macro and std-spec crates behind it.
+/// Returns the rlib and the directories of its profile's compiled units, which
+/// rustc needs in order to resolve the proc-macro and std-spec crates behind it.
 ///
 /// Two places, and the newest wins. `target/<profile>/libtrust_wp.rlib` is the
 /// uplifted copy, which cargo refreshes only when someone names the package
-/// (`cargo build -p trust-wp`); `target/<profile>/deps/libtrust_wp-<hash>.rlib`
-/// is written whenever anything depends on it. Preferring whichever is newer
-/// is what keeps single-file mode working after an ordinary workspace build
-/// instead of failing with a bare `can't find crate for trust_wp` against a
-/// copy left over from an older compiler or an older `trust-wp-core`.
-pub(crate) fn find_contract_rlib(rlib_name: &str) -> Option<(PathBuf, PathBuf)> {
+/// (`targo --unverified build -p trust-wp`); a `libtrust_wp-<hash>.rlib` among
+/// the profile's units is written whenever anything depends on it. Preferring
+/// whichever is newer is what keeps single-file mode working after an ordinary
+/// workspace build instead of failing with a bare `can't find crate for
+/// trust_wp` against a copy left over from an older compiler or an older
+/// `trust-wp-core`.
+pub(crate) fn find_contract_rlib(rlib_name: &str) -> Option<(PathBuf, Vec<PathBuf>)> {
     for dir in engine_search_dirs() {
-        let deps = dir.join("deps");
+        let units = profile_unit_dirs(&dir);
         let mut candidates: Vec<PathBuf> = Vec::new();
 
         let uplifted = dir.join(rlib_name);
@@ -1142,14 +1182,16 @@ pub(crate) fn find_contract_rlib(rlib_name: &str) -> Option<(PathBuf, PathBuf)> 
         // `libtrust_wp.rlib` -> ("libtrust_wp-", ".rlib")
         if let Some(stem) = rlib_name.strip_suffix(".rlib") {
             let hashed_prefix = format!("{stem}-");
-            if let Ok(entries) = fs::read_dir(&deps) {
-                candidates.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-                    path.extension() == Some(OsStr::new("rlib"))
-                        && path
-                            .file_stem()
-                            .and_then(OsStr::to_str)
-                            .is_some_and(|name| name.starts_with(&hashed_prefix))
-                }));
+            for unit in &units {
+                if let Ok(entries) = fs::read_dir(unit) {
+                    candidates.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+                        path.extension() == Some(OsStr::new("rlib"))
+                            && path
+                                .file_stem()
+                                .and_then(OsStr::to_str)
+                                .is_some_and(|name| name.starts_with(&hashed_prefix))
+                    }));
+                }
             }
         }
 
@@ -1159,10 +1201,33 @@ pub(crate) fn find_contract_rlib(rlib_name: &str) -> Option<(PathBuf, PathBuf)> 
                 .unwrap_or(std::time::UNIX_EPOCH)
         });
         if let Some(rlib) = newest {
-            return Some((rlib, deps));
+            return Some((rlib, units));
         }
     }
     None
+}
+
+/// The directories holding a cargo profile's compiled units: `deps/` (every
+/// unit, before cargo 1.100), then each unit's `build/<package>/<hash>/out/`
+/// (cargo's build-dir layout, always on since 1.100, which keeps no `deps/`).
+fn profile_unit_dirs(profile_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let deps = profile_dir.join("deps");
+    if deps.is_dir() {
+        dirs.push(deps);
+    }
+    let Ok(packages) = fs::read_dir(profile_dir.join("build")) else {
+        return dirs;
+    };
+    let mut units: Vec<PathBuf> = packages
+        .flatten()
+        .filter_map(|package| fs::read_dir(package.path()).ok())
+        .flat_map(|hashes| hashes.flatten().map(|hash| hash.path().join("out")))
+        .filter(|out| out.is_dir())
+        .collect();
+    units.sort();
+    dirs.extend(units);
+    dirs
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,11 +1342,13 @@ fn run_single_file(cli: &Cli, file: &Path) -> i32 {
             continue;
         }
         match find_contract_rlib(rlib_name) {
-            Some((rlib, deps)) => {
+            Some((rlib, units)) => {
                 rustc_args.push("--extern".to_string());
                 rustc_args.push(format!("{crate_name}={}", rlib.display()));
-                if !dependency_dirs.contains(&deps) {
-                    dependency_dirs.push(deps);
+                for unit in units {
+                    if !dependency_dirs.contains(&unit) {
+                        dependency_dirs.push(unit);
+                    }
                 }
             }
             // Only a hard error when the file actually imports it: a machine
@@ -1295,7 +1362,9 @@ fn run_single_file(cli: &Cli, file: &Path) -> i32 {
                     "error: {} uses the `{crate_name}` contract crate, but `{rlib_name}` is not built",
                     path.display()
                 );
-                eprintln!("help: build it:  cd {root} && cargo build --release -p {package}");
+                eprintln!(
+                    "help: build it:  cd {root} && targo --unverified build --release -p {package}"
+                );
                 eprintln!(
                     "help: or pass your own copy through:  trust-wp {} -- --extern {crate_name}=<path to {rlib_name}>",
                     path.display()
@@ -1496,7 +1565,10 @@ fn apply_sysroot_library_path(command: &mut Command) {
     if env::var_os(var).is_some() {
         return;
     }
-    let Ok(output) = Command::new("rustc").args(["--print", "sysroot"]).output() else {
+    let Ok(output) = Command::new(compiler_tool())
+        .args(["--print", "sysroot"])
+        .output()
+    else {
         return;
     };
     if !output.status.success() {
@@ -1553,7 +1625,7 @@ fn filter_value(cli: &Cli) -> Option<&str> {
 
 /// Ask the engine for per-function progress when the user asked for it.
 ///
-/// `-v` advertises "show verification progress" and used to change nothing:
+/// `-v` advertises "show verification progress", but on its own changes nothing:
 /// the engine's timing layer keys off its own log filter, and the `--verbose`
 /// flag the CLI forwards does not reach it. Setting the filter here is what
 /// makes the promise true — a verifier that thinks for seconds should be able
@@ -1847,11 +1919,11 @@ impl StderrRelay {
         if self.saw_proof_trusted {
             // A bare `? f unknown (proof-trusted)` and a source span tell
             // someone nothing about what to do. The verdict has one dominant
-            // so say what it means and what to try. An earlier version of this
-            // hint named `&mut` plus a branch as "the usual cause"; that shape
-            // proves now, and a hint that names a cause it no longer has sends
-            // the reader to rewrite working code. What stays true is the
-            // meaning and the two things worth doing next.
+            // so say what it means and what to try. The hint names no "usual
+            // cause": which shapes trip this verdict changes as the verifier
+            // improves, and a hint naming a stale cause sends the reader to
+            // rewrite working code. What stays true is the meaning and the two
+            // things worth doing next.
             eprintln!(
                 "help: `proof-trusted` means the solver reached UNSAT but the proof carried a \
                  step no checker confirmed, so the verdict is withheld. It is a completeness \
@@ -1869,20 +1941,21 @@ impl StderrRelay {
             eprintln!(
                 "help: that is a dynamic-loader failure, not a proof failure: `{DRIVER_BIN}` is \
                  linked with absolute rpaths into a Trust private sysroot. Rebuild it against the \
-                 current stage2:  cargo build --release -p trust-wp-driver --bin trust-wp-rustc"
+                 current Trust sysroot:  targo --unverified build --release -p trust-wp-driver \
+                 --bin trust-wp-rustc"
             );
         }
         if self.saw_missing_std {
             eprintln!(
-                "help: the engine could not resolve a sysroot. Check that `rustc --print sysroot` \
-                 names the Trust stage2 sysroot, then re-run."
+                "help: the engine could not resolve a sysroot. Check that `trustc --print sysroot` \
+                 names the Trust sysroot, then re-run."
             );
         }
         if self.saw_unresolved_contract_crate {
             eprintln!(
                 "help: the contract crate was not usable — most often it is stale, built \
                  against an older compiler or an older trust-wp-core than the engine. \
-                 Rebuild it:  cargo build -p trust-wp -p creusot-contracts"
+                 Rebuild it:  targo --unverified build -p trust-wp -p creusot-contracts"
             );
             eprintln!(
                 "help: or pass your own:  trust-wp <FILE.rs> -- --extern \
@@ -2068,7 +2141,7 @@ fn run_crate(cli: &Cli) -> i32 {
         }
     };
     // `cargo-trust-wp` looks for the driver next to itself or on $PATH; make
-    // sure the one this front door resolved is reachable either way.
+    // sure the one this binary resolved is reachable either way.
     let driver = match find_engine(&DRIVER_BINS, "TRUST_WP_RUSTC") {
         Ok(engine) => engine,
         Err(missing) => {
@@ -2093,7 +2166,7 @@ fn run_crate(cli: &Cli) -> i32 {
     args.extend(cli.passthrough.iter().cloned());
 
     // `cargo-trust-wp` looks for the driver next to itself or on $PATH, so the
-    // real run puts the driver this front door resolved at the front of PATH.
+    // real run puts the driver this binary resolved at the front of PATH.
     // The dry-run line has to show that too, or the command it prints resolves
     // a different engine than the command it stands for.
     let driver_dir = driver.program.parent().map(Path::to_path_buf);
@@ -2238,7 +2311,10 @@ use trust_wp::{ensures, requires};
 
 /// `requires` is the precondition the caller must establish; `ensures` is the
 /// postcondition trust-wp proves for every input that satisfies it.
-#[requires(x > 0)]
+///
+/// The upper bound is part of the proof, not decoration: without it `x + 1`
+/// overflows at `i32::MAX`, and trust-wp hands back that input.
+#[requires(x > 0 && x < 1_000_000)]
 #[ensures(result > x)]
 pub fn increment(x: i32) -> i32 {
     x + 1
@@ -2366,7 +2442,8 @@ fn run_doctor(json: bool) -> i32 {
                          the current stage2:"
                     );
                     out!(
-                        "                    cargo build --release -p trust-wp-driver --bin trust-wp-rustc"
+                        "                    targo --unverified build --release -p trust-wp-driver \
+                         --bin trust-wp-rustc"
                     );
                 }
                 Err(err) => {
@@ -2414,30 +2491,35 @@ fn run_doctor(json: bool) -> i32 {
                     "not built (only needed for `use creusot_contracts::…` files)"
                 };
                 out!("{label} {rlib_name} {note}");
-                out!("                    cargo build --release -p {package}");
+                out!("                    targo --unverified build --release -p {package}");
             }
         }
     }
 
-    // Crate mode shells out to `cargo`; a report that says "ready" without it
-    // is wrong for half the tool.
-    match Command::new("cargo").arg("--version").output() {
+    // Crate mode shells out to the build tool; a report that says "ready"
+    // without it is wrong for half the tool.
+    let tool = build_tool();
+    match build_tool_identity(&tool).output() {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            out!("  cargo             {version}");
+            out!("  build tool        {version} ({})", tool.display());
         }
         _ => {
             ready = false;
-            out!("  cargo             NOT RUNNABLE (crate mode unavailable)");
+            out!(
+                "  build tool        {} NOT RUNNABLE (crate mode unavailable)",
+                tool.display()
+            );
+            out!("                    crate mode drives targo: put it on PATH or set $CARGO");
             out!("                    single-file mode still works: trust-wp <FILE.rs>");
         }
     }
 
-    // Asked from inside the checkout on purpose: `rust-toolchain.toml` pins
-    // `channel = "trust"`, and rustup resolves that per directory. Probing in
-    // the user's cwd would report whatever toolchain *they* are pinned to,
-    // which is not the one the engine was built against.
-    let mut sysroot_probe = Command::new("rustc");
+    // The probe runs `$RUSTC`, else `trustc` from PATH, which is no rustup
+    // proxy and ignores the cwd. It still runs inside the checkout because
+    // `$RUSTC` may name a rustup proxy, which resolves `rust-toolchain.toml`
+    // per directory; from the user's cwd it would report their pin instead.
+    let mut sysroot_probe = Command::new(compiler_tool());
     sysroot_probe.args(["--print", "sysroot"]);
     if let Some(root) = repo_root() {
         sysroot_probe.current_dir(root);
@@ -2483,7 +2565,7 @@ fn run_doctor(json: bool) -> i32 {
 /// SemVer build metadata, is ignored for version comparison — `0.3.0+gc1645cf`
 /// still satisfies `version = "0.3"` and `"=0.3.0"`.
 pub(crate) fn build_version() -> String {
-    match option_env!("TRUST_WP_BUILD") {
+    match option_env!("TWP_BUILD") {
         Some(build) => format!("{}+{build}", env!("CARGO_PKG_VERSION")),
         None => env!("CARGO_PKG_VERSION").to_string(),
     }
@@ -2833,6 +2915,46 @@ mod tests {
     }
 
     #[test]
+    fn the_build_tool_and_compiler_default_to_trust_names_never_stock_ones() {
+        assert_eq!(tool_or(None, "targo"), PathBuf::from("targo"));
+        assert_eq!(
+            tool_or(Some(OsStr::new("")), "trustc"),
+            PathBuf::from("trustc")
+        );
+        assert_eq!(
+            tool_or(Some(OsStr::new("/opt/trust/bin/targo")), "targo"),
+            PathBuf::from("/opt/trust/bin/targo")
+        );
+    }
+
+    #[test]
+    fn the_targo_identity_probe_is_the_flag_only_real_targo_accepts() {
+        let spelled = |tool: &str| -> Vec<String> {
+            build_tool_identity(Path::new(tool))
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            spelled("/opt/trust/bin/targo"),
+            ["--unverified", "--version"]
+        );
+        assert_eq!(spelled("targo"), ["--unverified", "--version"]);
+        assert_eq!(spelled("/opt/other/bin/cargo"), ["--version"]);
+    }
+
+    #[test]
+    fn no_build_fix_spells_a_stock_tool() {
+        for binary in [DRIVER_BIN, CARGO_FRONT_BIN] {
+            for fix in build_fixes(binary, "TRUST_WP_RUSTC") {
+                for word in fix.split_whitespace() {
+                    assert!(!matches!(word, "cargo" | "rustc" | "rustup"), "{fix}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_proof_trusted_verdict_is_explained_and_nothing_else_triggers_it() {
         let mut relay = StderrRelay::collecting();
         relay.line("trust-wp: f verified \u{2713}");
@@ -3036,7 +3158,7 @@ mod tests {
     #[test]
     fn example_source_is_something_the_engine_can_verify() {
         assert!(EXAMPLE_SOURCE.contains("use trust_wp::{ensures, requires};"));
-        assert!(EXAMPLE_SOURCE.contains("#[requires(x > 0)]"));
+        assert!(EXAMPLE_SOURCE.contains("#[requires(x > 0 && x < 1_000_000)]"));
         assert!(EXAMPLE_SOURCE.contains("#[ensures(result > x)]"));
         // crate-type=lib: a `fn main` would be dead weight.
         assert!(!EXAMPLE_SOURCE.contains("fn main"));

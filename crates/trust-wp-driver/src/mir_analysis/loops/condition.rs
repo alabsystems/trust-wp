@@ -33,13 +33,14 @@ use super::{
 /// This function finds the unique SwitchInt in the body with an exit edge and
 /// extracts the negated condition (continuation condition).
 ///
-/// Returns `None` if there are multiple SwitchInt exits (ambiguous) or none.
+/// Returns `None` if there are multiple SwitchInt exits (ambiguous) or none;
+/// otherwise the break `SwitchInt` block and the continuation condition.
 pub(super) fn find_body_break_condition(
     body: &Body<'_>,
     loop_info: &LoopInfo,
     local_exprs: &HashMap<Local, PureExpr>,
     all_loops: Option<&[LoopInfo]>,
-) -> Option<PureExpr> {
+) -> Option<(BasicBlock, PureExpr)> {
     let mut candidates: Vec<(BasicBlock, PureExpr)> = Vec::new();
 
     // Collect blocks belonging to inner loops (skip those — their SwitchInt
@@ -85,7 +86,7 @@ pub(super) fn find_body_break_condition(
             // Resolve temporaries from this block's statements
             let mut block_local_exprs = local_exprs.clone();
             for stmt in &bb_data.statements {
-                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
                     if place.projection.is_empty() {
                         if let Some(expr) = translate_rvalue(rvalue, &block_local_exprs, Some(body))
                         {
@@ -111,7 +112,7 @@ pub(super) fn find_body_break_condition(
 
     // Only use if there's exactly one break-exit point (unambiguous).
     if candidates.len() == 1 {
-        candidates.into_iter().next().map(|(_, cond)| cond)
+        candidates.into_iter().next()
     } else {
         None
     }

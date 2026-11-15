@@ -37,7 +37,11 @@ impl RA for Int {
 impl UnitRA for Int {
     #[cfg_attr(trust_wp, crate::logic)]
     fn unit() -> Self {
-        Int(0)
+        // `0i128`, not `0`: a bare literal in a specification is an `Int`
+        // (Creusot's pearlite typing, mirrored by `__spec_tc`), and `Int`'s
+        // field is an `i128`. The suffix is what the type-check vehicle
+        // leaves alone.
+        Int(0i128)
     }
 }
 

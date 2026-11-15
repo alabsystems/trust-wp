@@ -125,24 +125,98 @@ impl ContractParser<'_> {
             return Ok(None);
         }
 
-        let raw_args = self.capture_balanced_angles_text()?;
+        let (start, raw_args) = self.capture_balanced_angles_text()?;
         let mut parsed_args = Vec::new();
-        for raw_arg in split_turbofish_args(&raw_args) {
-            let raw_arg = raw_arg.trim();
-            if raw_arg.is_empty() {
+        for (at, raw_arg) in split_turbofish_args(&raw_args) {
+            let trimmed = raw_arg.trim();
+            if trimmed.is_empty() {
                 continue;
             }
+            let offset = start + at + (raw_arg.len() - raw_arg.trim_start().len());
+            let arg = self.parse_turbofish_arg(trimmed, offset)?;
             parsed_args.push(PureExpr::LogicFnCall {
                 name: TURBOFISH_ARG_WRAPPER_NAME.to_string(),
-                args: vec![parse_turbofish_arg_expr(raw_arg)],
+                args: vec![arg],
             });
         }
         Ok(Some(parsed_args))
     }
 
+    /// A generic argument `raw`, written at `offset` of the input: a type
+    /// placeholder, or the expression it is. The argument is parsed by a
+    /// parser of its own, which starts from this parser's counters and hands
+    /// back everything it records, so a clause is refused for what an
+    /// argument writes (a dropped borrow, a machine-integer annotation) as for
+    /// the same text anywhere else. A const argument (a block `{ .. }` or a
+    /// literal) is an expression, never a type, whatever characters it holds
+    /// (`{ 2 * 3 }`, `{ &p }`): the reason it does not parse is the
+    /// clause's. Only another argument can be read as a type, which the
+    /// driver drops.
+    fn parse_turbofish_arg(&mut self, raw: &str, offset: usize) -> Result<PureExpr, ParseError> {
+        let is_const = is_const_argument(raw);
+        if !is_const && is_definitely_type_like_turbofish_arg(raw) {
+            self.refuse_shadowed_type(raw, offset)?;
+            return Ok(make_turbofish_type_placeholder(raw));
+        }
+        let mut nested = ContractParser::new(raw);
+        nested.preserve_stmt_exprs = self.preserve_stmt_exprs;
+        nested.keeps_evaluated_calls = self.keeps_evaluated_calls;
+        nested.stmt_expr_counter = self.stmt_expr_counter;
+        nested.cast_counter = self.cast_counter;
+        nested.closure_param_counter = self.closure_param_counter;
+        nested.census = self
+            .census
+            .as_ref()
+            .map(|_| std::collections::BTreeSet::new());
+        self.share_arith_with(&mut nested);
+        match nested.parse_in_place() {
+            Ok(expr) => {
+                self.absorb_nested(nested, offset);
+                if !is_const
+                    && matches!(expr, PureExpr::Var(_, _))
+                    && is_likely_type_like_identifier_or_path(raw)
+                {
+                    Ok(make_turbofish_type_placeholder(raw))
+                } else {
+                    Ok(expr)
+                }
+            }
+            Err(error) if is_const => Err(ParseError {
+                message: format!("generic argument `{raw}`: {}", error.message),
+                position: offset + error.position,
+            }),
+            Err(_) => Ok(make_turbofish_type_placeholder(raw)),
+        }
+    }
+
+    /// Take in what a parser of the text at `offset` recorded.
+    fn absorb_nested(&mut self, nested: ContractParser<'_>, offset: usize) {
+        self.absorb_arith(&nested, offset);
+        self.stmt_expr_counter = nested.stmt_expr_counter;
+        self.cast_counter = nested.cast_counter;
+        self.closure_param_counter = nested.closure_param_counter;
+        self.written_types.extend(nested.written_types);
+        self.discarded_statements
+            .extend(nested.discarded_statements);
+        self.unchecked_annotations
+            .extend(nested.unchecked_annotations);
+        self.annotated_names.extend(
+            nested
+                .annotated_names
+                .into_iter()
+                .map(|(name, sort, at)| (name, sort, at + offset)),
+        );
+        self.pattern_forms
+            .extend(nested.pattern_forms.iter().copied());
+        if let (Some(census), Some(nested)) = (self.census.as_mut(), nested.census.as_ref()) {
+            census.extend(nested.iter().copied());
+        }
+        self.absorb_references(&nested.references, &nested.dropped_references, offset);
+    }
+
     /// Capture the text inside a balanced `<...>` group, consuming both
-    /// delimiters.
-    fn capture_balanced_angles_text(&mut self) -> Result<String, ParseError> {
+    /// delimiters, with where that text starts.
+    fn capture_balanced_angles_text(&mut self) -> Result<(usize, String), ParseError> {
         if !self.try_consume("<") {
             return Err(self.error("expected '<'"));
         }
@@ -152,7 +226,7 @@ impl ContractParser<'_> {
         while let Some(ch) = self.peek() {
             match ch {
                 '<' => {
-                    depth += 1;
+                    depth = depth.saturating_add(1);
                     self.advance();
                 }
                 '>' => {
@@ -160,7 +234,7 @@ impl ContractParser<'_> {
                     if depth == 0 {
                         let captured = self.input[start..self.position].to_string();
                         self.advance();
-                        return Ok(captured);
+                        return Ok((start, captured));
                     }
                     self.advance();
                 }
@@ -216,7 +290,7 @@ impl ContractParser<'_> {
                     return None;
                 }
                 Some('<') => {
-                    depth += 1;
+                    depth = depth.saturating_add(1);
                     path_buf.push('<');
                     self.advance();
                 }
@@ -390,25 +464,15 @@ fn ends_with_keyword_as(s: &str) -> bool {
     !(prev.is_ascii_alphanumeric() || prev == b'_')
 }
 
-fn parse_turbofish_arg_expr(raw: &str) -> PureExpr {
-    if raw.is_empty() {
-        return make_turbofish_type_placeholder(raw);
-    }
-
-    if is_definitely_type_like_turbofish_arg(raw) {
-        return make_turbofish_type_placeholder(raw);
-    }
-
-    match ContractParser::new(raw).parse() {
-        Ok(expr)
-            if matches!(expr, PureExpr::Var(_, _))
-                && is_likely_type_like_identifier_or_path(raw) =>
-        {
-            make_turbofish_type_placeholder(raw)
-        }
-        Ok(expr) => expr,
-        Err(_) => make_turbofish_type_placeholder(raw),
-    }
+/// A generic argument Rust reads as a const expression only: a block or a
+/// literal (`{ N + 1 }`, `3`, `-1`, `true`, `'x'`). A lifetime (`'a`) is not
+/// one: it has no closing quote.
+fn is_const_argument(raw: &str) -> bool {
+    let unsigned = raw.strip_prefix('-').unwrap_or(raw).trim_start();
+    raw.starts_with('{')
+        || unsigned.starts_with(|ch: char| ch.is_ascii_digit())
+        || matches!(raw, "true" | "false")
+        || (raw.len() >= 3 && raw.starts_with('\'') && raw.ends_with('\''))
 }
 
 fn make_turbofish_type_placeholder(raw: &str) -> PureExpr {
@@ -418,7 +482,9 @@ fn make_turbofish_type_placeholder(raw: &str) -> PureExpr {
     )
 }
 
-fn split_turbofish_args(raw: &str) -> Vec<&str> {
+/// The top-level comma-separated arguments of `raw`, each with where it
+/// starts in `raw`.
+fn split_turbofish_args(raw: &str) -> Vec<(usize, &str)> {
     let mut args = Vec::new();
     let mut start = 0usize;
     let mut angle_depth = 0u32;
@@ -427,29 +493,36 @@ fn split_turbofish_args(raw: &str) -> Vec<&str> {
     let mut brace_depth = 0u32;
 
     for (idx, ch) in raw.char_indices() {
+        // The decrements were already saturating; the increments were not, so
+        // the pair was asymmetric and the four `+= 1` sites were refuted. A
+        // depth that saturates keeps the nesting check conservative, which is
+        // the direction that matters here.
         match ch {
-            '<' => angle_depth += 1,
+            '<' => angle_depth = angle_depth.saturating_add(1),
             '>' => angle_depth = angle_depth.saturating_sub(1),
-            '(' => paren_depth += 1,
+            '(' => paren_depth = paren_depth.saturating_add(1),
             ')' => paren_depth = paren_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            '{' => brace_depth += 1,
+            '{' => brace_depth = brace_depth.saturating_add(1),
             '}' => brace_depth = brace_depth.saturating_sub(1),
             ',' if angle_depth == 0
                 && paren_depth == 0
                 && bracket_depth == 0
                 && brace_depth == 0 =>
             {
-                args.push(&raw[start..idx]);
-                start = idx + ch.len_utf8();
+                // `start` and `idx` are char boundaries from char_indices, so
+                // this range is always valid; `get` proves it here instead of
+                // leaving a byte-range panic for the verifier to refute.
+                args.push((start, raw.get(start..idx).unwrap_or("")));
+                start = idx.saturating_add(ch.len_utf8());
             }
             _ => {}
         }
     }
 
     if start <= raw.len() {
-        args.push(&raw[start..]);
+        args.push((start, raw.get(start..).unwrap_or("")));
     }
 
     args

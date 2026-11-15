@@ -13,7 +13,7 @@ repository.workspace = true
 [features]
 default = []
 bincode = ["dep:bincode"]
-trust-ir-native = ["dep:trust-ir"]
+trust-ir-native = ["dep:trust-ir", "dep:trust-ir-contract", "dep:trust-ir-build"]
 
 [dependencies]
 trust-wp-core = { workspace = true }
@@ -23,9 +23,13 @@ serde_json = "1"
 thiserror = { workspace = true }
 bincode = { version = "1", optional = true }
 trust-ir = { workspace = true, optional = true }
+trust-ir-contract = { workspace = true, optional = true }
+trust-ir-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+# Native fixture round-trips require the IR codecs explicitly in the test graph.
+trust-ir = { workspace = true, features = ["binary", "serde", "native-validation-observer"] }
 
 [lints]
 workspace = true

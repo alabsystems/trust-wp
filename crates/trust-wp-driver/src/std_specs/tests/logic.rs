@@ -170,9 +170,11 @@ fn test_fmap_ghost_mutation_spec_clauses_all_parse() {
 /// frame + len-preservation + post-containment. The `^self` mentions are
 /// load-bearing — they advance the receiver's carrier at the call site.
 /// The `^r` value write-back must stay ABSENT until the encoder can carry
-/// an Option-payload prophecy (Final on a pattern binder currently
-/// collapses to the binder — asserting it would pin the post-value to the
-/// PRE-write payload, a false premise).
+/// an Option-payload prophecy: `^` on an unannotated match-arm binder is
+/// refused fail-closed (`final_collapse_requires_prophecy`), so a `^r`
+/// clause would make the spec unencodable, and collapsing `^r` to the
+/// binder instead would pin the post-value to the PRE-write payload, a
+/// false premise.
 #[test]
 fn test_lookup_fmap_get_mut_ghost_post_state() {
     let spec = lookup_std_spec("trust_wp_std::logic::FMap::get_mut_ghost")
@@ -210,7 +212,7 @@ fn test_lookup_fmap_get_mut_ghost_post_state() {
 /// sound carrier for the split view's borrow-end generation exists at the
 /// call site). The remove-model frame foralls must stay ABSENT: they have
 /// no consumer until the parent write-back exists and their e-matching
-/// load alone blew the whole-test budget (measured 2026-08-05).
+/// load alone blows the whole-test budget.
 #[test]
 fn test_lookup_fmap_split_mut_ghost_seed_and_havoc() {
     let spec = lookup_std_spec("trust_wp_std::logic::FMap::split_mut_ghost")

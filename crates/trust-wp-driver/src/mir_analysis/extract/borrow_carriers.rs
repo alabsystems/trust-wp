@@ -111,7 +111,7 @@ pub(in crate::mir_analysis::extract) fn per_borrow_carrier_expr<'tcx>(
         return None;
     }
     let name = source_name_for_local(body, borrow_local, arg_names)
-        .unwrap_or_else(|| format!("__trust_wp_borrow_{}", borrow_local.as_u32()));
+        .unwrap_or_else(|| format!("$borrow_{}", borrow_local.as_u32()));
     Some(PureExpr::Var(name, Some(sort)))
 }
 
@@ -170,7 +170,7 @@ impl BorrowCarrierRegistry {
 
         for block in body.basic_blocks.iter() {
             for statement in &block.statements {
-                if let StatementKind::Assign(box (place, rvalue)) = &statement.kind {
+                if let StatementKind::Assign((place, rvalue)) = &statement.kind {
                     if place.projection.is_empty() {
                         *assign_counts.entry(place.local).or_insert(0) += 1;
                         if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src), _) = rvalue {
@@ -178,8 +178,7 @@ impl BorrowCarrierRegistry {
                                 copy_candidates.push((place.local, src.local));
                             }
                         }
-                        if let Rvalue::Aggregate(box AggregateKind::Closure(..), operands) = rvalue
-                        {
+                        if let Rvalue::Aggregate(AggregateKind::Closure(..), operands) = rvalue {
                             closure_env_candidates.push((
                                 place.local,
                                 operands
@@ -508,7 +507,7 @@ pub(in crate::mir_analysis::extract) fn note_moved_mut_refs_in_rvalue<'tcx>(
         | Rvalue::Cast(_, operand, _)
         | Rvalue::UnaryOp(_, operand)
         | Rvalue::Repeat(operand, _) => note(operand),
-        Rvalue::BinaryOp(_, box (left, right)) => {
+        Rvalue::BinaryOp(_, (left, right)) => {
             note(left);
             note(right);
         }
@@ -804,7 +803,7 @@ fn mint_carrier<'tcx>(
             return None;
         };
         registry.mint_seq += 1;
-        PureExpr::Var(format!("{name}__twp_m{}", registry.mint_seq), sort)
+        PureExpr::Var(format!("{name}$twp_m{}", registry.mint_seq), sort)
     } else {
         registry.mint_seq += 1;
         base

@@ -11,14 +11,17 @@
 mod clauses;
 mod lookup;
 mod rewrite;
+mod type_params;
 
 use std::collections::{HashMap, HashSet};
 
 // Re-export clause-building functions used by sibling modules.
 pub(super) use clauses::{
-    build_closure_capture_invariant_requires, build_current_closure_self_invariant_requires,
-    build_newtype_param_set, build_type_invariant_clauses, build_type_invariant_method_map,
-    build_type_invariant_structural_expr_map, rewrite_synthesized_invariant_calls,
+    build_capture_invariants, build_closure_capture_invariant_requires,
+    build_current_closure_self_invariant_requires, build_newtype_param_set,
+    build_type_invariant_clauses, build_type_invariant_method_map,
+    build_type_invariant_structural_expr_map, is_compound_native_single_field_struct,
+    rewrite_synthesized_invariant_calls,
 };
 use lookup::{adt_type_path, find_element_invariant_method};
 // Re-export lookup helpers used by sibling modules and tests.
@@ -41,6 +44,12 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{TyCtxt, TyKind};
 use tracing::trace;
 use trust_wp_core::formula::{internal::tuple_lowering::NAMED_FIELD_LOGIC_FN_PREFIX, PureExpr};
+pub(super) use type_params::install_invariant_type_names;
+pub(crate) use type_params::{
+    clear_invariant_type_names, instantiate_type_param_invariants, is_trivially_invariant_free,
+    mentions_type_param_invariant, type_param_invariant_at, type_param_invariant_of,
+    TypeParamInvariantAt,
+};
 
 /// Build synthetic `TypeInvariantDef` entries for container types (#869).
 ///
@@ -89,7 +98,7 @@ pub(super) fn build_container_invariant_defs(
                     continue;
                 }
                 if let Some(element_method) =
-                    find_element_invariant_method(tcx, substs, &invariant_type_names)
+                    find_element_invariant_method(tcx, *substs, &invariant_type_names)
                 {
                     // Use the short type name (last path segment) for the def,
                     // matching how build_type_invariant_method_map generates method names
@@ -132,7 +141,12 @@ pub(super) fn rewrite_invariant_def_named_fields(
     tcx: TyCtxt<'_>,
     type_invariant_defs: &mut [trust_wp_core::logic::TypeInvariantDef],
 ) {
-    use super::contract_rewrite::rewrite_named_field_access_expr;
+    use super::{
+        contract_rewrite::{rewrite_named_field_access_expr, FieldOrderTables},
+        struct_field_map::build_crate_ctor_field_order,
+    };
+
+    let ctor_field_order = build_crate_ctor_field_order(tcx);
 
     // Build a map from type name (both short and crate-qualified) to field map.
     // We iterate local ADTs once and cache the field maps.
@@ -191,7 +205,15 @@ pub(super) fn rewrite_invariant_def_named_fields(
             continue;
         }
 
-        let rewritten = rewrite_named_field_access_expr(inv_def.body(), field_map);
+        // A body whose named-field pattern cannot be placed is left AS
+        // WRITTEN, keeping its `{...}` field metadata. That is not a
+        // source-order fallback: the contract-level pass this body is spliced
+        // into sees the same metadata and refuses there (D-31), where a
+        // refusal has a function to attach to.
+        let tables = FieldOrderTables::new(field_map, &ctor_field_order);
+        let Ok(rewritten) = rewrite_named_field_access_expr(inv_def.body(), tables) else {
+            continue;
+        };
         let field_count = field_map.len();
         trace!(
             type_name = %inv_def.type_name(),

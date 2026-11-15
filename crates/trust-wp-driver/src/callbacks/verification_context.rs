@@ -40,7 +40,6 @@ pub(super) struct VerificationRunConfig<'a> {
     pub(super) type_invariant_defs: &'a [TypeInvariantDef],
     pub(super) trait_specs: &'a HashMap<DefId, StdSpec>,
     pub(super) trait_contracts: &'a [TraitMethodContract],
-    pub(super) trait_refinement_overrides: &'a HashSet<DefId>,
     pub(super) recursive_fns: &'a HashSet<DefId>,
     /// Extern specs for call-site resolution. Passed explicitly to replace
     /// `EXTERN_SPECS` thread-local access in `mir_analysis/` (#963 Phase C).
@@ -58,7 +57,7 @@ pub(super) struct VerificationRunConfig<'a> {
 /// Shared context for all verification passes within a single contract (#1986).
 ///
 /// Bundles the per-function parameters that are identical across
-/// `verify_contract_loop_path`, `check_trait_refinement`, and the non-loop
+/// `verify_contract_loop_path`, the standalone refinement pass, and the non-loop
 /// verification path. Replaces 21-parameter and 16-parameter positional
 /// signatures with a single `&VerificationContext` plus per-call args.
 ///
@@ -71,7 +70,6 @@ pub(super) struct VerificationContext<'a, 'tcx> {
     pub(super) def_path: &'a str,
     pub(super) loc: &'a str,
     pub(super) recursive_fns: &'a HashSet<DefId>,
-    pub(super) trait_refinement_overrides: &'a HashSet<DefId>,
     pub(super) trait_contract_map: &'a HashMap<DefId, HashMap<String, &'a TraitMethodContract>>,
     pub(super) type_invariants_opt: Option<&'a [TypeInvariantDef]>,
     pub(super) logic_fns_opt: Option<&'a [LogicFnDef]>,

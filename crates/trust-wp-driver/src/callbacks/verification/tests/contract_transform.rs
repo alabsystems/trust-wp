@@ -27,6 +27,11 @@ pub(super) fn make_parsed_contract() -> crate::callbacks::parsing::ParsedContrac
         call_obligations: vec![],
         pre_loop_call_obligations: vec![],
         post_loop_call_obligations: vec![],
+        returning_path_facts: Vec::new(),
+        extraction_fail_closed_reason: None,
+        panic_unreachability_obligations: 0,
+        user_written_false_obligations: 0,
+        proved_dead_edges: Default::default(),
         loop_fields: LoopFields {
             invariants: vec![],
             per_loop_invariants: vec![],
@@ -39,7 +44,9 @@ pub(super) fn make_parsed_contract() -> crate::callbacks::parsing::ParsedContrac
         mut_borrow: MutBorrowFields {
             mut_borrow_body: None,
             mut_ref_param_names: HashSet::new(),
+            state_params: HashSet::new(),
             projected_final_pins: Vec::new(),
+            stale_call_final_params: HashSet::new(),
         },
         reborrow_prophecy: None,
     }
@@ -104,6 +111,7 @@ fn transform_contract_closure_captures_excluded_from_mut_ref_params() {
         mutation_continued_params: HashSet::new(),
         nested_slot_resolutions: vec![],
         nested_transfer_params: HashSet::new(),
+        lent_path_resolutions: vec![],
     });
 
     let tc = transform_contract(&parsed);
@@ -199,7 +207,7 @@ fn transform_contract_bridges_old_call_result_constructor_to_upgraded() {
     };
     let old_call_result_ok = PureExpr::BinOp(
         Arc::new(PureExpr::Old(Arc::new(PureExpr::Var(
-            "call_3".to_string(),
+            "$call_3".to_string(),
             None,
         )))),
         BinOp::Eq,
@@ -208,7 +216,7 @@ fn transform_contract_bridges_old_call_result_constructor_to_upgraded() {
 
     let mut parsed = make_parsed_contract();
     parsed.requires = vec![PureExpr::Bool(true)];
-    parsed.result_expr = Some(PureExpr::Var("call_3".to_string(), None));
+    parsed.result_expr = Some(PureExpr::Var("$call_3".to_string(), None));
     parsed.call_assumptions = vec![old_call_result_ok];
 
     let tc = transform_contract(&parsed);
@@ -217,7 +225,7 @@ fn transform_contract_bridges_old_call_result_constructor_to_upgraded() {
         tc.effective_requires.iter().any(|expr| matches!(
             expr,
             PureExpr::BinOp(left, BinOp::Eq, right)
-                if matches!(left.as_ref(), PureExpr::Var(name, _) if name == "call_3__upgraded")
+                if matches!(left.as_ref(), PureExpr::Var(name, _) if name == "$call_3__upgraded")
                 && **right == ok_five
         )),
         "call-result assumptions should synthesize an upgraded constructor fact; got {:?}",
@@ -251,8 +259,13 @@ fn transform_contract_base_counts_track_user_clauses_not_merged() {
     );
 }
 
+/// Creusot semantics: `*x` in an `ensures` over a `&mut` param is the ENTRY
+/// value and stays a current read (`Deref`); only `^x` is the final value.
+/// Rewriting it to `Final` lets `#[ensures(result@ == (*r)@)] fn f(r: &mut
+/// u32) -> u32 { *r = 5; 5 }` verify although it is false for any entry
+/// `*r != 5` (`s48_mutref_ens_entry_value.rs`).
 #[test]
-fn transform_contract_mut_ref_ensures_rewritten_to_final() {
+fn transform_contract_mut_ref_ensures_deref_stays_entry_read() {
     let mut parsed = make_parsed_contract();
     parsed.ensures = vec![PureExpr::Deref(Arc::new(PureExpr::Var(
         "x".to_string(),
@@ -262,15 +275,139 @@ fn transform_contract_mut_ref_ensures_rewritten_to_final() {
 
     let tc = transform_contract(&parsed);
 
-    assert!(
-        !tc.effective_ensures.is_empty(),
-        "should have transformed ensures"
-    );
-    // Verify the ensures was actually transformed (not left as raw Deref)
     let first = &tc.effective_ensures[0];
     assert!(
-        !matches!(first, PureExpr::Deref(_)),
-        "mut-ref param postcondition should not remain as Deref; got: {first:?}"
+        matches!(first, PureExpr::Deref(inner) if matches!(inner.as_ref(), PureExpr::Var(n, _) if n == "x")),
+        "`*x` in a Creusot ensures must stay the entry read `Deref(x)`; got: {first:?}"
+    );
+}
+
+/// The legacy dialect `*x == old(*x) + 1` marks the entry value with `old`:
+/// in a clause naming `x` inside `old(..)`, bare `*x` is the post-state and is
+/// still rewritten to `^x`, while `old(*x)` stays the entry read.
+#[test]
+fn transform_contract_legacy_old_clause_rewrites_bare_deref_to_final() {
+    let mut parsed = make_parsed_contract();
+    let deref_x = PureExpr::Deref(Arc::new(PureExpr::Var("x".to_string(), None)));
+    parsed.ensures = vec![PureExpr::BinOp(
+        Arc::new(deref_x.clone()),
+        BinOp::Eq,
+        Arc::new(PureExpr::BinOp(
+            Arc::new(PureExpr::Old(Arc::new(deref_x))),
+            BinOp::Add,
+            Arc::new(PureExpr::Int(1)),
+        )),
+    )];
+    parsed.mut_borrow.mut_ref_param_names = HashSet::from(["x".to_string()]);
+    parsed.mut_borrow.state_params = parsed.mut_borrow.mut_ref_param_names.clone();
+
+    let tc = transform_contract(&parsed);
+
+    let PureExpr::BinOp(lhs, BinOp::Eq, rhs) = &tc.effective_ensures[0] else {
+        panic!("expected an equality; got {:?}", tc.effective_ensures[0]);
+    };
+    assert!(
+        matches!(lhs.as_ref(), PureExpr::Final(_)),
+        "bare `*x` beside `old(*x)` is the post-state; got: {lhs:?}"
+    );
+    assert!(
+        format!("{rhs:?}").contains("Old(Deref(Var(\"x\""),
+        "`old(*x)` must stay the entry read; got: {rhs:?}"
+    );
+}
+
+/// The legacy dialect is a property of the CLAUSE: in `*a == old(*b)` the
+/// clause names a `&mut` param inside `old(..)`, so bare `*a` is the
+/// post-state (`^a`) although `a` itself is never named under `old`. Reading
+/// it as the entry value turns swap's contract into `entry(a) == entry(b)`.
+#[test]
+fn transform_contract_legacy_old_clause_rewrites_every_mut_ref_deref_to_final() {
+    let mut parsed = make_parsed_contract();
+    let deref = |n: &str| PureExpr::Deref(Arc::new(PureExpr::Var(n.to_string(), None)));
+    parsed.ensures = vec![PureExpr::BinOp(
+        Arc::new(deref("a")),
+        BinOp::Eq,
+        Arc::new(PureExpr::Old(Arc::new(deref("b")))),
+    )];
+    parsed.mut_borrow.mut_ref_param_names = HashSet::from(["a".to_string(), "b".to_string()]);
+    parsed.mut_borrow.state_params = parsed.mut_borrow.mut_ref_param_names.clone();
+
+    let tc = transform_contract(&parsed);
+
+    let PureExpr::BinOp(lhs, BinOp::Eq, rhs) = &tc.effective_ensures[0] else {
+        panic!("expected an equality; got {:?}", tc.effective_ensures[0]);
+    };
+    assert!(
+        matches!(lhs.as_ref(), PureExpr::Final(inner) if matches!(inner.as_ref(), PureExpr::Var(n, _) if n == "a")),
+        "bare `*a` in a clause with `old(*b)` is the post-state `^a`; got: {lhs:?}"
+    );
+    assert!(
+        format!("{rhs:?}").contains("Old(Deref(Var(\"b\""),
+        "`old(*b)` must stay the entry read; got: {rhs:?}"
+    );
+}
+
+/// The dialect is decided over the signature's `&mut` parameters
+/// (`state_params`), the set every call of the function reads the clause
+/// over, never over the set body extraction widens. With no mut-borrow body,
+/// extraction once added every name read as `old(*x)` to the rewrite's
+/// parameters, so `*p == old(*x)` of a shared `x` read `*p` as `^p` here and
+/// as the entry value at every call: the body was proved of one value and
+/// each caller credited with another.
+#[test]
+fn transform_contract_reads_states_over_the_signature_parameters() {
+    let mut parsed = make_parsed_contract();
+    let deref = |n: &str| PureExpr::Deref(Arc::new(PureExpr::Var(n.to_string(), None)));
+    parsed.ensures = vec![PureExpr::BinOp(
+        Arc::new(deref("p")),
+        BinOp::Eq,
+        Arc::new(PureExpr::Old(Arc::new(deref("x")))),
+    )];
+    parsed.arg_names = vec!["x".to_string(), "p".to_string()];
+    parsed.mut_borrow.mut_ref_param_names = HashSet::from(["p".to_string()]);
+    parsed.mut_borrow.state_params = HashSet::from(["p".to_string()]);
+
+    let tc = transform_contract(&parsed);
+
+    let PureExpr::BinOp(lhs, BinOp::Eq, _) = &tc.effective_ensures[0] else {
+        panic!("expected an equality; got {:?}", tc.effective_ensures[0]);
+    };
+    assert!(
+        matches!(lhs.as_ref(), PureExpr::Deref(inner) if matches!(inner.as_ref(), PureExpr::Var(n, _) if n == "p")),
+        "`old(*x)` of a shared `x` puts no clause in the pre-Creusot dialect: `*p` stays the \
+         entry read every call reads; got: {lhs:?}"
+    );
+}
+
+/// A clause without `old(..)` keeps Creusot's reading for EVERY `&mut` param,
+/// even when a sibling clause of the same contract is in the legacy dialect.
+#[test]
+fn transform_contract_old_dialect_is_per_clause() {
+    let mut parsed = make_parsed_contract();
+    let deref = |n: &str| PureExpr::Deref(Arc::new(PureExpr::Var(n.to_string(), None)));
+    parsed.ensures = vec![
+        PureExpr::BinOp(
+            Arc::new(deref("a")),
+            BinOp::Eq,
+            Arc::new(PureExpr::Old(Arc::new(deref("b")))),
+        ),
+        PureExpr::BinOp(
+            Arc::new(PureExpr::Var("result".to_string(), None)),
+            BinOp::Eq,
+            Arc::new(deref("a")),
+        ),
+    ];
+    parsed.mut_borrow.mut_ref_param_names = HashSet::from(["a".to_string(), "b".to_string()]);
+    parsed.mut_borrow.state_params = parsed.mut_borrow.mut_ref_param_names.clone();
+
+    let tc = transform_contract(&parsed);
+
+    let PureExpr::BinOp(_, BinOp::Eq, rhs) = &tc.effective_ensures[1] else {
+        panic!("expected an equality; got {:?}", tc.effective_ensures[1]);
+    };
+    assert!(
+        matches!(rhs.as_ref(), PureExpr::Deref(inner) if matches!(inner.as_ref(), PureExpr::Var(n, _) if n == "a")),
+        "`*a` in a clause without `old(..)` stays the entry read; got: {rhs:?}"
     );
 }
 

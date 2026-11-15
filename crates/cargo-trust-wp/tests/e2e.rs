@@ -5,8 +5,8 @@
 //! End-to-end tests for cargo-trust-wp against fixture projects.
 //!
 //! This file is a thin module loader. All test bodies and the shared harness
-//! live under `e2e/`. Existing `cargo test -p cargo-trust-wp --test e2e ...`
-//! usage remains valid.
+//! live under `e2e/`. Run them with
+//! `targo --unverified test -p targo-trust-wp --test e2e ...`.
 
 #[path = "e2e/support.rs"]
 mod support;

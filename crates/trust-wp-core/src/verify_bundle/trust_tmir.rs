@@ -1011,11 +1011,15 @@ fn trust_tmir_to_verify_bundle_inner(
             }
         };
         let formula_metrics = formula.adapter_metrics_from_payload(payload.len());
-        metrics.bindings += formula_metrics.bindings;
-        metrics.expr_nodes += formula_metrics.expr_nodes;
+        metrics.bindings = metrics.bindings.saturating_add(formula_metrics.bindings);
+        metrics.expr_nodes = metrics
+            .expr_nodes
+            .saturating_add(formula_metrics.expr_nodes);
         metrics.max_expr_depth = metrics.max_expr_depth.max(formula_metrics.max_expr_depth);
-        metrics.payload_bytes += formula_metrics.payload_bytes;
-        metrics.summary_facts += summary_facts.len();
+        metrics.payload_bytes = metrics
+            .payload_bytes
+            .saturating_add(formula_metrics.payload_bytes);
+        metrics.summary_facts = metrics.summary_facts.saturating_add(summary_facts.len());
         metrics.source_locations += usize::from(location.is_some());
 
         let mut bundle_obligation = BundleObligation::new(
@@ -1115,15 +1119,26 @@ fn trust_tmir_adapter_metrics(
     };
 
     for obligation in &bundle.obligations {
-        metrics.summary_facts += obligation.summary_facts.len();
-        metrics.source_locations += usize::from(obligation.location.is_some());
+        // Metrics tallies over an untrusted bundle: saturating keeps a report
+        // that overstates by a bounded amount rather than one that wraps to a
+        // small number and reads as a tiny bundle.
+        metrics.summary_facts = metrics
+            .summary_facts
+            .saturating_add(obligation.summary_facts.len());
+        metrics.source_locations = metrics
+            .source_locations
+            .saturating_add(usize::from(obligation.location.is_some()));
 
         match obligation.formula.adapter_metrics() {
             Ok(formula_metrics) => {
-                metrics.bindings += formula_metrics.bindings;
-                metrics.expr_nodes += formula_metrics.expr_nodes;
+                metrics.bindings = metrics.bindings.saturating_add(formula_metrics.bindings);
+                metrics.expr_nodes = metrics
+                    .expr_nodes
+                    .saturating_add(formula_metrics.expr_nodes);
                 metrics.max_expr_depth = metrics.max_expr_depth.max(formula_metrics.max_expr_depth);
-                metrics.payload_bytes += formula_metrics.payload_bytes;
+                metrics.payload_bytes = metrics
+                    .payload_bytes
+                    .saturating_add(formula_metrics.payload_bytes);
             }
             Err(formula_diagnostics) => {
                 diagnostics.extend(with_obligation_context(&obligation.id, formula_diagnostics));

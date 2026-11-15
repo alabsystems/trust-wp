@@ -223,10 +223,8 @@ fn test_loop_mem_track_level_detects_preservation_failure() {
 #[test]
 #[timeout(30000)]
 fn test_loop_verification_propagates_encoding_error_from_invariant() {
-    // Use a Float(NaN) expression as the invariant — NaN is rejected by
-    // try_real_const, producing EncodingError::Unsupported.
-    // Updated for #985: closures now encode conservatively, so Float(NaN) is used.
-    let bad_inv = PureExpr::Float(trust_wp_core::formula::FloatBits::from_f64(f64::NAN));
+    // An invariant the encoder refuses, producing EncodingError::Unsupported.
+    let bad_inv = crate::tests::helpers::unencodable_float_order();
 
     let result = verify_loop_invariant_positional(&LoopVerificationContext {
         requires: &[],

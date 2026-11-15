@@ -7,14 +7,12 @@
 //! Binary and unary operator encoding, Bool-context operand handling, bitwise
 //! BV (bitvector) encoding, legacy UF axioms, and division proof obligations.
 //!
-//! Since #2666, bitwise operations (AND, OR, XOR, SHL, SHR) use ay's native
-//! BV theory by default via `encode_int_binop_bv`. Int-sorted operands are
+//! Bitwise operations (AND, OR, XOR, SHL, SHR) use ay's native BV theory by
+//! default via `encode_int_binop_bv` (#2666). Int-sorted operands are
 //! converted to BV(64) via `int2bv`, the native BV operation is applied, and
 //! the result is converted back to Int via `bv2int`. The legacy UF path
 //! (`encode_int_binop_uf`) is retained for test backward compatibility but is
 //! unreachable in production since `bitwise_proof_mode` defaults to `true`.
-//!
-//! Extracted from `pure_encoding.rs` as part of the encoder decomposition (#1988).
 
 use std::collections::HashSet;
 
@@ -30,6 +28,32 @@ use super::{
     unsoundness, AYEncoder, NumericOperandMode,
 };
 use crate::error::EncodingError;
+
+/// A machine-integer bit operation encoded at its type (D-242).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MachineBitOp {
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    /// `!` (bitwise complement).
+    Not,
+}
+
+impl MachineBitOp {
+    /// The binary bit operator `op`, if it is one.
+    pub(crate) fn from_binop(op: BinOp) -> Option<Self> {
+        Some(match op {
+            BinOp::BitAnd => Self::And,
+            BinOp::BitOr => Self::Or,
+            BinOp::BitXor => Self::Xor,
+            BinOp::Shl => Self::Shl,
+            BinOp::Shr => Self::Shr,
+            _ => return None,
+        })
+    }
+}
 
 /// Bitwise operation kind for the native BV encoding path (#2666).
 enum BitwiseBvOp {
@@ -59,6 +83,8 @@ fn expr_is_known_int_key_for_bool_context(expr: &PureExpr) -> bool {
                     | BinOp::Mul
                     | BinOp::Div
                     | BinOp::Mod
+                    | BinOp::DivTrunc
+                    | BinOp::RemTrunc
                     | BinOp::Shl
                     | BinOp::Shr
                     | BinOp::BitAnd
@@ -67,6 +93,8 @@ fn expr_is_known_int_key_for_bool_context(expr: &PureExpr) -> bool {
             ) && expr_is_known_int_key_for_bool_context(left)
                 && expr_is_known_int_key_for_bool_context(right)
         }
+        // A machine bit operation at its type (D-242) is an integer.
+        PureExpr::LogicFnCall { name, .. } => super::parse_int_bitop_name(name).is_some(),
         PureExpr::MethodCall { method, .. } => matches!(
             method.as_str(),
             "len"
@@ -155,6 +183,7 @@ impl AYEncoder {
         eq_sort: Option<&Sort>,
         signed_narrow: Option<u32>,
     ) -> Result<Term, EncodingError> {
+        self.refuse_float_binop(l, op, r)?;
         Ok(match op {
             BinOp::Add => {
                 let (l, r) =
@@ -686,6 +715,153 @@ impl AYEncoder {
 
         // Convert the BV result back to Int for the rest of the encoding.
         self.solver.bv2int(bv_result)
+    }
+
+    /// Encode a machine-integer bit operation AT ITS TYPE: `bits` wide, with
+    /// the type's signedness (the `__trust_wp_int_bitop_*` marker, D-242).
+    ///
+    /// Each Int operand (an in-range value of the type) is taken to its
+    /// `bits`-wide two's-complement pattern with `int2bv`, the operation is
+    /// the BV operation on those patterns, and the pattern is read back
+    /// signed or unsigned. That is the Rust operation exactly: `<<` keeps the
+    /// low `bits` bits (`200u8 << 1 == 144`), `!` complements within the type,
+    /// `&`/`|`/`^` of `u128` operands keep their high half, a signed result is
+    /// its two's-complement value, and a signed `>>` is ARITHMETIC (`bvashr`).
+    /// The shift amount is the `bits`-wide pattern of its value, exact for
+    /// every amount the shift's range obligation admits (`0 <= s < bits`).
+    /// `right` is `None` for `!`.
+    pub(crate) fn encode_int_bitop_at_type(
+        &mut self,
+        op: MachineBitOp,
+        left: Term,
+        right: Option<Term>,
+        bits: u32,
+        signed: bool,
+    ) -> Result<Term, EncodingError> {
+        let pattern = |encoder: &mut Self, term: Term| -> Result<Term, EncodingError> {
+            let term = match encoder.solver.get_sort(term) {
+                // A BV-sorted operand carries its unsigned value.
+                Sort::BitVec(_) => encoder.solver.bv2int(term),
+                Sort::Int => term,
+                _ => {
+                    let zero = encoder.solver.int_const(0);
+                    coerce_to_numeric(&mut encoder.solver, term, zero, NumericOperandMode::IntOnly)
+                        .0
+                }
+            };
+            encoder.solver.try_int2bv(term, bits).map_err(|error| {
+                EncodingError::unsupported(format!(
+                    "machine bit operation at {bits} bits: operand not convertible: {error}"
+                ))
+            })
+        };
+        let l = pattern(self, left)?;
+        let result = match (op, right) {
+            (MachineBitOp::And, Some(r)) => {
+                let r = pattern(self, r)?;
+                self.solver.bvand(l, r)
+            }
+            (MachineBitOp::Or, Some(r)) => {
+                let r = pattern(self, r)?;
+                self.solver.bvor(l, r)
+            }
+            (MachineBitOp::Xor, Some(r)) => {
+                let r = pattern(self, r)?;
+                self.solver.bvxor(l, r)
+            }
+            (MachineBitOp::Shl, Some(r)) => {
+                let r = pattern(self, r)?;
+                self.solver.bvshl(l, r)
+            }
+            (MachineBitOp::Shr, Some(r)) => {
+                let r = pattern(self, r)?;
+                if signed {
+                    self.solver.bvashr(l, r)
+                } else {
+                    self.solver.bvlshr(l, r)
+                }
+            }
+            (MachineBitOp::Not, None) => self.solver.bvnot(l),
+            _ => {
+                return Err(EncodingError::unsupported(
+                    "machine bit operation marker with the wrong operand count",
+                ))
+            }
+        };
+        Ok(if signed {
+            self.solver.bv2int_signed(result)
+        } else {
+            self.solver.bv2int(result)
+        })
+    }
+
+    /// Encode a machine `value >> shift` by a literal `0 <= shift < bits`
+    /// (D-242). Its Rust value is `floor(value / 2^shift)` for either
+    /// signedness (an arithmetic shift is the floor).
+    ///
+    /// * Up to 64 bits it is the Euclidean quotient by the positive literal
+    ///   `2^shift`, a linear definition shared with a clause's machine `>>`
+    ///   by a literal (D-232 reads it as that quotient), plus the lemma that
+    ///   a quotient of a value in the type lies in the shifted range
+    ///   (monotonicity of the floor; it holds wherever the definition does,
+    ///   and is guarded by the active path as the definition is).
+    /// * Above 64 bits the type's bounds reach `2^128`, and a proof through
+    ///   them (`2^64 * q <= x <= 2^128 - 1`, so `q <= 2^64 - 1`) is beyond
+    ///   what the strict certificate admits. The shift is then the
+    ///   bit-vector shift at the type, whose result range is a THEOREM of
+    ///   the encoding (a logical shift of a 128-bit pattern by `k` is below
+    ///   `2^(128-k)`; an arithmetic one lies in `[-2^(127-k), 2^(127-k))`),
+    ///   asserted without premise.
+    pub(crate) fn encode_machine_shr_by_literal(
+        &mut self,
+        value: Term,
+        bits: u32,
+        signed: bool,
+        shift: u32,
+    ) -> Result<Term, EncodingError> {
+        let one = BigInt::from(1u8);
+        let (min, max) = if signed {
+            let half = &one << (bits - 1);
+            (-half.clone(), half - &one)
+        } else {
+            (BigInt::from(0u8), (&one << bits) - &one)
+        };
+        let divisor = &one << shift;
+        let range_lo = euclidean_div_bigint(&min, &divisor);
+        let range_hi = euclidean_div_bigint(&max, &divisor);
+        let in_quantifier = self.quantifier_state.quantifier_depth() != 0;
+        if bits <= 64 {
+            let divisor = self.solver.int_const_bigint(&divisor);
+            let quotient = self.encode_binop(value, BinOp::Div, divisor, None)?;
+            if !in_quantifier && self.solver.get_sort(quotient) == Sort::Int {
+                let min = self.solver.int_const_bigint(&min);
+                let max = self.solver.int_const_bigint(&max);
+                let ge_min = self.solver.ge(value, min);
+                let le_max = self.solver.le(value, max);
+                let in_type = self.solver.and(ge_min, le_max);
+                let lo = self.solver.int_const_bigint(&range_lo);
+                let hi = self.solver.int_const_bigint(&range_hi);
+                let ge_lo = self.solver.ge(quotient, lo);
+                let le_hi = self.solver.le(quotient, hi);
+                let in_range = self.solver.and(ge_lo, le_hi);
+                let lemma = self.solver.implies(in_type, in_range);
+                let guarded = self.guard_with_active_path(lemma);
+                self.assert_solver_term("machine_shr/quotient_range", guarded);
+            }
+            return Ok(quotient);
+        }
+        let amount = self.solver.int_const(i64::from(shift));
+        let result =
+            self.encode_int_bitop_at_type(MachineBitOp::Shr, value, Some(amount), bits, signed)?;
+        if !in_quantifier {
+            let lo = self.solver.int_const_bigint(&range_lo);
+            let hi = self.solver.int_const_bigint(&range_hi);
+            let ge_lo = self.solver.ge(result, lo);
+            let le_hi = self.solver.le(result, hi);
+            let in_range = self.solver.and(ge_lo, le_hi);
+            self.assert_solver_term("machine_shr/pattern_range", in_range);
+        }
+        Ok(result)
     }
 
     /// Encode an integer narrowing cast using BV truncation (#2666, #938).
@@ -1236,11 +1412,12 @@ impl AYEncoder {
 
     /// Collect division/modulo proof obligation: divisor != 0.
     ///
-    /// SMT-LIB2 integer division is total (div-by-zero returns 0), so no
-    /// background assumption is needed for well-formedness. Instead, we
-    /// collect path-guarded `divisor != 0` obligations that the verification
-    /// layer asserts alongside negated postconditions. This makes the verifier
-    /// detect division-by-zero as a verification failure. (#1629)
+    /// The quotient and remainder encodings are total functions whose value at
+    /// a zero divisor is left unconstrained, so no background assumption is
+    /// needed for well-formedness. Instead, we collect path-guarded
+    /// `divisor != 0` obligations that the verification layer asserts
+    /// alongside negated postconditions. This makes the verifier detect
+    /// division-by-zero as a verification failure. (#1629)
     ///
     /// Path-guarded so dead branches (e.g., `if false { x / y }`) don't trigger.
     fn assert_nonzero_divisor(&mut self, divisor: Term) {
@@ -1249,6 +1426,16 @@ impl AYEncoder {
         // variables, so recording them here would let those variables escape
         // their quantifier and become unconstrained globals in the negated goal.
         if self.quantifier_state.quantifier_depth() > 0 {
+            return;
+        }
+        // An assumed formula owes no divisor check, by the rule the shift range
+        // obligation follows (`ArithmeticModeState::assumption_position`). A
+        // callee's `ensures` or a `requires` fact is Pearlite, where division is
+        // total; a division the program executes is charged at its own MIR
+        // assert. Collected here, `(rhs@ != 0) ==> r@ == x@ / rhs@` assumed at
+        // `rhs == 0` became the unguarded goal `0 != 0` and refuted a true
+        // contract (D-114, div_in_assumed_callee_spec_control.rs).
+        if self.arithmetic_mode.assumption_position() {
             return;
         }
         if self.solver.get_sort(divisor) == Sort::Int && self.term_is_nonzero_int_literal(divisor) {
@@ -1502,12 +1689,11 @@ impl AYEncoder {
     /// these UFs — so it adds no unsound hypothesis (same class as the
     /// `int_mod/euclidean_positive_divisor_bounds` axiom); path-guarded.
     ///
-    /// Without it the div/mod pair is under-axiomatized: the 2026-07-04 ay
-    /// line is complete enough to find a genuine model of the WEAK encoding
-    /// for obligations like `result == b*(a/b) + a%b ==> result == a`
-    /// (e.g. `a=1, b=1, result=0` with `int_div(1,1)=0`), which trust-wp then
-    /// reported as a (spurious for Rust semantics) counterexample. The old ay
-    /// returned Unknown on the same query, masking the encoding gap.
+    /// Without it the div/mod pair is under-axiomatized: ay finds a genuine
+    /// model of the WEAK encoding for obligations like
+    /// `result == b*(a/b) + a%b ==> result == a` (e.g. `a=1, b=1, result=0`
+    /// with `int_div(1,1)=0`), which trust-wp would report as a counterexample
+    /// that is spurious for Rust semantics.
     fn assert_int_div_euclidean_identity(&mut self, dividend: Term, divisor: Term, quotient: Term) {
         let mod_term = self.int_mod_uf(dividend, divisor);
         let prod = self.encode_nonlinear_mul_uf(divisor, quotient);
@@ -1793,9 +1979,37 @@ impl AYEncoder {
         self.assert_solver_term("int_div/euclidean_literal_divisor", guarded);
     }
 
-    /// Encode a unary operation
-    #[allow(clippy::unnecessary_wraps)] // Consistent with other encode_* methods
+    /// A float reaches a `BinOp` only as an operand of logical `==`/`!=`
+    /// (equality of values: NaN equals itself, `0.0` and `-0.0` differ).
+    /// Rust's arithmetic and comparisons on floats arrive as reserved IEEE
+    /// calls (`trust_wp_core::formula::ieee`); a `BinOp` spelling of one would
+    /// be read by the integer/real branches below, whose coercions replace a
+    /// float by a fresh number and can make `x <= x` hold of NaN.
+    fn refuse_float_binop(&self, l: Term, op: BinOp, r: Term) -> Result<(), EncodingError> {
+        let l_sort = self.solver.get_sort(l);
+        let r_sort = self.solver.get_sort(r);
+        let is_float = crate::encoder::pure_encoding::ieee::is_float_value_sort;
+        if !is_float(&l_sort) && !is_float(&r_sort) {
+            return Ok(());
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) && l_sort == r_sort {
+            return Ok(());
+        }
+        Err(EncodingError::unsupported(format!(
+            "`{op:?}` over a float operand ({l_sort:?}, {r_sort:?}): only logical equality \
+             of two values of one float format is a relation on floats"
+        )))
+    }
+
+    /// Encode a unary operation. A float operand is refused: its negation
+    /// arrives as the reserved IEEE call, never as a `UnOp`.
     pub(super) fn encode_unop(&mut self, op: UnOp, inner: Term) -> Result<Term, EncodingError> {
+        let inner_sort = self.solver.get_sort(inner);
+        if crate::encoder::pure_encoding::ieee::is_float_value_sort(&inner_sort) {
+            return Err(EncodingError::unsupported(format!(
+                "`{op:?}` over a float operand: float negation arrives as its reserved IEEE call"
+            )));
+        }
         Ok(match op {
             UnOp::Not => {
                 if self.solver.get_sort(inner) == Sort::Int {

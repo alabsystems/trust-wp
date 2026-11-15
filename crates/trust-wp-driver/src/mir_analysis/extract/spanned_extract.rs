@@ -64,6 +64,8 @@ struct SpannedVisitor<'a, 'tcx> {
     local_exprs: HashMap<Local, SpannedBodyExpr>,
     visited: HashSet<BasicBlock>,
     ctx: &'a SpannedExtractionContext<'a>,
+    /// The `Drop` just visited may run glue that writes (D-140).
+    handed_off: bool,
 }
 
 impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
@@ -104,6 +106,21 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
 
     fn on_return(&self, _body: &Body<'tcx>) -> Option<Self::Result> {
         self.local_exprs.get(&Local::from_u32(0)).cloned()
+    }
+
+    // D-140: this walk keeps no projected write and re-binds nothing, and its
+    // result stands in for the primary walk's when that one gives up. Past
+    // drop glue that may write, it gives up too.
+    fn on_drop_place(&mut self, place: &Place<'tcx>, body: &Body<'tcx>) {
+        self.handed_off =
+            super::drop_glue_writes::locals_changed_by_drop(self.tcx, body, place).is_some();
+    }
+
+    fn on_drop(&mut self, target: BasicBlock) -> VisitorAction<Self::Result> {
+        if self.handed_off {
+            return VisitorAction::bail();
+        }
+        VisitorAction::Continue(target)
     }
 
     fn on_assert(
@@ -167,6 +184,18 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
         let Some(next_bb) = target else {
             return VisitorAction::bail();
         };
+        if super::drop_glue_writes::locals_changed_by_call(
+            self.tcx,
+            body,
+            bb,
+            func,
+            args,
+            &destination,
+        )
+        .is_some()
+        {
+            return VisitorAction::bail();
+        }
         let terminator = body.basic_blocks[bb].terminator();
         let call_span = terminator.source_info.span;
 
@@ -189,7 +218,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
 
         let result_expr = if cell_builtin.is_some() {
             PureExpr::Var(
-                format!("_call_{}", destination.local.as_u32()),
+                format!("$_call_{}", destination.local.as_u32()),
                 ty_to_expr_sort_enriched(self.tcx, body.local_decls[destination.local].ty),
             )
         } else {
@@ -228,7 +257,7 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
                         arg_expr
                     } else {
                         PureExpr::Var(
-                            format!("_call_{}", destination.local.as_u32()),
+                            format!("$_call_{}", destination.local.as_u32()),
                             ty_to_expr_sort_enriched(
                                 self.tcx,
                                 body.local_decls[destination.local].ty,
@@ -260,14 +289,14 @@ impl<'a, 'tcx> BlockVisitor<'tcx> for SpannedVisitor<'a, 'tcx> {
                         }
                     }
                     PureExpr::Var(
-                        format!("_call_{}", destination.local.as_u32()),
+                        format!("$_call_{}", destination.local.as_u32()),
                         ty_to_expr_sort_enriched(self.tcx, body.local_decls[destination.local].ty),
                     )
                 }
                 ResolvedCallKind::MappingFromClosure
                 | ResolvedCallKind::MapInvFromClosure
                 | ResolvedCallKind::Opaque => PureExpr::Var(
-                    format!("_call_{}", destination.local.as_u32()),
+                    format!("$_call_{}", destination.local.as_u32()),
                     ty_to_expr_sort_enriched(self.tcx, body.local_decls[destination.local].ty),
                 ),
             }
@@ -329,6 +358,7 @@ fn extract_from_block_spanned_inner<'tcx>(
         local_exprs,
         visited,
         ctx,
+        handed_off: false,
     };
     block_visitor::walk_block(body, bb, &mut visitor)
 }
@@ -355,7 +385,7 @@ fn try_extract_try_operator_spanned<'tcx>(
             .iter()
             .find(|(val, _)| *val == 0)
             .map_or(targets.otherwise(), |(_, bb)| bb),
-        TerminatorKind::Goto { target } => {
+        TerminatorKind::Goto { target, .. } => {
             let goto_data = &body.basic_blocks[*target];
             match &goto_data.terminator().kind {
                 TerminatorKind::SwitchInt { targets, .. } => targets
@@ -378,7 +408,7 @@ fn try_extract_try_operator_spanned<'tcx>(
 
     let continue_data = &body.basic_blocks[continue_bb];
     for stmt in &continue_data.statements {
-        if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+        if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
             if place.projection.is_empty() {
                 if rvalue_reads_from_local(rvalue, destination_local) {
                     local_exprs.insert(
@@ -404,7 +434,14 @@ fn try_extract_try_operator_spanned<'tcx>(
 
     let continue_term = continue_data.terminator();
     let continue_result = match &continue_term.kind {
-        TerminatorKind::Goto { target } | TerminatorKind::Drop { target, .. } => {
+        TerminatorKind::Goto { target, .. } => {
+            extract_from_block_spanned_inner(tcx, body, *target, local_exprs, visited, ctx)
+        }
+        // D-140: see `SpannedVisitor::on_drop`.
+        TerminatorKind::Drop { place, target, .. } => {
+            if super::drop_glue_writes::locals_changed_by_drop(tcx, body, place).is_some() {
+                return None;
+            }
             extract_from_block_spanned_inner(tcx, body, *target, local_exprs, visited, ctx)
         }
         TerminatorKind::Return => local_exprs.get(&Local::from_u32(0)).cloned(),
@@ -549,6 +586,12 @@ fn apply_spec_for_spanned<'tcx>(
     let mut effects = CallEffects::new();
     apply_postconditions_with_effects(
         &spec.ensures,
+        &crate::mir_analysis::call_signature(
+            tcx,
+            def_id,
+            param_names,
+            Some(crate::mir_analysis::CallSite { body, func }),
+        ),
         &result_var,
         &translated_args,
         param_names,

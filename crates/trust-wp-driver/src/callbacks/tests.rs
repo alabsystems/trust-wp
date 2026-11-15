@@ -30,14 +30,13 @@ use super::{
         analyze_call_assumptions, expr_contains_old, extract_final_vars, parent_module,
         scope_logic_fn_modes, synthesize_identity_final_values,
     },
-    parsing::build_param_normalization,
     proof_assert_extract::{
         apply_projected_writes_to_substitutions, apply_type_and_field_rewrites,
         collapse_idempotent_views, is_deref_precondition, normalize_scalar_proof_assert_boundary,
         normalize_view_fn_calls,
     },
     should_preload_builtin_extern_specs,
-    thread_locals::{clear_caches, CacheGuard, EXTERN_SPECS, MIR_BODIES},
+    thread_locals::{clear_caches, CacheGuard, EXTERN_SPECS},
 };
 use crate::mir_analysis::{
     clear_qualified_assoc_const_definitions,

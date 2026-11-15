@@ -13,7 +13,8 @@ use super::*;
 #[timeout(30000)]
 fn test_register_logic_fn_cleanup_on_error() {
     // Test that register_logic_fn restores variable bindings when body encoding fails.
-    // Issue #256: Verify the cleanup logic at lib.rs:450-457 works correctly.
+    // Issue #256: a failed registration must not leave its parameter shadowing
+    // the caller's binding.
     let mut encoder = AYEncoder::new_with_quantifiers();
 
     // First, bind 'x' to a known term in the encoder's vars map
@@ -23,9 +24,9 @@ fn test_register_logic_fn_cleanup_on_error() {
 
     // Create a logic function with 'x' as a parameter (will shadow original)
     // and a body that will fail to encode (complex deref expression).
-    // Note: Deref(Int(0)) succeeds (#1075), and Deref(BinOp) now succeeds
-    // via BinOp distribution (#2700). Use Deref(Exists(...)) instead, which
-    // still hits the unsupported complex-deref catch-all.
+    // Deref(Int(0)) encodes (#1075) and Deref(BinOp) encodes via BinOp
+    // distribution (#2700), so neither can serve as the failing body.
+    // Deref(Exists(...)) hits the unsupported complex-deref catch-all.
     let invalid_logic_fn = LogicFnDef::new(
         "bad_fn".to_string(),
         "test::bad_fn".to_string(),
@@ -50,7 +51,7 @@ fn test_register_logic_fn_cleanup_on_error() {
     );
 
     // Verify original 'x' binding was restored (not polluted by the failed registration)
-    // The code at lib.rs:450-457 should restore bindings even on error
+    // register_logic_fn must restore bindings even on error
     let current_x = encoder.vars_for_test().get("x");
     assert!(
         current_x.is_some(),
@@ -67,8 +68,7 @@ fn test_register_logic_fn_cleanup_on_error() {
 /// When multiple logic functions are registered, the E-matcher must instantiate
 /// all of their axioms correctly for goals that reference multiple logic fns.
 ///
-/// Root cause: ay#1939 - E-matching bug with multiple triggered quantifiers.
-/// ay#1939 was fixed on 2026-02-02.
+/// Regression guard for ay#1939 (E-matching with multiple triggered quantifiers).
 #[test]
 #[timeout(30000)]
 fn test_bug_259_multiple_logic_fns_registered() {
@@ -126,7 +126,7 @@ fn test_bug_259_multiple_logic_fns_registered() {
     );
 
     // Now verify with BOTH logic functions registered
-    // Fixed: ay#1939 resolved (2026-02-02) - E-matching works with multiple quantifiers
+    // E-matching must instantiate both axioms (ay#1939).
     let logic_fns = vec![add_one, double];
     let result_multiple = verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures_multiple)
@@ -134,7 +134,7 @@ fn test_bug_259_multiple_logic_fns_registered() {
             .logic_fns(Some(&logic_fns)),
     );
 
-    // ay#1939 fixed: Multiple logic functions now verify correctly
+    // Both registered logic functions must verify (ay#1939).
     assert!(
         matches!(result_multiple, Ok(VerificationResult::Verified(_))),
         "Multiple logic functions should verify (ay#1939 fixed): {result_multiple:?}"
@@ -143,7 +143,7 @@ fn test_bug_259_multiple_logic_fns_registered() {
 
 /// Test logic fn filtering when function is referenced ONLY in postcondition.
 ///
-/// Verifies #259 fix correctly handles the case where logic fn appears
+/// Verifies the #259 filtering handles the case where logic fn appears
 /// in ensures but not in requires (guards registration via postcondition scan).
 #[test]
 #[timeout(30000)]

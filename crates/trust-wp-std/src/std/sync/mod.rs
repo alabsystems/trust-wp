@@ -557,7 +557,12 @@ pub mod specs {
     ";
 
     /// Contract for `Mutex::lock`
+    ///
+    /// Locking a mutex the calling thread already holds never returns: it
+    /// panics or deadlocks. Which locks a thread holds is not modelled, so
+    /// the call is refused rather than trusted.
     pub const MUTEX_LOCK: &str = r"
+        requires: __trust_wp_std_site_unmodelled_panic()
         ensures: self.inv().inv(*result)
     ";
 
@@ -588,8 +593,6 @@ pub mod specs {
     ";
 
     // Inner-value equality: clone preserves the inner T value.
-    // Combined with the inner-value biconditional ptr_eq spec, this
-    // proves ptr_eq after clone.
     /// Contract for `Arc::clone`
     pub const ARC_CLONE: &str = r"
         ensures: *result == *self
@@ -627,25 +630,20 @@ pub mod specs {
 
     /// Contract for `Rc::ptr_eq`
     ///
-    /// Biconditional on inner-value equality: `result == (*self == *rhs)`.
-    /// Combined with the whole-value clone spec (`result == self`, so
-    /// `*result == *self`), this proves `ptr_eq` after clone.
-    ///
-    /// Soundness note: this spec is slightly over-strong — two distinct
-    /// `Rc::new(42)` allocations would prove `ptr_eq == true`, which is
-    /// incorrect in Rust. A fully sound model requires allocation identity
-    /// tracking, which the current SMT encoding does not support.
-    /// The current encoding is safe for the Creusot test suite patterns
-    /// (clone-then-ptr_eq and different-value-ptr_eq).
+    /// One direction only: the same allocation holds the same value. The
+    /// encoding reads an `Rc` as the value it points to and has no
+    /// allocation identity, so the converse (equal values, the same
+    /// allocation) would make two distinct `Rc::new(1)` allocations
+    /// `ptr_eq` (D-190, v24_ptr_eq_of_two_allocations_holding_one_value.rs).
     pub const RC_PTR_EQ: &str = r"
-        ensures: result == (*self == *rhs)
+        ensures: result ==> self == rhs
     ";
 
     /// Contract for `Arc::ptr_eq`
     ///
-    /// Biconditional on inner-value equality (same as `RC_PTR_EQ`).
+    /// One direction only, as `RC_PTR_EQ` (D-190).
     pub const ARC_PTR_EQ: &str = r"
-        ensures: result == (*self == *rhs)
+        ensures: result ==> self == rhs
     ";
 
     /// Contract for `Cell::new`
@@ -669,12 +667,19 @@ pub mod specs {
     ";
 
     /// Contract for `RefCell::borrow`
+    ///
+    /// Panics while the cell is mutably borrowed. The borrow state is not
+    /// modelled, so the call is refused rather than trusted.
     pub const REFCELL_BORROW: &str = r"
+        requires: __trust_wp_std_site_unmodelled_panic()
         ensures: *result == self.inner()
     ";
 
     /// Contract for `RefCell::borrow_mut`
+    ///
+    /// Panics while the cell is borrowed at all; refused for the same reason.
     pub const REFCELL_BORROW_MUT: &str = r"
+        requires: __trust_wp_std_site_unmodelled_panic()
         ensures: *result == self.inner()
         ensures: (^self).inner() == ^result
     ";

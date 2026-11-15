@@ -4,7 +4,7 @@
 
 //! Logic-function catalog shaping for shared verification preparation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rustc_middle::ty::TyCtxt;
 use trust_wp_core::{formula::PureExpr, logic::LogicFnDef};
@@ -48,15 +48,148 @@ pub(in crate::callbacks) fn filter_downstream_logic_fns(
         .iter()
         .map(|lf| {
             if unverified_axioms.contains(lf.full_path()) {
-                let mut neutralized = lf.clone();
-                neutralized.set_is_opaque(true);
-                neutralized.set_ensures(Vec::new());
-                neutralized
+                neutralized(lf)
             } else {
                 lf.clone()
             }
         })
         .collect()
+}
+
+/// `lf` stripped to a bare declaration: no defining axiom, no spec axiom.
+/// The one spelling of neutralization, for the downstream set and for the
+/// logic pass's own environment alike.
+pub(in crate::callbacks) fn neutralized(lf: &LogicFnDef) -> LogicFnDef {
+    let mut neutralized = lf.clone();
+    neutralized.set_is_opaque(true);
+    neutralized.set_ensures(Vec::new());
+    neutralized
+}
+
+/// Name a neutralized axiom this obligation's own symbols can reach, if any.
+///
+/// Neutralization (see [`filter_downstream_logic_fns`]) WITHDRAWS an unproved
+/// logic function's axioms. The solver may then build a model in which the
+/// withdrawn fact is false — and a model that exists only because a fact was
+/// taken away refutes nothing the user wrote. Publishing it as a
+/// counterexample asserts "a state exists that violates your contract"; the
+/// honest claim is "I cannot decide this without the axiom I refused to
+/// grant". The verdict path asks this question before it publishes a
+/// refutation.
+///
+/// Deliberately over-approximate, and only ever in the refusal direction. The
+/// same logic symbol is spelled as a full path, a crate-relative path, or a
+/// bare method name depending on which rewrite produced the call, so a call is
+/// matched on any of the three; and reachability runs through the bodies and
+/// clauses of the functions that are still live, because a withdrawn fact
+/// reached two hops away is just as absent. A spurious match costs one
+/// withheld refutation; a missed one publishes a false counterexample, which
+/// is the worse error.
+pub(in crate::callbacks) fn neutralized_axiom_reached<'e>(
+    logic_fns: &[LogicFnDef],
+    unverified_axioms: &HashSet<String>,
+    obligations: impl IntoIterator<Item = &'e PureExpr>,
+) -> Option<String> {
+    if unverified_axioms.is_empty() {
+        return None;
+    }
+    let mut withdrawn: HashMap<String, &str> = HashMap::new();
+    for path in unverified_axioms {
+        for spelling in path_spellings(path) {
+            withdrawn.entry(spelling).or_insert(path.as_str());
+        }
+    }
+    // A live function's axioms still hold, so reaching one is not a hit — but
+    // the symbols ITS body and clauses mention are reachable from here, and a
+    // withdrawn fact two hops away is just as absent.
+    let mut live: HashMap<String, Vec<&LogicFnDef>> = HashMap::new();
+    for lf in logic_fns {
+        let is_withdrawn = unverified_axioms.contains(lf.full_path());
+        for spelling in def_spellings(lf) {
+            if is_withdrawn {
+                withdrawn.entry(spelling).or_insert(lf.full_path());
+            } else {
+                live.entry(spelling).or_default().push(lf);
+            }
+        }
+    }
+
+    let mut pending: Vec<String> = Vec::new();
+    for obligation in obligations {
+        collect_logic_call_names(obligation, &mut pending);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut expanded: HashSet<&str> = HashSet::new();
+    let mut hits: BTreeSet<&str> = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(path) = withdrawn.get(&name) {
+            hits.insert(path);
+            continue;
+        }
+        let Some(defs) = live.get(&name) else {
+            continue;
+        };
+        for def in defs {
+            if !expanded.insert(def.full_path()) {
+                continue;
+            }
+            collect_logic_call_names(def.body(), &mut pending);
+            for clause in def.requires().iter().chain(def.ensures()) {
+                collect_logic_call_names(clause, &mut pending);
+            }
+        }
+    }
+    hits.into_iter().next().map(str::to_owned)
+}
+
+/// Every way a call site may spell the logic function defined at `full_path`.
+///
+/// The solver symbol is the injective unique id, but clauses that never
+/// reached name normalization still carry the source path, the crate-relative
+/// path, or the bare method name.
+fn path_spellings(full_path: &str) -> Vec<String> {
+    let mut spellings = vec![
+        full_path.to_string(),
+        trust_wp_core::logic::identity::logic_fn_unique_id(full_path),
+    ];
+    if let Some((_, relative)) = full_path.split_once("::") {
+        if !relative.is_empty() {
+            spellings.push(relative.to_string());
+        }
+    }
+    if let Some((_, leaf)) = full_path.rsplit_once("::") {
+        if !leaf.is_empty() {
+            spellings.push(leaf.to_string());
+        }
+    }
+    spellings
+}
+
+/// The spellings a definition answers to, including the id it was renamed to.
+fn def_spellings(lf: &LogicFnDef) -> Vec<String> {
+    let mut spellings = path_spellings(lf.full_path());
+    spellings.push(lf.name().to_string());
+    spellings.push(lf.short_name().to_string());
+    spellings
+}
+
+/// Collect the callee names a formula mentions.
+///
+/// Both call shapes count: contract rewriting turns a receiver call into
+/// `LogicFnCall`, but clauses that never went through it keep `MethodCall`,
+/// and the axiom is equally absent under either spelling.
+fn collect_logic_call_names(expr: &PureExpr, out: &mut Vec<String>) {
+    expr.any_recursive(|node| {
+        match node {
+            PureExpr::LogicFnCall { name, .. } => out.push(name.clone()),
+            PureExpr::MethodCall { method, .. } => out.push(method.clone()),
+            _ => {}
+        }
+        false
+    });
 }
 
 pub(in crate::callbacks) fn build_trait_logic_fn_groups(
@@ -170,5 +303,116 @@ pub(super) fn substitute_const_items_into_logic_fns(
         for ensure in lf.ensures_mut() {
             *ensure = ensure.substitute(&filtered);
         }
+    }
+}
+
+#[cfg(test)]
+mod neutralized_axiom_reached_tests {
+    use std::collections::HashSet;
+
+    use trust_wp_core::{
+        formula::PureExpr,
+        logic::{identity::logic_fn_unique_id, LogicFnDef},
+    };
+
+    use super::neutralized_axiom_reached;
+
+    fn def(full_path: &str, body: PureExpr) -> LogicFnDef {
+        let leaf = full_path.rsplit_once("::").map_or(full_path, |(_, l)| l);
+        let mut lf = LogicFnDef::new(
+            leaf.to_string(),
+            full_path.to_string(),
+            vec!["self".to_string()],
+            body,
+        );
+        // Name normalization renames every definition to its injective id, so
+        // call sites in real obligations are spelled that way and nothing else.
+        lf.assign_unique_id(logic_fn_unique_id(full_path));
+        lf
+    }
+
+    fn call(full_path: &str) -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: logic_fn_unique_id(full_path),
+            args: vec![PureExpr::Var("self".to_string(), None)],
+        }
+    }
+
+    #[test]
+    fn a_call_to_the_withdrawn_axiom_is_named() {
+        let bumped = def("c::Spec::bumped", PureExpr::Bool(true));
+        let unverified: HashSet<String> = ["c::Spec::bumped".to_string()].into_iter().collect();
+        let obligation = call("c::Spec::bumped");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[bumped], &unverified, [&obligation]),
+            Some("c::Spec::bumped".to_string())
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_axiom_two_hops_away_is_still_reached() {
+        // `via` keeps its axioms, so the model is only free where `bumped` was
+        // withdrawn — but the obligation reaches that freedom through `via`.
+        let bumped = def("c::Spec::bumped", PureExpr::Bool(true));
+        let via = def("c::via", call("c::Spec::bumped"));
+        let unverified: HashSet<String> = ["c::Spec::bumped".to_string()].into_iter().collect();
+        let obligation = call("c::via");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[bumped, via], &unverified, [&obligation]),
+            Some("c::Spec::bumped".to_string())
+        );
+    }
+
+    #[test]
+    fn an_obligation_that_reaches_no_withdrawn_axiom_keeps_its_refutation() {
+        let base = def("c::Spec::base", PureExpr::Bool(true));
+        let bumped = def("c::Spec::bumped", PureExpr::Bool(true));
+        let unverified: HashSet<String> = ["c::Spec::bumped".to_string()].into_iter().collect();
+        let obligation = call("c::Spec::base");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[base, bumped], &unverified, [&obligation]),
+            None
+        );
+    }
+
+    #[test]
+    fn nothing_withdrawn_means_nothing_withheld() {
+        let bumped = def("c::Spec::bumped", PureExpr::Bool(true));
+        let obligation = call("c::Spec::bumped");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[bumped], &HashSet::new(), [&obligation]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_path_absent_from_the_slice_is_still_matched() {
+        // The catalog slice need not contain the definition whose postcondition
+        // was refused; the path alone must still withhold the refutation.
+        let unverified: HashSet<String> = ["c::Spec::bumped".to_string()].into_iter().collect();
+        let obligation = call("c::Spec::bumped");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[], &unverified, [&obligation]),
+            Some("c::Spec::bumped".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cycle_between_live_definitions_terminates() {
+        let mut left = def("c::left", call("c::right"));
+        let right = def("c::right", call("c::left"));
+        left.set_body(call("c::right"));
+        let unverified: HashSet<String> = ["c::gone".to_string()].into_iter().collect();
+        let obligation = call("c::left");
+
+        assert_eq!(
+            neutralized_axiom_reached(&[left, right], &unverified, [&obligation]),
+            None
+        );
     }
 }

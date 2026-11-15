@@ -10,7 +10,6 @@
 //! computes the delta after, and demotes `Verified` results to `Unknown` when
 //! demoting categories fired.
 //!
-//! Design: `designs/2026-03-08-unsoundness-demotion-pipeline.md`
 //! Reference: trust-mc's `unsoundness_fields.rs` + `unsoundness_per_harness.rs`
 
 use std::{cell::RefCell, collections::HashMap, fmt};
@@ -19,9 +18,9 @@ use tracing::debug;
 
 /// Risk level for an unsoundness category.
 ///
-/// Formalizes the HIGH/MEDIUM/LOW/ELIMINATED classification that was
-/// previously only tracked in comments. Used by `UnsoundnessCategory::risk_level()`
-/// and test assertions to prevent silent reclassification. (#2663)
+/// The HIGH/MEDIUM/LOW/ELIMINATED classification as a value rather than a
+/// comment, so `UnsoundnessCategory::risk_level()` and test assertions can
+/// catch a silent reclassification. (#2663)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RiskLevel {
     /// Can produce false proofs. Demotes `Verified` to `Unknown`.
@@ -62,7 +61,8 @@ impl fmt::Display for RiskLevel {
 /// - **MEDIUM** (demoting): Can produce false proofs in edge cases
 /// - **LOW** (conservative): Can produce false counterexamples but not false proofs
 ///
-/// See R1-189 audit for the full category catalog with file locations.
+/// A variant's `Site:` line names the code that increments it; the
+/// ELIMINATED variants carry none because nothing increments them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnsoundnessCategory {
@@ -77,30 +77,27 @@ pub enum UnsoundnessCategory {
     /// Bool→Int causes `eq` instead of `iff`, making equality unconstrained.
     /// Sites: `encoder/sep_logic.rs`, `verify/mut_borrow/resolve.rs`, `encoder/operators.rs`.
     SortFallbackToInt,
-    /// ELIMINATED (#2541): closure body no longer defaults to `Bool(true)`.
-    /// Missing bodies are stored as `None` and ensures-only inlining is used
-    /// when the contract constrains `result`; otherwise the UF fallback runs.
-    /// Retained in the enum for test backward compatibility only.
-    /// Reclassified non-demoting: no production code increments this category.
-    /// Former site: `encoder/closure_inline.rs`.
+    /// ELIMINATED (#2541): a missing closure body is stored as `None`, never
+    /// defaulted to `Bool(true)`; ensures-only inlining covers a contract that
+    /// constrains `result`, otherwise the UF fallback runs. No production code
+    /// increments this category, so it is non-demoting; the variant exists
+    /// only for the tests that name it.
     ClosureBodyTrueDefault,
-    /// ELIMINATED (#2666): BV mode is now always-on in production
-    /// (`per_contract.rs` hardcodes `bitwise_proof: true`). Bitwise operations
-    /// use ay's native BV theory via `encode_int_binop_bv` instead of UF
-    /// approximations. The legacy UF fallback path (`encode_int_binop_uf`)
-    /// still exists for test backward compatibility but is unreachable in
-    /// production. Retained in the enum for backward compat only.
-    /// Reclassified non-demoting: no production code increments this category.
-    /// Former site: `encoder/operators.rs` shift/bitwise handlers.
+    /// ELIMINATED (#2666): BV mode is always on in production
+    /// (`per_contract.rs` hardcodes `bitwise_proof: true`), so bitwise
+    /// operations go through ay's native BV theory via `encode_int_binop_bv`.
+    /// The UF path (`encode_int_binop_uf`) is reachable only from tests. No
+    /// production code increments this category, so it is non-demoting; the
+    /// variant exists only for the tests that name it.
     BitwiseUfApproximation,
     /// Opaque function call with no spec available.
     ///
-    /// **Historical name:** "TrueAssumption" reflects the original behavior where
-    /// opaque calls assumed `postcondition = true`. The current implementation
-    /// uses Creusot's `requires(false)` pattern: a `Bool(false)` obligation is
-    /// injected, making the caller's proof impossible (fail-closed).
+    /// The name is a misnomer: opaque calls do NOT assume `postcondition =
+    /// true`. They follow Creusot's `requires(false)` pattern: a `Bool(false)`
+    /// obligation is injected, making the caller's proof impossible
+    /// (fail-closed).
     ///
-    /// **Encoding-level guard (#2663):** `encode_let_obligation` now detects
+    /// **Encoding-level guard (#2663):** `encode_let_obligation` detects
     /// constant-false obligations and returns an `EncodingError`, preventing the
     /// non-Bool body path from asserting `false` as a solver fact (which would
     /// make the context trivially UNSAT → false "Verified"). This blocks the
@@ -115,8 +112,8 @@ pub enum UnsoundnessCategory {
     /// exact only for pure values; on `&mut`-embedding carriers (match binders
     /// over `Option<&mut T>` payloads, ADT-embedded `&mut` fields) no prophecy
     /// slot exists and the collapse would assert the false premise/goal
-    /// `^x == *x` — the take_first_mut adjudicated false accept (Final-collapse
-    /// audit 2026-08-05). The refusal produces an `EncodingError::unsupported`
+    /// `^x == *x` — the `take_first_mut` false accept (D-14). The refusal
+    /// produces an `EncodingError::unsupported`
     /// (premise-side: assumption dropped via the LetAssumeDropped /
     /// requires-error lane; goal-side: honest obligation failure) and this
     /// counter guarantees demotion even if some path absorbs the error.
@@ -129,14 +126,14 @@ pub enum UnsoundnessCategory {
     /// wrapping semantics. This can produce false proofs when a postcondition
     /// depends on the cast target's bit width.
     ///
-    /// **Partially addressed by #2666:** When the target type is known at
-    /// MIR extraction time (the common case), the driver now emits a
+    /// **Narrowed by #2666:** When the target type is known at
+    /// MIR extraction time (the common case), the driver emits a
     /// `__trust_wp_int_truncate_{s|u}{bits}` LogicFnCall that the encoder
     /// intercepts and routes to `encode_int_truncation_bv`, giving exact
     /// modular truncation semantics via BV theory. This counter only fires
     /// for the fallback case where the target type cannot be determined.
     ///
-    /// Previously unsound patterns (now handled by BV truncation):
+    /// Patterns the identity fallback gets wrong (and BV truncation gets right):
     /// - **Narrowing**: `x as u8` where `x > 255` — real Rust truncates to `x % 256`.
     /// - **Sign change**: `(-1_i32) as u32` — real Rust wraps to `u32::MAX`.
     /// - **Widening** (benign): `x as u32` where `x: u8` — value-preserving.
@@ -166,10 +163,10 @@ pub enum UnsoundnessCategory {
     /// hypothetical. Booked as HIGH so no obligation encoded on top of a
     /// fabricated closure value can ever be reported `Verified`.
     ///
-    /// Previously this site incremented the LOW / non-demoting
-    /// `UnsupportedConstructSkip`, which does not demote — the only
-    /// `UnsupportedConstructSkip` site that continued encoding with a
-    /// synthesized value instead of returning an `EncodingError`.
+    /// Not `UnsupportedConstructSkip` (LOW, non-demoting): that category is
+    /// for sites that refuse (`EncodingError::unsupported*`) or fall back to
+    /// unconstrained terms; this site continues encoding with a synthesized
+    /// value, so it must demote.
     ///
     /// Site: `encoder/pure_encoding/mod.rs` encode_closure_in_logic fallback.
     OpaqueClosureValueFallback,
@@ -267,8 +264,10 @@ pub enum UnsoundnessCategory {
     /// Goal-side (negated-postcondition) fabrications do NOT increment this
     /// category — the placeholder is unprovable there, which is exactly the
     /// conservative behavior, and expected-failure verdicts must survive.
-    /// Site: `encoder/solver.rs` `fresh_unencodable_eq_bool` (gated on
-    /// assumption position).
+    /// Sites: `encoder/solver.rs` `fresh_unencodable_eq_bool` (gated on
+    /// assumption position); `verify/function/result_binding.rs`, where a
+    /// datatype result's binding to a body branch its sort cannot read is
+    /// withheld.
     PremiseNeutralizedEq,
     /// `#[non_exhaustive]` catch-all guard in sort inference. Currently
     /// unreachable — all variants of BinOp, UnOp, PureExpr, and ExprSort
@@ -398,9 +397,9 @@ impl UnsoundnessCategory {
             Self::ClosureBodyTrueDefault | Self::BitwiseUfApproximation => 0,
             // LOW — non-demoting, tracked for observability
             Self::UnsupportedConstructSkip => 4, // error.rs(3 factory methods),
-            // match_enc/mod.rs(1) declare-collision skip. (Was 5: the
-            // pure_encoding/mod.rs closure-value fallback moved to the
-            // demoting OpaqueClosureValueFallback — vacfix.)
+            // match_enc/mod.rs(1) declare-collision skip. The
+            // pure_encoding/mod.rs closure-value fallback counts under
+            // OpaqueClosureValueFallback, not here.
             Self::CatchUnwindFallback => 1,      // type_resolve.rs(1)
             Self::ClosureAxiomSkipped => 1,      // closure_axioms/mod.rs(1)
             Self::SortFallbackToIntFromVar => 8, // sort_inference.rs(1), resolution.rs(2),
@@ -412,8 +411,8 @@ impl UnsoundnessCategory {
             Self::SortCoercionBridge => 15,       // sort_coercion.rs(10), placeholder.rs(1),
             // match_enc/pattern_condition(2), seq/operations.rs(1),
             // verify/loops/variant.rs(1)
-            Self::PremiseNeutralizedEq => 1, // solver.rs fresh_unencodable_eq_bool
-            // (assumption-position gated)
+            Self::PremiseNeutralizedEq => 2, // solver.rs fresh_unencodable_eq_bool
+            // (assumption-position gated), result_binding.rs(1)
             Self::SortFallbackToIntFromCatchAll => 4, // sort_inference.rs(3) BinOp/UnOp/PureExpr
                                                       // + sort_mapping.rs(1) ExprSort catch-alls
         }
@@ -654,7 +653,7 @@ pub(crate) fn apply_delta(delta: &Snapshot) {
 
 /// Restore counters to a previous snapshot.
 ///
-/// Used to roll back false-positive increments from analytical code paths
+/// Rolls back false-positive increments from analytical code paths
 /// (e.g., `result_is_bool_by_postcondition`) that call `infer_expr_sort`
 /// for structural analysis but should not affect demotion decisions. (#994)
 pub fn restore(snapshot: &Snapshot) {
@@ -665,7 +664,7 @@ pub fn restore(snapshot: &Snapshot) {
 
 /// Restore a single counter category to its value in a previous snapshot.
 ///
-/// Used to roll back false-positive increments from hint collection code paths
+/// Rolls back false-positive increments from hint collection code paths
 /// that call Tier 3 sort inference (which fires `SortFallbackToIntFromLogicFn`
 /// on `LogicFnCall` nodes) without access to encoder declarations. The actual
 /// encoding goes through Tier 1 where declarations are checked. (#2062)

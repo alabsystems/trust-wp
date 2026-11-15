@@ -623,7 +623,7 @@ const TIERED_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Minimum solver timeout before tiered solving is worth the overhead (#2674).
 ///
-/// When the solver timeout is <= 15s, the tiered probe (10s) would consume
+/// When the solver timeout is below 15s, the tiered probe (10s) would consume
 /// most of the budget. In that case, skip the probe and go directly to the
 /// full solve.
 const TIERED_PROBE_MIN_FULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -645,9 +645,8 @@ const TIERED_PROBE_MIN_FULL_TIMEOUT: std::time::Duration = std::time::Duration::
 /// within that envelope since `TIERED_PROBE_TIMEOUT < solver_timeout`.
 ///
 /// Falls back to a single `check_sat_with_retry` when:
-/// - The solver timeout is <= 15s (probe would consume most of the budget)
+/// - The solver timeout is below 15s (probe would consume most of the budget)
 /// - No solver timeout is configured
-/// - `TRUST_WP_NO_RETRY=1` (retry disabled)
 pub(crate) fn tiered_check_sat(encoder: &mut AYEncoder) -> ay_dpll::api::SolveResult {
     tiered_check_sat_with_phase(encoder).0
 }
@@ -673,6 +672,15 @@ pub(crate) enum TieredSolvePhase {
 pub(crate) fn tiered_check_sat_with_phase(
     encoder: &mut AYEncoder,
 ) -> (ay_dpll::api::SolveResult, TieredSolvePhase) {
+    tiered_check_sat_using(encoder, AYEncoder::check_sat)
+}
+
+// Keep scheduling independent of the solver's current completeness: routing
+// tests can supply a probe decline without relying on an unclosed theorem.
+fn tiered_check_sat_using(
+    encoder: &mut AYEncoder,
+    mut check_sat: impl FnMut(&mut AYEncoder) -> ay_dpll::api::SolveResult,
+) -> (ay_dpll::api::SolveResult, TieredSolvePhase) {
     let original_timeout = encoder.solver().timeout();
 
     // Skip tiered solving when the solver timeout is too short for it to help,
@@ -688,65 +696,23 @@ pub(crate) fn tiered_check_sat_with_phase(
 
     // Phase 1: Short probe.
     encoder.set_timeout(Some(TIERED_PROBE_TIMEOUT));
-    let probe_result = encoder.check_sat();
+    let probe_result = check_sat(encoder);
     encoder.set_timeout(original_timeout);
 
     match probe_result {
         ay_dpll::api::SolveResult::Unknown => {
-            // EVERY probe Unknown proceeds to the full solve — including
-            // `QuantifierUnhandled` (#129 leg B, removing the 71dfb30 #perf
-            // short-circuit).
-            //
-            // The removed short-circuit treated a probe `QuantifierUnhandled`
-            // as a STRUCTURAL property of the query ("re-running with a larger
-            // timeout re-derives the same verdict") and returned the probe's
-            // Unknown without ever running the full solve. Both halves of that
-            // rationale went stale:
-            //
-            // - The verdict is NOT structural: it reports where the quantifier
-            //   engine stood when the 10s probe budget expired, and the full
-            //   solve (incremental continuation, larger budget) CAN reach a
-            //   different verdict. Measured under the decoupled budget regime
-            //   (e36ef2e): probe-declined slices sat next to sibling slices of
-            //   the same obligation that verified with clean strict
-            //   certificates (list_index_mut: 3 of 4 slices verified, the 4th
-            //   was declined with the full solve skipped by construction), so
-            //   the skip — not the engine — was what sank the obligation to
-            //   Unknown without a real attempt.
-            // - The perf motivation priced full-solve churn against a per-test
-            //   wall the solver budget was coupled to (pre-e36ef2e). Under the
-            //   decoupled regime the full solve runs inside a derived budget
-            //   that nests within the wall, so the churn is bounded and cannot
-            //   kill the test by itself.
-            //
-            // FAIL-CLOSED: this routing introduces no new accepting path. The
-            // full solve's result flows through the identical resolvers as
-            // every solve — Unsat must pass the accepted-evidence gates
-            // (proof-complete statistics, consumer-accepted) or is demoted to
-            // Unknown; Sat goes through the fail-closed counterexample path;
-            // Unknown resolves exactly as the probe's Unknown would have. A
-            // decline can only become an accept by producing the same evidence
-            // any other solve must.
+            // A probe Unknown, including QuantifierUnhandled, describes the
+            // current search rather than a permanent property of the query.
+            // Always allow the full solve. Its result still owes the ordinary
+            // proof or counterexample checks before receiving consumer credit.
             tracing::debug!(
                 probe_timeout_ms = TIERED_PROBE_TIMEOUT.as_millis(),
                 probe_unknown_reason = ?encoder.last_unknown_reason(),
                 "tiered solve: probe returned Unknown, proceeding to full solve (#2674)"
             );
-            // Phase 2: Full solve with the original timeout. The solver's
-            // incremental state carries over — learned clauses, conflict
-            // analysis, and partial model from the probe are retained.
-            //
-            // Skip retry (#2674): when the tiered probe already consumed
-            // TIERED_PROBE_TIMEOUT (10s) of search time and the full solve
-            // also returns Unknown, the solver has had 10s + T of cumulative
-            // search. A T/2 retry (30s for T=60s) is unlikely to resolve
-            // genuinely stuck problems but wastes significant wall-clock
-            // budget. For multi-slice functions, this 30s saving per slice
-            // can be the difference between fitting within the compat harness
-            // limit (120s) and timing out. The retry is only valuable for
-            // non-deterministic timeouts where the solver almost finished —
-            // these are resolved by the full solve's fresh timeout window.
-            let result = encoder.check_sat();
+            // Preserve incremental search state and restore the full budget.
+            // Do not add another retry after both search phases have run.
+            let result = check_sat(encoder);
             if matches!(result, ay_dpll::api::SolveResult::Unknown) {
                 tracing::debug!(
                     "tiered solve: full solve also returned Unknown — \
@@ -792,6 +758,7 @@ pub(in crate::verify) fn resolve_last_unsat_with_vacuity(
         ))),
         Ok(false) => {
             let summary = extract_proof_summary(encoder.solver());
+            let summary = encoder.refuse_unsat_credit_on_inconsistent_encoder_axioms(summary);
             VerificationResult::Verified(summary)
         }
     }
@@ -971,7 +938,16 @@ pub(in crate::verify) fn resolve_sat_result(encoder: &mut AYEncoder) -> Verifica
             if let Some(result) = fail_closed_solver_context_result(encoder, "SAT counterexample") {
                 return result;
             }
+            // A shortcut SAT is confirmed with a real solve before it is
+            // published: the refutation needs the model ay validated.
+            encoder.confirm_shortcut_sat_with_solver();
             let model = encoder.get_model();
+            crate::verify::authority_trace(|| {
+                format!(
+                    "SAT->Failed at solve_helpers {}",
+                    crate::verify::authority_encoder_evidence_tag(encoder)
+                )
+            });
             VerificationResult::Failed(Counterexample::from_encoder_model(encoder, model))
         }
         _ => unknown_result_from_encoder(encoder),
@@ -1208,6 +1184,138 @@ pub(in crate::verify) fn resolve_base_sat_result_with_tight_timeout(
         BaseRecheckEncoderDisposition::Disposable,
     ) {
         ResolveContinuation::Continue(result) | ResolveContinuation::Abort(result) => result,
+    }
+}
+
+/// Negated-goal label for the literal-`false` base WITNESS solve. Setting a
+/// label turns the encoder's syntactic SAT shortcuts off, so the answer comes
+/// from ay with a model it validated — the only kind of SAT a `Failed` may
+/// publish.
+const LITERAL_FALSE_WITNESS_LABEL: &str = "__trust_wp_literal_false_witness";
+
+/// Base recheck for a fresh (disposable) encoder that must leave a
+/// VALIDATED SAT model behind when the base is satisfiable.
+///
+/// `resolve_base_sat_result_with_tight_timeout` may confirm a satisfiable base
+/// through a detached process replay or a fresh batch solve, neither of which
+/// leaves a model in THIS encoder. A literal-`false` obligation is refuted by
+/// exactly such a base witness, and the driver's refutation-authority
+/// boundary rightly refuses a `Failed` whose model nothing validated. So this
+/// variant solves the base IN the encoder, under a negated-goal label (no
+/// syntactic shortcut), and on SAT records the model plus its evidence as the
+/// refutation witness ([`super::record_refutation_witness_from_encoder`]).
+///
+/// Same verdict semantics as the plain recheck: SAT base → `Verified(None)`
+/// (non-vacuous), UNSAT base → the vacuity demotion, else the encoder's
+/// Unknown. Strictly narrowing relative to publishing the structural
+/// `Failed`: a base that does not solve SAT here records no witness and the
+/// caller's verdict is withheld exactly as before.
+pub(in crate::verify) fn resolve_base_sat_result_with_witness(
+    encoder: &mut AYEncoder,
+) -> VerificationResult {
+    use crate::verify::hard_timeout::run_with_hard_timeout;
+
+    let original_timeout = encoder.solver().timeout();
+    // Long-budget regime only (the harness / driver runs, solver timeouts of
+    // tens of seconds). Short-budget callers — the unit tests' default
+    // requests — keep the classic recheck: the extra in-encoder solve plus
+    // the fresh batch replay measurably blow their wall-clock budgets, and
+    // the same tiering gate already routes every other expensive base lane.
+    if !base_recheck_long_budget_timeout(original_timeout) {
+        return resolve_base_sat_result_with_tight_timeout(encoder);
+    }
+    let base_timeout = original_timeout
+        .map(|timeout| timeout.min(BASE_RECHECK_FULL_CAP))
+        .unwrap_or(BASE_RECHECK_FULL_CAP);
+    encoder.set_timeout(Some(base_timeout));
+    let continuation = encoder
+        .with_negated_goal_label_prefix(LITERAL_FALSE_WITNESS_LABEL.to_string(), |encoder| {
+            run_with_hard_timeout(encoder, resolve_base_sat_result_in_encoder)
+        });
+    match continuation {
+        ResolveContinuation::Continue(result) => {
+            encoder.set_timeout(original_timeout);
+            if matches!(result, VerificationResult::Verified(None)) {
+                // A base with nothing to assert (`#[ensures(false)]` under no
+                // requires, `proof_assert!(false)` after a spec-free call,
+                // `impl requires(false)` under a trait with no requires)
+                // answers SAT through the empty-stack shortcut, which ay
+                // never validated. This lane exists to produce a REFUTATION
+                // model, so confirm the shortcut with a real solve on this
+                // fresh, disposable encoder before recording the witness;
+                // the bar (`evidence_is_validated_sat`) is unchanged.
+                if !encoder.confirm_shortcut_sat_with_solver() {
+                    crate::verify::authority_trace(|| {
+                        format!(
+                            "literal-false witness: base SAT not confirmed by ay {}",
+                            crate::verify::authority_encoder_evidence_tag(encoder)
+                        )
+                    });
+                }
+                // Main thread, restored encoder: the witness slot is
+                // thread-local, so it must be written HERE, not inside the
+                // hard-timeout worker.
+                let _ = super::record_refutation_witness_from_encoder(encoder);
+                return result;
+            }
+            if matches!(result, VerificationResult::Unknown(_)) {
+                crate::verify::authority_trace(|| {
+                    format!(
+                        "literal-false witness solve inconclusive: {} {}; falling back to \
+                         the classic base recheck",
+                        crate::verify::authority_result_tag(&result),
+                        crate::verify::authority_encoder_evidence_tag(encoder)
+                    )
+                });
+                // The incremental solver could not construct a model (a
+                // closure defining universal, typically) but a fresh
+                // non-incremental replay of the IDENTICAL stack usually can
+                // (#985, #2316). ay validates that model; its API returns the
+                // solve details, not the assignment, so the witness carries
+                // the validated evidence with no printable values. That is
+                // still the bar: ay computed AND validated a satisfying
+                // assignment for this exact assertion set.
+                encoder.refresh_native_replay_json();
+                if let Some(details) = encoder.batch_current_stack_validated_sat_details() {
+                    crate::verify::authority_trace(|| {
+                        "literal-false witness: fresh batch replay validated SAT".to_string()
+                    });
+                    if super::record_isolated_refutation_witness(
+                        &details,
+                        None,
+                        encoder.native_replay_json().map(str::to_owned),
+                    )
+                    .is_some()
+                    {
+                        return VerificationResult::Verified(None);
+                    }
+                }
+                // No model to publish. Classify the base exactly as before
+                // this witness lane existed: a SAT confirmed here (batch or
+                // detached replay) still leaves the caller's `Failed` without
+                // a witness, which the authority boundary withholds — the
+                // pre-existing verdict for this shape.
+                return resolve_base_sat_result_with_tight_timeout(encoder);
+            }
+            result
+        }
+        ResolveContinuation::Abort(result) => result,
+    }
+}
+
+/// In-encoder base SAT check (no detached replay, no batch shortcut) so a SAT
+/// answer leaves its model in the encoder. Vacuity semantics as
+/// [`resolve_base_sat_result`].
+fn resolve_base_sat_result_in_encoder(encoder: &mut AYEncoder) -> VerificationResult {
+    if encoder.solver_panic_reason().is_some() {
+        return unknown_result_from_encoder(encoder);
+    }
+    match tiered_base_recheck(encoder) {
+        ay_dpll::api::SolveResult::Unsat(_) => VerificationResult::Unknown(
+            UnknownReason::SolverMessage(VACUOUS_PROOF_MESSAGE.to_string()),
+        ),
+        ay_dpll::api::SolveResult::Sat => VerificationResult::Verified(None),
+        _ => unknown_result_from_encoder(encoder),
     }
 }
 
@@ -1562,7 +1670,16 @@ pub(in crate::verify) fn resolve_sat_result_without_vacuity(
             if let Some(result) = fail_closed_solver_context_result(encoder, "SAT counterexample") {
                 return result;
             }
+            // A shortcut SAT is confirmed with a real solve before it is
+            // published: the refutation needs the model ay validated.
+            encoder.confirm_shortcut_sat_with_solver();
             let model = encoder.get_model();
+            crate::verify::authority_trace(|| {
+                format!(
+                    "SAT->Failed at solve_helpers {}",
+                    crate::verify::authority_encoder_evidence_tag(encoder)
+                )
+            });
             VerificationResult::Failed(Counterexample::from_encoder_model(encoder, model))
         }
         _ => unknown_result_from_encoder(encoder),
@@ -1593,7 +1710,9 @@ pub(super) fn accepted_unsat_proof_authority(
     encoder: &mut AYEncoder,
 ) -> Option<crate::verify::ProofCertificateSummary> {
     if let Some(summary) = extract_proof_summary(encoder.solver()) {
-        return Some(summary);
+        // A retained artifact bypasses `install_strict_unsat_authority`, so
+        // apply the encoder-axiom consistency guard here too.
+        return encoder.refuse_unsat_credit_on_inconsistent_encoder_axioms(Some(summary));
     }
     encoder.authorize_current_stack_unsat_with_strict_proof()
 }
@@ -1625,7 +1744,16 @@ fn resolve_unsat_without_vacuity(encoder: &mut AYEncoder) -> VerificationResult 
             if let Some(result) = fail_closed_solver_context_result(encoder, "SAT counterexample") {
                 return result;
             }
+            // A shortcut SAT is confirmed with a real solve before it is
+            // published: the refutation needs the model ay validated.
+            encoder.confirm_shortcut_sat_with_solver();
             let model = encoder.get_model();
+            crate::verify::authority_trace(|| {
+                format!(
+                    "SAT->Failed at solve_helpers {}",
+                    crate::verify::authority_encoder_evidence_tag(encoder)
+                )
+            });
             VerificationResult::Failed(Counterexample::from_encoder_model(encoder, model))
         }
         _ => unknown_result_from_encoder(encoder),
@@ -1937,7 +2065,7 @@ mod tests {
             UnknownReason::SolverMessage(VACUOUS_PROOF_MESSAGE.to_string()),
         ));
         let recheck_fn: Box<FreshBaseRecheckFn<'_>> =
-            Box::new(|| Ok(VerificationResult::Failed(Counterexample::empty())));
+            Box::new(|| Ok(crate::verify::structural_failed_traced()));
         let result = prefer_non_vacuous_core_on_fresh_base_recheck(
             core,
             base,
@@ -2267,35 +2395,15 @@ mod tests {
 
     #[test]
     fn test_tiered_probe_decline_reaches_full_solve_and_stays_unknown() {
-        // Routing pin (#129 leg B): a probe DECLINE must reach the full solve.
-        //
-        // `forall x. f(x+1) > f(x)` puts arithmetic inside every candidate
-        // trigger, so E-matching cannot instantiate it and CEGQI does not
-        // converge: ay's probe declines it as Unknown(QuantifierUnhandled)
-        // in well under the probe budget (measured ~0.3ms at ay 3d1bd442d).
-        // The removed 71dfb30 short-circuit treated that probe verdict as
-        // authoritative and skipped the full solve by construction; this pin
-        // asserts the routing instead — the result must come from the
-        // FullSolve phase, never from the probe.
-        //
-        // Fail-closed pin, same test: a decline the full solve ALSO cannot
-        // close stays Unknown — routing never manufactures an accept.
+        // Pin scheduling directly. A satisfiable quantified formula can stop
+        // declining as AY improves, so it cannot supply a stable probe refusal.
         let mut encoder = AYEncoder::new_with_quantifiers();
         encoder.set_timeout(Some(TIERED_PROBE_MIN_FULL_TIMEOUT));
-
-        let expr = forall(
-            "x",
-            gt(
-                logic_fn_call("f", vec![add(var("x"), int(1))]),
-                logic_fn_call("f", vec![var("x")]),
-            ),
-        );
-        let term = encoder
-            .encode_pure(&expr)
-            .expect("triggerless forall should encode");
-        encoder.assert_term(term);
-
-        let (result, phase) = tiered_check_sat_with_phase(&mut encoder);
+        let mut observed_timeouts = Vec::new();
+        let (result, phase) = tiered_check_sat_using(&mut encoder, |encoder| {
+            observed_timeouts.push(encoder.solver().timeout());
+            ay_dpll::api::SolveResult::Unknown
+        });
 
         assert_eq!(
             phase,
@@ -2308,18 +2416,56 @@ mod tests {
             "a decline the full solve cannot close must stay Unknown \
              (fail-closed), got {result:?}"
         );
-        assert!(
-            encoder
-                .last_unknown_reason()
-                .is_some_and(crate::shared_types::UnknownReason::is_quantifier),
-            "the decline reason should remain quantifier-classed, got {:?}",
-            encoder.last_unknown_reason()
+        assert!(encoder.last_unknown_reason().is_none());
+        assert_eq!(
+            observed_timeouts,
+            [
+                Some(TIERED_PROBE_TIMEOUT),
+                Some(TIERED_PROBE_MIN_FULL_TIMEOUT),
+            ],
+            "the full solve must run once with the restored original budget"
         );
         assert_eq!(
             encoder.solver().timeout(),
             Some(TIERED_PROBE_MIN_FULL_TIMEOUT),
             "original timeout should be restored after the routed full solve"
         );
+    }
+
+    #[test]
+    fn test_tiered_probe_decline_preserves_the_full_solve_verdict() {
+        for full_result in [
+            ay_dpll::api::SolveResult::Sat,
+            ay_dpll::api::SolveResult::unsat(),
+        ] {
+            let mut encoder = AYEncoder::new();
+            encoder.set_timeout(Some(TIERED_PROBE_MIN_FULL_TIMEOUT));
+            let expected = std::mem::discriminant(&full_result);
+            let mut scripted_results =
+                [ay_dpll::api::SolveResult::Unknown, full_result].into_iter();
+            let mut observed_timeouts = Vec::new();
+            let (result, phase) = tiered_check_sat_using(&mut encoder, |encoder| {
+                observed_timeouts.push(encoder.solver().timeout());
+                scripted_results
+                    .next()
+                    .expect("no extra solve is scheduled")
+            });
+
+            assert_eq!(phase, TieredSolvePhase::FullSolve);
+            assert_eq!(std::mem::discriminant(&result), expected);
+            assert!(scripted_results.next().is_none());
+            assert_eq!(
+                observed_timeouts,
+                [
+                    Some(TIERED_PROBE_TIMEOUT),
+                    Some(TIERED_PROBE_MIN_FULL_TIMEOUT),
+                ]
+            );
+            assert_eq!(
+                encoder.solver().timeout(),
+                Some(TIERED_PROBE_MIN_FULL_TIMEOUT)
+            );
+        }
     }
 
     // ── tiered solve constants ─────────────────────────────────────────

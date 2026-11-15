@@ -10,10 +10,14 @@
 use std::collections::HashMap;
 
 use tracing::debug;
-use trust_wp_core::formula::PureExpr;
+use trust_wp_core::formula::{
+    elaborate::{postcondition_at_a_call, Signature},
+    PureExpr,
+};
 
 use super::{
-    insert_std_symbolic_substitutions, receiver_state::connect_final_receiver_state_witness,
+    applied_opaque_callable_param, insert_std_symbolic_substitutions, names_of_stale_arguments,
+    reads_a_stale_argument, receiver_state::connect_final_receiver_state_witness,
     result_extraction::try_extract_result_expr, substitutions_for_expr, unresolved_symbolic_names,
     warn_unresolved_names, TranslatedArg,
 };
@@ -25,6 +29,7 @@ use crate::mir_analysis::effects::{CallEffects, DroppedClauseKind};
 /// fail-closed semantics (#1739).
 pub(in crate::mir_analysis) fn apply_postconditions_with_effects(
     ensures: &[String],
+    callee: &Signature,
     result_var: &PureExpr,
     translated_args: &[TranslatedArg],
     param_names: Option<&[String]>,
@@ -35,6 +40,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_with_effects(
     // provenance recording and synthetic false obligation insertion (#1739).
     apply_postconditions_with_self_inner(
         ensures,
+        callee,
         result_var,
         translated_args,
         param_names,
@@ -54,6 +60,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_with_effects(
 /// Dropped postconditions generate synthetic `false` obligations (#1739).
 pub(in crate::mir_analysis) fn apply_postconditions_for_loop_body_with_effects(
     ensures: &[String],
+    callee: &Signature,
     result_var: &PureExpr,
     translated_args: &[TranslatedArg],
     param_names: Option<&[String]>,
@@ -61,6 +68,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_for_loop_body_with_effects(
 ) -> PureExpr {
     apply_postconditions_with_self_inner(
         ensures,
+        callee,
         result_var,
         translated_args,
         param_names,
@@ -77,6 +85,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_for_loop_body_with_effects(
 /// `record_dropped_clause()` in the inner function (#1739).
 pub(in crate::mir_analysis) fn apply_postconditions_with_self_and_effects(
     ensures: &[String],
+    callee: &Signature,
     result_var: &PureExpr,
     translated_args: &[TranslatedArg],
     param_names: Option<&[String]>,
@@ -85,6 +94,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_with_self_and_effects(
 ) -> PureExpr {
     apply_postconditions_with_self_inner(
         ensures,
+        callee,
         result_var,
         translated_args,
         param_names,
@@ -113,6 +123,7 @@ pub(in crate::mir_analysis) fn apply_postconditions_with_self_and_effects(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn apply_postconditions_with_self_inner(
     ensures: &[String],
+    callee: &Signature,
     result_var: &PureExpr,
     translated_args: &[TranslatedArg],
     param_names: Option<&[String]>,
@@ -158,6 +169,7 @@ fn apply_postconditions_with_self_inner(
     let self_arg_expr = explicit_self_expr
         .cloned()
         .or_else(|| translated_args.first().map(|arg| arg.expr.clone()));
+    let stale_names = names_of_stale_arguments(translated_args, param_names);
     // Parse all ensures clauses once and store the parsed results. (#1935)
     // Previously, each clause was parsed twice: once for result extraction (pass 1)
     // and again for assumption recording (pass 2). This merges both passes to
@@ -165,8 +177,46 @@ fn apply_postconditions_with_self_inner(
     let parsed_clauses: Vec<_> = ensures
         .iter()
         .filter_map(|ensures_str| {
-            match trust_wp_core::contract_parser::parse_contract(ensures_str) {
+            let parsed = trust_wp_core::contract_parser::parse_contract(ensures_str)
+                .map_err(|e| {
+                    crate::result_protocol_state::record_parse_error();
+                    format!("parse error: {e}")
+                })
+                .and_then(|expr| {
+                    // The clause as the callee's own lane proves it, read at
+                    // this call: the same state elaboration over the
+                    // callee's signature, with its `old(..)` the call's
+                    // pre-state.
+                    postcondition_at_a_call(&expr, callee)
+                        .map_err(|reason| format!("no reading at the call: {reason}"))
+                })
+                .and_then(|expr| match reads_a_stale_argument(&expr, &stale_names) {
+                    Some(name) => Err(format!(
+                        "no reading at the call: it reads `{name}`, whose argument is read \
+                         through a reference after a store the argument's translation does not \
+                         see, so it reads the pointee's entry value, not its value at the call"
+                    )),
+                    None => Ok(expr),
+                });
+            match parsed {
                 Ok(ensures_expr) => {
+                    // A clause that applies a parameter bound to an opaque
+                    // callable (anything but an exact thunk value applied with
+                    // no arguments) would have that application replaced by
+                    // the closure's environment / an arity-shared UF. Drop it:
+                    // an omitted postcondition only weakens the call's facts.
+                    if let Some(name) = applied_opaque_callable_param(
+                        &ensures_expr,
+                        translated_args,
+                        param_names,
+                        self_arg_expr.is_some(),
+                    ) {
+                        debug!(
+                            "trust-wp: postcondition `{ensures_str}` dropped: it applies \
+                             `{name}`, which is bound to an opaque callable argument"
+                        );
+                        return None;
+                    }
                     let substitutions = substitutions_for_expr(
                         ensures_str,
                         &ensures_expr,
@@ -175,11 +225,9 @@ fn apply_postconditions_with_self_inner(
                     );
                     Some((ensures_str, ensures_expr, substitutions))
                 }
-                Err(e) => {
-                    crate::result_protocol_state::record_parse_error();
-                    let reason = format!("parse error: {e}");
+                Err(reason) => {
                     debug!(
-                        "trust-wp: error: failed to parse ensures clause `{ensures_str}`: {e} \
+                        "trust-wp: error: failed to read ensures clause `{ensures_str}`: {reason} \
                          (verification will fail — fail-closed #1739)"
                     );
                     effects.record_dropped_clause(

@@ -25,6 +25,7 @@ use super::{
 };
 use crate::{
     encoder::AYEncoder,
+    error::EncodingError,
     tests::helpers::{
         add, and, deref, eq, final_expr, forall, ge, gt, implies, int, ite, le, logic_fn_call, lt,
         method_call, mul, ne, sub, var, var_with_sort, view,
@@ -264,9 +265,15 @@ fn test_mut_borrow_projection_only_result_uses_body_referent_sort() {
     )
     .expect("projection-only result binding should encode");
 
+    // SOUNDNESS PIN (borrows lent into the return value): `*self` is returned;
+    // the second clause equates `^self` with `*result`, false once the caller writes.
+    // Encoding must still succeed at the referent sort (the `.expect` above).
+    // The identity `final_values` entry below is a driver shape ay must not
+    // trust: the lent param is mutation-continued, and ay must not equate
+    // `^result` with `*result`, so the prophecy clause is unprovable.
     assert!(
-        matches!(result, super::VerificationResult::Verified(_)),
-        "projection-only result aliases should verify at the referent sort: got {result:?}"
+        !matches!(result, VerificationResult::Verified(_)),
+        "a lent borrow's identity final must not prove a prophecy clause: got {result:?}"
     );
 }
 
@@ -300,7 +307,7 @@ fn test_mut_borrow_literal_false_first_slice_uses_axiom_light_base() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "literal false obligation on satisfiable base should fail: got {result:?}"
     );
 }
@@ -335,9 +342,14 @@ fn test_bug_922_nested_mut_ref_return_aliases() {
     )
     .expect("encoding should succeed");
 
+    // SOUNDNESS PIN (borrows lent into the return value): `&mut *x0.1` is returned, so
+    // `^result == *(^x0).1` is the caller's to decide, not `*x0`'s.
+    // The identity `final_values` entry below is a driver shape ay must not
+    // trust: the lent param is mutation-continued, and ay must not equate
+    // `^result` with `*result`, so the prophecy clause is unprovable.
     assert!(
-        matches!(result, super::VerificationResult::Verified(_)),
-        "nested mut-ref return aliases should verify: got {result:?}"
+        !matches!(result, VerificationResult::Verified(_)),
+        "a lent borrow's identity final must not prove a prophecy clause: got {result:?}"
     );
 }
 
@@ -392,15 +404,34 @@ fn test_bug_922_reconstructed_tuple_field_finality_verifies() {
     );
     final_values.insert("x0.1".to_string(), x0_field1_current.clone());
 
-    let result = verify_mut_borrow_function_with_modes(
+    let result = match verify_mut_borrow_function_with_modes(
         MutBorrowRequest::new(&[], &ensures, &final_values)
-            .return_expr(Some(&x0_field1_current_ref)),
-    )
-    .expect("encoding should succeed");
+            .return_expr(Some(&x0_field1_current_ref))
+            .timeout(Some(std::time::Duration::from_secs(5))),
+    ) {
+        Ok(result) => result,
+        // `^(^x0).1` is the final value of the borrow `x0`'s final value
+        // holds in its second field, which the caller decides: refused, not
+        // read as the field of `x0`'s final value (D-129).
+        Err(EncodingError::Unsupported { message, .. }) => {
+            assert!(
+                message.contains("final value refused"),
+                "unexpected refusal: {message}"
+            );
+            return;
+        }
+        Err(other) => panic!("unexpected encoding error: {other:?}"),
+    };
 
+    // SOUNDNESS PIN (returned reborrow of an inner borrow): the returned value
+    // reborrows the inner borrow stored in `x0.1`, so `^result` is the
+    // caller's prophecy. Matching `Final(result)` syntactically against the
+    // reconstructed final of `x0` (a field of `x0`'s entry value) would
+    // discharge it without a caller link; without that link the clause is
+    // not provable.
     assert!(
-        matches!(result, super::VerificationResult::Verified(_)),
-        "bug/922 reconstructed field-finality shape should verify: got {result:?}"
+        !matches!(result, super::VerificationResult::Verified(_)),
+        "a returned inner-borrow reborrow's ^result must not follow from x0's reconstructed final: got {result:?}"
     );
 }
 
@@ -435,7 +466,7 @@ fn test_bug_922_nested_mut_ref_wrong_field_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "returning wrong field should fail: got {:?}",
         result
     );
@@ -460,8 +491,8 @@ fn test_mut_borrow_seq_typed_result_no_sort_conflict() {
     )
     .expect("encoding should succeed without sort mismatch");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
+    // KNOWN-CLASS PIN (strict UNSAT certification gap): the verdict may demote
+    // to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
@@ -1566,8 +1597,8 @@ fn test_proof_assert_sequence_lasso_bare_forall_uses_mut_borrow_structural_match
     ))
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
+    // KNOWN-CLASS PIN (strict UNSAT certification gap): the verdict may demote
+    // to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
@@ -1651,8 +1682,9 @@ fn test_proof_assert_sequence_lasso_exact_matcher_rejects_aliased_altered_body()
 // ── Error-path regression tests (#2139) ──
 
 /// Non-boolean postcondition must produce `EncodingError::Unsupported`, not a
-/// panic or spurious `Ok`. The mut_borrow path has its own non-bool check at
-/// mod.rs:420-427 that was previously untested.
+/// panic or spurious `Ok`. The mut_borrow path reaches the shared
+/// `is_definitely_non_bool` check through the pipeline; this exercises it
+/// from the mut-borrow entry.
 #[test]
 #[timeout(30000)]
 fn test_non_bool_postcondition_returns_encoding_error() {
@@ -1825,8 +1857,8 @@ fn test_resolve_assumption_with_precondition_constraint() {
 /// parameters. The driver must NOT emit resolve assumptions for parameters
 /// with computed (non-identity) final values.
 ///
-/// Post-#2663: `emit_resolve_assertions` now SKIPS resolve for non-identity
-/// final values, so the contradiction no longer occurs. The false postcondition
+/// `emit_resolve_assertions` SKIPS resolve for non-identity final values, so
+/// the contradiction does not occur (#2663). The false postcondition
 /// `^v != ^v` simply fails (correctly), because there is no UNSAT base.
 ///
 /// Re: #2124 (resolve assertion test coverage finding), #2663 (non-identity skip)
@@ -1850,7 +1882,7 @@ fn test_resolve_assumption_non_identity_creates_contradiction() {
     )
     .expect("encoding should succeed");
 
-    // After #2663, resolve is skipped for non-identity final values, so
+    // Resolve is skipped for non-identity final values, so
     // the base is SAT (no contradiction). The false postcondition ^v != ^v
     // correctly fails with a counterexample.
     assert!(
@@ -1979,7 +2011,7 @@ fn test_unnest_nested_mut_ref_return_sort() {
 /// Full `unnest` postconditions that cross-project both `result` and `x`:
 ///   *result == **x, ^result == *^x, ^*x == ^^x
 ///
-/// The previous test (#2583) only exercised result self-projections.
+/// `test_unnest_nested_mut_ref_return_sort` (#2583) exercises only result self-projections.
 /// This test exercises the full interaction between result and parameter
 /// projections at different borrow depths, which triggers the selector-domain
 /// sort mismatch when wrapper-derived names use raw annotations instead of
@@ -2012,9 +2044,14 @@ fn test_unnest_full_postconditions_selector_domain() {
     )
     .expect("encoding should succeed without selector-domain sort mismatch (#2585)");
 
+    // SOUNDNESS PIN (borrows lent into the return value): `*x` (a reborrow of the inner
+    // borrow) is returned; `^result == *^x` and `^*x == ^^x` need the caller link.
+    // The identity `final_values` entry below is a driver shape ay must not
+    // trust: the lent param is mutation-continued, and ay must not equate
+    // `^result` with `*result`, so the prophecy clause is unprovable.
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "unnest full postconditions should verify without selector-domain ay panics; got {result:?}"
+        !matches!(result, VerificationResult::Verified(_)),
+        "a lent borrow's identity final must not prove a prophecy clause: got {result:?}"
     );
 }
 
@@ -2048,9 +2085,14 @@ fn test_final_borrows_unnesting_non_extensional_overderef_return_verifies() {
     )
     .expect("encoding should succeed for final nested reborrow return");
 
+    // SOUNDNESS PIN (borrows lent into the return value): `&mut **x` is
+    // returned; `^result == *^x` is not a consequence of `^x == *x` (a false premise).
+    // The identity `final_values` entry below is a driver shape ay must not
+    // trust: the lent param is mutation-continued, and ay must not equate
+    // `^result` with `*result`, so the prophecy clause is unprovable.
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "final_borrows unnesting_non_extensional shape should verify: got {result:?}"
+        !matches!(result, VerificationResult::Verified(_)),
+        "a lent borrow's identity final must not prove a prophecy clause: got {result:?}"
     );
 }
 
@@ -2210,9 +2252,22 @@ fn test_take_max_conditional_mut_ref_return_verifies() {
     let return_expr_val = ite(ge(ma.clone(), mb.clone()), ma.clone(), mb.clone());
 
     // final_values: identity (neither param is mutated)
-    let mut final_values = HashMap::new();
-    final_values.insert("ma".to_string(), deref(ma.clone()));
-    final_values.insert("mb".to_string(), deref(mb.clone()));
+    use crate::tests::helpers::not;
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            ge(deref(ma.clone()), deref(mb.clone())),
+            eq(final_expr(mb.clone()), deref(mb.clone())),
+        ),
+        implies(
+            not(ge(deref(ma.clone()), deref(mb.clone()))),
+            eq(final_expr(ma.clone()), deref(ma.clone())),
+        ),
+    ];
 
     // ensures: if *ma >= *mb { *mb == ^mb && result == ma }
     //                   else  { *ma == ^ma && result == mb }
@@ -2230,14 +2285,21 @@ fn test_take_max_conditional_mut_ref_return_verifies() {
         ),
     )];
 
-    let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values).return_expr(Some(&return_expr_val)),
+    let outcome = verify_mut_borrow_function_with_modes_outcome(
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
+            .return_expr(Some(&return_expr_val)),
     )
     .expect("encoding should succeed for take_max (#2593)");
+    let replay = outcome
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.native_replay_json.clone())
+        .unwrap_or_else(|| "native replay unavailable".to_string());
+    let result = super::legacy_result_from_outcome(outcome);
 
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "take_max conditional mut-ref return should verify: got {result:?}"
+        matches!(&result, VerificationResult::Verified(Some(proof)) if proof.is_fully_verified()),
+        "take_max conditional mut-ref return needs a fully checked proof: got {result:?}\nAY_NATIVE_REPLAY_BEGIN\n{replay}\nAY_NATIVE_REPLAY_END"
     );
 }
 
@@ -2419,12 +2481,12 @@ fn test_vacuity_identity_final_value_non_vacuous() {
 /// Regression for resolve assertion + non-identity final value contradiction (#2663).
 ///
 /// When the driver sends both `final_values = {"a": *a + 1}` and
-/// `resolve_assumptions = Some(["a"])`, the ay layer previously asserted both:
+/// `resolve_assumptions = Some(["a"])`, the ay layer must not assert both:
 ///   - `a_final == a_current + 1` (from bind_final_values)
 ///   - `a_final == a_current` (from emit_resolve_assertions)
 /// These are contradictory (`current + 1 == current` is UNSAT), making the base
-/// UNSAT and triggering vacuous proof detection. The fix (#2663) skips the
-/// resolve assertion when the final value is non-identity.
+/// UNSAT and triggering vacuous proof detection, so the resolve assertion is
+/// skipped when the final value is non-identity (#2663).
 #[test]
 #[timeout(30000)]
 fn test_vacuity_resolve_with_non_identity_final_is_non_vacuous() {
@@ -2628,5 +2690,48 @@ fn test_writeback_view_propagation_child_view_equals_parent() {
     assert!(
         matches!(result, VerificationResult::Verified(_)),
         "writeback view propagation should make (*z)@ == (*y)@ verify: {result:?}"
+    );
+}
+
+/// Soundness (vacuous whole-Seq equality): a `&mut Vec` param passed by
+/// reborrow to an un-advanced mutating call (`v.extend(w)`) is
+/// mutation-continued; its final value is constrained ONLY by the callee
+/// postcondition, which here permits `(^v)@ != (*v)@`. The whole-Seq
+/// equality `(^v)@ == (*v)@` must therefore NOT verify.
+#[test]
+#[timeout(120000)]
+fn s25_extend_mutation_continued_whole_seq_equality_is_not_vacuous() {
+    use trust_wp_core::formula::intern_sort_name;
+    let vec_id = intern_sort_name("std::vec::Vec");
+    let v = var_with_sort("v", ExprSort::MutRef(Box::new(ExprSort::Datatype(vec_id))));
+    let w = var_with_sort("w", ExprSort::Datatype(vec_id));
+    let mut final_values = HashMap::new();
+    final_values.insert("v".to_string(), deref(v.clone()));
+    let mutation_continued = HashSet::from(["v".to_string()]);
+    let requires = vec![
+        eq(
+            view(final_expr(v.clone())),
+            method_call(view(v.clone()), "concat", vec![view(w.clone())]),
+        ),
+        eq(
+            method_call(view(final_expr(v.clone())), "len", vec![]),
+            add(
+                method_call(view(v.clone()), "len", vec![]),
+                method_call(view(w.clone()), "len", vec![]),
+            ),
+        ),
+        eq(final_expr(v.clone()), final_expr(var("v_rb4"))),
+        PureExpr::Bool(true),
+        PureExpr::Bool(true),
+    ];
+    let ensures = vec![eq(view(final_expr(v.clone())), view(deref(v.clone())))];
+    let result = verify_mut_borrow_function_with_modes(
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
+            .mutation_continued_params(Some(mutation_continued)),
+    );
+    eprintln!("S25 extend result: {result:?}");
+    assert!(
+        !matches!(result, Ok(VerificationResult::Verified(_))),
+        "(^v)@ == (*v)@ after extend must not verify: {result:?}"
     );
 }

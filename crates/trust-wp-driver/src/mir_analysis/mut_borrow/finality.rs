@@ -70,7 +70,7 @@ pub(super) fn compute_reborrow_metadata<'tcx>(
     // Scan for reborrows (`dest = &mut *source`) and query finality at each site.
     for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
-            let StatementKind::Assign(box (dest, rvalue)) = &stmt.kind else {
+            let StatementKind::Assign((dest, rvalue)) = &stmt.kind else {
                 continue;
             };
 
@@ -94,8 +94,8 @@ pub(super) fn compute_reborrow_metadata<'tcx>(
                     let parent_name = local_to_name
                         .get(&place.local)
                         .cloned()
-                        .unwrap_or_else(|| format!("_reborrow_{}", place.local.as_u32()));
-                    let child_name = format!("{parent_name}_rb{}", dest.local.as_u32());
+                        .unwrap_or_else(|| format!("$reborrow_{}", place.local.as_u32()));
+                    let child_name = format!("{parent_name}$rb{}", dest.local.as_u32());
 
                     local_to_name.insert(dest.local, child_name.clone());
 

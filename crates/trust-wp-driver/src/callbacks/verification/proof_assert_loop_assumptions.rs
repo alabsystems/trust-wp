@@ -50,22 +50,6 @@ pub(super) fn rewrite_post_loop_proof_assert_assumptions(
         .collect()
 }
 
-pub(super) fn normalize_post_loop_proof_assert_assumptions(
-    assumptions: &[PureExpr],
-) -> Vec<PureExpr> {
-    if assumptions.is_empty() {
-        return Vec::new();
-    }
-
-    assumptions
-        .iter()
-        .cloned()
-        .map(|expr| {
-            collapse_idempotent_views(rewrite_iterator_spec_expr(&collapse_idempotent_views(expr)))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -73,10 +57,7 @@ mod tests {
     use rustc_span::BytePos;
     use trust_wp_core::formula::{intern_sort_name, BinOp, ExprSort, PureExpr};
 
-    use super::{
-        normalize_post_loop_proof_assert_assumptions, proof_assert_after_all_loops,
-        rewrite_post_loop_proof_assert_assumptions,
-    };
+    use super::{proof_assert_after_all_loops, rewrite_post_loop_proof_assert_assumptions};
     use crate::mir_analysis::NameSubstitutions;
 
     #[test]
@@ -196,8 +177,5 @@ mod tests {
                 Arc::new(PureExpr::Int(3)),
             )]
         );
-
-        let normalized = normalize_post_loop_proof_assert_assumptions(&assumptions);
-        assert_eq!(normalized, assumptions);
     }
 }

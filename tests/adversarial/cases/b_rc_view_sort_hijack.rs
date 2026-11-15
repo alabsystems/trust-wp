@@ -14,6 +14,9 @@
 //@ teeth: in-tree (driver Rc/Arc peel + encoder canonical-Int fail-safe). This case still rejects
 //@ teeth: (error). Premise fabrication is premise WEAKENING: it can never make a false goal provable.
 //@ teeth: The teeth for this mechanism live in b_rc_view_control.
+//@ WHY THE DECLARED ASSERTIONS ARE TRUE: `a` holds 0 and `b` holds 1, the two values their
+//@ `Rc::new` calls were given; only the third assertion, `same`, is false.
+//@ also-verified-assertion: creusot_test::rc_ptr_eq_false_claim, creusot_test::rc_ptr_eq_false_claim
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0

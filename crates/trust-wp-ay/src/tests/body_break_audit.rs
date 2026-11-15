@@ -5,9 +5,9 @@
 //! Body-break `condition_is_body_break` algorithm audit tests (#1385, #1386).
 //!
 //! These tests exercise the `condition_is_body_break: true` path through
-//! `verify_loop_invariant`, which was previously untested at the ay
-//! verification level. The body-break pattern models `loop { body; if cond
-//! { break } }` where the exit condition is checked AFTER the body.
+//! `verify_loop_invariant` at the ay verification level. The body-break
+//! pattern models `loop { body; if cond { break } }` where the exit
+//! condition is checked AFTER the body.
 //!
 //! Key insight: for body-break loops, preservation must apply the continuation
 //! condition to **primed** (post-body) variables. The step=2 tests demonstrate
@@ -29,9 +29,9 @@ use super::{super::*, helpers::*};
 /// Uses `i < n` (strict) because `i == n` is unreachable at loop head: the
 /// break fires when post-body `i` reaches `n`. (#1385)
 /// Postcondition priming is tested separately in loops::tests. (#1385)
-// ADJUDICATED LOAD FLAKE (#133 mass unit adjudication, 2026-08-27): passes 3/3
-// solo at this pin; when it fails in-suite it is queued behind the global
-// 8-permit `encoder::test_solver_limiter` cap, which ntest counts as wall-clock.
+// KNOWN-CLASS LOAD FLAKE (#133): passes solo; when it fails in-suite it is
+// queued behind the global 8-permit `encoder::test_solver_limiter` cap, which
+// ntest counts as wall-clock.
 // Same class and same root cause as
 // `tests::basic::boolean_models_and_diagnostics::test_counterexample_contains_meaningful_bindings`,
 // where the mechanism is written up in full. Budget deliberately unchanged.

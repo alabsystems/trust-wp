@@ -160,7 +160,7 @@ impl AYEncoder {
             ) {
                 let exact = BigInt::from(vx) * BigInt::from(vy);
                 if self.assert_product_exact_value(product, &exact) {
-                    emitted += 1;
+                    emitted = emitted.saturating_add(1);
                 }
                 // Exact value subsumes the looser monotonicity bound.
                 continue;
@@ -180,7 +180,7 @@ impl AYEncoder {
             let product_bound: BigInt = BigInt::from(kx) * BigInt::from(ky);
 
             if self.assert_one_product_bound(product, x, y, kx, ky, &product_bound) {
-                emitted += 1;
+                emitted = emitted.saturating_add(1);
             }
         }
         Ok(emitted)

@@ -19,6 +19,7 @@ use crate::callbacks::{
 
 fn install_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(
@@ -54,36 +55,39 @@ impl Callbacks for CurrentClosureCaptureCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let contracts = find_contract_functions(tcx);
-        self.snapshot.contract_paths = contracts
-            .iter()
-            .map(|contract| tcx.def_path_str(contract.def_id))
-            .collect();
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let contracts = find_contract_functions(tcx);
+            self.snapshot.contract_paths = contracts
+                .iter()
+                .map(|contract| tcx.def_path_str(contract.def_id))
+                .collect();
 
-        let closure_contract = contracts
-            .iter()
-            .find(|contract| tcx.def_kind(contract.def_id) == DefKind::Closure)
-            .expect("fixture should discover a contracted closure");
-        self.snapshot.current_closure_path = Some(tcx.def_path_str(closure_contract.def_id));
+            let closure_contract = contracts
+                .iter()
+                .find(|contract| tcx.def_kind(contract.def_id) == DefKind::Closure)
+                .expect("fixture should discover a contracted closure");
+            self.snapshot.current_closure_path = Some(tcx.def_path_str(closure_contract.def_id));
 
-        let root = tcx
-            .typeck_root_def_id(closure_contract.def_id)
-            .expect_local();
-        let _ = tcx.mir_borrowck(root);
+            let root = tcx
+                .typeck_root_def_id(closure_contract.def_id)
+                .expect_local();
+            let _ = tcx.mir_borrowck(root);
 
-        let user_specs = build_user_spec_table(&contracts);
-        let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
-        let extern_specs: HashMap<String, StdSpec> = HashMap::new();
-        self.snapshot.infos = collect_closure_capture_infos(
-            tcx,
-            closure_contract.local_def_id,
-            &user_specs,
-            &trait_specs,
-            &extern_specs,
-        );
-        self.snapshot.ran = true;
-        Compilation::Stop
+            let user_specs = build_user_spec_table(tcx, &contracts, &[]);
+            let trait_specs: HashMap<DefId, StdSpec> = HashMap::new();
+            let extern_specs: HashMap<String, StdSpec> = HashMap::new();
+            self.snapshot.infos = collect_closure_capture_infos(
+                tcx,
+                closure_contract.local_def_id,
+                &user_specs,
+                &trait_specs,
+                &extern_specs,
+            );
+            self.snapshot.ran = true;
+            Compilation::Stop
+        })
     }
 }
 

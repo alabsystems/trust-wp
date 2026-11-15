@@ -28,6 +28,11 @@ impl AssertionPhase {
 }
 
 impl AssertionPipelineState {
+    /// The assertion family currently being emitted.
+    pub(crate) fn current_phase(&self) -> AssertionPhase {
+        self.current_phase
+    }
+
     pub(crate) fn replace_phase(&mut self, phase: AssertionPhase) -> AssertionPhase {
         std::mem::replace(&mut self.current_phase, phase)
     }

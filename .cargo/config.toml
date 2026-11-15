@@ -3,21 +3,18 @@
 # names scripts/trustc-private-wrapper.sh, a dev-only rustc wrapper).
 #
 # trust-wp builds with the Trust toolchain (rust-toolchain.toml pins
-# channel = "trust"; build it from https://github.com/alabsystems/trust, or
-# register an existing stage2 with the trust repo's rustup link script). The
-# Trust compiler's verification pass is fail-closed BY DEFAULT and would try
-# to prove panic-freedom for every unit, including third-party build scripts.
-# Building the verifier itself is not a verification run, so the pass is off
-# here — the same off-switch the dev config carries.
+# channel = "trust"). Install aterm (https://github.com/alabsystems/aterm);
+# atpkg installs Trust and links it as the `trust` rustup toolchain (atpkg
+# ships Trust for Apple-silicon macOS only; no other platform has a public
+# Trust package or supported install path today). Build through the Trust
+# toolchain's own cargo, targo, which names the lane: `targo --unverified
+# <verb>` switches the Trust verification pass off for every unit (build
+# scripts, proc macros and doctests included), `targo trust <verb>` verifies
+# with per-unit scoping. The release gate (publish/config.sh) runs both.
 #
-# rust-toolchain.toml pins the trust channel for every cargo invocation in
-# this repo, so a stock toolchain (which rejects -Ztrust-verify as unknown)
-# never sees these flags.
-
-[build]
-rustflags = ["-Ztrust-verify=off"]
-rustdocflags = ["-Ztrust-verify=off"]
-
+# So this file carries NO verification off-switch. A `[host]` off-switch table
+# makes `targo trust` refuse the whole run, and the other off-switch tables
+# served only lane-less cargo; T3 refuses any of them in the installed copy.
 [net]
 git-fetch-with-cli = true
 

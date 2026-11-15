@@ -134,6 +134,7 @@ pub(in crate::callbacks) fn build_recursive_induction_hypotheses(
     let param_set: HashSet<&str> = params.iter().map(String::as_str).collect();
     let zero = PureExpr::Int(0);
     let mut hypotheses = Vec::new();
+    let mut integrality = Vec::new();
     for call in calls {
         let PureExpr::LogicFnCall { args, .. } = &call else {
             continue;
@@ -168,7 +169,7 @@ pub(in crate::callbacks) fn build_recursive_induction_hypotheses(
         // Guard: 0 ≤ m[A]  ∧  m[A] < m[P]  ∧  requires[A]
         let mut guard = Vec::with_capacity(2 + logic_fn.requires().len());
         guard.push(binop(zero.clone(), BinOp::Le, variant_at_args.clone()));
-        guard.push(binop(variant_at_args, BinOp::Lt, variant_at_params));
+        guard.push(binop(variant_at_args.clone(), BinOp::Lt, variant_at_params));
         for req in logic_fn.requires() {
             guard.push(req.substitute(&subst));
         }
@@ -186,7 +187,27 @@ pub(in crate::callbacks) fn build_recursive_induction_hypotheses(
             .collect();
 
         hypotheses.push(binop(and_all(guard), BinOp::Implies, and_all(conclusion)));
+
+        // Integrality of the measure across a literal decrement. When the
+        // recursion steps `m[P] - k` (k a positive literal), `0 ≤ m[A]` is
+        // implied by `m[P] > k - 1`; over the RATIONALS a certificate checker
+        // replays in, it is not, so the step discharging the IH's own `0 ≤
+        // m[A]` guard degrades to an unverified trust rule. The same
+        // `is_integer_measure` gate the IH's well-foundedness rests on already
+        // established that `m` is integer-sorted, so the stated disjunction is
+        // VALID: it excludes no model and can strengthen nothing. It is
+        // spelled with `m[P]` rather than `m[A] ≤ -1` because the solver
+        // normalises the latter to exactly this, and a certificate step can
+        // only resolve against an assertion it can recognise.
+        if let Some(step) = literal_decrement(&variant_at_args, variant) {
+            integrality.push(binop(
+                binop(zero.clone(), BinOp::Le, variant_at_args),
+                BinOp::Or,
+                binop(variant.clone(), BinOp::Le, PureExpr::Int(step - 1)),
+            ));
+        }
     }
+    hypotheses.extend(integrality);
 
     hypotheses
 }
@@ -243,7 +264,7 @@ fn is_integer_measure(
 /// `creusot`'s mathematical `Int` interns its `Datatype` name as a qualified
 /// path (`creusot_std::Int`), so we compare on the bare (last `::`-segment)
 /// name. Type parameters, floats, sequences, etc. are rejected (no IH).
-fn is_integer_sort(sort: &ExprSort) -> bool {
+pub(in crate::callbacks) fn is_integer_sort(sort: &ExprSort) -> bool {
     match sort {
         ExprSort::Int => true,
         ExprSort::Datatype(id) => {
@@ -444,6 +465,29 @@ fn env_without<S: AsRef<str>>(
         scoped.remove(name.as_ref());
     }
     Some(scoped)
+}
+
+/// `Some(k)` when `at_args` is syntactically `at_params - k` (or `at_params +
+/// (-k)`) for a positive integer literal `k` — the decrement shape an integer
+/// `#[variant]` almost always takes.
+///
+/// Syntactic, and deliberately so: the caller states a fact about the two
+/// terms it is holding, and a term it cannot see the shape of gets no fact.
+fn literal_decrement(at_args: &PureExpr, at_params: &PureExpr) -> Option<i64> {
+    let PureExpr::BinOp(lhs, op, rhs) = at_args else {
+        return None;
+    };
+    if lhs.as_ref() != at_params {
+        return None;
+    }
+    let PureExpr::Int(k) = rhs.as_ref() else {
+        return None;
+    };
+    match op {
+        BinOp::Sub if *k > 0 => Some(*k),
+        BinOp::Add if *k < 0 => k.checked_neg(),
+        _ => None,
+    }
 }
 
 fn binop(l: PureExpr, op: BinOp, r: PureExpr) -> PureExpr {
@@ -652,7 +696,13 @@ mod tests {
         def.set_ensures(vec![PureExpr::Bool(true)]);
 
         let hyps = build_recursive_induction_hypotheses(&def, None);
-        assert_eq!(hyps.len(), 1, "the shadowed self-call must yield an IH");
+        // One IH, then the measure's integrality across the literal decrement.
+        assert_eq!(hyps.len(), 2, "the shadowed self-call must yield an IH");
+        assert!(
+            matches!(&hyps[1], PureExpr::BinOp(_, BinOp::Or, _)),
+            "the trailing fact is the integrality disjunction, got {:?}",
+            hyps[1]
+        );
         let PureExpr::BinOp(guard, BinOp::Implies, _) = &hyps[0] else {
             panic!("expected guarded implication, got {:?}", hyps[0]);
         };
@@ -723,7 +773,8 @@ mod tests {
         def.set_ensures(vec![binop(var("result"), BinOp::Eq, var("x"))]);
 
         let hyps = build_recursive_induction_hypotheses(&def, None);
-        assert_eq!(hyps.len(), 1);
+        // One IH, then the measure's integrality across the literal decrement.
+        assert_eq!(hyps.len(), 2);
         let PureExpr::BinOp(_, BinOp::Implies, concl) = &hyps[0] else {
             panic!("expected guarded implication");
         };

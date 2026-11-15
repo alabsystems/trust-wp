@@ -86,7 +86,17 @@ fn expand_proof_assert_with_marker(input: TokenStream, marker_prefix: &str) -> T
         }
     }
 
-    proof_assert_expansion_with_marker(&expr_text, marker_prefix).into()
+    let mut expansion = proof_assert_expansion_with_marker(&expr_text, marker_prefix);
+    // Type-check the assertion the way Creusot's `proof_assert!` expansion
+    // does (see `spec_tc`); the marker closure above is left byte-identical.
+    let kind = marker_prefix
+        .strip_prefix("trust-wp:")
+        .and_then(|rest| rest.strip_suffix(':'))
+        .unwrap_or(marker_prefix);
+    if let Some(tc) = crate::spec_tc::proof_assert_statement(kind, &original_input.into()) {
+        expansion = quote! { { #tc #expansion } };
+    }
+    expansion.into()
 }
 
 /// Generate the proof_assert expansion tokens from a validated expression string.

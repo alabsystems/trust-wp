@@ -15,7 +15,10 @@
 //! This pattern follows Creusot's approach (see reference/creusot/creusot-rustc/).
 
 #![feature(rustc_private)]
-#![feature(box_patterns)]
+#![feature(deref_patterns)]
+#![cfg_attr(test, feature(custom_test_frameworks, test, exitcode_exit_method))]
+#![cfg_attr(test, reexport_test_harness_main = "trust_wp_test_harness_main")]
+#![cfg_attr(test, test_runner(native_test_entry))]
 // Trust bootstrap applies rustc-internal warning policy to this standalone
 // verifier crate; these lints are not actionable for trust-wp's public surface.
 #![allow(
@@ -76,10 +79,12 @@
 
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
+extern crate rustc_attr_ir;
 extern crate rustc_borrowck;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
+extern crate rustc_hir_pretty;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_session;
@@ -95,6 +100,16 @@ extern crate rustc_index;
 // and ResultsCursor used by not_final_places (#2150).
 extern crate rustc_mir_dataflow;
 
+#[cfg(test)]
+extern crate jobserver_utils;
+#[cfg(test)]
+extern crate trust_resource_controller;
+#[cfg(test)]
+mod compiler_test_process;
+
+#[cfg(test)]
+extern crate test;
+
 #[macro_use]
 extern crate log;
 
@@ -107,15 +122,21 @@ mod contracts;
 #[cfg(feature = "clean-kernel")]
 mod formula_kernel_lane;
 mod ghost;
+mod hir_use;
 mod logic;
 mod mir_analysis;
+mod param_patterns;
 mod proof_assert;
+mod provenance;
 mod result_protocol_state;
+mod std_site;
+mod trait_credit;
 
 use std::env;
 
 use callbacks::{DefaultCallbacks, TrustWpCallbacks, TrustWpOptions};
 use rustc_driver::run_compiler;
+#[cfg(not(test))]
 use rustc_session::{config::ErrorOutputType, EarlyDiagCtxt};
 use trust_wp_core::tracing_init::{init_trust_wp_tracing, trust_wp_log_help};
 
@@ -139,6 +160,12 @@ const TRUST_WP_RUSTC_ARGS: &[&str] = &[
     // that uses no statement-expression attribute prints
     // "feature `stmt_expr_attributes` is declared but not used".
     "--allow=unused_features",
+    // ... and a crate that DID declare one of them (trust-wp-std declares
+    // `unsized_fn_params` itself) must not be failed for the duplicate the
+    // injection creates: `duplicate_features` is deny-by-default, so
+    // `error: the feature 'unsized_fn_params' has already been enabled`
+    // would be a compile error the crate's author cannot avoid.
+    "--allow=duplicate_features",
     "--cfg",
     "trust_wp",
 ];
@@ -149,7 +176,39 @@ struct ParsedTrustWpRequest {
     help_requested: bool,
 }
 
-fn main() {
+#[cfg(test)]
+fn native_test_entry(tests: &[&test::TestDescAndFn]) -> ! {
+    // SAFETY: FIRST runner operation. The compiler's test_harness.rs::add_main
+    // and mk_tests_slice generate only a static test-reference array and an
+    // immediate call here; no libtest IO, environment parsing or threads run
+    // first. Capture the inherited GNU and SDK custody before libtest can
+    // open/reuse descriptors. Reexporting the generated main alone does not
+    // run the production main: the generated #[rustc_main] still owns entry.
+    if let Err(error) = unsafe { rustc_data_structures::jobserver::capture_early() } {
+        eprintln!("error: inherited WP compiler resource custody unavailable: {error}");
+        std::process::exit(75);
+    }
+    // SAFETY: immediately after the fixed compiler capture above, before
+    // libtest IO or callbacks. Its fixed importers retain the original GNU/SDK
+    // slots and only duplicate descriptions, so no advertised slot was reused.
+    if let Err(error) = unsafe { compiler_test_process::capture_child_custody() } {
+        eprintln!("error: inherited compiler test child custody unavailable: {error}");
+        std::process::exit(75);
+    }
+    // This is the compiler's default libtest entry, including its ordinary
+    // command-line handling and exact exit code.
+    test::test_main_env_args(tests).exit_process()
+}
+
+#[cfg(not(test))]
+fn main() -> std::process::ExitCode {
+    // SAFETY: FIRST native-entry operation, before diagnostics, logging,
+    // defaults or callbacks can open/reuse inherited resource descriptors.
+    // Capture checked GNU and original SDK custody; this grants no authority.
+    if let Err(error) = unsafe { rustc_data_structures::jobserver::capture_early() } {
+        eprintln!("error: inherited WP compiler resource custody unavailable: {error}");
+        std::process::exit(75);
+    }
     let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Set backtrace to minimal by default (verification tools crash often during development)
@@ -160,10 +219,10 @@ fn main() {
         // test-only code and there is no save/restore to guard. The
         // single-threaded-startup invariant is what makes the mutation sound.
         // The canonical Trust review gate promotes the Trust toolchain's
-        // `env_mutation` lint to deny; stock rustc doesn't know it, hence
-        // `unknown_lints`.
+        // `env_mutation` lint to deny. This crate links rustc_private and
+        // builds only with the Trust toolchain, which knows the lint.
         // SAFETY: single-threaded at this point
-        #[allow(unknown_lints, env_mutation)]
+        #[allow(env_mutation)]
         unsafe {
             std::env::set_var("RUST_BACKTRACE", "0");
         }
@@ -176,10 +235,100 @@ fn main() {
     // mutation cannot race a concurrent `getenv`.
     apply_default_solver_stack();
 
+    // Order against `apply_default_solver_stack` does not matter for
+    // correctness: ay seeds its flag set from exactly one variable,
+    // `AY_SAT_VARIANT`, which this driver never writes, so the set installed
+    // here equals the one ay would have built lazily apart from `debug_cert`.
+    // What DOES matter is that the install precede the first
+    // `misc_cli_flags()` read, because the seam is first-writer-wins; no
+    // startup step between here and the callbacks links to ay, and a lost
+    // race is reported rather than swallowed.
+    apply_ay_cert_diagnostics();
+
     rustc_driver::install_ice_hook(BUG_REPORT_URL, |_| ());
     rustc_driver::init_rustc_env_logger(&handler);
 
-    run_trust_wp_driver();
+    // Compiler diagnostics unwind with the compiler's typed fatal marker.
+    // Match the compiler entrypoint: map only that marker to ordinary failure;
+    // unrelated panics still unwind and keep their crash status.
+    rustc_driver::catch_with_exit_code(run_trust_wp_driver)
+}
+
+/// Opt-in carrier for ay's certificate-path diagnostics (`--debug-cert`).
+///
+/// # The gap this closes
+///
+/// When strict certification refuses an UNSAT, the typed error names the
+/// Alethe step and the rule and stops there. The step's CLAUSE is the datum
+/// that separates the producers of a refusal — a demoted assumption prints
+/// the assumption term, whole-proof poison prints the empty clause, a minted
+/// leaf prints its own — and without it a refusal cannot be attributed to
+/// one of them. ay prints the clause, but only behind its `--debug-cert`
+/// carrier, and this driver parses no ay command line: the flag set is
+/// unreachable from here except through ay's process-wide install seam.
+///
+/// # Why it is off by default
+///
+/// This is a diagnostic. With the flag off it may not move a verdict, a
+/// counter or an exit code, so it is reached only when the operator asks. The whole
+/// effect is a `debug_cert` bool that gates `eprintln!` sites in ay's proof
+/// checker AND across its executor; every other field of the installed set is
+/// exactly what ay would have built for itself. Those sites print and do not
+/// steer: the one that also restores state performs the same restore on both
+/// arms. Rendering is not free, though, so a budget-sensitive obligation can
+/// answer differently with the flag on — it attributes a refusal, it does not
+/// measure one.
+///
+/// The thread-local test override cannot serve here: verification runs on a
+/// dedicated verifier stack thread and, by default, inside a forked child.
+/// The process-wide install survives both — `fork(2)` copies the address
+/// space, so the child inherits the installed set, and its stderr is the
+/// parent's.
+const AY_CERT_DIAGNOSTICS_ENV: &str = "TRUST_WP_AY_DEBUG_CERT";
+
+/// Whether the operator asked for certificate diagnostics, given the raw
+/// environment value.
+///
+/// Pure half, split out so the default-OFF contract is unit-testable without
+/// touching the process environment. An explicit disabling spelling is
+/// honoured so that a value set in a wrapper script can be turned off
+/// downstream without having to unset the name.
+fn ay_cert_diagnostics_requested(raw: Option<&str>) -> bool {
+    match raw {
+        None => false,
+        Some(value) => !matches!(
+            value.trim(),
+            "" | "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO"
+        ),
+    }
+}
+
+/// Install ay's certificate diagnostics when `AY_CERT_DIAGNOSTICS_ENV` asks.
+///
+/// A refused install is reported rather than swallowed: the seam is
+/// first-writer-wins, so a `false` return means something already read or
+/// wrote the flag set and the operator's request had NO effect. A diagnostic
+/// that silently does nothing is worse than none — it makes an absent
+/// `clause=[...]` line read as "no refusal happened".
+fn apply_ay_cert_diagnostics() {
+    let raw = std::env::var(AY_CERT_DIAGNOSTICS_ENV).ok();
+    if !ay_cert_diagnostics_requested(raw.as_deref()) {
+        return;
+    }
+    let installed = ay_core::debug_channel::set_global_misc_cli_flags_with(|flags| {
+        flags.debug_cert = true;
+    });
+    // Silent on success: the driver is re-entered once per crate in a cargo
+    // build, so a per-process banner would bury the diagnostic it announces
+    // and eat the harness's per-row capture budget. Only the failure is
+    // announced, and tracing is not initialized this early in `main`, so it
+    // uses the `[TRUST_WP_DEBUG]` stderr idiom the rest of startup uses.
+    if !installed {
+        eprintln!(
+            "[TRUST_WP_DEBUG] {AY_CERT_DIAGNOSTICS_ENV} had no effect: ay's flag set was \
+             already initialized by an earlier reader"
+        );
+    }
 }
 
 /// The certified default configuration of the ay solver backend.
@@ -267,7 +416,7 @@ fn apply_default_solver_stack() {
 
     for (name, value) in &to_apply {
         // SAFETY: single-threaded at this point (top of `main`)
-        #[allow(unknown_lints, env_mutation)]
+        #[allow(env_mutation)]
         unsafe {
             std::env::set_var(name, value);
         }
@@ -333,11 +482,22 @@ fn run_trust_wp_driver() {
     // hyphenated form `trust-wp=` never appears in rustc args — that was a
     // pre-rename leftover that silently disabled trust-wp analysis on every
     // fixture and caused logic-law mismatch checks to be skipped.
-    let has_trust_wp = args.iter().any(|arg| {
-        arg == "trust_wp"
-            || arg.contains("trust_wp=")
-            || arg == "trust_wp_std"
-            || arg.contains("trust_wp_std=")
+    // The bare-name arms match an `--extern trust_wp_std` with no path (the
+    // driver's own injection downstream) as well as cargo's `--extern
+    // <name>=<path>`. They are scoped to an `--extern` VALUE on purpose:
+    // `--crate-name trust_wp_std` also puts the bare string `trust_wp_std`
+    // in argv, so an unscoped scan made the driver analyse trust-wp-std
+    // ITSELF — which it then refuses outright ("local item `crate::std`
+    // shadows a standard or spec-library path root"), leaving no `.rmeta`
+    // and failing every crate downstream of it with `extern location for
+    // trust_wp_std does not exist`. The spec library is not a crate under
+    // verification; it is what the crates under verification are verified
+    // against.
+    let has_trust_wp = (0..args.len()).any(|i| {
+        extern_arg_value(&args, i).is_some_and(|v| {
+            let name = v.split('=').next().unwrap_or_default();
+            name == "trust_wp" || name == "trust_wp_std"
+        })
     });
 
     let force_callbacks = request.as_ref().is_some_and(|r| r.options.force_callbacks);
@@ -393,8 +553,8 @@ fn run_trust_wp_driver() {
     // every dependency (memchr, serde, syn, …). For trust-wp it is redundant
     // (TrustWpCallbacks does the real verification via ay) and harmful: it is
     // slow on the full dep stack and ICEs on some third-party deps — exactly the
-    // E0463/vcgen-depth failures the workspace's own `.cargo/config.toml`
-    // `-Ztrust-verify=off` rustflag exists for. Without it the compat-harness
+    // E0463/vcgen-depth failures `targo --unverified` switches the pass off
+    // for in this workspace's own build. Without it the compat-harness
     // warmup panics (exit 101) and every test pays a multi-minute dep-verify cost
     // (90s timeouts). Inject it once for both the verify and passthrough paths.
     let has_trust_verify_off = args.iter().enumerate().any(|(i, a)| {
@@ -413,6 +573,7 @@ fn run_trust_wp_driver() {
 
         // Inject trust-wp-required rustc args for tool attribute registration
         inject_trust_wp_args(&mut args);
+        inject_spec_tc_extern(&mut args);
 
         run_compiler(&args, &mut TrustWpCallbacks::new(opts));
     } else {
@@ -477,6 +638,94 @@ fn parse_trust_wp_options(args: &mut Vec<String>) -> Option<ParsedTrustWpRequest
 ///
 /// These enable the `#[trust_wp::...]` tool attributes without requiring
 /// manual feature flags in user code.
+/// Put `trust_wp_std` in the compiled crate's extern prelude.
+///
+/// Contract macros expand to ABSOLUTE `::trust_wp_std::...` paths — the
+/// `__spec_tc` type-check surface, `logic::OrdLogic`, `ghost::Snapshot` — the
+/// way Creusot's expansion writes `::creusot_std::...`. An absolute path
+/// resolves only against the extern prelude, and cargo puts a crate there only
+/// when the manifest names it as a direct dependency. A crate that depends on
+/// `trust-wp` alone (or on `creusot-contracts` alone) therefore could not
+/// compile a single contract:
+///
+/// ```text
+/// error[E0433]: cannot find `trust_wp_std` in the crate root
+/// ```
+///
+/// which is every one of the `targo-trust-wp` e2e fixtures and
+/// `examples/verified_math`. A `pub extern crate trust_wp_std;` re-export in
+/// `trust-wp` does NOT fix it: a re-export makes `trust_wp::trust_wp_std` a
+/// valid path, it does not enter a downstream crate's extern prelude.
+///
+/// So the driver adds the name itself, as the PATHLESS `--extern <name>`
+/// form: rustc locates the crate with its own resolution — the same one that
+/// resolves every other crate — instead of this driver guessing a file name
+/// and a metadata hash. That resolution reads the CRATE search path, and
+/// cargo passes its `deps` directory as `-L dependency=` (transitive kind
+/// only), so the same directories are re-registered as `-L crate=`. Nothing
+/// is forced: a pathless `--extern` is resolved lazily, so a crate that
+/// mentions no contract is unaffected.
+///
+/// The one case this cannot settle is a `deps` directory holding SEVERAL
+/// builds of trust-wp-std (different features or profiles landing side by
+/// side). rustc then reports `E0464: multiple candidates`, naming the files —
+/// which is the honest outcome: picking one here could bind the clause to a
+/// different trust-wp-std than the `trust_wp` the crate links, and the type
+/// errors from that would name neither cause.
+///
+/// Skipped when the caller already supplied the crate (cargo does when the
+/// manifest depends on trust-wp-std directly; `trust-wp <FILE.rs>` injects a
+/// resolved path of its own) and when the crate being compiled IS
+/// trust-wp-std, whose own contracts resolve against itself.
+/// The value of the `--extern` option at `args[i]`, in either spelling
+/// (`--extern NAME[=PATH]` as two arguments, or `--extern=NAME[=PATH]`).
+fn extern_arg_value(args: &[String], i: usize) -> Option<String> {
+    flag_arg_value(args, i, "--extern")
+}
+
+fn flag_arg_value(args: &[String], i: usize, flag: &str) -> Option<String> {
+    let a = &args[i];
+    if a == flag {
+        args.get(i + 1).cloned()
+    } else {
+        a.strip_prefix(&format!("{flag}=")).map(ToString::to_string)
+    }
+}
+
+fn inject_spec_tc_extern(args: &mut Vec<String>) {
+    const CRATE: &str = "trust_wp_std";
+    let flag_value = flag_arg_value;
+    let already_supplied = (0..args.len()).any(|i| {
+        flag_value(args, i, "--extern")
+            .is_some_and(|v| v == CRATE || v.starts_with(&format!("{CRATE}=")))
+    });
+    if already_supplied {
+        return;
+    }
+    let compiling_itself =
+        (0..args.len()).any(|i| flag_value(args, i, "--crate-name").as_deref() == Some(CRATE));
+    if compiling_itself {
+        return;
+    }
+    // `-L dependency=DIR` is searched for TRANSITIVE crates only; a crate
+    // named by `--extern` is looked up in the `crate`/`all` search paths.
+    let dep_dirs: Vec<String> = (0..args.len())
+        .filter_map(|i| flag_value(args, i, "-L"))
+        .filter_map(|v| v.strip_prefix("dependency=").map(ToString::to_string))
+        .collect();
+    let mut seen: Vec<String> = Vec::new();
+    for dir in dep_dirs {
+        if seen.contains(&dir) {
+            continue;
+        }
+        seen.push(dir.clone());
+        args.push("-L".to_string());
+        args.push(format!("crate={dir}"));
+    }
+    args.push("--extern".to_string());
+    args.push(CRATE.to_string());
+}
+
 fn inject_trust_wp_args(args: &mut Vec<String>) {
     // Insert after the binary name but before other args
     for (i, arg) in TRUST_WP_RUSTC_ARGS.iter().enumerate() {
@@ -624,6 +873,17 @@ TRUST_WP OPTIONS:
     --verify           Enable verification (default unless emit-only)
     --no-verify        Skip verification
     -h, --help         Print this trust-wp option help
+
+DIAGNOSTICS:
+    TRUST_WP_AY_DEBUG_CERT=1
+        Turn on ay's certificate-path diagnostics. A strict-certification
+        refusal then prints the refused proof step's rule AND clause on
+        stderr; without it only the opaque reason code is available.
+        Diagnostic only, and OFF by default. With it off, verdicts,
+        counters and exit codes are unchanged. With it on, clause
+        rendering runs inside the solve and its output is large, so a
+        budget-sensitive obligation may answer differently: turn it on
+        to attribute a refusal, not to measure one.
 
 {}
 ",

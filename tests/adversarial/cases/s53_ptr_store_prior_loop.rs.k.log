@@ -1,0 +1,67 @@
+    Checking creusot_test v0.1.0 (/private/var/folders/w6/hcy0yr1d35qcfjb9x2mr5b340000gn/T/s53probe_r0zvc735/test_project)
+warning: unused doc comment
+  --> src/lib.rs:15:12
+   |
+15 | #[requires(x > 0i32)]
+   |            ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+   = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+  --> src/lib.rs:18:11
+   |
+18 | #[ensures(^x == -5i32)]
+   |           ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:21:11
+   |
+21 | #[ensures(true)]
+   |           ^^^^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:22:88
+   |
+22 | ... x; let mut i: u32 = 0; #[invariant(i <= n)] while i < n { *r = -5i32; i += 1; } let mut j: u32 = 0; #[invariant(j <= n)] while j...
+   |                                        ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused doc comment
+  --> src/lib.rs:22:165
+   |
+22 | ...; } let mut j: u32 = 0; #[invariant(j <= n)] while j < n { need_pos(x); j += 1; } }
+   |                                        ^ rustdoc does not generate documentation for expressions
+   |
+   = help: use `//` for a plain comment
+
+warning: unused variable: `x`
+  --> src/lib.rs:16:17
+   |
+16 | pub fn need_pos(x: i32) {}
+   |                 ^ help: if this is intentional, prefix it with an underscore: `_x`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+trust-wp: need_pos verified ✓
+trust-wp: setneg verified ✓
+TRUST_WP_DIAGNOSTIC:v1 def_path=f kind=loop_call_obligation status=failed reason=counterexample solve_time_ms=24 assertions=0 timeout_ms=58000 ay_result=sat accepted_for_consumer=true model_validated=true unsat_proof_available=false verification_level=DebugChecked replay_present=true replay_bytes=1093 replay_sha256=2a5cf4f5e37f23d73f47eba77754f9c964c5c28a3ee79afbd3d4830b3ac997fd native_replay_present=true native_replay_bytes=12228 native_replay_sha256=56f932613da2194a971b9004b83908953fc52441fb67d0e030f2d6c97164bf16 native_replay_schema=ay.native-replay.v1 native_replay_path=none native_replay_write_error=none strict_replay=none strict_replay_unbound=0
+trust-wp: f FAILED ✗ (loop call obligations)
+  at src/lib.rs:22:1: 22:17
+  check: call-site precondition obligations under loop invariants
+  counterexample:
+    j = 0
+    n = 1
+
+trust-wp: 2 verified, 1 failed, 0 errors
+warning: `creusot_test` (lib) generated 6 warnings (run `cargo fix --lib -p creusot_test` to apply 1 suggestion)
+error: could not compile `creusot_test` (lib); 6 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `/var/folders/w6/hcy0yr1d35qcfjb9x2mr5b340000gn/T/trust_wp_harness_bin_p9mkx_3v/trust-wp-rustc <rustup-home>/toolchains/trust-wpcamp/bin/rustc --crate-name creusot_test --edition=2024 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(trust_wp)' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=338dd5d60a93f3f2 -C extra-filename=-9716421c1943ef5c --out-dir <campaign-root>/s53/harness-target/debug/deps -L dependency=<campaign-root>/s53/harness-target/debug/deps --extern creusot_contracts=<campaign-root>/s53/harness-target/debug/deps/libcreusot_contracts-1976c791ef999853.rmeta --extern creusot_std=<campaign-root>/s53/harness-target/debug/deps/libcreusot_std-796fae5de59eddf0.rmeta --extern trust_wp=<campaign-root>/s53/harness-target/debug/deps/libtrust_wp-badd645ccc1cd69f.rmeta --extern trust_wp_std=<campaign-root>/s53/harness-target/debug/deps/libtrust_wp_std-32f054453635ac5b.rmeta` (exit status: 1)
+TRUST_WP_RESULT:v1 base_exit_code=1 verified=2 failed=1 errors=0 warnings=0 assumed=0 trusted=0 skipped=0 verified_with_axiom_deps=0 unverified_axioms=0 vacuous=0 evidence_gaps=0 proof_assert_verified=0 proof_assert_inconclusive=0 verified_native_only=0 proof_assert_failed=0 proof_assert_errors=0 panics=0 demoted=0 parse_errors=0 termination_errors=0 logic_recursion_errors=0 erasure_errors=0

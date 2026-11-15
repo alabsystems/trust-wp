@@ -24,10 +24,10 @@ use trust_wp_driver::StdSpec;
 
 use super::{
     closure_enrichment::{
-        collect_closure_capture_infos, collect_trivial_closure_receivers,
+        collect_closure_capture_infos, collect_contract_free_closure_receivers,
         enrich_existentials_with_closure_ensures, enrich_forall_goals_with_closure_ensures,
-        instantiate_forall_precondition_rules, rewrite_trivial_closure_precondition_goal,
-        synthesized_ensures_from_capture_infos,
+        instantiate_forall_precondition_rules, rewrite_contract_free_closure_precondition_goal,
+        synthesized_ensures_from_capture_infos, ClosurePreconditions,
     },
     logic_fn_scope::scope_logic_fn_modes,
     proof_assert_extract::is_deref_precondition,
@@ -53,7 +53,6 @@ pub(super) struct ClosureWiringContext<'a, 'tcx> {
     pub(super) user_specs: &'a HashMap<DefId, StdSpec>,
     pub(super) const_item_substitutions: &'a HashMap<String, PureExpr>,
     pub(super) logic_fn_defs: &'a [trust_wp_core::logic::LogicFnDef],
-    pub(super) type_invariant_defs: &'a [trust_wp_core::logic::TypeInvariantDef],
     pub(super) verbose: bool,
     pub(super) body_arg_names: &'a [String],
     pub(super) fn_path: &'a str,
@@ -77,7 +76,6 @@ pub(super) fn apply_closure_wiring(
     let user_specs = ctx.user_specs;
     let const_item_substitutions = ctx.const_item_substitutions;
     let logic_fn_defs = ctx.logic_fn_defs;
-    let type_invariant_defs = ctx.type_invariant_defs;
     let verbose = ctx.verbose;
     let body_arg_names = ctx.body_arg_names;
     let fn_path = ctx.fn_path;
@@ -147,14 +145,14 @@ pub(super) fn apply_closure_wiring(
             );
         }
     }
-    let capture_inv_requires =
-        build_closure_capture_invariant_requires(&closure_capture_infos, type_invariant_defs);
+    let capture_inv_requires = build_closure_capture_invariant_requires(&closure_capture_infos);
     if verbose && !capture_inv_requires.is_empty() {
         debug!(
             "trust-wp:   (proof_assert: {} closure capture invariant precondition(s) injected)",
             capture_inv_requires.len()
         );
     }
+    // fact-source: closure_capture_invariants
     preconditions.extend(capture_inv_requires);
 
     if verbose {
@@ -222,23 +220,31 @@ pub(super) fn apply_closure_wiring(
         }
     }
 
-    // Concrete closures without explicit requires have vacuous preconditions.
-    // Keep explicit closure requires as obligations.
-    let trivial_closure_receivers =
-        collect_trivial_closure_receivers(containing_fn, body_arg_names, user_specs);
+    // A contract-free closure's precondition is its body's weakest
+    // precondition. This lane holds no trait or extern specs (see the empty
+    // maps above), so a WP computed here would miss every obligation whose
+    // callee contract lives in one — weaker than the real precondition, which
+    // is a false credit. Withhold instead.
+    let contract_free_receivers =
+        collect_contract_free_closure_receivers(tcx, containing_fn, body_arg_names, user_specs);
     debug!(
-        "trust-wp:   (proof_assert debug trivial closure receivers: {trivial_closure_receivers:?})"
+        "trust-wp:   (proof_assert debug contract-free closure receivers: {contract_free_receivers:?})"
     );
-    if !trivial_closure_receivers.is_empty() {
+    if !contract_free_receivers.is_empty() {
+        let closure_preconditions = ClosurePreconditions::withholding();
         let mut rewritten = 0usize;
         for goal in &mut ensures_vec {
-            if rewrite_trivial_closure_precondition_goal(goal, &trivial_closure_receivers) {
+            if rewrite_contract_free_closure_precondition_goal(
+                goal,
+                &contract_free_receivers,
+                &closure_preconditions,
+            ) {
                 rewritten += 1;
             }
         }
         if verbose && rewritten > 0 {
             debug!(
-                "trust-wp:   (proof_assert: {rewritten} trivial closure precondition obligation(s) discharged)",
+                "trust-wp:   (proof_assert: {rewritten} contract-free closure precondition(s) resolved)",
             );
         }
     }
@@ -533,6 +539,7 @@ mod tests {
             param_names: vec![],
             capture_bindings: vec![(0, "x".to_string())],
             ensures_exprs: vec![],
+            env_arity: None,
         }];
 
         let rewritten =

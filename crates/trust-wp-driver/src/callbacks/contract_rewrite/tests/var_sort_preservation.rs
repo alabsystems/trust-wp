@@ -136,7 +136,8 @@ fn rewrite_named_field_access_preserves_forall_var_sort() {
         triggers: vec![],
     };
     let field_map = HashMap::new();
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     match result {
         PureExpr::Forall { var_sort, .. } => {
             assert_eq!(
@@ -159,7 +160,8 @@ fn rewrite_named_field_access_preserves_exists_var_sort() {
         triggers: vec![],
     };
     let field_map = HashMap::new();
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     match result {
         PureExpr::Exists { var_sort, .. } => {
             assert_eq!(
@@ -204,7 +206,8 @@ fn var_sort_survives_all_three_rewrite_passes() {
     // Pass 3: named field access rewriting (rewrites __trust_wp_field_inner → __trust_wp_tuple_get_0)
     let mut field_map = HashMap::new();
     field_map.insert("inner".to_string(), 0);
-    let after_pass3 = rewrite_named_field_access_expr(&after_pass2, &field_map);
+    let after_pass3 =
+        rewrite_named_field_access_expr(&after_pass2, flat_tables(&field_map)).expect("resolvable");
 
     // Verify var_sort survived all three passes
     match after_pass3 {

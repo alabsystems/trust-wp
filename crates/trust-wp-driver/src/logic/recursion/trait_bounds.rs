@@ -135,14 +135,11 @@ fn build_trait_bound_graph(tcx: TyCtxt<'_>) -> TraitBoundGraph {
         }
         let mut successors = HashSet::new();
 
-        // Supertrait edges. `trait_explicit_predicates_and_bounds` carries the
+        // Supertrait edges. `trait_explicit_clauses_and_bounds` carries the
         // user-written trait predicates WITHOUT the implicit identity
-        // `Self: Trait` that plain `predicates_of` appends for traits — the
+        // `Self: Trait` that plain `clauses_of` appends for traits — the
         // identity predicate would fabricate a self-loop on every trait.
-        for (clause, _span) in tcx
-            .trait_explicit_predicates_and_bounds(local_def_id)
-            .predicates
-        {
+        for (clause, _span) in tcx.trait_explicit_clauses_and_bounds(local_def_id).clauses {
             if let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() {
                 let target = predicate.trait_ref.def_id;
                 successors.insert(target);
@@ -165,7 +162,7 @@ fn build_trait_bound_graph(tcx: TyCtxt<'_>) -> TraitBoundGraph {
         for item in tcx.associated_items(trait_def_id).in_definition_order() {
             match item.kind {
                 ty::AssocKind::Fn { .. } => {
-                    for (clause, _span) in tcx.predicates_of(item.def_id).predicates {
+                    for (clause, _span) in tcx.clauses_of(item.def_id).clauses {
                         if let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() {
                             let target = predicate.trait_ref.def_id;
                             successors.insert(target);

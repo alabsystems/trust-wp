@@ -8,8 +8,8 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::Expr;
 
+use super::snapshot_expr_kind::{contains_spec_only_call, is_place_or_reference_expr};
 use crate::{
-    expr_walk::any_expr,
     snapshot_rewrite::{
         annotate_closure_params_with_int, annotate_closure_wildcards_only,
         rewrite_snapshot_call_arg_derefs, rewrite_such_that_closure_to_mapping,
@@ -17,24 +17,6 @@ use crate::{
     },
     transform::preprocess_view_syntax,
 };
-
-/// Check if an expression contains a call to a spec-only function
-/// (`such_that`, `dead`, `unreachable`) that cannot be evaluated at runtime.
-fn contains_spec_only_call(expr: &Expr) -> bool {
-    any_expr(expr, &mut |e| {
-        matches!(e,
-            Expr::Call(call) if matches!(
-                call.func.as_ref(),
-                Expr::Path(path) if path.path.segments.last()
-                    .is_some_and(|seg| {
-                        seg.ident == "such_that"
-                            || seg.ident == "dead"
-                            || seg.ident == "unreachable"
-                    })
-            )
-        )
-    })
-}
 
 fn parse_snapshot_expr(input2: &proc_macro2::TokenStream) -> syn::Result<Expr> {
     match syn::parse2(input2.clone()) {
@@ -346,22 +328,4 @@ pub(crate) fn expand_snapshot(input: TokenStream) -> TokenStream {
         }
     }
     .into()
-}
-
-/// Whether `expr` is a place expression or a reference expression — the only
-/// syntactic forms that can have `&mut` type and thus need the loan-decoupling
-/// snapshot-capture dispatch. Place/reference expressions also always have a
-/// fully-known type at macro-expansion time, which the type-directed dispatch
-/// requires (a not-yet-inferred type would poison its `&mut` selection). (bug/869)
-fn is_place_or_reference_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Path(_) => true,
-        Expr::Field(_) => true,
-        Expr::Index(_) => true,
-        Expr::Reference(_) => true,
-        Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)),
-        Expr::Paren(p) => is_place_or_reference_expr(&p.expr),
-        Expr::Group(g) => is_place_or_reference_expr(&g.expr),
-        _ => false,
-    }
 }

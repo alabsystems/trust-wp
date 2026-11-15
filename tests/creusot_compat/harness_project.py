@@ -20,10 +20,12 @@ try:
         PROJECT_REQUIRED_ATTRS,
         resolve_harness_facade,
     )
+    from tests.creusot_compat.harness_targets import build_tool_argv
 except ModuleNotFoundError:
     # Running as a script (`python3 tests/creusot_compat/harness.py`) puts this
     # directory on sys.path, so import sibling modules directly.
     from harness_facade import PROJECT_REQUIRED_ATTRS, resolve_harness_facade
+    from harness_targets import build_tool_argv
 
 
 def _resolve_harness_facade(facade: object | None) -> object:
@@ -100,12 +102,19 @@ def find_creusot_tests(
 
 
 def _scaffold_manifest(workspace: Path) -> str:
-    """Return the Cargo manifest shared by every synthesized fixture."""
+    """Return the Cargo manifest shared by every synthesized fixture.
+
+    ``edition = "2024"`` mirrors Creusot's own corpus invocation
+    (``reference/creusot/tests/tests/ui.rs``: ``--edition=2024``). The edition
+    changes MIR (tail-expression temporaries, if-let scrutinee scope, RPIT
+    capture, never-type fallback), so any other edition verifies a different
+    program than the one Creusot proves or rejects.
+    """
     return f"""\
 [package]
 name = "creusot_test"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [workspace]
 
@@ -211,28 +220,37 @@ def _parse_lock_packages(lock_text: str) -> list[dict]:
     return packages
 
 
-def _resolve_lock_dep(dep: str, by_name: dict[str, list[dict]]) -> tuple[str, str]:
-    """Resolve a lockfile dependency string to a (name, version) pair.
+def _resolve_lock_dep(
+    dep: str, by_name: dict[str, list[dict]]
+) -> tuple[str, str, str]:
+    """Resolve a dependency to Cargo's full (name, version, source) identity.
 
-    Lockfile dependency strings are `name`, `name version`, or
-    `name version (source)` depending on how many candidates share the name.
+    Cargo writes a source qualifier when equal name/version packages coexist.
+    The source qualifier omits the precise Git commit fragment. With a version
+    but no source qualifier, a path package wins over equal-version Git or
+    registry entries; a lone non-path candidate may be unqualified as well.
     """
-    parts = dep.split(" ")
-    name = parts[0]
+    match = re.fullmatch(r"([^ ]+)(?: ([^ ]+))?(?: \((.*)\))?", dep)
+    if match is None:
+        raise RuntimeError(f"Invalid lockfile dependency {dep!r}")
+    name, version, source = match.groups()
     candidates = by_name.get(name, [])
-    if len(parts) >= 2:
-        version = parts[1]
-        if not any(pkg.get("version") == version for pkg in candidates):
-            raise RuntimeError(
-                f"Lockfile dependency {dep!r} does not resolve to a package entry"
-            )
-        return (name, version)
+    if version is not None:
+        candidates = [pkg for pkg in candidates if pkg.get("version") == version]
+    if source is not None:
+        candidates = [
+            pkg for pkg in candidates
+            if pkg.get("source", "").split("#", 1)[0] == source
+        ]
+    elif len(candidates) > 1 and version is not None:
+        candidates = [pkg for pkg in candidates if pkg.get("source") is None]
     if len(candidates) != 1:
         raise RuntimeError(
             f"Lockfile dependency {dep!r} is ambiguous or missing "
             f"({len(candidates)} candidates)"
         )
-    return (name, candidates[0]["version"])
+    pkg = candidates[0]
+    return (name, pkg["version"], pkg.get("source", ""))
 
 
 def _verify_child_lock_subgraph(child_text: str, workspace_lock_text: str) -> None:
@@ -257,6 +275,9 @@ def _verify_child_lock_subgraph(child_text: str, workspace_lock_text: str) -> No
             f"{sorted(expected_root_deps)}"
         )
 
+    for dep in root[0]["dependencies"]:
+        _resolve_lock_dep(dep, child_by_name)
+
     violations: list[str] = []
     for pkg in child_packages:
         name = pkg["name"]
@@ -264,13 +285,15 @@ def _verify_child_lock_subgraph(child_text: str, workspace_lock_text: str) -> No
             continue
         version = pkg.get("version")
         reviewed = next(
-            (p for p in ws_by_name.get(name, []) if p.get("version") == version),
+            (p for p in ws_by_name.get(name, [])
+             if p.get("version") == version and p.get("source") == pkg.get("source")),
             None,
         )
         if reviewed is None:
             reviewed_versions = [p.get("version") for p in ws_by_name.get(name, [])]
             violations.append(
-                f"{name} {version}: not in the reviewed workspace lock "
+                f"{name} {version} ({pkg.get('source', 'path')}): "
+                "not in the reviewed workspace lock "
                 f"(reviewed versions: {reviewed_versions or 'none'})"
             )
             continue
@@ -334,7 +357,7 @@ def _derived_child_lock(workspace: Path) -> str:
         # Seeded distillation: cargo restricts the reviewed lock to this
         # project's graph, keeping every locked version/source/checksum.
         distill = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1"],
+            build_tool_argv("metadata", "--format-version", "1"),
             cwd=seed_dir,
             capture_output=True,
             text=True,
@@ -349,7 +372,7 @@ def _derived_child_lock(workspace: Path) -> str:
         # Self-check: the derived lock must be a fixed point, so per-fixture
         # --locked runs never resolve anything themselves.
         locked_check = subprocess.run(
-            ["cargo", "metadata", "--locked", "--format-version", "1"],
+            build_tool_argv("metadata", "--locked", "--format-version", "1"),
             cwd=seed_dir,
             capture_output=True,
             text=True,
@@ -473,18 +496,12 @@ def create_warmup_project(
 def transform_creusot_to_trust_wp(source: str, facade: object | None = None) -> str:
     """Transform Creusot source to trust-wp-compatible source."""
     _ = facade
-    lines = source.split("\n")
-    result = []
-
-    for line in lines:
-        # Remove extern crate declarations — unnecessary in edition 2021
-        # and the compat crates provide the names directly.
-        if "extern crate creusot_std" in line or "extern crate creusot_contracts" in line:
-            continue
-
-        result.append(line)
-
-    transformed = "\n".join(result)
+    # ``extern crate creusot_std;`` is kept verbatim: Creusot compiles the corpus
+    # with ``--edition=2024 --extern creusot_std=...`` and the line is valid in
+    # every edition; the fixture's Cargo dependency supplies the same crate
+    # name. Deleting it would shift every line number and has no Creusot
+    # counterpart.
+    transformed = source
 
     # The trust-wp driver injects `stmt_expr_attributes` via -Zcrate-attr.
     # Strip it from any source feature attributes to avoid E0636 duplicates.
@@ -620,15 +637,10 @@ def apply_test_specific_shims(
             "snapshot!(self@.insert(*k, *v))",
             "snapshot!((&*self)@.insert(*k, *v))",
         )
-        source = source.replace("#[logic(law)]", "#[trusted]")
         source = source.replace("self.0@.auth() != None", "self.0@.auth != None")
         source = source.replace(
             "self.0@.auth().unwrap_logic()",
             "self.0@.auth.unwrap_logic()",
-        )
-        source = source.replace(
-            "impl<K: std::cmp::Eq + std::hash::Hash, V: Clone + std::cmp::PartialEq> Clone for Fragment<K, V> {\n    #[check(ghost)]",
-            "impl<K: std::cmp::Eq + std::hash::Hash, V: Clone + std::cmp::PartialEq> Clone for Fragment<K, V> {\n    #[trusted]\n    #[check(ghost)]",
         )
     if test_file.as_posix().endswith("tests/should_succeed/cc/collections.rs"):
         source = source.replace(
@@ -653,10 +665,6 @@ def apply_test_specific_shims(
             "let (x, map2) = map.split_mut_ghost(&1);",
             "let (x, mut map2) = map.split_mut_ghost(&1);",
         )
-    # hashmap_list.rs: Custom Resolve impls with #[logic(prophetic)] resolve_coherence
-    # now compile natively — blanket `impl<T> Resolve for T` was removed and
-    # resolve_coherence was added to the Resolve trait (#2683, 892439efc).
-    # No shim needed.
     if test_file.as_posix().endswith("examples/hillel.rs"):
         # trust-wp's Int is a newtype (Int(i128)), not a compiler-builtin integer.
         # Creusot's pearlite maps integer literals to Int automatically; trust-wp
@@ -675,10 +683,6 @@ def apply_test_specific_shims(
             "#[cfg(creusot)]\nuse creusot_std::resolve::structural_resolve;",
             "use creusot_std::resolve::structural_resolve;",
         )
-        # Custom Resolve impls with #[logic(prophetic)] resolve_coherence now
-        # compile natively — blanket `impl<T> Resolve for T` was removed and
-        # resolve_coherence was added to the Resolve trait (#2683, 892439efc).
-        # No Resolve-stripping shim needed.
     if test_file.as_posix().endswith("examples/sparse_array.rs"):
         # trust-wp does not set cfg(creusot), so #[cfg(creusot)] imports are
         # elided. Replace with unconditional import since the resolve module
@@ -687,10 +691,6 @@ def apply_test_specific_shims(
             "#[cfg(creusot)]\nuse creusot_std::resolve::structural_resolve;",
             "use creusot_std::resolve::structural_resolve;",
         )
-        # Custom Resolve impls with resolve_coherence now compile natively —
-        # blanket `impl<T> Resolve for T` was removed and resolve_coherence
-        # was added to the Resolve trait (#2683, 892439efc).
-        # No Resolve-stripping shim needed.
         # trust-wp's prelude intentionally omits the consuming `View` trait
         # (to prevent method-resolution surprises with `view()` function).
         # sparse_array.rs `impl View for Sparse` needs the trait in scope.
@@ -949,22 +949,6 @@ def apply_test_specific_shims(
         source = source.replace("snapshot!(*cur@)", "snapshot!(cur.as_ref().clone())")
         source = source.replace("snapshot!(*next@)", "snapshot!(next.as_ref().clone())")
         source = source.replace("ghost!(&mut *pa)", "ghost!(pa.into_inner())")
-        # The `Clone for PersistentArray<T>` body is large enough to exhaust
-        # the adaptive verification budget under the harness timeout, which
-        # surfaces as an "unknown (incomplete)" trust-wp result and bubbles
-        # up as a compile-error category exit. Mark the impl as `#[trusted]`
-        # so compile clears and the rest of the file can be exercised; the
-        # postcondition itself (`result@ == self@`) is straightforward and
-        # remains preserved as a trusted axiom for downstream functions.
-        source = source.replace(
-            "    impl<T> Clone for PersistentArray<T> {\n"
-            "        #[ensures(result@ == self@)]\n"
-            "        fn clone(&self) -> Self {",
-            "    impl<T> Clone for PersistentArray<T> {\n"
-            "        #[trusted]\n"
-            "        #[ensures(result@ == self@)]\n"
-            "        fn clone(&self) -> Self {",
-        )
     # --- Iterator example shims ---
     if test_file.as_posix().endswith("examples/iterators/03_std_iterators.rs"):
         # `snapshot! { slice@ }` where `slice: &mut [T]` moves the mutable
@@ -975,10 +959,6 @@ def apply_test_specific_shims(
             "snapshot! { slice@ }",
             "snapshot! { (&*slice)@ }",
         )
-    # Snapshot::inner() now returns T by value (matching Creusot), so the
-    # workarounds that replaced .inner() with .into_inner() are no longer
-    # needed.
-    #
     # The iterator examples update ghost production history inside snapshot!.
     # Creusot erases that expression before Rust borrow checking, but trust-wp
     # currently type-checks the Rust expression under cfg(trust_wp). Capture the
@@ -1004,80 +984,15 @@ def apply_test_specific_shims(
             "self.produced.push_back(v)",
             "self.produced.push_back(Snapshot::capture(&v).into_inner())",
         )
-        # `produces_one_invariant`'s body uses Seq indexing inside a
-        # `proof_assert!`. The match-encoder maps the closure-typed sequence
-        # element to a Map sort and then attempts seq-index arithmetic on
-        # `Int + Map`, surfacing as an `ay error: seq_index_term: index
-        # argument has wrong sort`. Mark the helper `#[trusted]` so the
-        # encoder skips its body; callers still see the contracted
-        # `ensures` clauses as trusted axioms.
-        source = source.replace(
-            "    #[ensures(Self::next_precondition(iter, ^f, self.produced.push_back(e)))]\n"
-            "    fn produces_one_invariant(self, e: I::Item, r: B, f: &mut F, iter: I) {",
-            "    #[ensures(Self::next_precondition(iter, ^f, self.produced.push_back(e)))]\n"
-            "    #[trusted]\n"
-            "    fn produces_one_invariant(self, e: I::Item, r: B, f: &mut F, iter: I) {",
-        )
-    # Syntax tests with NO_REPLAY markers historically passed as parse-only.
-    # The strict gate now requires telemetry-clean runs (no failures, no
-    # ``trusted``-only obligations).  For tests whose Creusot contracts are
-    # intentionally non-tautological (they exist to exercise the contract
-    # parser, not the prover), restate the postcondition as an equivalent
-    # syntactic form whose validity is structural -- preserving the macro
-    # surface under test while making the obligation actually provable.
-    if test_file.as_posix().endswith("tests/should_succeed/syntax/04_assoc_prec.rs"):
-        # ``x.0 == x.1`` exercises tuple-field projection parsing.  The first
-        # two ensures already cover operator precedence; rewrite the third to
-        # use the same tuple-field syntax in a reflexive form so the parse
-        # test is preserved and the obligation discharges.
-        source = source.replace(
-            "#[ensures(x.0 == x.1)]\n"
-            "pub fn respect_prec(x: (u32, u32)) {}",
-            "#[ensures(x.0 == x.0 && x.1 == x.1)]\n"
-            "pub fn respect_prec(x: (u32, u32)) {}",
-        )
-        # ``0u32@ + 1u32@ == 0`` is statically false (1 != 0).  Correct the
-        # sum so the ``@`` (view) operator parse is still exercised and the
-        # postcondition discharges.
-        source = source.replace(
-            "#[ensures(0u32@ + 1u32@ == 0)]\n"
-            "pub fn respect_assoc() {}",
-            "#[ensures(0u32@ + 1u32@ == 1)]\n"
-            "pub fn respect_assoc() {}",
-        )
-    if test_file.as_posix().endswith("tests/should_succeed/syntax/05_pearlite.rs"):
-        # ``solver`` is annotated ``#[trusted]`` in the original test; the
-        # strict-trust gate flags any ``trusted > 0`` as a soundness gap.
-        # ``solver``'s ensures (``x.a == x.a``) is reflexively true, so
-        # dropping the ``#[trusted]`` annotation lets trust-wp verify it
-        # directly without a soundness gap.
-        source = source.replace(
-            "#[trusted]\n#[ensures(x.a == x.a)]\npub fn solver(x: A) {}",
-            "#[ensures(x.a == x.a)]\npub fn solver(x: A) {}",
-        )
-        # ``x == A { a: false }`` exists to exercise struct-constructor
-        # parsing inside an ensures clause.  Bind ``x`` to the literal via a
-        # ``#[requires]`` clause with the same constructor expression so the
-        # postcondition discharges trivially.  The struct-constructor literal
-        # is preserved in both clauses for the parser test.
-        source = source.replace(
-            "#[ensures(x == A { a: false })]\n"
-            "pub fn struct_in_pearlite(x: A) {}",
-            "#[requires(x == A { a: false })]\n"
-            "#[ensures(x == A { a: false })]\n"
-            "pub fn struct_in_pearlite(x: A) {}",
-        )
-        # Same treatment for ``struct_order``: constrain the input fields via
-        # ``#[requires]`` so the literal-constructor ensures discharges, while
-        # keeping the out-of-order ``field2/field1`` syntax under test.
-        source = source.replace(
-            "#[ensures(x == B { field2: 0u32, field1: false })]\n"
-            "pub fn struct_order(x: B) {}",
-            "#[requires(x.field1 == false && x.field2 == 0u32)]\n"
-            "#[ensures(x == B { field2: 0u32, field1: false })]\n"
-            "pub fn struct_order(x: B) {}",
-        )
-    # 10_mutual_rec_types.rs has no user contracts; trust-wp already produces a
-    # clean wire line for it.  The NO_REPLAY classifier change accepts that
-    # clean telemetry, so no source shim is required.
+    # No shim may weaken or replace a contract: rewriting an intentionally
+    # FALSE Creusot ensures, or adding a ``#[requires]`` premise, so that the
+    # rewritten program verifies credits a proof of a program that is not the
+    # Creusot test (D-21). No shim may hide a Creusot goal or change Creusot's
+    # trust base either: turning ``#[logic(law)]`` into ``#[trusted]``, adding
+    # a ``#[trusted]`` or stripping one routes around a driver limitation at
+    # the cost of the fidelity the corpus is meant to measure. The fixture
+    # compiles the corpus item as Creusot does and loses credit for goals
+    # trust-wp cannot yet prove.
+    # tests/creusot_compat/test_shim_claim_guard.py refuses any rewrite of
+    # trust or contract text that is not in its justified allowlist.
     return source

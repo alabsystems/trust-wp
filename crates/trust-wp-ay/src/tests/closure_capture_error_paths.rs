@@ -338,8 +338,8 @@ fn test_partial_capture_unbound_accessor_is_not_fully_constrained() {
 }
 
 /// When `param_name` is `None` on a `ClosureCaptureInfo` entry, the projection
-/// loop must skip it entirely without error. This tests the guard at
-/// `verify/mod.rs:134-136`. (#1485 error path audit)
+/// loop must skip it entirely without error. This tests the `param_name`
+/// guard in `assert_closure_capture_projections`. (#1485 error path audit)
 #[test]
 #[timeout(30000)]
 fn test_missing_param_name_skips_projection_without_error() {
@@ -784,7 +784,7 @@ fn test_capture_projection_existing_post_state_var_sort_conflict_returns_error()
 }
 
 // ---------------------------------------------------------------------------
-// assert_captured_param_type_invariants: direct unit tests (fix3-closure-typeinv)
+// assert_captured_param_type_invariants: direct unit tests
 // ---------------------------------------------------------------------------
 
 /// Build the `Zero` invariant body `self.0@ == 0` using positional tuple access
@@ -869,7 +869,7 @@ fn negated_field0_goal(
 /// Build the driver-injected opaque invariant precondition `inv_<type>(recv)`
 /// for the given invariant type name and receiver variable. This is the exact
 /// shape `build_closure_capture_invariant_requires` produces and is the
-/// soundness gate the helper now requires before materializing the body.
+/// soundness gate the helper requires before materializing the body.
 fn capture_invariant_requires(type_name: &str, recv: &str) -> Vec<PureExpr> {
     vec![PureExpr::MethodCall {
         receiver: Arc::new(PureExpr::Var(recv.to_string(), None)),
@@ -893,8 +893,6 @@ fn zero_self_capture_info(sort: crate::ExprSort) -> ClosureCaptureInfo {
 
 /// POSITIVE: a `Zero` capture `x` in scope makes the substituted invariant body
 /// (`x.0@ == 0`) a ground hypothesis, so the negated goal `x.0@ != 0` is UNSAT.
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_makes_field_constraint_unsat() {
@@ -931,8 +929,7 @@ fn test_captured_param_type_invariant_makes_field_constraint_unsat() {
 /// `requires`). The helper must NOT materialize the invariant body, because the
 /// program never established it. The negated goal `x.0@ != 0` therefore stays
 /// SAT (the VC correctly cannot certify safety). Without this gate the helper
-/// would fabricate `x.0@ == 0` from nothing, a false-accept. (soundness fix
-/// 2026-06-02)
+/// would fabricate `x.0@ == 0` from nothing, a false-accept.
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_requires_injected_precondition() {
@@ -965,8 +962,6 @@ fn test_captured_param_type_invariant_requires_injected_precondition() {
 /// NEGATIVE CONTROL: the SAME setup WITHOUT calling the helper leaves `x.0@`
 /// unconstrained, so the negated goal `x.0@ != 0` is SAT. Proves the helper is
 /// load-bearing (this is exactly the closures/10_tyinv false-SAT).
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_negative_control_is_sat_without_helper() {
@@ -994,8 +989,6 @@ fn test_captured_param_type_invariant_negative_control_is_sat_without_helper() {
 
 /// GUARD (a): only the `_final` (prophecy) var is in scope — the helper must
 /// assert nothing, so the negated goal over the final field stays SAT.
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_skips_final_only_scope() {
@@ -1030,8 +1023,6 @@ fn test_captured_param_type_invariant_skips_final_only_scope() {
 
 /// GUARD (b): a trivial `Bool(true)` invariant body adds no constraint, so the
 /// negated goal stays SAT.
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_skips_trivial_body() {
@@ -1072,8 +1063,6 @@ fn test_captured_param_type_invariant_skips_trivial_body() {
 }
 
 /// GUARD (c): a capture whose type has NO matching invariant is a no-op.
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_no_matching_def_is_noop() {
@@ -1120,8 +1109,6 @@ fn test_captured_param_type_invariant_no_matching_def_is_noop() {
 /// GUARD (d): suffix matching — invariant registered as crate-qualified
 /// `creusot_test::Zero`, capture resolves to unqualified `Zero` → suffix
 /// fallback matches and the body is asserted (negated goal becomes UNSAT).
-///
-/// fix3-closure-typeinv
 #[test]
 #[timeout(30000)]
 fn test_captured_param_type_invariant_suffix_match() {

@@ -26,10 +26,10 @@ use super::{
 fn sample_for_loop_state() -> ForLoopGhostState {
     ForLoopGhostState {
         produced_name: "visited".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_7".to_string(), None),
-        iter_state: PureExpr::Var("__trust_wp_for_iter_state_7".to_string(), None),
+        iter_old: PureExpr::Var("$for_iter_old_7".to_string(), None),
+        iter_state: PureExpr::Var("$for_iter_state_7".to_string(), None),
         iter_state_binding: PureExpr::Var("iter".to_string(), None),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_7".to_string(), None),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_7".to_string(), None),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: Some(PureExpr::Old(Arc::new(PureExpr::Var(
             "input".to_string(),
@@ -52,13 +52,10 @@ fn sample_range_for_loop_state() -> ForLoopGhostState {
     )));
     ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_8".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_8".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_8".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_8".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_8".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_8".to_string(), range_sort),
         loop_elem: PureExpr::Var("i".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: Some((
@@ -74,13 +71,10 @@ fn sample_range_inclusive_for_loop_state() -> ForLoopGhostState {
     )));
     ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_8".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_8".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_8".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_8".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_8".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_8".to_string(), range_sort),
         loop_elem: PureExpr::Var("i".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: Some((
@@ -324,20 +318,14 @@ fn seq_for_loop_yielded_element_facts_instantiate_source_bounds() {
     let loop_elem = PureExpr::Var("m".to_string(), Some(ExprSort::Tuple(2)));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_17".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_17".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_17".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_17".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::MethodCall {
             receiver: Arc::new(source.clone()),
             method: "into_iter".to_string(),
             args: vec![],
         },
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_next_17".to_string(), into_iter_sort),
+        iter_state_next: PureExpr::Var("$for_iter_next_17".to_string(), into_iter_sort),
         loop_elem: loop_elem.clone(),
         iterable: Some(source.clone()),
         range_bounds: None,
@@ -437,20 +425,14 @@ fn seq_for_loop_yielded_element_facts_require_matching_source_len() {
     let source = PureExpr::Var("xs".to_string(), Some(ExprSort::Seq));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_9".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_9".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_9".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_9".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::MethodCall {
             receiver: Arc::new(source.clone()),
             method: "into_iter".to_string(),
             args: vec![],
         },
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_next_9".to_string(), into_iter_sort),
+        iter_state_next: PureExpr::Var("$for_iter_next_9".to_string(), into_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: Some(source.clone()),
         range_bounds: None,
@@ -522,16 +504,13 @@ fn for_loop_structural_invariant_uses_range_length_form_for_discarded_element() 
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -559,16 +538,13 @@ fn for_loop_structural_invariant_uses_range_length_form_for_mutref_range_state()
     let range_sort = mutref_range_sort();
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::MutRef(Box::new(ExprSort::Datatype(
                     intern_sort_name("core::ops::range::Range"),
                 )))),
@@ -618,19 +594,10 @@ fn seq_iter_structural_invariant_uses_direct_concat_equality() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_5".to_string(),
-            seq_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_5".to_string(),
-            seq_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_5".to_string(), seq_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_5".to_string(), seq_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), seq_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_5".to_string(),
-            seq_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_5".to_string(), seq_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: None,
@@ -661,19 +628,10 @@ fn vec_into_iter_structural_invariant_uses_direct_concat_equality() {
     )));
     let state = ForLoopGhostState {
         produced_name: "visited".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_6".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_6".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_6".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_6".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), into_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_6".to_string(),
-            into_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_6".to_string(), into_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: None,
@@ -701,19 +659,10 @@ fn seq_for_loop_call_obligations_get_current_element_facts() {
     let elem = PureExpr::Var("m".to_string(), None);
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_9".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_9".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_9".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_9".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), into_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_9".to_string(),
-            into_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_9".to_string(), into_iter_sort),
         loop_elem: elem.clone(),
         iterable: Some(iterable.clone()),
         range_bounds: None,
@@ -783,19 +732,10 @@ fn for_loop_transition_fact_rewrites_vec_into_iter_state() {
     )));
     let state = ForLoopGhostState {
         produced_name: "visited".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_9".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_9".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_9".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_9".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), into_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_9".to_string(),
-            into_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_9".to_string(), into_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: None,
@@ -830,16 +770,13 @@ fn for_loop_transition_end_fact_keeps_range_end_constant() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -969,16 +906,13 @@ fn range_loop_transition_facts_use_direct_arithmetic_form() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -1012,16 +946,13 @@ fn mutref_range_loop_transition_facts_use_direct_arithmetic_form() {
     let range_sort = mutref_range_sort();
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::MutRef(Box::new(ExprSort::Datatype(
                     intern_sort_name("core::ops::range::Range"),
                 )))),
@@ -1074,19 +1005,10 @@ fn seq_iter_transition_facts_use_direct_push_front() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_3".to_string(),
-            seq_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_3".to_string(),
-            seq_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_3".to_string(), seq_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_3".to_string(), seq_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), seq_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_3".to_string(),
-            seq_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_3".to_string(), seq_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: None,
@@ -1121,19 +1043,10 @@ fn vec_into_iter_transition_facts_use_direct_push_front() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_4".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_4".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_4".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_4".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), into_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_4".to_string(),
-            into_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_4".to_string(), into_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: None,
         range_bounds: None,
@@ -1166,19 +1079,10 @@ fn logical_fmap_iter_transition_facts_use_direct_map_delta() {
     let entry = PureExpr::Var("entry".to_string(), Some(ExprSort::Tuple(2)));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_13".to_string(),
-            fmap_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_13".to_string(),
-            fmap_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_13".to_string(), fmap_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_13".to_string(), fmap_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), fmap_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_13".to_string(),
-            fmap_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_13".to_string(), fmap_iter_sort),
         loop_elem: entry.clone(),
         iterable: None,
         range_bounds: None,
@@ -1331,19 +1235,10 @@ fn logical_fmap_iter_structural_invariant_auto_injected_even_when_produced_unuse
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_14".to_string(),
-            fmap_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_14".to_string(),
-            fmap_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_14".to_string(), fmap_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_14".to_string(), fmap_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), fmap_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_14".to_string(),
-            fmap_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_14".to_string(), fmap_iter_sort),
         loop_elem: PureExpr::Var("entry".to_string(), Some(ExprSort::Tuple(2))),
         iterable: None,
         range_bounds: None,
@@ -1376,19 +1271,10 @@ fn logical_fmap_iter_structural_invariant_stays_when_produced_is_used() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_15".to_string(),
-            fmap_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_15".to_string(),
-            fmap_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_15".to_string(), fmap_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_15".to_string(), fmap_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), fmap_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_15".to_string(),
-            fmap_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_15".to_string(), fmap_iter_sort),
         loop_elem: PureExpr::Var("entry".to_string(), Some(ExprSort::Tuple(2))),
         iterable: None,
         range_bounds: None,
@@ -1420,16 +1306,13 @@ fn for_loop_transition_guard_fact_bounds_range_current_state() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -1466,16 +1349,13 @@ fn for_loop_transition_step_fact_advances_range_start_by_one() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -1516,16 +1396,13 @@ fn for_loop_produced_len_step_fact_advances_by_one() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var("__trust_wp_for_iter_old_2".to_string(), range_sort.clone()),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_2".to_string(),
-            range_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_2".to_string(), range_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_2".to_string(), range_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), range_sort.clone()),
-        iter_state_next: PureExpr::Var("__trust_wp_for_iter_state_next_2".to_string(), range_sort),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_2".to_string(), range_sort),
         loop_elem: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var(
-                "__trust_wp_for_iter_state_2".to_string(),
+                "$for_iter_state_2".to_string(),
                 Some(ExprSort::Datatype(intern_sort_name(
                     "core::ops::range::Range",
                 ))),
@@ -1654,23 +1531,14 @@ fn for_loop_init_facts_allow_non_var_iter_state_binding() {
     let ghost_seq_sort = Some(ExprSort::Datatype(intern_sort_name("trust_wp::GhostSeq")));
     let state = ForLoopGhostState {
         produced_name: "visited".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_11".to_string(),
-            into_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_11".to_string(),
-            into_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_11".to_string(), into_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_11".to_string(), into_iter_sort.clone()),
         iter_state_binding: PureExpr::MethodCall {
             receiver: Arc::new(PureExpr::Var("input".to_string(), ghost_seq_sort)),
             method: "into_inner".to_string(),
             args: vec![],
         },
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_11".to_string(),
-            into_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_11".to_string(), into_iter_sort),
         loop_elem: PureExpr::Var("x".to_string(), Some(ExprSort::Int)),
         iterable: Some(PureExpr::Old(Arc::new(PureExpr::Var(
             "input".to_string(),
@@ -1974,19 +1842,10 @@ fn for_loop_completion_facts_use_empty_fmap_for_fmap_iterators() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_12".to_string(),
-            fmap_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_12".to_string(),
-            fmap_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_12".to_string(), fmap_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_12".to_string(), fmap_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), fmap_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_12".to_string(),
-            fmap_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_12".to_string(), fmap_iter_sort),
         loop_elem: PureExpr::Var("entry".to_string(), Some(ExprSort::Tuple(2))),
         iterable: Some(PureExpr::Old(Arc::new(PureExpr::Var(
             "m".to_string(),
@@ -2148,19 +2007,10 @@ fn for_loop_fmap_structural_invariant_always_auto_injected() {
     )));
     let state = ForLoopGhostState {
         produced_name: "produced".to_string(),
-        iter_old: PureExpr::Var(
-            "__trust_wp_for_iter_old_20".to_string(),
-            fmap_iter_sort.clone(),
-        ),
-        iter_state: PureExpr::Var(
-            "__trust_wp_for_iter_state_20".to_string(),
-            fmap_iter_sort.clone(),
-        ),
+        iter_old: PureExpr::Var("$for_iter_old_20".to_string(), fmap_iter_sort.clone()),
+        iter_state: PureExpr::Var("$for_iter_state_20".to_string(), fmap_iter_sort.clone()),
         iter_state_binding: PureExpr::Var("iter".to_string(), fmap_iter_sort.clone()),
-        iter_state_next: PureExpr::Var(
-            "__trust_wp_for_iter_state_next_20".to_string(),
-            fmap_iter_sort,
-        ),
+        iter_state_next: PureExpr::Var("$for_iter_state_next_20".to_string(), fmap_iter_sort),
         loop_elem: PureExpr::Var("entry".to_string(), Some(ExprSort::Tuple(2))),
         iterable: None,
         range_bounds: None,

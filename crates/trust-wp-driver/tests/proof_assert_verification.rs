@@ -11,14 +11,21 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_fixture_target_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{
+    fixture_dir, nested_cargo, trust_wp_rustc_fixture_target_dir, trust_wp_rustc_path,
+};
 
+/// Every test here runs the one fixture crate in one target dir, one at a
+/// time, and a test's `#[timeout]` runs from its start: it includes the wait
+/// for this lock and, for whichever test takes it first, the cold build of
+/// the fixture's dependencies. Budgets sized for one fixture run timed out
+/// behind the queue on a loaded machine, whichever tests happened to wait
+/// longest, so each budget covers the whole queue instead.
 fn proof_assert_fixture_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -40,7 +47,7 @@ fn run_fixture_with_trust_wp_args(bin: &str, trust_wp_args: Option<&str>) -> std
     };
     let target_dir = trust_wp_rustc_fixture_target_dir(&format!("proof_assert_tests_{suffix}"));
 
-    let mut cmd = Command::new("cargo");
+    let mut cmd = nested_cargo("check");
     cmd.current_dir(fixture_dir("proof_assert"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path());
@@ -49,9 +56,9 @@ fn run_fixture_with_trust_wp_args(bin: &str, trust_wp_args: Option<&str>) -> std
         cmd.env("TRUST_WP_ARGS", args);
     }
 
-    cmd.args(["check", "--quiet", "--bin", bin])
+    cmd.args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for proof_assert fixture")
+        .expect("failed to run targo check for proof_assert fixture")
 }
 
 fn run_fixture(bin: &str, verify: bool) -> std::process::Output {
@@ -59,20 +66,56 @@ fn run_fixture(bin: &str, verify: bool) -> std::process::Output {
     run_fixture_with_trust_wp_args(bin, trust_wp_args)
 }
 
+/// The assertion at `fn_path` is not proved, whatever the word: `FAILED`,
+/// `unknown`, or `inconclusive` (an unproved assertion in a contract-free
+/// body, #2700).
 fn assert_proof_assert_rejected(stderr: &str, fn_path: &str) {
-    let failed_line = format!("proof_assert in {fn_path} FAILED");
-    let unknown_line = format!("proof_assert in {fn_path} unknown");
+    let words = ["FAILED", "unknown", "inconclusive"];
     assert!(
-        stderr.contains(&failed_line) || stderr.contains(&unknown_line),
-        "expected proof_assert rejection ({failed_line} or {unknown_line}); stderr: {stderr}"
+        words
+            .iter()
+            .any(|word| stderr.contains(&format!("proof_assert in {fn_path} {word}"))),
+        "expected proof_assert rejection (proof_assert in {fn_path} FAILED, unknown or \
+         inconclusive); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&format!("proof_assert in {fn_path} verified")),
+        "the assertion must not be proved; stderr: {stderr}"
+    );
+}
+
+/// A refuted `proof_assert!` is a goal of the function it sits in (D-87):
+/// each function in `owners` is FAILED and never credited, and a
+/// function-level FAILED fails the crate. The fixtures below predate D-87 and
+/// asserted a clean exit beside a refuted assertion.
+fn assert_owners_failed(output: &std::process::Output, stderr: &str, owners: &[&str]) {
+    for owner in owners {
+        assert!(
+            stderr.contains(&format!("trust-wp: {owner} FAILED")),
+            "the function owning a refuted assertion must be FAILED: {owner}; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("trust-wp: {owner} verified")),
+            "the function owning a refuted assertion must not be credited: {owner}; stderr: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("panicked"),
+        "the failure is a verdict, not a crash; stderr: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "a function-level FAILED fails the crate; stderr: {stderr}"
     );
 }
 
 fn assert_single_rejection_summary(stderr: &str) {
     assert!(
         stderr.contains("trust-wp: proof_assert: 0 verified, 1 failed, 0 errors")
-            || stderr.contains("trust-wp: proof_assert: 0 verified, 0 failed, 1 errors"),
-        "expected single rejection summary (failed or unknown); stderr: {stderr}"
+            || stderr.contains("trust-wp: proof_assert: 0 verified, 0 failed, 1 errors")
+            || stderr
+                .contains("trust-wp: proof_assert: 0 verified, 0 failed, 0 errors, 1 inconclusive"),
+        "expected single rejection summary (failed, unknown or inconclusive); stderr: {stderr}"
     );
 }
 
@@ -123,20 +166,20 @@ fn main() {
 
     let target_dir: PathBuf = trust_wp_rustc_fixture_target_dir("proof_assert_tests_verify_inline");
 
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(&fixture_dir)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
         .env("TRUST_WP_ARGS", "--verify")
-        .args(["check", "--quiet"])
+        .args(["--quiet"])
         .output()
-        .expect("failed to run cargo check for inline quantifier fixture");
+        .expect("failed to run targo check for inline quantifier fixture");
     let _ = fs::remove_dir_all(&fixture_dir);
     output
 }
 
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_should_verify() {
     let output = run_fixture("should_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -169,7 +212,7 @@ fn proof_assert_should_verify() {
 /// Regression for #1279: proof_assert must accept and verify
 /// Creusot quantifier/implication syntax.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_quantifier_syntax_verify() {
     let output = run_inline_quantifier_fixture();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -195,7 +238,7 @@ fn proof_assert_quantifier_syntax_verify() {
 }
 
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_should_fail() {
     let output = run_fixture("should_fail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -223,7 +266,7 @@ fn proof_assert_should_fail() {
 /// Before the fix, extraction retained both `pair.0 == 5` and `pair.0 == 7`,
 /// allowing `proof_assert!(pair.0@ == 5)` to verify vacuously.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_contradictory_projected_writes_should_fail() {
     let output = run_fixture("contradictory_projected_writes_should_fail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -247,7 +290,7 @@ fn proof_assert_contradictory_projected_writes_should_fail() {
 /// - `pair = (7,)` (whole-local overwrite)
 /// - `proof_assert!(pair.0@ == 5)` must fail.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_projected_write_then_whole_reassign_should_fail() {
     let output = run_fixture("projected_write_then_whole_reassign_should_fail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -268,7 +311,7 @@ fn proof_assert_projected_write_then_whole_reassign_should_fail() {
 /// to exercise the soundness-critical path where constant folding doesn't mask
 /// the stale fact.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_stale_projected_write_symbolic_reassign_should_fail() {
     let output = run_fixture("stale_projected_write_symbolic_reassign_should_fail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -287,7 +330,7 @@ fn proof_assert_stale_projected_write_symbolic_reassign_should_fail() {
 /// Regression for #1500: assigning a parent projected path (for example `pair.0`)
 /// must invalidate stale nested-path facts (for example `pair.0.1`).
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_projected_substruct_overwrite_should_fail() {
     let output = run_fixture("projected_substruct_overwrite_should_fail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -312,7 +355,7 @@ fn proof_assert_projected_substruct_overwrite_should_fail() {
 ///
 /// Both functions should FAIL verification.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_soundness_815_branch_leak() {
     let output = run_fixture("soundness_815_branch_leak", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -339,9 +382,11 @@ fn proof_assert_soundness_815_branch_leak() {
         stderr.contains("trust-wp: proof_assert: 0 verified, 2 failed, 0 errors"),
         "expected exact proof_assert summary (0 verified, 2 failed, 0 errors); stderr: {stderr}"
     );
-    assert!(
-        output.status.success(),
-        "fixture should compile; proof_assert failures are asserted through the proof_assert summary; stderr: {stderr}"
+    // A refuted assertion is a goal of the function it sits in (D-87).
+    assert_owners_failed(
+        &output,
+        &stderr,
+        &["branch_unsound", "precondition_unsound"],
     );
 }
 
@@ -353,7 +398,7 @@ fn proof_assert_soundness_815_branch_leak() {
 ///
 /// Fixed in 82c9f53b: sort annotation propagation from MIR type info.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_soundness_816_bool_ice() {
     let output = run_fixture("soundness_816_bool_ice", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -363,24 +408,19 @@ fn proof_assert_soundness_816_bool_ice() {
         !stderr.contains("panicked") && !stderr.contains("BUG: mk_eq"),
         "fixture must not crash with sort mismatch; stderr: {stderr}"
     );
+    // `flag` is unconstrained and `id_bool(flag)` requires it, so the call's
+    // `ensures(flag)` may not be assumed (#815): `proof_assert!(flag)` is
+    // refuted. A `verified` here would be the #815 leak, which this test
+    // accepted beside the refutation until D-87 made the verdict exact.
     assert!(
-        output.status.success(),
-        "fixture should compile without ICE (#816); stderr: {stderr}"
+        stderr.contains("proof_assert in soundness_816_bool_ice::bool_call_no_crash FAILED"),
+        "an unconstrained flag refutes the assertion; stderr: {stderr}"
     );
-    // This fixture may either verify or fail depending on surrounding call-spec
-    // reasoning, but it must report a concrete verification outcome.
-    let verified_line = "proof_assert in soundness_816_bool_ice::bool_call_no_crash verified";
-    let failed_line = "proof_assert in soundness_816_bool_ice::bool_call_no_crash FAILED";
     assert!(
-        stderr.contains(verified_line) || stderr.contains(failed_line),
-        "expected concrete proof_assert outcome for bool_call_no_crash; stderr: {stderr}"
+        stderr.contains("trust-wp: proof_assert: 0 verified, 1 failed, 0 errors"),
+        "expected exact proof_assert summary (0 verified, 1 failed, 0 errors); stderr: {stderr}"
     );
-    let verified_summary = "trust-wp: proof_assert: 1 verified, 0 failed, 0 errors";
-    let failed_summary = "trust-wp: proof_assert: 0 verified, 1 failed, 0 errors";
-    assert!(
-        stderr.contains(verified_summary) || stderr.contains(failed_summary),
-        "expected exact proof_assert summary (verified or failed, zero errors); stderr: {stderr}"
-    );
+    assert_owners_failed(&output, &stderr, &["bool_call_no_crash"]);
 }
 
 /// Soundness test for #817 AC1: branch-scoped call assumptions.
@@ -390,7 +430,7 @@ fn proof_assert_soundness_816_bool_ice() {
 /// - `branch_scoped_verify`: proof_assert INSIDE branch should verify
 /// - `branch_scoped_fail`: proof_assert OUTSIDE branch should fail
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_callspec_branch_scope() {
     let output = run_fixture("callspec_branch_scope", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -417,9 +457,28 @@ fn proof_assert_callspec_branch_scope() {
         stderr.contains("trust-wp: proof_assert: 1 verified, 1 failed, 0 errors"),
         "expected 1 verified, 1 failed; stderr: {stderr}"
     );
+    // A refuted assertion is a goal of the function it sits in (D-87): the
+    // function that owns it is FAILED, never credited, while the function
+    // whose assertion held keeps its credit.
     assert!(
-        output.status.success(),
-        "fixture should compile; proof_assert failure is asserted through the proof_assert summary; stderr: {stderr}"
+        stderr.contains("trust-wp: branch_scoped_fail FAILED \u{2717} (proof_assert)"),
+        "the function owning the refuted assertion must be FAILED; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("trust-wp: branch_scoped_fail verified"),
+        "the function owning the refuted assertion must not be credited; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("trust-wp: branch_scoped_verify verified \u{2713}"),
+        "the function whose assertion held keeps its credit; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the failure is a verdict, not a crash; stderr: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "a function-level FAILED fails the crate; stderr: {stderr}"
     );
 }
 
@@ -430,7 +489,7 @@ fn proof_assert_callspec_branch_scope() {
 /// - `precondition_met_verify`: precondition satisfied, assertion verifies
 /// - `precondition_violated_fail`: precondition violated, assertion fails
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_callspec_precondition_obligation() {
     let output = run_fixture("callspec_precondition_obligation", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -460,15 +519,16 @@ fn proof_assert_callspec_precondition_obligation() {
         "expected 1 verified, 1 failed; stderr: {stderr}"
     );
     assert!(
-        output.status.success(),
-        "fixture should compile; proof_assert failure is asserted through the proof_assert summary; stderr: {stderr}"
+        stderr.contains("trust-wp: precondition_met_verify verified"),
+        "the function whose assertion held keeps its credit; stderr: {stderr}"
     );
+    assert_owners_failed(&output, &stderr, &["precondition_violated_fail"]);
 }
 
 /// Regression test for #927: nested branch obligations from both ITE arms
 /// must be enforced with branch guards, not treated as global assumptions.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_callspec_multibranch_obligation() {
     let output = run_fixture("callspec_multibranch_obligation", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -487,10 +547,7 @@ fn proof_assert_callspec_multibranch_obligation() {
         stderr.contains("trust-wp: proof_assert: 0 verified, 1 failed, 0 errors"),
         "expected 0 verified, 1 failed summary; stderr: {stderr}"
     );
-    assert!(
-        output.status.success(),
-        "fixture should compile; proof_assert failure is asserted through the proof_assert summary; stderr: {stderr}"
-    );
+    assert_owners_failed(&output, &stderr, &["multibranch_obligation_unsound"]);
 }
 
 /// Soundness test for #817 AC3: bool-returning call specs in proof_assert path.
@@ -500,7 +557,7 @@ fn proof_assert_callspec_multibranch_obligation() {
 /// - `bool_call_verify`: precondition met, assertion verifies
 /// - `bool_call_fail`: precondition violated, assertion fails
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_callspec_bool_return() {
     let output = run_fixture("callspec_bool_return", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -527,16 +584,17 @@ fn proof_assert_callspec_bool_return() {
         "expected 1 verified, 1 failed; stderr: {stderr}"
     );
     assert!(
-        output.status.success(),
-        "fixture should compile; proof_assert failure is asserted through the proof_assert summary; stderr: {stderr}"
+        stderr.contains("trust-wp: bool_call_verify verified"),
+        "the function whose assertion held keeps its credit; stderr: {stderr}"
     );
+    assert_owners_failed(&output, &stderr, &["bool_call_fail"]);
 }
 
 /// Program-point regression for #746:
 /// proof_assert extraction must stop at the assertion span so unsupported
 /// tail MIR does not block call-spec reasoning before the assertion.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_callspec_before_unsupported_tail() {
     let output = run_fixture("callspec_before_unsupported_tail", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -549,9 +607,22 @@ fn proof_assert_callspec_before_unsupported_tail() {
         stderr.contains("proof_assert in callspec_before_unsupported_tail::callspec_before_unsupported_tail verified"),
         "proof_assert should verify using call spec before unsupported tail MIR; stderr: {stderr}"
     );
+    // The summary is not asserted as an exact count: the same proof_assert is
+    // reported once per lane that discharges it, and the fixture's helper
+    // `identity_positive` legitimately verifies as well. What matters is that
+    // nothing in the run failed or errored.
     assert!(
-        stderr.contains("trust-wp: proof_assert: 1 verified, 0 failed, 0 errors"),
-        "expected 1 verified, 0 failed summary; stderr: {stderr}"
+        !stderr.contains("proof_assert in callspec_before_unsupported_tail::callspec_before_unsupported_tail FAILED")
+            && !stderr.contains("proof_assert in callspec_before_unsupported_tail::callspec_before_unsupported_tail unknown"),
+        "proof_assert must not be rejected in any lane; stderr: {stderr}"
+    );
+    let summary = stderr
+        .lines()
+        .find(|line| line.starts_with("trust-wp: proof_assert: "))
+        .unwrap_or_default();
+    assert!(
+        summary.contains(" 0 failed, 0 errors"),
+        "expected a proof_assert summary with 0 failed, 0 errors; got `{summary}`; stderr: {stderr}"
     );
     assert!(
         output.status.success(),
@@ -562,7 +633,7 @@ fn proof_assert_callspec_before_unsupported_tail() {
 /// Regression for #746: scoped extraction must tolerate diverging panic branches
 /// before the proof_assert program point.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_diverging_branch_before_assert() {
     let output = run_fixture("diverging_branch_before_assert", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -579,10 +650,10 @@ fn proof_assert_diverging_branch_before_assert() {
         stderr.contains("trust-wp: proof_assert: 1 verified, 0 failed, 0 errors"),
         "expected 1 verified, 0 failed summary; stderr: {stderr}"
     );
-    assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
-    );
+    // The `panic!` arm is reachable (nothing constrains `flag`), and a
+    // contract-free body owes its abort obligations (D-71): the function is
+    // FAILED while the assertion past the diverging arm holds.
+    assert_owners_failed(&output, &stderr, &["diverging_branch_before_assert"]);
 }
 
 /// AC3 for #746: proof_assert inside `if let Some(b) = Some(true)` block.
@@ -594,7 +665,7 @@ fn proof_assert_diverging_branch_before_assert() {
 /// - Downcast projection as no-op in expression model
 /// - Field(0) identity passthrough for scalar values
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_if_let_some_verify() {
     let output = run_fixture("if_let_some_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -623,7 +694,7 @@ fn proof_assert_if_let_some_verify() {
 
 /// AC for #1457: match-arm discriminant guards must flow to proof_assert.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_match_arm_discriminant_verify() {
     let output = run_fixture("match_arm_discriminant_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -654,7 +725,7 @@ fn proof_assert_match_arm_discriminant_verify() {
 /// pipeline tracks deref writes and the substitution system maps `*a` to
 /// the written value.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_deref_assign_verify() {
     let output = run_fixture("deref_assign_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -677,31 +748,47 @@ fn proof_assert_deref_assign_verify() {
     );
 }
 
-/// Regression for #746: projected deref writes through call-returned tuples
-/// must flow into source-name substitutions at proof_assert program points.
+/// #746 carried a projected deref write through a call-returned tuple
+/// (`*p.0 = 10` of `p = swap_refs((&mut a, &mut b))`) into `b`'s value. Two
+/// rules now meet here. The callee states the swap by comparing the `&mut`s
+/// its tuple parameter holds whole, which D-181 refuses: its own lane read the
+/// comparison over current values while every call read it as which borrow
+/// the result holds (tuple_param_held_mut_whole_swap_claimed_unswapped). And
+/// the borrows reach the callee in a tuple it is handed by value, so each
+/// assertion reading `a` or `b` after the hand-off is refused (D-129), these
+/// true ones included. tuple_param_held_mut_whole_swap_control is the xfail
+/// that names the price: no assertion is credited.
 #[test]
-#[timeout(120_000)]
-fn proof_assert_projected_deref_write_verify() {
+#[timeout(600_000)]
+fn proof_assert_projected_deref_write_through_a_whole_held_mut_claim_is_refused() {
     let output = run_fixture("projected_deref_write_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        stderr.contains("proof_assert"),
-        "expected proof_assert output in stderr; stderr: {stderr}"
-    );
+    for name in ["b", "a"] {
+        assert!(
+            stderr.contains(&format!(
+                "proof_assert in projected_deref_write_verify::projected_deref_write_verify error: \
+                 stale read refused (fail-closed): `{name}`"
+            )),
+            "the read of `{name}` after the holder's hand-off should be refused; stderr: {stderr}"
+        );
+    }
     assert!(
         stderr.contains(
+            "swap_refs: ensures `result == (x.1, x.0)` is refused: `x` holds a `&mut` without \
+             being one, and a postcondition reads that `&mut` only through `*`, `^` or `@`"
+        ),
+        "the whole comparison of the held `&mut`s should be refused (D-181); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(
             "proof_assert in projected_deref_write_verify::projected_deref_write_verify verified"
         ),
-        "projected deref write proof_asserts should verify; stderr: {stderr}"
+        "no assertion may be credited; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("trust-wp: proof_assert: 2 verified, 0 failed, 0 errors"),
-        "expected 2 verified, 0 failed summary; stderr: {stderr}"
-    );
-    assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
+        !output.status.success(),
+        "a refused clause fails the run; stderr: {stderr}"
     );
 }
 
@@ -713,7 +800,7 @@ fn proof_assert_projected_deref_write_verify() {
 /// branches via cutoff-reachability: the panic arm is unreachable (diverges),
 /// so only the success arm is followed.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_runtime_assert_before_proof_assert() {
     let output = run_fixture("runtime_assert_before_proof_assert", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -739,9 +826,30 @@ fn proof_assert_runtime_assert_before_proof_assert() {
         stderr.contains("trust-wp: proof_assert: 2 verified, 0 failed, 0 errors"),
         "expected 2 verified, 0 failed; stderr: {stderr}"
     );
+    // The `assert!` arm is charged unreachable by the switch lane and
+    // discharged, and the body is loop-free with exact values, so the
+    // clause-free cap reads the charged edge as dead and lets `verified`
+    // stand (D-142; the adversarial control is
+    // `contract_free_assert_provable_control`).
     assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
+        stderr.contains("trust-wp: assert_after_let_binding verified"),
+        "a contract-free body's charged, discharged assert! is not capped (D-142); \
+         stderr: {stderr}"
+    );
+    // Here the charge `y > 0` is proved from `identity_positive`'s
+    // postcondition, a premise that is not an entry fact, so no edge counts
+    // as dead and the cap stands although the assertion verifies (D-143's
+    // named price).
+    assert!(
+        stderr.contains(
+            "trust-wp: assert_between_call_and_proof_assert unknown (partial: panic paths unchecked (panic call))"
+        ),
+        "a charge proved from a callee postcondition proves no edge dead (D-143); \
+         stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(" FAILED") && !stderr.contains("panicked"),
+        "a provable assert! is never refuted; stderr: {stderr}"
     );
 }
 
@@ -750,7 +858,7 @@ fn proof_assert_runtime_assert_before_proof_assert() {
 /// `extract_from_block_with_context` would replace `local_exprs[_3]` with just
 /// the RHS expression, losing the tuple/struct context.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_tuple_field_assign_verify() {
     let output = run_fixture("tuple_field_assign_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -778,7 +886,7 @@ fn proof_assert_tuple_field_assign_verify() {
 /// Regression for #1180: proof_assert path must apply closure enrichment
 /// to quantifier goals using `postcondition_mut`.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_closure_quantifier_enrichment() {
     let output =
         run_fixture_with_trust_wp_args("closure_quantifier_enrichment", Some("--verify --verbose"));
@@ -815,7 +923,7 @@ fn proof_assert_closure_quantifier_enrichment() {
 /// Regression for #1190: closure-body proof_assert checks that depend on
 /// mutable captures must use post-assignment substitutions.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_closure_mutation_capture_verify() {
     let output = run_fixture("closure_mutation_capture_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -826,7 +934,7 @@ fn proof_assert_closure_mutation_capture_verify() {
     );
     assert!(
         stderr.contains(
-            "proof_assert in closure_mutation_capture_verify::mutable_capture::{closure#0} verified"
+            "proof_assert in closure_mutation_capture_verify::mutable_capture::{closure#1} verified"
         ),
         "mutable closure body assertions should verify; stderr: {stderr}"
     );
@@ -838,9 +946,26 @@ fn proof_assert_closure_mutation_capture_verify() {
         stderr.contains("trust-wp: proof_assert: 4 verified, 0 failed, 0 errors"),
         "expected 4 verified, 0 failed summary; stderr: {stderr}"
     );
+    // The hosts own verdicts of their own, and neither is a pass. Each owes its
+    // closure's precondition (D-71), which `mutable_capture` discharges over
+    // the captured constant; its call enters the closure through
+    // `FnMut::call_mut`, whose body the panic account does not read at a call
+    // (D-104), so its verdict is partial. `captures_and_call` hands a closure
+    // that writes a captured `&mut` to a trusted callee that runs it where no
+    // lane sees the write, and its verdict is withdrawn (D-118).
     assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
+        stderr.contains(
+            "trust-wp: mutable_capture unknown (partial: panic paths unchecked (call to std::ops::FnMut::call_mut))"
+        ),
+        "expected mutable_capture's precondition discharged and its verdict partial (D-104); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("trust-wp: captures_and_call error: verdict withdrawn"),
+        "expected captures_and_call's verdict withdrawn (D-118); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("FAILED"),
+        "no host call of a closure should be refuted; stderr: {stderr}"
     );
 }
 
@@ -849,7 +974,7 @@ fn proof_assert_closure_mutation_capture_verify() {
 /// Writes to distinct tuple fields (`pair.0 = 1; pair.1 = 2`) must produce
 /// separate LetAssume facts that are both visible at the proof_assert point.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_multi_field_projected_writes_should_eventually_verify() {
     let output = run_fixture("multi_field_projected_writes_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -873,7 +998,7 @@ fn proof_assert_multi_field_projected_writes_should_eventually_verify() {
 /// Regression for #1515: projected-write facts must survive both call and
 /// match/switch block boundaries before reaching proof_assert.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_projected_write_call_match_verify() {
     let output = run_fixture("projected_write_call_match_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -895,7 +1020,7 @@ fn proof_assert_projected_write_call_match_verify() {
 }
 
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_detection_without_verify() {
     // Even without --verify, proof assertions should be detected in verbose mode
     let output = run_fixture("should_verify", false);
@@ -914,7 +1039,7 @@ fn proof_assert_detection_without_verify() {
 /// substitution path maps the capture variable (`x`) to its post-call
 /// value (`Final(x)`) so `x == 11` is correctly encoded as `x_final == 11`.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_closure_caller_capture_verify() {
     let output = run_fixture("closure_caller_capture_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -955,16 +1080,28 @@ fn proof_assert_closure_caller_capture_verify() {
         stderr.contains("trust-wp: proof_assert: 3 verified, 0 failed, 0 errors"),
         "expected exact proof_assert summary (3 verified, 0 failed, 0 errors); stderr: {stderr}"
     );
+    // `main` is a clause-free caller of the three functions above, and each of
+    // their bodies calls an `FnMut` closure. A `FnMut::call_mut` site enters no
+    // body for the clause-free panic account (D-104), so those bodies are not
+    // clean, `main` is capped at `unknown` and the run is not clean. Every
+    // function this test is about verifies.
     assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
+        stderr.contains(
+            "trust-wp: main unknown (partial: panic paths unchecked (call to \
+             direct_fnmut_call (unchecked panic paths in direct_fnmut_call)"
+        ),
+        "main should be capped by D-104's `FnMut` exclusion; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("trust-wp: 6 verified, 0 failed, 1 errors"),
+        "only `main` should go unverified; stderr: {stderr}"
     );
 }
 
 /// Regression for #1264: by-value `self` methods (like Option::ok_or) must
 /// resolve `*self` in std spec postconditions within proof_assert blocks.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_by_value_self_verify() {
     let output = run_fixture("by_value_self_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -991,27 +1128,31 @@ fn proof_assert_by_value_self_verify() {
 /// ghost permission locals connected to the disjointness fact seen by
 /// subsequent proof_asserts.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_ghost_perm_disjoint_verify() {
     let output = run_fixture("ghost_perm_disjoint_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // The lemma's `&mut own1` goes through `DerefMut::deref_mut` on the ghost
+    // handle, and the write flows back to `own1`: K1's forwarding quarantine
+    // is gone, and D-8 names this program's corpus spelling, the compat row
+    // ghost/disjoint_raw_ptr.rs, in the price of deleting it. Over
+    // trust_wp_std's `Perm` the premises each assertion is read under are
+    // unsatisfiable on their own, and the vacuity guard refuses both rather
+    // than credit them. The pin keeps that neither assertion is credited and
+    // neither is refuted; the TRUE program is the xfail control
+    // perm_disjoint_lemma_through_ghost_deref_mut_control.rs.
     assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
+        stderr.contains("trust-wp: proof_assert: 0 verified, 0 failed, 2 errors")
+            && stderr
+                .matches("perm_disjoint_verify unknown (vacuous proof")
+                .count()
+                == 2,
+        "expected both Perm disjointness assertions refused as vacuous; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("proof_assert"),
-        "expected proof_assert output in stderr; stderr: {stderr}"
-    );
-    assert!(
-        stderr
-            .contains("proof_assert in ghost_perm_disjoint_verify::perm_disjoint_verify verified"),
-        "wrapped Perm disjointness proof_asserts should verify; stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("trust-wp: proof_assert: 2 verified, 0 failed, 0 errors"),
-        "expected exact proof_assert summary (2 verified, 0 failed, 0 errors); stderr: {stderr}"
+        !stderr.contains("FAILED"),
+        "no Perm disjointness assertion should be refuted; stderr: {stderr}"
     );
 }
 
@@ -1019,22 +1160,26 @@ fn proof_assert_ghost_perm_disjoint_verify() {
 /// substitutions to the post-state instead of collapsing through the
 /// pre-mutation tuple literal.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_ghost_tuple_mutation_post_state_verify() {
     let output = run_fixture("ghost_tuple_mutation_post_state_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        output.status.success(),
-        "fixture should compile; stderr: {stderr}"
-    );
+    // The write `p.0 = 4` goes through `DerefMut::deref_mut` and flows back
+    // to `p` as the final value of the constant the tuple was built from,
+    // which the final-collapse guard's constant-carrier arm refuses (D-14).
+    // That is the price D-8 names for deleting K1's `deref_mut` forwarding
+    // quarantine: the assertions had verified on the stale entry value.
+    // The xfail control is ghost_tuple_field_write_through_deref_mut_control.rs.
+    // What #2533 pins still holds: no stale pre-mutation literal, no vacuity.
     assert!(
         stderr.contains("proof_assert"),
         "expected proof_assert output in stderr; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("trust-wp: proof_assert: 2 verified, 0 failed, 0 errors"),
-        "ghost tuple mutation should verify both proof_asserts; stderr: {stderr}"
+        stderr.contains("final-collapse refused (fail-closed): `^Int(2)` applies a prophecy to a constant carrier")
+            && stderr.contains("trust-wp: proof_assert: 0 verified, 0 failed, 2 errors"),
+        "both assertions refused on the constant carrier, neither credited; stderr: {stderr}"
     );
     assert!(
         !stderr.contains("call_assumption[3]: (2 == 4)"),
@@ -1053,7 +1198,7 @@ fn proof_assert_ghost_tuple_mutation_post_state_verify() {
 /// Canary for #2616: ghost Seq push_back should now verify through the
 /// proof_assert path without falling back to the vacuous-proof demotion.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_seq_push_back_ghost_vacuity_canary() {
     let output = run_fixture("seq_push_back_ghost_vacuity", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1087,41 +1232,96 @@ fn proof_assert_seq_push_back_ghost_vacuity_canary() {
     );
 }
 
-/// Regression for the resolve_drop class: a proof_assert reading a local
-/// AFTER a write through a (plain or boxed) mutable borrow of it must see the
-/// POST-write value. Before the fix, the cutoff-time substitution map kept the
-/// entry-time binding (`x -> 12`) alongside the writeback (`x == 13`),
-/// manufacturing UNSAT base premises — a vacuous "proof" the vacuity guard
-/// then rejected as an error.
+/// The resolve_drop class: a proof_assert reading a local AFTER a write
+/// through a (plain or boxed) mutable borrow of it. A TRUE assertion there is
+/// owed the POST-write value; while the lane cannot state it without a
+/// contradiction or a havoc, the assertion must be refused, never credited
+/// and never refuted.
 #[test]
-#[timeout(120_000)]
+#[timeout(600_000)]
 fn proof_assert_deref_write_local_current_value_verify() {
     let output = run_fixture("deref_write_local_current_value_verify", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // The plain chain is not credited: `*b += 1` is recorded for the borrow
+    // chain as the raw `x + 1`, which the name lane reads at the post-write
+    // binding, so the premises state `x == 12 + 1` beside `x == (12 + 1) + 1`
+    // and the vacuity guard refuses the assertion. Handing the handlers the
+    // governed write's resolved value removes that contradiction only on paths
+    // where `x` has a binding of its own, and on a path where `x` is still the
+    // parameter's entry symbol the contradiction stays and is then path-local,
+    // which the guard does not see (D-171). The cost is this TRUE assertion;
+    // its xfail control is deref_write_through_local_borrow_post_write_value_control.rs.
     assert!(
         stderr.contains(
-            "proof_assert in deref_write_local_current_value_verify::plain_borrow_write verified"
+            "proof_assert in deref_write_local_current_value_verify::plain_borrow_write unknown (vacuous proof"
         ),
-        "plain &mut chain should verify post-write value; stderr: {stderr}"
+        "plain &mut chain: expected the doubled write refused as vacuous (D-171); stderr: {stderr}"
     );
+    // The `Box<&mut _>` chain is not credited: `Box::new(&mut x)` hands the
+    // borrow into a container, the lane havocs `x` there, and nothing carries
+    // the write through the boxed borrow back to it, so the assertion ends
+    // `unknown`. That is the residual gap
+    // s48v4_box_new_handback_deref_control.rs is the xfail control for; the
+    // pin is that it is not credited and not vacuous.
     assert!(
         stderr.contains(
-            "proof_assert in deref_write_local_current_value_verify::boxed_borrow_write verified"
+            "proof_assert in deref_write_local_current_value_verify::boxed_borrow_write unknown"
         ),
-        "Box<&mut _> chain should verify post-write value; stderr: {stderr}"
+        "Box<&mut _> chain: expected the handback gap's `unknown`; stderr: {stderr}"
     );
     assert!(
-        !stderr
-            .contains("vacuous proof: base assertions are UNSAT without the negated postcondition"),
-        "deref-write locals must not manufacture vacuous premises; stderr: {stderr}"
+        !stderr.contains(
+            "proof_assert in deref_write_local_current_value_verify::boxed_borrow_write unknown (vacuous proof"
+        ),
+        "Box<&mut _> chain: the handback gap must not manufacture vacuous premises; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("trust-wp: proof_assert: 2 verified, 0 failed, 0 errors"),
-        "expected exactly 2 verified proof_asserts; stderr: {stderr}"
+        stderr.contains("trust-wp: proof_assert: 0 verified, 0 failed, 2 errors"),
+        "expected neither chain's assertion credited and neither refuted; stderr: {stderr}"
+    );
+}
+
+/// A `proof_assert!` in a loop body reads a local the loop writes later in
+/// the body (`y = 5` after the assertion) or carries as its counter: at the
+/// head of an arbitrary iteration it holds the value the back edge carried
+/// in, not the first iteration's. Both assertions are false (n = 2 reads
+/// `y == 5`, `v == 1` on the second iteration) and must not be credited
+/// (D-187).
+#[test]
+#[timeout(600_000)]
+fn proof_assert_in_loop_body_reads_a_local_the_body_writes_later() {
+    let output = run_fixture("loop_body_local_written_later", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_proof_assert_rejected(&stderr, "loop_body_local_written_later::written_later");
+    assert_proof_assert_rejected(&stderr, "loop_body_local_written_later::counter_copy");
+    assert!(
+        stderr.contains("trust-wp: proof_assert: 0 verified"),
+        "no assertion of the fixture may be credited; stderr: {stderr}"
     );
     assert!(
-        output.status.success(),
-        "fixture should compile and verify; stderr: {stderr}"
+        !stderr.contains("panicked"),
+        "the rejection is a verdict, not a crash; stderr: {stderr}"
+    );
+}
+
+/// A `proof_assert!` in a loop placed before the loop's own test (a `loop`
+/// whose break test follows it, a `while` condition block) runs on the
+/// iteration whose test fails too: with n = 0 both assertions read i = 0.
+/// The loop condition must not be assumed there (D-188).
+#[test]
+#[timeout(600_000)]
+fn proof_assert_before_a_loops_test_is_not_proved_from_that_test() {
+    let output = run_fixture("assert_before_loop_test", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_proof_assert_rejected(&stderr, "assert_before_loop_test::before_break_test");
+    assert_proof_assert_rejected(&stderr, "assert_before_loop_test::in_while_condition_block");
+    assert!(
+        stderr.contains("trust-wp: proof_assert: 0 verified"),
+        "no assertion of the fixture may be credited; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the rejection is a verdict, not a crash; stderr: {stderr}"
     );
 }

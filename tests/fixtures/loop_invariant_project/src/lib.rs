@@ -14,12 +14,15 @@ use trust_wp::{ensures, invariant, requires};
 
 /// Accumulate `n` unit steps into `sum` using a while loop.
 ///
-/// This keeps the proof obligations simple (`sum >= 0`) while still exercising
-/// non-counter return binding (`return sum`).
+/// This keeps the proof obligations simple while still exercising non-counter
+/// return binding (`return sum`). `sum <= i` is the weakest bound that makes
+/// the invariant self-supporting: `sum >= 0` alone admits `sum == i32::MAX`
+/// at the loop head, where `sum += 1` overflows; with `sum <= i` and the loop
+/// guard `i < n`, `sum + 1 <= i + 1 <= n` stays in range.
 #[requires(n >= 0)]
 #[ensures(result >= 0)]
 #[invariant(i >= 0 && i <= n)]
-#[invariant(sum >= 0)]
+#[invariant(sum >= 0 && sum <= i)]
 pub fn sum_to_n(n: i32) -> i32 {
     let mut sum = 0;
     let mut i = 0;
@@ -160,11 +163,11 @@ pub fn loop_with_bad_pre_loop_call<F: Fn(i32) -> i32>(f: &F, n: i32) -> i32 {
 
 /// Regression test for #638 (dimension 2): in-loop call obligations must be checked.
 ///
-/// `f(i)` is called INSIDE the loop body. The Fn trait contract generates a
-/// call-site obligation `(*self).precondition(arg)` at each iteration. For a
-/// generic `F: Fn(i32) -> i32` without a concrete closure, this precondition
-/// is an unconstrained predicate the solver can falsify — so this function
-/// is expected to FAIL (matching `loop_with_bad_pre_loop_call` above).
+/// `f(i)` is called INSIDE the loop body. The Fn trait contract owes
+/// `(*self).precondition(arg)` at each iteration, which for a generic
+/// `F: Fn(i32) -> i32` the loop lane cannot state: it refuses the call with a
+/// fail-closed `false`, so this function is never credited (and is not proved
+/// by Creusot either, which cannot discharge an unknown precondition).
 ///
 /// This test confirms that in-loop call-site obligations are collected and
 /// checked, not silently dropped. The return value is the counter (not the
@@ -189,8 +192,8 @@ pub fn loop_with_in_loop_call<F: Fn(i32) -> i32>(f: &F, n: i32) -> i32 {
 /// loop's condition and used it for ALL in-loop obligations. That was unsound.
 ///
 /// `#752` fixes this by pairing each loop's obligations with its own condition.
-/// This fixture still expects FAILED because a generic `Fn` precondition is
-/// unconstrained even when the correct per-loop condition is available. The
+/// This fixture is still never credited: each loop refuses its generic `Fn`
+/// call, whose precondition no lane can state, with a fail-closed `false`. The
 /// positive `multi_loop_per_loop_condition_obligations` regression below
 /// isolates the per-loop condition preservation behavior directly.
 ///

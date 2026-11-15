@@ -124,6 +124,28 @@ struct StrictNativeReplay {
     details: ay_dpll::api::SolveDetails,
     proof_artifact: Option<ay_dpll::api::UnsatProofArtifact>,
     native_problem_json: String,
+    problem_hash: [u8; 32],
+}
+
+/// SHA-256 of the exact native problem a strict replay solves (timeout and
+/// normalized capture time included), used only to recognise a repeat of an
+/// already-refused replay.
+fn strict_replay_problem_hash(native_problem_json: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"trust-wp.strict-replay-problem.v1\0");
+    hasher.update(native_problem_json.as_bytes());
+    hasher.finalize().into()
+}
+
+/// ay reason codes whose refusal is a property of the problem and its proof,
+/// not of the budget: re-running the identical replay reproduces it. Timeouts
+/// and resource limits are deliberately absent — a retry may succeed.
+pub(crate) fn is_deterministic_strict_replay_refusal(unknown_reason: Option<&str>) -> bool {
+    matches!(
+        unknown_reason,
+        Some("proof_trusted" | "self_check_rejected")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +214,13 @@ impl AYEncoder {
         if artifact.replay_gaps.as_slice() != ["solve details were not captured"]
             || !artifact.unsupported_atoms.is_empty()
         {
+            crate::verify::authority_trace(|| {
+                format!(
+                    "strict replay NOT RUN: export gaps={:?} unsupported_atoms={}",
+                    artifact.replay_gaps,
+                    artifact.unsupported_atoms.len()
+                )
+            });
             return None;
         }
         artifact.replay_gaps.clear();
@@ -200,12 +229,30 @@ impl AYEncoder {
         artifact.created_unix_ms = 0;
         artifact.timeout_ms = Some(timeout.as_millis());
         let native_problem_json = artifact.to_pretty_json();
+        let problem_hash = strict_replay_problem_hash(&native_problem_json);
+        if self
+            .encoding_cache
+            .strict_replay_refused_deterministically(problem_hash)
+        {
+            // Refusing direction only: the identical replay was already refused
+            // for a deterministic reason in this very scope, and that refusal's
+            // observation is still the recorded one.
+            crate::verify::authority_trace(|| {
+                "strict replay NOT RUN: identical problem already deterministically refused \
+                 in this scope"
+                    .to_string()
+            });
+            return None;
+        }
         let (details, proof_artifact) =
             match ay_dpll::api::Solver::replay_native_replay_artifact_with_checked_proof(
                 &artifact, timeout,
             ) {
                 Ok(replay) => replay,
                 Err(error) => {
+                    crate::verify::authority_trace(|| {
+                        format!("strict replay NOT RUN: replay refused: {error}")
+                    });
                     if std::env::var_os("TWP_BR_DBG").is_some() {
                         eprintln!("[TWP_BR] strict proof_assert replay refused: {error}");
                     }
@@ -216,6 +263,7 @@ impl AYEncoder {
             details,
             proof_artifact,
             native_problem_json,
+            problem_hash,
         })
     }
 
@@ -250,6 +298,7 @@ impl AYEncoder {
             details,
             proof_artifact,
             native_problem_json,
+            problem_hash,
         } = strict_replay;
 
         let evidence = SolveEvidenceSnapshot::from_solve_details(&details);
@@ -284,6 +333,53 @@ impl AYEncoder {
             })
             .flatten();
 
+        // Encoder-axiom consistency guard (vacuity shield for axioms): a
+        // certified UNSAT whose encoder axioms are refutable ON THEIR OWN is a
+        // vacuous proof, never authority. Refusal-only: a not-refuted check
+        // (SAT/unknown/timeout) leaves the decision above untouched. See
+        // `encoder/axiom_consistency.rs`.
+        let mut axiom_refusal: Option<String> = None;
+        let authorized = match authorized {
+            Some(summary) => match self.check_encoder_axiom_consistency() {
+                verdict if verdict.refuses_credit() => {
+                    axiom_refusal = Some(format!(
+                        "vacuous: encoder axioms inconsistent ({verdict:?})"
+                    ));
+                    None
+                }
+                _ => Some(summary),
+            },
+            None => None,
+        };
+        let (unknown_reason, unknown_detail) = match &axiom_refusal {
+            Some(detail) => (
+                Some(super::axiom_consistency::ENCODER_AXIOMS_INCONSISTENT_REASON.to_string()),
+                Some(detail.clone()),
+            ),
+            None => (unknown_reason, unknown_detail),
+        };
+
+        crate::verify::authority_trace(|| {
+            let stat = |key: &str| details.statistics.get_int(key);
+            format!(
+                "strict replay scope={:?} result={} complete_unsat_proof={} accepted_for_consumer={} \
+                 authorized={} axiom_refusal={:?} unknown_reason={:?} unknown_detail={:?} proof_trust={:?} checked={:?} \
+                 total={:?} skipped_holes={:?} checker_failures={:?}",
+                self.encoding_cache.strict_replay_scope(),
+                evidence.result,
+                solve_details_have_complete_unsat_proof(&details),
+                evidence.accepted_for_consumer,
+                authorized.is_some(),
+                axiom_refusal,
+                unknown_reason,
+                unknown_detail,
+                stat("proof_trust"),
+                stat("proof_checker_checked_steps"),
+                stat("proof_checker_total_steps"),
+                stat("proof_checker_skipped_hole_steps"),
+                stat("proof_checker_failures"),
+            )
+        });
         self.encoding_cache.set_strict_proof_replay_observation(
             crate::shared_types::StrictProofReplayObservation {
                 evidence: evidence.clone(),
@@ -295,7 +391,16 @@ impl AYEncoder {
             },
         );
 
-        let summary = authorized?;
+        let Some(summary) = authorized else {
+            if is_deterministic_strict_replay_refusal(
+                self.encoding_cache
+                    .strict_proof_replay_observation_unknown_reason(),
+            ) {
+                self.encoding_cache
+                    .record_strict_replay_deterministic_refusal(problem_hash);
+            }
+            return None;
+        };
         self.encoding_cache
             .set_strict_unsat_authority(statistics, evidence, native_problem_json);
         Some(summary)
@@ -508,6 +613,33 @@ impl AYEncoder {
     /// (UNSAT) base re-solves UNSAT (or the cap expires), never SAT, so a
     /// vacuous proof is never accepted. Mirrors [`batch_base_smt_is_sat`] but
     /// sources the SMT from the live solver rather than a snapshot string.
+    /// [`Self::batch_current_stack_is_sat`] returning the fresh replay's
+    /// `SolveDetails` on a model-VALIDATED SAT, `None` otherwise. For lanes
+    /// that must carry the validating solve's evidence (a refutation witness),
+    /// not just its boolean.
+    pub(crate) fn batch_current_stack_validated_sat_details(
+        &self,
+    ) -> Option<ay_dpll::api::SolveDetails> {
+        // The replay solves the same stack, split constants and all, so its
+        // model is no more an execution than the incremental solver's: the
+        // refutation it would back is withheld by the same gate (D-218).
+        if let Some(name) = self.split_source_read_by_assertions() {
+            crate::verify::authority_trace(|| {
+                format!("fresh replay witness refused: a phantom sort upgrade split `{name}`")
+            });
+            return None;
+        }
+        let details = self.replay_current_stack_diagnostic_with_timeout(
+            self.capped_fresh_timeout(std::time::Duration::from_secs(10)),
+        )?;
+        has_complete_sat_validation(
+            details.result.is_sat(),
+            details.result.was_model_validated(),
+            details.verification.sat_model_validated,
+        )
+        .then_some(details)
+    }
+
     pub(crate) fn batch_current_stack_is_sat(&self) -> bool {
         // The predicate-closure base carries a closure defining universal; the
         // fresh solver confirms SAT via CEGQI quantifier instantiation, which
@@ -1949,5 +2081,101 @@ mod tests {
         // wrapper must always return a typed Result.
         let result = encoder.safe_model_provenance("prov");
         assert!(result.is_ok() || result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod strict_replay_refusal_tests {
+    use ay_dpll::api::{SolveResult, Sort};
+
+    use super::*;
+
+    fn unsat_encoder() -> AYEncoder {
+        let mut encoder = AYEncoder::new_pure();
+        encoder.begin_strict_replay_obligation();
+        encoder.begin_strict_replay_obligation_slice();
+        let x = encoder.solver_mut().declare_const("x", Sort::Int);
+        let zero = encoder.solver_mut().int_const(0);
+        let pos = encoder.solver_mut().gt(x, zero);
+        encoder.assert_term(pos);
+        let neg = encoder.solver_mut().lt(x, zero);
+        encoder.assert_term(neg);
+        assert_eq!(encoder.check_sat(), SolveResult::unsat());
+        encoder
+    }
+
+    #[test]
+    fn a_recorded_refusal_skips_only_the_identical_problem_in_the_same_scope() {
+        let mut encoder = unsat_encoder();
+        let six = std::time::Duration::from_secs(6);
+        let first = encoder
+            .replay_current_stack_with_strict_proofs(six)
+            .expect("replay runs");
+        encoder
+            .encoding_cache
+            .record_strict_replay_deterministic_refusal(first.problem_hash);
+        assert!(
+            encoder
+                .replay_current_stack_with_strict_proofs(six)
+                .is_none(),
+            "the identical problem in the same scope is not re-solved"
+        );
+        assert!(
+            encoder
+                .replay_current_stack_with_strict_proofs(std::time::Duration::from_secs(5))
+                .is_some(),
+            "different problem bytes (another budget) still replay"
+        );
+        encoder.encoding_cache.begin_solve();
+        let again = encoder
+            .replay_current_stack_with_strict_proofs(six)
+            .expect("a new solve is a new scope, so the replay runs again");
+        assert_eq!(
+            again.problem_hash, first.problem_hash,
+            "export is deterministic"
+        );
+        encoder.encoding_cache.begin_obligation_slice();
+        assert!(!encoder
+            .encoding_cache
+            .strict_replay_refused_deterministically(first.problem_hash));
+    }
+
+    #[test]
+    fn a_refusal_recorded_for_another_problem_never_blocks_authority() {
+        let mut encoder = unsat_encoder();
+        encoder
+            .encoding_cache
+            .record_strict_replay_deterministic_refusal([7; 32]);
+        assert!(encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .is_some());
+    }
+
+    #[test]
+    fn an_authorized_replay_records_no_refusal() {
+        let mut encoder = unsat_encoder();
+        let replay = encoder
+            .replay_current_stack_with_strict_proofs(std::time::Duration::from_secs(6))
+            .expect("replay runs");
+        let hash = replay.problem_hash;
+        assert!(encoder.install_strict_unsat_authority(replay).is_some());
+        assert!(!encoder
+            .encoding_cache
+            .strict_replay_refused_deterministically(hash));
+    }
+
+    #[test]
+    fn only_budget_independent_reasons_are_deterministic() {
+        assert!(is_deterministic_strict_replay_refusal(Some(
+            "proof_trusted"
+        )));
+        assert!(is_deterministic_strict_replay_refusal(Some(
+            "self_check_rejected"
+        )));
+        assert!(!is_deterministic_strict_replay_refusal(Some("timeout")));
+        assert!(!is_deterministic_strict_replay_refusal(Some(
+            "resource_out"
+        )));
+        assert!(!is_deterministic_strict_replay_refusal(None));
     }
 }

@@ -18,8 +18,48 @@ use super::{
     annotate_var_sorts, erase_box_deref_expr, is_newtype_param_expr,
     normalize_turbofish_logic_fn_expr, reorder_named_fields_to_positional,
     rewrite_logic_method_calls_expr, rewrite_named_field_access_expr, rewrite_named_struct_pattern,
-    simplify_newtype_field_access_expr,
+    simplify_newtype_field_access_expr, FieldOrderTables,
 };
+use crate::callbacks::struct_field_map::{CtorCandidates, CtorFieldOrder, DeclaredFields};
+
+/// The empty constructor table, for the tests that exercise the flat
+/// name->index map on its own.
+fn empty_ctors() -> &'static CtorFieldOrder {
+    static EMPTY: std::sync::OnceLock<CtorFieldOrder> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(CtorFieldOrder::default)
+}
+
+/// Tables that carry only the flat field map (no constructor declarations).
+fn flat_tables(flat: &HashMap<String, usize>) -> FieldOrderTables<'_> {
+    FieldOrderTables::new(flat, empty_ctors())
+}
+
+/// Tables that also declare `type_name`'s fields in declaration order.
+fn ctor_tables<'a>(
+    flat: &'a HashMap<String, usize>,
+    ctors: &'a CtorFieldOrder,
+) -> FieldOrderTables<'a> {
+    FieldOrderTables::new(flat, ctors)
+}
+
+/// A one-constructor declaration table.
+fn ctors_for(type_name: &str, fields: &[&str]) -> CtorFieldOrder {
+    ctors_with_candidates(type_name, &[fields])
+}
+
+/// A declaration table where several constructors answer to `type_name`.
+///
+/// Built through `CtorCandidates::record_declared`, the same entry point the
+/// driver uses for a constructor that merely answers to a spelling, so the cap
+/// behaves in the test exactly as it does in production.
+fn ctors_with_candidates(type_name: &str, candidates: &[&[&str]]) -> CtorFieldOrder {
+    let mut map = CtorFieldOrder::new();
+    let entry = map.entry(type_name.to_string()).or_default();
+    for fields in candidates {
+        CtorCandidates::record_declared(entry, DeclaredFields::from_names_for_test(fields));
+    }
+    map
+}
 
 #[test]
 fn rewrites_logic_method_call_to_logic_fn_call() {
@@ -72,6 +112,8 @@ mod tuple_get_simplification;
 mod named_field_access_rewriting;
 
 mod named_struct_constructor_reordering;
+
+mod placement_kernel;
 
 mod annotate_var_sorts;
 mod final_guard_regressions;

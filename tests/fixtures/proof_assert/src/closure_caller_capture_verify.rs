@@ -19,7 +19,7 @@ use trust_wp::{ensures, proof_assert, requires};
 pub fn direct_fnmut_call(mut x: i32) {
     let mut c = {
         #[requires(x < 1_000_000i32)]
-        #[ensures(x == old(x) + 1i32)]
+        #[ensures(x@ == old(x@) + 1)]
         || {
             x += 1;
             5
@@ -35,7 +35,7 @@ pub fn direct_fnmut_call(mut x: i32) {
 pub fn direct_fnmut_two_calls(mut x: i32) {
     let mut c = {
         #[requires(x < 1_000_000i32)]
-        #[ensures(x == old(x) + 1i32)]
+        #[ensures(x@ == old(x@) + 1)]
         || {
             x += 1;
             5
@@ -47,11 +47,11 @@ pub fn direct_fnmut_two_calls(mut x: i32) {
 }
 
 /// Exact mirror of test_fnmut from 07_mutable_capture.rs — uses u32 and x@ (view).
-#[requires(x@ == 100_000i64)]
+#[requires(x@ == 100_000)]
 pub fn test_fnmut_mirror(mut x: u32) {
     let mut c = {
-        #[requires(x@ < 1_000_000i64)]
-        #[ensures(x@ == old(x@ + 1i64))]
+        #[requires(x@ < 1_000_000)]
+        #[ensures(x@ == old(x@ + 1))]
         || {
             x += 1;
             5

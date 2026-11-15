@@ -272,3 +272,34 @@ fn redetect_recursion_keeps_genuine_logic_fn_self_call() {
     lf.redetect_recursion_logic_calls_only();
     assert!(lf.is_recursive());
 }
+
+#[test]
+fn type_param_invariant_name_round_trips_its_index() {
+    let name = type_param_invariant_method_name(3, "T");
+    assert!(is_invariant_method_name(&name));
+    assert_eq!(type_param_invariant_index(&name), Some(3));
+    assert_eq!(
+        type_param_invariant_index(&type_param_invariant_method_name(0, "Self")),
+        Some(0)
+    );
+}
+
+#[test]
+fn no_type_invariant_name_reads_as_a_type_parameter() {
+    // A type literally named like the tag must still name the TYPE: its
+    // encoded suffix starts `__`, never `_TP`.
+    for type_name in ["_TP0_T", "TP0", "_T", "T", "Sum10", "a::_TP1_U"] {
+        let name = type_invariant_method_name(type_name);
+        assert_eq!(
+            type_param_invariant_index(&name),
+            None,
+            "{type_name} -> {name}"
+        );
+    }
+    assert_eq!(type_param_invariant_index("invariant"), None);
+    assert_eq!(
+        type_param_invariant_index("__trust_wp_invariant__TP_T"),
+        None,
+        "a tag with no index names no parameter"
+    );
+}

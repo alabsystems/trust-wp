@@ -403,7 +403,7 @@ fn capture_avoiding_simple_substitution() {
 fn capture_avoiding_renames_to_avoid_capture() {
     // forall<x> (x + y) with triggers [p(x, y)] and subs {y → x}
     // Without capture avoidance: forall<x> (x + x) — WRONG (captures y→x)
-    // With capture avoidance: forall<x_α0> (x_α0 + x) with trigger [p(x_α0, x)]
+    // With capture avoidance: forall<x$α0> (x$α0 + x) with trigger [p(x$α0, x)]
     let expr = PureExpr::Forall {
         var: "x".to_string(),
         var_sort: None,
@@ -584,9 +584,12 @@ fn substitute_unop_no_match_unchanged() {
 
 #[test]
 fn substitute_float_unchanged() {
-    let expr = PureExpr::Float(FloatBits(314_159));
+    let expr = PureExpr::Float(FloatBits::from_f64(std::f64::consts::PI));
     let result = expr.substitute(&subs(&[("x", int(42))]));
-    assert_eq!(result, PureExpr::Float(FloatBits(314_159)));
+    assert_eq!(
+        result,
+        PureExpr::Float(FloatBits::from_f64(std::f64::consts::PI))
+    );
 }
 
 // === substitute: Ite ===
@@ -633,7 +636,7 @@ fn substitute_in_ite_partial_replacement() {
 fn capture_avoiding_exists_renames_to_avoid_capture() {
     // exists<x> (x > y) with subs {y → x}
     // Without capture avoidance: exists<x> (x > x) — captures y→x
-    // With capture avoidance: exists<x_α0> (x_α0 > x)
+    // With capture avoidance: exists<x$α0> (x$α0 > x)
     let expr = PureExpr::Exists {
         var: "x".to_string(),
         var_sort: None,

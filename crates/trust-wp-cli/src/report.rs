@@ -74,7 +74,7 @@ pub fn version_report() -> Value {
     // share. `build` names the one commit this binary came from, so a report
     // pasted into an issue identifies a tree. Absent from a tarball build,
     // where there is no commit to name.
-    if let Some(build) = option_env!("TRUST_WP_BUILD") {
+    if let Some(build) = option_env!("TWP_BUILD") {
         map.insert("build".into(), Value::from(build));
     }
     Value::Object(map)
@@ -543,8 +543,8 @@ fn print_human_summary(outcome: &RunReport) {
 /// looks like; this reuses the same probes and reports them as data.
 pub fn doctor_report() -> i32 {
     use crate::{
-        find_cargo_front, find_contract_rlib, find_engine, repo_root, CARGO_FRONT_BIN,
-        CONTRACT_CRATES, DRIVER_BIN, DRIVER_BINS,
+        compiler_tool, find_cargo_front, find_contract_rlib, find_engine, repo_root,
+        CARGO_FRONT_BIN, CONTRACT_CRATES, DRIVER_BIN, DRIVER_BINS,
     };
 
     let mut checks: Vec<Value> = Vec::new();
@@ -598,7 +598,7 @@ pub fn doctor_report() -> i32 {
                         false,
                         format!("BROKEN: {first}"),
                         vec![
-                            "cargo build --release -p trust-wp-driver --bin trust-wp-rustc"
+                            "targo --unverified build --release -p trust-wp-driver --bin trust-wp-rustc"
                                 .to_string(),
                         ],
                     );
@@ -659,13 +659,13 @@ pub fn doctor_report() -> i32 {
                     } else {
                         "not built (only needed for creusot_contracts sources)".to_string()
                     },
-                    vec![format!("cargo build --release -p {package}")],
+                    vec![format!("targo --unverified build --release -p {package}")],
                 );
             }
         }
     }
 
-    match std::process::Command::new("rustc")
+    match std::process::Command::new(compiler_tool())
         .args(["--print", "sysroot"])
         .output()
     {

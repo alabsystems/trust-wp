@@ -219,11 +219,27 @@ pub(in crate::verify::loops) fn verify_initialization_outcome(
     let mut slice_results: Vec<obligation_slices::SliceOutcome> = Vec::with_capacity(slices.len());
 
     for slice in &slices {
+        // The substitution above rewrote every pre-loop-bound name the
+        // invariant reads to its value, so the slice no longer names it. An
+        // initialization fact describing that name is a premise of the slice
+        // all the same, with the binding that ties the name to the value the
+        // slice reads: a model that never saw them picks what they fix (an
+        // empty map's `get`: loop_fmap_iter_new_map_empty_at_entry_control),
+        // and is no counterexample. A name no fact describes gains nothing
+        // from its binding beyond the substitution itself.
+        let written_invariant = invariants.get(slice.index);
         let relevant_entry_vars: HashSet<&str> = assignment_expr_entries
             .iter()
             .filter_map(|(name, _)| {
                 let singleton: HashSet<&str> = [name.as_str()].into_iter().collect();
-                expr_references_any_var(slice.ensure.as_ref(), &singleton).then_some(name.as_str())
+                let replaced_and_described = written_invariant
+                    .is_some_and(|written| expr_references_any_var(written, &singleton))
+                    && init_extra_facts
+                        .iter()
+                        .any(|fact| expr_references_any_var(fact, &singleton));
+                (expr_references_any_var(slice.ensure.as_ref(), &singleton)
+                    || replaced_and_described)
+                    .then_some(name.as_str())
             })
             .collect();
         let relevant_assignment_exprs: Vec<PureExpr> = assignment_expr_entries
@@ -427,6 +443,7 @@ pub(in crate::verify::loops) fn verify_initialization_outcome(
         });
     }
 
+    super::withhold_synthesized_goal_refutations(&mut slice_results, config.stated_invariants);
     let aggregate = obligation_slices::aggregate_slice_outcomes(slice_results);
     Ok(aggregate)
 }

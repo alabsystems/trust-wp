@@ -157,3 +157,30 @@ fn no_seq_patterns_leaves_array_theory_false() {
         "simple arithmetic should not set needs_array_theory"
     );
 }
+
+#[test]
+fn exchange_and_permutation_require_array_capable_quantified_logic() {
+    for (method, args) in [
+        (
+            "exchange",
+            vec![
+                PureExpr::Var("t".into(), None),
+                PureExpr::Int(0),
+                PureExpr::Int(1),
+            ],
+        ),
+        ("permutation_of", vec![PureExpr::Var("t".into(), None)]),
+    ] {
+        let expr = PureExpr::MethodCall {
+            receiver: Arc::new(PureExpr::Var("s".into(), None)),
+            method: method.into(),
+            args,
+        };
+        let (quantifiers, arrays, _) =
+            detect_logic_requirements(&[expr], &[], &[], None, None, None);
+        assert!(
+            quantifiers && arrays,
+            "{method} installs quantified array/frame axioms"
+        );
+    }
+}

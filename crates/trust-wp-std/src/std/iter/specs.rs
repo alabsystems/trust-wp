@@ -53,9 +53,14 @@ pub const VEC_ITER_MUT: &str = r"
 /// Seeds the iterator state's view (`result@`) from the source
 /// collection's view (`self@`), connecting the `produces` rewrite
 /// chain to the original content. (#2172)
+///
+/// Creusot's `vec.rs` states exactly `self@ == result@`. The equivalent
+/// `result@.ext_eq(self@)` puts a pointwise quantifier into every caller's
+/// premises, which the base vacuity recheck cannot decide
+/// (h_collect_roundtrip_vec_len_control).
 pub const VEC_INTO_ITER: &str = r"
     params: self
-    ensures: result@.ext_eq(self@)
+    ensures: self@ == result@
 ";
 
 /// Contract for `<Range<T> as IntoIterator>::into_iter`.
@@ -135,29 +140,54 @@ pub const ITER_ZIP: &str = r"
     ensures: U::into_iter.postcondition((other,), result.iterb())
 ";
 
-/// Contract for `Iterator::collect`.
+/// Contract for `Iterator::collect` — the generic, ungated entry.
 ///
-/// The collected result must satisfy the reusable `FromIteratorSpec`
-/// bridge for its concrete output type. This lets `Vec`, `HashMap`, and
-/// other collection types supply a structural postcondition without
-/// duplicating the `collect()` lowering. (#2116)
+/// Creusot (`creusot-std/src/std/iter.rs`, `Iterator::collect`) states
+/// `exists<done, prod> resolve(^done) && done.completed()
+///     && self.produces(prod, *done) && B::from_iter_post(prod, result)`.
+/// The produced sequence `prod` is NOT `self@` in general: for `filter`,
+/// `map`, `rev`, `skip`, `take`, `chain`, `step_by`, `enumerate`, `once`,
+/// ranges, `drain`, ... the iterator's view is a different object (or has a
+/// different length / order) than what it produces. This lowering has no
+/// `produces` model to instantiate that existential, so the generic entry
+/// states NOTHING about the result. In particular neither
+/// `result.from_iter_post(self@)` nor `result@ == self@` belongs here: both
+/// are false for adapters, and nothing but an accidental view-sort conflict
+/// stands between them and a false accept.
 ///
-/// The `result@ == self@` clause is the round-trip bridge: when the
-/// iterator's view sort matches the result collection's view sort
-/// (e.g., `HashMap::IntoIter` ↔ `HashMap` both view as `FMap`, `Vec::IntoIter`
-/// ↔ `Vec` both view as `Seq`, `HashSet::IntoIter` ↔ `HashSet` both view
-/// as `FSet`), the collected result extensionally matches the source. The
-/// solver applies this clause when the view sorts unify; otherwise it is
-/// vacuous. This closes the `xs.into_iter().collect()` ext-equality gap
-/// (#bucket-B-cc-collections).
+/// Call sites whose monomorphized `(Self, B)` pair makes `prod` exactly
+/// determined get [`ITERATOR_COLLECT_ROUNDTRIP`] appended by the driver's
+/// collect gate (`mir_analysis/extract/collect_gate.rs`).
 ///
 /// Note: post-borrowck MIR does NOT inline `collect()` to `FromIterator::from_iter`,
 /// so `Iterator::collect` is the path that actually appears at call sites.
-/// The `FromIterator::from_iter` entries in collections.rs handle the rare
-/// case of direct `from_iter` calls.
 pub const ITERATOR_COLLECT: &str = r"
     params: self
-    ensures: result.from_iter_post(self@)
+";
+
+/// Roundtrip clauses for `Iterator::collect`, applied ONLY to whitelisted
+/// `(Self, B)` pairs resolved from the call's generic arguments:
+///
+/// - `vec::IntoIter<T>` into `Vec<T>`: Creusot `vec.rs` —
+///   `produces(visited, o) == (self@ == visited.concat(o@))`,
+///   `completed() == (self@ == Seq::empty())`, so `prod == self@`; and
+///   `Vec::from_iter_post(prod, res) == (prod == res@)`. Hence `result@ == self@`.
+/// - `hash_map::IntoIter<K, V>` into `HashMap<K, V, S>`: Creusot `hash_map.rs`
+///   — `produces` makes `self@.len() == visited.len() + o@.len()`, every
+///   visited pair a `self@` entry absent from `o@`, every `self@` entry either
+///   visited or in `o@`; `completed()` empties `o@`. So the produced pairs
+///   cover `self@` exactly with pairwise-distinct keys (length equality), and
+///   the last-occurrence `HashMap::from_iter_post` gives `result@ == self@`.
+/// - `hash_set::IntoIter<T>` into `HashSet<T, S>`: Creusot `hash_set.rs`
+///   `set_produces` + `completed() == self@.is_empty()` give
+///   `start@.contains(x) == exists<x1> x1.deep_model() == x && prod.contains(x1)`,
+///   which with `HashSet::from_iter_post` gives `result@ == self@`.
+///
+/// `slice::Iter<T>` is deliberately NOT whitelisted: its `produces` goes
+/// through `to_ref_seq`, a bodiless logic function whose impl is `#[trusted]`,
+/// so `Vec<&T>@ == self@` is not a literal consequence of a stated spec.
+pub const ITERATOR_COLLECT_ROUNDTRIP: &str = r"
+    params: self
     ensures: result@ == self@
 ";
 
@@ -238,16 +268,14 @@ pub const DOUBLE_ENDED_NEXT_BACK: &str = r"
 
 /// Contract for `Iterator::sum`.
 ///
-/// Consumes the iterator, producing the sum of all elements. The result
-/// is unconstrained beyond the iterator being fully consumed — the solver
-/// cannot express generic summation without induction, but having a spec
-/// prevents the opaque-call fallback from assuming `true` postcondition.
-///
-/// For concrete usage patterns (e.g., summing a known-length sequence),
-/// the type constraint `result@ >= 0` for unsigned types is added.
+/// Consumes the iterator, producing the sum of all elements. It panics when
+/// the running sum overflows the integer type, a condition over the whole
+/// produced sequence that no clause here can state, so the call is refused
+/// rather than trusted. The result is unconstrained: `result@ >= 0` would be
+/// false for a signed sum.
 pub const ITERATOR_SUM: &str = r"
     params: self
-    ensures: result@ >= 0
+    requires: __trust_wp_std_site_unmodelled_panic()
 ";
 
 /// Contract for `Iterator::count`.
@@ -255,8 +283,16 @@ pub const ITERATOR_SUM: &str = r"
 /// Consumes the iterator, returning the number of elements. The result
 /// is non-negative. For iterators with a known-length view, this equals
 /// the view's length.
+///
+/// The running count inherits the caller's overflow checks, so the call
+/// panics when the iterator produces more than `usize::MAX` elements. The
+/// produced sequence is not bounded by any clause a caller can discharge for
+/// an arbitrary iterator, so the call is refused unless the call site
+/// instantiates `Self` with an iterator whose length is a `usize` by
+/// construction (a slice or `Vec` iterator, a narrow integer range).
 pub const ITERATOR_COUNT: &str = r"
     params: self
+    requires: __trust_wp_std_site_unmodelled_panic_unless_length_fits_Self()
     ensures: result@ >= 0
 ";
 
@@ -306,8 +342,13 @@ pub const ITERATOR_FIND: &str = r"
 ///
 /// Returns the index of the first element satisfying the predicate.
 /// The result (if Some) is a valid index into the produced sequence.
+///
+/// The running index inherits the caller's overflow checks, so the call
+/// panics past `usize::MAX` elements that fail the predicate; refused as
+/// `ITERATOR_COUNT` is, unless the iterator cannot be that long.
 pub const ITERATOR_POSITION: &str = r"
     params: self, predicate
+    requires: __trust_wp_std_site_unmodelled_panic_unless_length_fits_Self()
     ensures: match result {
         Some(i) => i@ >= 0,
         None => true,
@@ -351,9 +392,10 @@ pub const ITER_INSPECT: &str = r"
 /// Contract for `Iterator::step_by`.
 ///
 /// Creates an iterator starting at the same point, but stepping by
-/// the given amount at each iteration.
+/// the given amount at each iteration. Panics when `step` is zero.
 pub const ITER_STEP_BY: &str = r"
     params: self, step
+    requires: step@ > 0
     ensures: result.iter() == self
 ";
 
@@ -452,9 +494,11 @@ pub const ITERATOR_MAX_BY_KEY: &str = r"
 
 /// Contract for `Iterator::product`.
 ///
-/// Iterates over the entire iterator, multiplying all elements.
+/// Iterates over the entire iterator, multiplying all elements. It panics
+/// when the running product overflows, which is refused as for `sum`.
 pub const ITERATOR_PRODUCT: &str = r"
     params: self
+    requires: __trust_wp_std_site_unmodelled_panic()
 ";
 
 /// Contract for `Iterator::find_map`.

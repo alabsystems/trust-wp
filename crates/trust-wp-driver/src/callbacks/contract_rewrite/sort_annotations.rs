@@ -124,10 +124,10 @@ fn closure_capture_sort_map(
         return sort_map;
     };
 
-    let Some(body_with_facts) = super::super::try_get_body_with_context(local_def_id) else {
+    let Some(body_with_facts) = super::super::try_get_body_with_context(tcx, local_def_id) else {
         return sort_map;
     };
-    let mir_body = super::super::super::mir_analysis::get_mir_body(body_with_facts);
+    let mir_body = super::super::super::mir_analysis::get_mir_body(&body_with_facts);
 
     // Closure formal arguments: contract-side arg_names are zipped with MIR
     // arg locals.
@@ -333,10 +333,10 @@ fn annotate_local_vars_from_mir(
         return;
     };
 
-    let Some(body_with_facts) = super::super::try_get_body_with_context(local_def_id) else {
+    let Some(body_with_facts) = super::super::try_get_body_with_context(tcx, local_def_id) else {
         return;
     };
-    let mir_body = super::super::super::mir_analysis::get_mir_body(body_with_facts);
+    let mir_body = super::super::super::mir_analysis::get_mir_body(&body_with_facts);
 
     let arg_count = mir_body.arg_count;
 
@@ -403,10 +403,10 @@ fn propagate_closure_capture_sort_annotations(
         return;
     };
 
-    let Some(body_with_facts) = super::super::try_get_body_with_context(local_def_id) else {
+    let Some(body_with_facts) = super::super::try_get_body_with_context(tcx, local_def_id) else {
         return;
     };
-    let mir_body = super::super::super::mir_analysis::get_mir_body(body_with_facts);
+    let mir_body = super::super::super::mir_analysis::get_mir_body(&body_with_facts);
 
     let mut sort_map: HashMap<String, ExprSort> = HashMap::new();
 
@@ -490,6 +490,14 @@ pub(super) fn normalize_turbofish_logic_fn_args(parsed: &mut ParsedContract) {
 /// layout values. (#2324)
 const LAYOUT_INTRINSICS: &[&str] = &["size_of_logic", "align_of_logic"];
 
+/// A call's generic arguments, from the parser's wrappers: a const argument
+/// becomes the leading value argument it is, and a type argument leaves the
+/// argument list. A type argument is part of which function is called
+/// (`k::<u8>()` and `k::<u16>()` are two values), so the call is renamed to
+/// the instance its type arguments name, `k::<u8>`: dropped from a name that
+/// stayed `k`, two calls differing only in a type argument were read as one.
+/// A layout intrinsic's instance is spelled `size_of_logic__u8`, the name its
+/// axioms are declared under (#2324).
 pub(super) fn normalize_turbofish_logic_fn_expr(expr: &PureExpr) -> PureExpr {
     expr.rewrite_bottom_up(|node| match node {
         PureExpr::LogicFnCall { name, args } if name == TURBOFISH_ARG_WRAPPER_NAME => {
@@ -497,39 +505,33 @@ pub(super) fn normalize_turbofish_logic_fn_expr(expr: &PureExpr) -> PureExpr {
         }
         PureExpr::LogicFnCall { name, args } => {
             let mut normalized = Vec::with_capacity(args.len());
-            let mut specialized_name = name.clone();
+            let mut type_args: Vec<String> = Vec::new();
             let mut idx = 0usize;
             while idx < args.len() {
                 let Some(inner) = turbofish_wrapper_inner(&args[idx]) else {
                     break;
                 };
-                if let PureExpr::Var(type_name, Some(ExprSort::TypeParam(_))) = inner {
-                    // For layout intrinsics, encode the type name into the
-                    // function name so the encoder can assert concrete axioms.
-                    // (#2324)
-                    if LAYOUT_INTRINSICS.contains(&name.as_str()) {
-                        specialized_name = format!("{name}__{type_name}");
+                match inner {
+                    PureExpr::Var(type_name, Some(ExprSort::TypeParam(_))) => {
+                        type_args.push(type_name.clone());
                     }
-                    // TypeParam args are still dropped from the arg list
-                } else if let PureExpr::Var(type_name, _) = inner {
-                    // Concrete types (bool, u32, etc.) in turbofish position
-                    // may not have TypeParam sort — the contract parser doesn't
-                    // infer sorts for type names. For layout intrinsics, still
-                    // encode the type name to enable concrete axiom matching.
-                    if LAYOUT_INTRINSICS.contains(&name.as_str()) {
-                        specialized_name = format!("{name}__{type_name}");
-                        // Drop the arg like TypeParam args
-                    } else {
-                        normalized.push(inner.clone());
+                    PureExpr::Var(type_name, _) if LAYOUT_INTRINSICS.contains(&name.as_str()) => {
+                        type_args.push(type_name.clone());
                     }
-                } else {
-                    normalized.push(inner.clone());
+                    _ => normalized.push(inner.clone()),
                 }
                 idx += 1;
             }
             normalized.extend(args[idx..].iter().cloned());
+            let name = if type_args.is_empty() {
+                name
+            } else if LAYOUT_INTRINSICS.contains(&name.as_str()) {
+                format!("{name}__{}", type_args.join("__"))
+            } else {
+                format!("{name}::<{}>", type_args.join(", "))
+            };
             PureExpr::LogicFnCall {
-                name: specialized_name,
+                name,
                 args: normalized,
             }
         }
@@ -620,10 +622,11 @@ fn erase_box_deref_in_closure_contract(
     }
 
     let closure_substs = {
-        let Some(body_with_facts) = super::super::try_get_body_with_context(local_def_id) else {
+        let Some(body_with_facts) = super::super::try_get_body_with_context(tcx, local_def_id)
+        else {
             return;
         };
-        let mir_body = super::super::super::mir_analysis::get_mir_body(body_with_facts);
+        let mir_body = super::super::super::mir_analysis::get_mir_body(&body_with_facts);
         let env_ty = mir_body.local_decls[rustc_middle::mir::Local::from_u32(1)].ty;
         match env_ty.kind() {
             TyKind::Closure(_, substs) => Some(*substs),
@@ -1023,9 +1026,16 @@ mod tests {
             mut_borrow: MutBorrowFields {
                 mut_borrow_body: None,
                 mut_ref_param_names: HashSet::new(),
-            projected_final_pins: Vec::new(),
+                state_params: HashSet::new(),
+                projected_final_pins: Vec::new(),
+                stale_call_final_params: HashSet::new(),
             },
             reborrow_prophecy: None,
+            returning_path_facts: vec![],
+            extraction_fail_closed_reason: None,
+            panic_unreachability_obligations: 0,
+            user_written_false_obligations: 0,
+            proved_dead_edges: Default::default(),
         }
     }
 

@@ -102,10 +102,10 @@ impl AYEncoder {
     /// Build the index value used by one extensional-equality quantifier.
     ///
     /// A concrete concat is expanded into a local ITE over its recorded
-    /// operands. This is the same Seq law as the former global Axioms 16/17,
-    /// but it has only the ext-equality index binder instead of adding two
-    /// more universally quantified sequence operands to every concat query.
-    /// Non-concat leaves retain the legacy `seq_index_logic` bridge.
+    /// operands. This is the Seq concat-index law (Axioms 16/17) instantiated
+    /// locally: it has only the ext-equality index binder instead of adding
+    /// two more universally quantified sequence operands to every concat
+    /// query. Non-concat leaves use the `seq_index_logic` bridge.
     fn ext_eq_pointwise_index_term(
         &mut self,
         seq_term: Term,
@@ -213,8 +213,8 @@ impl AYEncoder {
     /// instantiating quantified Seq length axioms on the ground terms
     /// inside the conjunction (#962). The reverse implication
     /// `(len(a) == len(b) AND pointwise) => ext_eq_N` is suppressed because
-    /// it causes ay quantifier instantiation loops even with the ay#6481
-    /// NNF skolemization fix. The encoding is one-directional: positive
+    /// it causes ay quantifier instantiation loops even with ay's NNF
+    /// skolemization (ay#6481). The encoding is one-directional: positive
     /// `ext_eq` uses are sound, negated `ext_eq` is conservative.
     ///
     /// For non-Seq receivers, falls back to a Bool uninterpreted function.
@@ -340,9 +340,9 @@ impl AYEncoder {
             //
             // Prefer direct Array selects when either side already has a
             // concrete SeqValue. This keeps singleton/concat cases on the
-            // Array+Length model instead of routing back through the older
-            // seq_index_logic UF + concat axioms path, which is the remaining
-            // false-Unsat surface in #2404.
+            // Array+Length model instead of routing through the
+            // seq_index_logic UF + concat axioms path, which is the
+            // false-Unsat surface of #2404.
             //
             // Fully symbolic non-concat leaves use seq_index_logic UF
             // applications. Concrete concat terms are expanded locally into
@@ -443,7 +443,7 @@ impl AYEncoder {
             // `seq_index_logic` term to fire at i=0. On the Array-backed path
             // above, the triggers are direct `select` terms and `fwd_idx0`
             // already propagates the first element without re-entering the
-            // legacy bridge/concat axiom chain from #2404.
+            // bridge/concat axiom chain of #2404.
             if !use_array_pointwise && !suppress_quantified_pointwise {
                 self.set_needs_seq_index_ground_terms();
                 let zero = self.solver.int_const(0);
@@ -452,8 +452,7 @@ impl AYEncoder {
             }
 
             // Axiom 3 (full reverse direction) is SUPPRESSED:
-            // Even with the ay#6481 NNF skolemization fix (included in
-            // the current ay pin), the reverse axiom
+            // Even with ay's NNF skolemization (ay#6481), the reverse axiom
             //   (len_eq AND pointwise) => ext_eq_var
             // causes quantifier instantiation loops when the pointwise
             // forall appears in the antecedent.
@@ -537,8 +536,8 @@ impl AYEncoder {
             // instance. Without it the fallback UF has no defining law in
             // scope and even the reflexive `r@.ext_eq(xs_snap@)` (equal-view)
             // goal is unprovable. Scoped to FMap-sorted operands, where the
-            // cited law governs. (ce-census 2026-08-20, cc/collections
-            // roundtrip_hashmap_into_iter proof_assert#4)
+            // cited law governs. (cc/collections roundtrip_hashmap_into_iter
+            // proof_assert#4)
             if self.quantifier_state.quantifier_depth() == 0 {
                 if let TermKind::App { num_args: 2, .. } = self.solver.term_kind(result) {
                     let children = self.solver.term_children(result);

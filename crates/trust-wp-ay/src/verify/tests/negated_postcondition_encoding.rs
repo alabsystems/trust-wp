@@ -627,11 +627,11 @@ fn predicate_index_logic_postcondition_does_not_panic_2245() {
 
 // --- encode_and_assert_negated_postconditions: logic_fns + return_expr threading (#2580) ---
 
-/// Regression for #2580: `encode_and_assert_negated_postconditions` previously
-/// hardcoded `None` for both `logic_fns` and `return_expr` when delegating to
-/// `encode_negated_postcondition`, making the skolemization and witness
-/// instantiation paths unreachable. This test verifies the `logic_fns`
-/// parameter is now threaded through by exercising the skolemization path
+/// Regression for #2580: if `encode_and_assert_negated_postconditions`
+/// hardcodes `None` for `logic_fns` and `return_expr` when delegating to
+/// `encode_negated_postcondition`, the skolemization and witness
+/// instantiation paths are unreachable. This test verifies the `logic_fns`
+/// parameter is threaded through by exercising the skolemization path
 /// for a universal postcondition when an open logic function is present.
 #[test]
 #[timeout(30000)]
@@ -706,15 +706,15 @@ fn non_reflexive_equality_not_trivially_true() {
 // `is_trivially_true_postcondition_under_requires`, a path that BYPASSES the
 // solver) must never fold or structurally accept `Final(<literal>)` — the
 // print of the driver's borrow-chain advance of a borrowed place's constant
-// value, the 8d7bf70 false-accept class. Mirrors
+// value, the prophecy-over-constant false-accept class. Mirrors
 // `AYEncoder::refuse_prophecy_over_constant`'s fail-closed semantics.
 
 #[test]
 fn final_over_literal_never_trivially_accepts() {
     use crate::tests::helpers::{final_expr, forall};
 
-    // The folding route: `^3 == 3` is the exact evil-shape goal the driver
-    // minted pre-#124 (`x` lowered to `Final(Int(3))`).
+    // The folding route: `^3 == 3` is the exact evil-shape goal a driver that
+    // conflates prophecies mints (#124: `x` lowered to `Final(Int(3))`).
     let folded = eq(final_expr(int(3)), int(3));
     assert!(!is_trivially_true_postcondition(&folded));
     assert!(!is_trivially_true_postcondition_under_requires(
@@ -734,7 +734,7 @@ fn final_over_literal_never_trivially_accepts() {
     ));
 
     // Quantifier wrapping must not launder either shape (the #126 gate's
-    // probe family: quantifier-wrapped variants ACCEPTED at 4d809ba).
+    // probe family: quantifier-wrapped variants of both routes).
     let forall_wrapped = forall("i", folded.clone());
     assert!(!is_trivially_true_postcondition_under_requires(
         &forall_wrapped,
@@ -1414,8 +1414,7 @@ fn trivially_true_in_fast_path_conjunction_verified() {
 // --- encode_and_assert_requires: chained Mapping<_, Bool>::get witness (#5) ---
 
 /// Regression for the second `such_that` witness in
-/// `tests/should_succeed/such_that.rs` (issue #5, design
-/// `2026-05-19-such-that-strict-pass-residual.md` Gap 1).
+/// `tests/should_succeed/such_that.rs` (issue #5).
 ///
 /// Shape:
 /// ```text
@@ -1425,15 +1424,15 @@ fn trivially_true_in_fast_path_conjunction_verified() {
 ///   // driver injects assumption: (*predicate).get(*x)            (Bool)
 /// ```
 ///
-/// Before the defensive coercion at the precondition/assumption
+/// Without the defensive coercion at the precondition/assumption
 /// `assert_term` boundary, encoding `(*predicate).get(witness)` together
-/// with the mapping-closure forall axioms panicked ay with
+/// with the mapping-closure forall axioms panics ay with
 /// `sort mismatch in assert_term: expected Bool, got Int`, because sort
 /// inference loses the Bool context through `Deref` + `MethodCall` for
-/// the chained `Mapping<Int, Bool>::get` call. The fix coerces via
-/// `!= 0` (Bool encoded as 0/1 Int) at `setup::encode_and_assert_requires`
-/// before calling `assert_term`. This test asserts that `assert_term` does
-/// not panic for this chained-witness shape.
+/// the chained `Mapping<Int, Bool>::get` call.
+/// `setup::encode_and_assert_requires` coerces via `!= 0` (Bool encoded as
+/// 0/1 Int) before calling `assert_term`. This test asserts that
+/// `assert_term` does not panic for this chained-witness shape.
 #[test]
 #[timeout(30000)]
 fn chained_predicate_get_witness_assumption_does_not_panic_5() {

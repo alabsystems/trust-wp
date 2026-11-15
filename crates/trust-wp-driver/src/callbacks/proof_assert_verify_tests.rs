@@ -1111,3 +1111,63 @@ fn inline_bool_mapping_closure_calls_rewrites_predicate_index_logic() {
         )
     );
 }
+
+/// D-241: a re-bound parameter's own name inside a recorded value is renamed
+/// to its entry symbol occurrence by occurrence, keeping each occurrence's
+/// sort; a binder of the same spelling and another name are left alone.
+#[test]
+fn entry_value_rename_keeps_each_sort_and_every_binder() {
+    use super::proof_assert_snapshot::{param_entry_value_name, rename_to_entry_values};
+
+    let datatype = Some(ExprSort::Datatype(intern_sort_name("P")));
+    let var = |name: &str, sort: Option<ExprSort>| PureExpr::Var(name.to_string(), sort);
+    let eq =
+        |lhs: PureExpr, rhs: PureExpr| PureExpr::BinOp(Arc::new(lhs), BinOp::Eq, Arc::new(rhs));
+    let field_of = |base: PureExpr| PureExpr::LogicFnCall {
+        name: "__trust_wp_tuple_get_0".to_string(),
+        args: vec![base],
+    };
+    let bound = |name: &str| PureExpr::Forall {
+        var: name.to_string(),
+        var_sort: Some(ExprSort::Int),
+        body: Arc::new(eq(
+            var(name, Some(ExprSort::Int)),
+            var("y", Some(ExprSort::Int)),
+        )),
+        triggers: Vec::new(),
+    };
+    let fact = PureExpr::BinOp(
+        Arc::new(eq(
+            PureExpr::BinOp(
+                Arc::new(var("x", Some(ExprSort::Int))),
+                BinOp::Add,
+                Arc::new(PureExpr::Int(1)),
+            ),
+            field_of(var("x", datatype.clone())),
+        )),
+        BinOp::And,
+        Arc::new(bound("x")),
+    );
+    let entry = param_entry_value_name("x");
+    let renamed = rename_to_entry_values(&fact, &HashSet::from(["x".to_string()]));
+    let expected = PureExpr::BinOp(
+        Arc::new(eq(
+            PureExpr::BinOp(
+                Arc::new(var(&entry, Some(ExprSort::Int))),
+                BinOp::Add,
+                Arc::new(PureExpr::Int(1)),
+            ),
+            field_of(var(&entry, datatype)),
+        )),
+        BinOp::And,
+        Arc::new(bound("x")),
+    );
+    assert_eq!(renamed, expected);
+    let renamed_y = rename_to_entry_values(&fact, &HashSet::from(["y".to_string()]));
+    assert!(
+        renamed_y.free_vars().contains(&param_entry_value_name("y"))
+            && !renamed_y.free_vars().contains("y")
+            && renamed_y.free_vars().contains("x"),
+        "a free `y` is renamed inside the binder too, and `x` is left alone: {renamed_y}"
+    );
+}

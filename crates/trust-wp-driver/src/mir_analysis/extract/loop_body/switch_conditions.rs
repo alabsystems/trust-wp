@@ -22,7 +22,7 @@ use crate::mir_analysis::translate::{
 /// For integer switches (match lowering): each explicit value branch gets
 /// `discr == value`, and the otherwise branch gets the conjunction of all
 /// `discr != value` predicates.
-pub(super) fn switch_branch_conditions<'tcx>(
+pub(crate) fn switch_branch_conditions<'tcx>(
     discr: &Operand<'tcx>,
     targets: &SwitchTargets,
     local_exprs: &HashMap<Local, PureExpr>,

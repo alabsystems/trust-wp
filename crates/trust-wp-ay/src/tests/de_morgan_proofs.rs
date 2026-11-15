@@ -924,9 +924,11 @@ fn de_morgan_preserves_none_sort_annotation_encodes_consistently() {
 #[test]
 #[timeout(30000)]
 fn eager_negated_existential_instantiation_call_fnmut_pattern() {
-    use super::helpers::resolve_call;
+    use super::helpers::{resolve_call, value_state};
 
-    // Ground precondition terms (what the verifier knows after two f() calls)
+    // Ground precondition terms (what the verifier knows after two f() calls).
+    // The terminal state is annotated at a sort holding no borrow, whose
+    // `resolve` is the by-value `true` (D-126).
     let req_mut_1 = method_call(
         var("f"),
         "postcondition_mut",
@@ -935,9 +937,9 @@ fn eager_negated_existential_instantiation_call_fnmut_pattern() {
     let req_mut_2 = method_call(
         var("f_final"),
         "postcondition_mut",
-        vec![int(0), var("f_final_final"), var("result")],
+        vec![int(0), value_state("f_final_final"), var("result")],
     );
-    let req_resolve = resolve_call(var("f_final_final"));
+    let req_resolve = resolve_call(value_state("f_final_final"));
     let requires = vec![and(req_mut_1, and(req_mut_2, req_resolve))];
 
     // Existential postcondition:
@@ -979,9 +981,16 @@ fn eager_negated_existential_instantiation_call_fnmut_pattern() {
 /// call-site assumptions use `Deref(Var("f"))` for `(*self)` and
 /// `Final(Var("f"))` for `^self`, while the ensures body uses bare variables.
 /// The eager instantiation normalizes Deref/Final before matching. (#970)
+///
+/// Not credited since D-127: the premise `resolve(^f_final)` resolves the
+/// value `^f_final` at its own type, a closure state that may hold the
+/// caller's borrow, and the goal's `resolve(st2)` reads the final value of a
+/// written binder with no sort. Both are refused rather than read as the
+/// collapse `st2 == st2` the idiom verified through, which also verified the
+/// same claim of a function that RETURNS the state.
 #[test]
 #[timeout(30000)]
-fn eager_negated_existential_with_deref_final_wrappers() {
+fn eager_negated_existential_with_deref_final_wrappers_is_not_credited() {
     use super::helpers::resolve_call;
 
     let deref_f = PureExpr::Deref(Arc::new(var("f")));
@@ -1028,11 +1037,10 @@ fn eager_negated_existential_with_deref_final_wrappers() {
 
     let result = verify_function_with_modes(
         VerificationRequest::new(&requires, &ensures).return_expr(Some(&return_expr)),
-    )
-    .expect("verification should not error");
+    );
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "call_fnmut with Deref/Final wrappers should verify: got {result:?}"
+        !matches!(result, Ok(VerificationResult::Verified(_))),
+        "call_fnmut's resolve of a closure state must not be credited (D-127): got {result:?}"
     );
 }
 

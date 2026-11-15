@@ -21,6 +21,7 @@ struct MirBorrowckGuardProbe {
 impl Callbacks for MirBorrowckGuardProbe {
     fn config(&mut self, config: &mut Config) {
         config.override_queries = Some(|_sess, providers| {
+            crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
             providers.queries.mir_borrowck = |tcx, local_id| {
                 // Same guard as TrustWpCallbacks::config (#2229)
                 if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
@@ -44,25 +45,28 @@ impl Callbacks for MirBorrowckGuardProbe {
         clippy::ignored_unit_patterns
     )]
     fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        // Run full analysis (type checking + borrow checking) with our
-        // custom mir_borrowck provider installed via config(). Before the
-        // body_id() guard (#2229), this could panic for crates with
-        // bodyless trait methods via nested_bodies_within → body_owned_by.
-        let _ = tcx.analysis(());
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            // Run full analysis (type checking + borrow checking) with our
+            // custom mir_borrowck provider installed via config(). Before the
+            // body_id() guard (#2229), this could panic for crates with
+            // bodyless trait methods via nested_bodies_within → body_owned_by.
+            let _ = tcx.analysis(());
 
-        // Verify the fixture has a bodyless trait method (test sanity check).
-        for local_id in tcx.iter_local_def_id() {
-            if tcx.def_kind(local_id) == DefKind::AssocFn && !is_bodyful_trait_method(tcx, local_id)
-            {
-                let parent = tcx.parent(local_id.to_def_id());
-                if tcx.def_kind(parent) == DefKind::Trait {
-                    self.has_bodyless_trait_method = true;
+            // Verify the fixture has a bodyless trait method (test sanity check).
+            for local_id in tcx.iter_local_def_id() {
+                if tcx.def_kind(local_id) == DefKind::AssocFn
+                    && !is_bodyful_trait_method(tcx, local_id)
+                {
+                    let parent = tcx.parent(local_id.to_def_id());
+                    if tcx.def_kind(parent) == DefKind::Trait {
+                        self.has_bodyless_trait_method = true;
+                    }
                 }
             }
-        }
 
-        self.ran = true;
-        Compilation::Stop
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 

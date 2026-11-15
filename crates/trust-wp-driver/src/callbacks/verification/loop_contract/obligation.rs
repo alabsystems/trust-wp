@@ -8,8 +8,6 @@
 //! `record_encoding_error`, `report_obligation_result`,
 //! `LoopCallObligationContext`, `worse_result`, and
 //! `verify_loop_call_obligations`.
-//!
-//! Extracted from `loop_contract.rs` per #2321.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -30,7 +28,10 @@ use trust_wp_core::{
 use super::super::super::{
     ghost_context::rustc_span_to_source_span,
     helpers::report_counterexample,
-    reporting::{verified_evidence_gap_reason, VerificationCounters},
+    loop_verify::pre_loop_store::PreLoopStoreLinks,
+    reporting::{
+        verified_evidence_gap_reason, withhold_unvalidated_refutation, VerificationCounters,
+    },
     verification_context::VerificationContext,
 };
 
@@ -113,6 +114,11 @@ pub(crate) fn classify_obligation_outcome(
     def_path: &str,
     loc: &str,
 ) -> (ObligationOutcome, usize, usize, usize, usize, usize) {
+    // No FAILED without a validated counterexample -- applied here as well as
+    // at the ay boundary so this classifier is correct for ANY outcome handed
+    // to it, including one a caller built itself. Idempotent; the discarded
+    // count is tallied by `report_obligation_result`, which owns the counters.
+    let outcome = withhold_unvalidated_refutation(outcome, &mut 0);
     if let Some(reason) = verified_evidence_gap_reason(&outcome) {
         eprintln!("trust-wp: {def_path} evidence gap (loop call obligations: {reason})");
         eprintln!("  at {loc}");
@@ -129,8 +135,8 @@ pub(crate) fn classify_obligation_outcome(
 /// counter, and emits diagnostics to stderr. Returns `ErrorRecorded` so callers
 /// treat the outcome as unsuccessful.
 ///
-/// Extracted so the counter-mutation logic is directly testable without a
-/// compiler context (#1996).
+/// Kept TyCtxt-free so the counter-mutation logic is directly testable without
+/// a compiler context (#1996).
 pub(crate) fn record_encoding_error(
     err: &EncodingError,
     counters: &mut VerificationCounters,
@@ -151,8 +157,10 @@ pub(crate) fn record_encoding_error(
 /// `Assumed` for success outcomes so the caller can apply context-specific
 /// reporting (e.g., spec-drop fail-closed logic, message suffix selection).
 ///
-/// Deduplicates the identical match arms that appeared twice in
-/// `verify_contract_loop_path` (#1986 Step 3).
+/// The one dispatch shared by both call-obligation result sites in
+/// `verify_contract_loop_path` — the partial-result `Ok` arm and
+/// `handle_all_verified` — so their counter accounting cannot drift apart
+/// (#1986).
 pub(crate) fn report_obligation_result(
     result: Result<VerificationOutcome, EncodingError>,
     vctx: &VerificationContext<'_, '_>,
@@ -160,6 +168,8 @@ pub(crate) fn report_obligation_result(
 ) -> ObligationOutcome {
     match result {
         Ok(outcome) => {
+            let outcome =
+                withhold_unvalidated_refutation(outcome, &mut counters.refutations_withheld);
             let (
                 outcome,
                 delta_failed,
@@ -168,11 +178,11 @@ pub(crate) fn report_obligation_result(
                 delta_evidence_gaps,
                 delta_warnings,
             ) = classify_obligation_outcome(outcome, vctx.def_path, vctx.loc);
-            counters.failed += delta_failed;
-            counters.errors += delta_errors;
-            counters.demoted += delta_demoted;
-            counters.evidence_gaps += delta_evidence_gaps;
-            counters.warnings += delta_warnings;
+            counters.failed = counters.failed.saturating_add(delta_failed);
+            counters.errors = counters.errors.saturating_add(delta_errors);
+            counters.demoted = counters.demoted.saturating_add(delta_demoted);
+            counters.evidence_gaps = counters.evidence_gaps.saturating_add(delta_evidence_gaps);
+            counters.warnings = counters.warnings.saturating_add(delta_warnings);
             if matches!(outcome, ObligationOutcome::Vacuous) {
                 counters.vacuous += 1;
                 counters.warnings += 1;
@@ -205,7 +215,12 @@ pub(crate) struct LoopCallObligationContext<'a> {
     /// for genuinely pre-loop obligations, but are intentionally not exposed
     /// to in-loop obligation groups.
     pub(crate) pre_loop_assumptions: &'a [PureExpr],
-    pub(crate) invariants: &'a [PureExpr],
+    /// Effective invariants of each loop, indexed like `loop_analysis.loops`.
+    /// A group assumes only the entry at its own `loop_index`: the invariants
+    /// of loop `k` hold at loop `k`'s header, and pooling them makes one loop's
+    /// stable bindings premises of another loop's checks
+    /// (`s40v5_crossloop_user_invariant_pooled.rs`).
+    pub(crate) per_loop_invariants: &'a [Vec<PureExpr>],
     pub(crate) pre_loop_obligations: &'a [PureExpr],
     /// Per-loop obligation groups, each with its own condition (#752).
     pub(crate) loop_obligation_groups: &'a [super::super::super::parsing::LoopObligationGroup],
@@ -221,6 +236,10 @@ pub(crate) struct LoopCallObligationContext<'a> {
     /// Required for the encoder to resolve SliceIndexSpec axioms and other
     /// trait-based method calls in obligation expressions. (#1709)
     pub(crate) adt_decls_opt: Option<&'a AdtDecls>,
+    /// Machine-integer ranges of ADT fields. A field value outside its type's
+    /// range is not one the program can hold, so a model picking one is not a
+    /// counterexample (loop_call_obligation_field_range_control).
+    pub(crate) adt_field_ranges_opt: Option<&'a trust_wp_core::logic::AdtFieldRanges>,
     pub(crate) track_level: TrackLevel,
     pub(crate) timeout: Option<std::time::Duration>,
 }
@@ -258,24 +277,38 @@ fn push_dedup(vec: &mut Vec<PureExpr>, expr: PureExpr) {
     }
 }
 
+/// The effective invariants a group's VC may assume: its own loop's, never
+/// another loop's (`s40v5_crossloop_user_invariant_pooled.rs`). A group with no
+/// (or an out-of-range) loop index assumes none — dropping premises only.
+fn group_invariants<'a>(
+    ctx: &LoopCallObligationContext<'a>,
+    group: &super::super::super::parsing::LoopObligationGroup,
+) -> &'a [PureExpr] {
+    group
+        .loop_index
+        .and_then(|index| ctx.per_loop_invariants.get(index))
+        .map_or(&[], Vec::as_slice)
+}
+
 fn loop_group_obligation_requires(
     ctx: &LoopCallObligationContext<'_>,
     group: &super::super::super::parsing::LoopObligationGroup,
 ) -> Vec<PureExpr> {
+    let invariants = group_invariants(ctx, group);
     let extra_condition = usize::from(group.condition.is_some());
     let mut obligation_requires = Vec::with_capacity(
-        ctx.base_requires.len() + ctx.invariants.len() + group.assumptions.len() + extra_condition,
+        ctx.base_requires.len() + invariants.len() + group.assumptions.len() + extra_condition,
     );
     obligation_requires.extend(ctx.base_requires.iter().cloned());
     obligation_requires.extend(group.assumptions.iter().cloned());
-    obligation_requires.extend(ctx.invariants.iter().cloned());
+    obligation_requires.extend(invariants.iter().cloned());
 
     if let Some(ref cond) = group.condition {
         // Condition-guarded range facts are not raw invariants: they only hold
         // while this loop body is active. Since this VC also assumes the loop
         // condition, expose matching RHS facts directly to avoid making simple
         // call obligations reconstruct bounds through an implication.
-        for invariant in ctx.invariants {
+        for invariant in invariants {
             if let PureExpr::BinOp(lhs, BinOp::Implies, rhs) = invariant {
                 if lhs.as_ref() == cond {
                     push_dedup(&mut obligation_requires, rhs.as_ref().clone());
@@ -678,14 +711,24 @@ fn verify_function_obligations_outcome(
     ctx: &LoopCallObligationContext<'_>,
     requires: &[PureExpr],
     obligations: &[PureExpr],
+    guarded_marker: bool,
 ) -> Result<VerificationOutcome, EncodingError> {
     verify_function_with_modes_outcome(
         VerificationRequest::new(requires, obligations)
+            // D-27: every goal here is a call obligation the DRIVER built,
+            // so a `false` among them is always a fail-closed marker
+            // for a construct trust-wp could not model — never a user clause.
+            // A marker the loop body walk put under its path is `path ⇒
+            // false`, which no scan for `false` sees; the walk says so.
+            .injected_fail_closed_goal(
+                guarded_marker || trust_wp_ay::goals_carry_fail_closed_marker(obligations),
+            )
             .logic_fns(ctx.logic_fns_opt)
             .mode_overrides(ctx.mode_overrides_opt)
             .type_invariants(ctx.type_invariants_opt)
             .type_constants(ctx.type_constants_opt)
             .adt_decls(ctx.adt_decls_opt.cloned())
+            .adt_field_ranges(ctx.adt_field_ranges_opt.cloned())
             .track(Some(ctx.track_level))
             .timeout(ctx.timeout),
     )
@@ -746,15 +789,26 @@ pub(crate) fn verify_loop_call_obligations_outcome(
         .cloned()
         .collect();
     if !filtered_pre_loop.is_empty() {
-        let mut obligation_requires = Vec::with_capacity(
-            ctx.base_requires.len() + ctx.pre_loop_assumptions.len() + ctx.invariants.len(),
-        );
+        // No loop invariant holds before the first loop runs:
+        // `need_pos(x); x = 5; #[invariant(x > 0)] loop {}` must not discharge
+        // `x > 0` at the call from the invariant established later
+        // (`s40v5_preloop_call_later_invariant.rs`).
+        let mut obligation_requires =
+            Vec::with_capacity(ctx.base_requires.len() + ctx.pre_loop_assumptions.len());
         obligation_requires.extend(ctx.base_requires.iter().cloned());
         obligation_requires.extend(ctx.pre_loop_assumptions.iter().cloned());
-        obligation_requires.extend(ctx.invariants.iter().cloned());
 
-        let outcome =
-            verify_function_obligations_outcome(ctx, &obligation_requires, &filtered_pre_loop)?;
+        if std::env::var_os("TRUST_WP_LOOP_GROUP_DUMP").is_some() {
+            eprintln!(
+                "TRUST_WP_LOOP_GROUP_DUMP pre_loop requires={obligation_requires:?} obligations={filtered_pre_loop:?}"
+            );
+        }
+        let outcome = verify_function_obligations_outcome(
+            ctx,
+            &obligation_requires,
+            &filtered_pre_loop,
+            false,
+        )?;
 
         match &outcome.result {
             VerificationResult::Verified(_) => {
@@ -781,9 +835,43 @@ pub(crate) fn verify_loop_call_obligations_outcome(
             continue;
         }
         let obligation_requires = loop_group_obligation_requires(ctx, group);
+        if std::env::var_os("TRUST_WP_LOOP_GROUP_DUMP").is_some() {
+            eprintln!(
+                "TRUST_WP_LOOP_GROUP_DUMP vc condition={:?} requires={:?} obligations={:?}",
+                group.condition, obligation_requires, group.obligations
+            );
+        }
 
-        let outcome =
-            verify_function_obligations_outcome(ctx, &obligation_requires, &group.obligations)?;
+        let mut outcome = verify_function_obligations_outcome(
+            ctx,
+            &obligation_requires,
+            &group.obligations,
+            group.injected_fail_closed,
+        )?;
+        if let Some(unstated) = group.condition_unstated.as_deref() {
+            withhold_condition_refutation(&mut outcome, unstated);
+        }
+        // The group's VC reads a name a store through a reference before the
+        // loop changed at its entry value, under the precondition and the
+        // invariants inferred from it (loop_call_obligation_after_param_store_control).
+        if let Some(reason) =
+            PreLoopStoreLinks::new(&group.pre_loop_stored_names, &obligation_requires, [])
+                .reason(&group.obligations)
+        {
+            withhold_stale_store_refutation(&mut outcome, &reason);
+        }
+        // An obligation reads a havoc the arithmetic walk bound for a local no
+        // loop writes; the program gave it one value before the loop, which
+        // the VC leaves free (loop_overflow_after_param_store_control).
+        if let Some(havoc) =
+            PreLoopStoreLinks::new(&group.unstated_entry_values, &obligation_requires, [])
+                .linked(&group.obligations)
+        {
+            withhold_stale_store_refutation(
+                &mut outcome,
+                &format!("the loop VC leaves free a value code before the loop fixed (`{havoc}`)"),
+            );
+        }
 
         match &outcome.result {
             VerificationResult::Verified(_) => {
@@ -833,6 +921,34 @@ pub(crate) fn verify_loop_call_obligations_outcome(
                 .track(Some(ctx.track_level))
                 .timeout(ctx.timeout),
         )
+    }
+}
+
+/// Withhold a refutation over a VC that assumes a loop condition reading a
+/// value no premise states: the model picks that value freely, so it need not
+/// be a state the program reaches (loop_condition_call_unstated_control).
+pub(crate) fn withhold_condition_refutation(outcome: &mut VerificationOutcome, unstated: &str) {
+    if matches!(outcome.result, VerificationResult::Failed(_)) {
+        *outcome = VerificationOutcome::without_provenance(VerificationResult::Unknown(
+            trust_wp_ay::UnknownReason::SolverMessage(format!(
+                "{}: the loop condition reads a value the loop VC does not state: {unstated}",
+                trust_wp_ay::REFUTATION_AUTHORITY_MESSAGE
+            )),
+        ));
+    }
+}
+
+/// Withhold a refutation over a VC that reads a stale entry value
+/// (`PreLoopStoreLinks::reason`), or a value it leaves free although the
+/// program fixed it before the loop.
+fn withhold_stale_store_refutation(outcome: &mut VerificationOutcome, reason: &str) {
+    if matches!(outcome.result, VerificationResult::Failed(_)) {
+        *outcome = VerificationOutcome::without_provenance(VerificationResult::Unknown(
+            trust_wp_ay::UnknownReason::SolverMessage(format!(
+                "{}: {reason}",
+                trust_wp_ay::REFUTATION_AUTHORITY_MESSAGE
+            )),
+        ));
     }
 }
 
@@ -1038,6 +1154,11 @@ mod tests {
             ))))],
         }];
         let group = LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations,
             condition: Some(condition.clone()),
@@ -1045,7 +1166,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &base_requires,
             pre_loop_assumptions: &[],
-            invariants: &invariants,
+            per_loop_invariants: std::slice::from_ref(&invariants),
             pre_loop_obligations: &[],
             loop_obligation_groups: &[],
             logic_fns_opt: None,
@@ -1053,6 +1174,7 @@ mod tests {
             type_invariants_opt: None,
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: None,
         };
@@ -1086,6 +1208,11 @@ mod tests {
         let condition = var("loop_active", Some(ExprSort::Bool));
         let preheader_fact = binop(var("m", None), BinOp::Eq, var("moves_at_i", None));
         let group = LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: vec![preheader_fact.clone()],
             obligations: vec![var("obligation", Some(ExprSort::Bool))],
             condition: Some(condition.clone()),
@@ -1093,7 +1220,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &[],
             pre_loop_assumptions: &[],
-            invariants: &[],
+            per_loop_invariants: &[],
             pre_loop_obligations: &[],
             loop_obligation_groups: &[],
             logic_fns_opt: None,
@@ -1101,6 +1228,7 @@ mod tests {
             type_invariants_opt: None,
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: None,
         };
@@ -1161,6 +1289,11 @@ mod tests {
         let invariants = vec![quantified_invariant, direct_lower, guarded_upper];
         let obligations = vec![method_call(i, "in_bounds", vec![v_view])];
         let group = LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations,
             condition: Some(condition),
@@ -1168,7 +1301,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &[],
             pre_loop_assumptions: &[],
-            invariants: &invariants,
+            per_loop_invariants: std::slice::from_ref(&invariants),
             pre_loop_obligations: &[],
             loop_obligation_groups: std::slice::from_ref(&group),
             logic_fns_opt: None,
@@ -1176,6 +1309,7 @@ mod tests {
             type_invariants_opt: None,
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: Some(Duration::from_secs(5)),
         };
@@ -1280,7 +1414,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &[],
             pre_loop_assumptions: &[],
-            invariants: &[],
+            per_loop_invariants: &[],
             pre_loop_obligations: &[],
             loop_obligation_groups: &[],
             logic_fns_opt: None,
@@ -1288,6 +1422,7 @@ mod tests {
             type_invariants_opt: Some(std::slice::from_ref(&invariant_def)),
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: Some(Duration::from_secs(5)),
         };
@@ -1368,7 +1503,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &[],
             pre_loop_assumptions: std::slice::from_ref(&fact),
-            invariants: &[],
+            per_loop_invariants: &[],
             pre_loop_obligations: std::slice::from_ref(&fact),
             loop_obligation_groups: &[],
             logic_fns_opt: None,
@@ -1376,6 +1511,7 @@ mod tests {
             type_invariants_opt: None,
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: Some(Duration::from_secs(5)),
         };
@@ -1393,6 +1529,11 @@ mod tests {
     fn pre_loop_assumptions_do_not_leak_to_loop_groups() {
         let fact = binop(var("x", None), BinOp::Gt, PureExpr::Int(0));
         let group = LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![fact.clone()],
             condition: None,
@@ -1400,7 +1541,7 @@ mod tests {
         let ctx = LoopCallObligationContext {
             base_requires: &[],
             pre_loop_assumptions: std::slice::from_ref(&fact),
-            invariants: &[],
+            per_loop_invariants: &[],
             pre_loop_obligations: &[],
             loop_obligation_groups: std::slice::from_ref(&group),
             logic_fns_opt: None,
@@ -1408,6 +1549,7 @@ mod tests {
             type_invariants_opt: None,
             type_constants_opt: None,
             adt_decls_opt: None,
+            adt_field_ranges_opt: None,
             track_level: trust_wp_core::TrackLevel::Auto,
             timeout: Some(Duration::from_secs(5)),
         };
@@ -1418,6 +1560,217 @@ mod tests {
         assert!(
             matches!(result, trust_wp_ay::VerificationResult::Failed(_)),
             "pre-loop assumptions must not prove in-loop obligations, got {result:?}"
+        );
+    }
+
+    /// A group whose condition reads a value no premise states has models
+    /// that pick it freely: its refutation is withheld, its proof is not.
+    #[test]
+    fn a_group_over_an_unstated_condition_withholds_its_refutation() {
+        let obligation = binop(var("x", None), BinOp::Gt, PureExpr::Int(0));
+        let group = |obligations: Vec<PureExpr>| LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: Some("the behaviour of `f`, which has no contract".to_string()),
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
+            assumptions: Vec::new(),
+            obligations,
+            condition: Some(var("$iter_result_3", Some(ExprSort::Bool))),
+        };
+        let run = |group: &LoopObligationGroup| {
+            let ctx = LoopCallObligationContext {
+                base_requires: &[],
+                pre_loop_assumptions: &[],
+                per_loop_invariants: &[],
+                pre_loop_obligations: &[],
+                loop_obligation_groups: std::slice::from_ref(group),
+                logic_fns_opt: None,
+                mode_overrides_opt: None,
+                type_invariants_opt: None,
+                type_constants_opt: None,
+                adt_decls_opt: None,
+                adt_field_ranges_opt: None,
+                track_level: trust_wp_core::TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+            };
+            super::verify_loop_call_obligations(&ctx).expect("loop-group obligation should encode")
+        };
+
+        let refuted = run(&group(vec![obligation]));
+        assert!(
+            trust_wp_ay::is_withheld_refutation(&refuted),
+            "a refutation over an unstated condition is withheld, got {refuted:?}"
+        );
+        let proved = run(&group(vec![PureExpr::Bool(true)]));
+        assert!(
+            matches!(proved, trust_wp_ay::VerificationResult::Verified(_)),
+            "withholding never touches a proof, got {proved:?}"
+        );
+    }
+
+    /// A group whose obligation reads a name a store before the loop changed,
+    /// under a precondition about its entry value, withholds its refutation;
+    /// one whose obligation reads no such name keeps it
+    /// (loop_call_obligation_after_param_store_{control,false}).
+    #[test]
+    fn a_group_over_a_stale_entry_value_withholds_its_refutation() {
+        let entry_fact = binop(var("a", None), BinOp::Eq, PureExpr::Int(0));
+        let reads_a = binop(var("a", None), BinOp::Eq, PureExpr::Int(7));
+        let reads_i = binop(var("i", None), BinOp::Gt, PureExpr::Int(5));
+        let run = |obligation: &PureExpr| {
+            let group = LoopObligationGroup {
+                loop_index: Some(0),
+                condition_unstated: None,
+                pre_loop_stored_names: std::collections::HashSet::from(["a".to_string()]),
+                unstated_entry_values: Default::default(),
+                injected_fail_closed: false,
+                assumptions: Vec::new(),
+                obligations: vec![obligation.clone()],
+                condition: None,
+            };
+            let ctx = LoopCallObligationContext {
+                base_requires: std::slice::from_ref(&entry_fact),
+                pre_loop_assumptions: &[],
+                per_loop_invariants: &[],
+                pre_loop_obligations: &[],
+                loop_obligation_groups: std::slice::from_ref(&group),
+                logic_fns_opt: None,
+                mode_overrides_opt: None,
+                type_invariants_opt: None,
+                type_constants_opt: None,
+                adt_decls_opt: None,
+                adt_field_ranges_opt: None,
+                track_level: trust_wp_core::TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+            };
+            super::verify_loop_call_obligations(&ctx).expect("loop-group obligation should encode")
+        };
+
+        let stale = run(&reads_a);
+        assert!(
+            trust_wp_ay::is_withheld_refutation(&stale),
+            "a refutation over a stale entry value is withheld, got {stale:?}"
+        );
+        let independent = run(&reads_i);
+        assert!(
+            matches!(independent, trust_wp_ay::VerificationResult::Failed(_)),
+            "a refutation no premise links to the store stands, got {independent:?}"
+        );
+    }
+
+    /// A group whose obligation reads a havoc the arithmetic walk bound for a
+    /// local no loop writes withholds its refutation: the model picks the
+    /// value code before the loop fixed. An obligation over the loop counter
+    /// alone keeps its refutation (loop_overflow_after_param_store_control,
+    /// loop_overflow_loop_written_local_false).
+    #[test]
+    fn a_group_over_an_unstated_entry_value_withholds_its_refutation() {
+        let havoc = "__trust_wp_arith_havoc_1_8";
+        let no_overflow = binop(
+            binop(var(havoc, None), BinOp::Add, PureExpr::Int(1)),
+            BinOp::Le,
+            PureExpr::Int(4_294_967_295),
+        );
+        let reads_i = binop(var("i", None), BinOp::Gt, PureExpr::Int(5));
+        let run = |obligation: &PureExpr, unstated: &[&str]| {
+            let group = LoopObligationGroup {
+                loop_index: Some(0),
+                condition_unstated: None,
+                pre_loop_stored_names: Default::default(),
+                unstated_entry_values: unstated.iter().map(|name| name.to_string()).collect(),
+                injected_fail_closed: false,
+                assumptions: Vec::new(),
+                obligations: vec![obligation.clone()],
+                condition: None,
+            };
+            let ctx = LoopCallObligationContext {
+                base_requires: &[],
+                pre_loop_assumptions: &[],
+                per_loop_invariants: &[],
+                pre_loop_obligations: &[],
+                loop_obligation_groups: std::slice::from_ref(&group),
+                logic_fns_opt: None,
+                mode_overrides_opt: None,
+                type_invariants_opt: None,
+                type_constants_opt: None,
+                adt_decls_opt: None,
+                adt_field_ranges_opt: None,
+                track_level: trust_wp_core::TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+            };
+            super::verify_loop_call_obligations(&ctx).expect("loop-group obligation should encode")
+        };
+
+        let unstated = run(&no_overflow, &[havoc]);
+        assert!(
+            trust_wp_ay::is_withheld_refutation(&unstated),
+            "a refutation over a value the VC leaves free is withheld, got {unstated:?}"
+        );
+        let loop_written = run(&no_overflow, &[]);
+        assert!(
+            matches!(loop_written, trust_wp_ay::VerificationResult::Failed(_)),
+            "a havoc for a loop-written local keeps its refutation, got {loop_written:?}"
+        );
+        let independent = run(&reads_i, &[havoc]);
+        assert!(
+            matches!(independent, trust_wp_ay::VerificationResult::Failed(_)),
+            "a refutation that reads no such havoc stands, got {independent:?}"
+        );
+    }
+
+    /// A marker the loop body walk injected under its path (`i < 3 ⇒ false`)
+    /// is refuted by every model that reaches it, so its refutation is
+    /// withheld whether the group says it holds one or the verdict gate reads
+    /// the guarded `false` itself (D-141). A goal that is no marker keeps its
+    /// refutation.
+    #[test]
+    fn a_group_holding_a_guarded_marker_withholds_its_refutation() {
+        let marker = binop(
+            binop(var("i", None), BinOp::Lt, PureExpr::Int(3)),
+            BinOp::Implies,
+            PureExpr::Bool(false),
+        );
+        let run = |injected_fail_closed: bool, goal: &PureExpr| {
+            let group = LoopObligationGroup {
+                loop_index: Some(0),
+                condition_unstated: None,
+                pre_loop_stored_names: Default::default(),
+                unstated_entry_values: Default::default(),
+                injected_fail_closed,
+                assumptions: Vec::new(),
+                obligations: vec![goal.clone()],
+                condition: None,
+            };
+            let ctx = LoopCallObligationContext {
+                base_requires: &[],
+                pre_loop_assumptions: &[],
+                per_loop_invariants: &[],
+                pre_loop_obligations: &[],
+                loop_obligation_groups: std::slice::from_ref(&group),
+                logic_fns_opt: None,
+                mode_overrides_opt: None,
+                type_invariants_opt: None,
+                type_constants_opt: None,
+                adt_decls_opt: None,
+                adt_field_ranges_opt: None,
+                track_level: trust_wp_core::TrackLevel::Auto,
+                timeout: Some(Duration::from_secs(5)),
+            };
+            super::verify_loop_call_obligations(&ctx).expect("loop-group obligation should encode")
+        };
+        for injected in [true, false] {
+            let outcome = run(injected, &marker);
+            assert!(
+                trust_wp_ay::is_withheld_refutation(&outcome),
+                "a refutation of a guarded marker is withheld (flag {injected}), got {outcome:?}"
+            );
+        }
+        let goal = binop(var("i", None), BinOp::Lt, PureExpr::Int(3));
+        let refuted = run(false, &goal);
+        assert!(
+            matches!(refuted, trust_wp_ay::VerificationResult::Failed(_)),
+            "a goal that is no marker keeps its refutation, got {refuted:?}"
         );
     }
 }

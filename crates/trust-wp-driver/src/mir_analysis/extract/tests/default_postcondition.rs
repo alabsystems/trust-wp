@@ -58,6 +58,8 @@ impl Callbacks for TakeDefaultCallbacks {
 
 fn generic_take_spec() -> StdSpec {
     StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "result == old(*dest)".to_string(),
@@ -268,6 +270,8 @@ fn specialize_default_i32_gives_zero() {
 
                 // Use a non-mem::take spec with Default::default() placeholder
                 let mut spec = StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec![
                         "result == old(*x)".to_string(),
@@ -353,6 +357,8 @@ fn specialize_default_u64_gives_zero() {
                 };
 
                 let mut spec = StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["(^dest) == Default::default()".to_string()],
                     param_names: Some(vec!["dest".to_string()]),
@@ -429,6 +435,8 @@ fn specialize_default_string_gives_empty_seq() {
                 };
 
                 let mut spec = StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["(^dest) == Default::default()".to_string()],
                     param_names: Some(vec!["dest".to_string()]),

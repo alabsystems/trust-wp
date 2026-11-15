@@ -57,13 +57,13 @@ pub(super) struct PipelineContext<'encoder, 'data> {
 pub(super) struct PipelineOptions<'a, 'data> {
     /// Expressions providing additional sort-inference context for the encoder.
     pub(super) context_exprs: &'a [&'data PureExpr],
-    /// Mut-borrow final-state bindings used to ground raw postconditions.
+    /// Mut-borrow final-state bindings that ground raw postconditions.
     pub(super) mut_borrow_final_values: Option<&'a HashMap<String, PureExpr>>,
     /// Mut-borrow parameters whose final state is constrained by call assumptions.
     pub(super) mutation_continued_params: Option<&'a HashSet<String>>,
     /// Debug prefix for closure capture projection messages.
     pub(super) closure_capture_debug_prefix: &'a str,
-    /// Debug label for axiom-only function detection messages.
+    /// Debug label naming the verification path in solve messages.
     pub(super) axiom_debug_label: &'a str,
     /// Optional callback to re-verify from a fresh encoder base when the
     /// primary solve returns Unknown.
@@ -157,6 +157,9 @@ where
         logic_ground_mode,
         bitwise_proof,
         local_unfolding_logic_fns: _,
+        // The verdict gate at the public boundary owns this flag; the pipeline
+        // encodes the goals it was given either way.
+        injected_fail_closed_goal: _,
     } = base;
     let track = track.unwrap_or_default();
     let pre_setup_snapshot = driver_snapshot
@@ -198,8 +201,8 @@ where
     // Use the post-bootstrap snapshot (after sort hints / logic fn decls /
     // type invariant registration, but BEFORE precondition encoding) so that
     // only bootstrap false-positive increments are absorbed into the baseline.
-    // Previously this used the full post-setup snapshot, which also absorbed
-    // real precondition-phase increments for SortFallbackToIntFromLogicFn. (#2623)
+    // A post-setup snapshot (after preconditions) would also absorb real
+    // precondition-phase increments for SortFallbackToIntFromLogicFn. (#2623)
     let demotion_baseline = super::merge_pre_verification_and_post_bootstrap_snapshots(
         &pre_setup_snapshot,
         &setup_result.post_bootstrap_snapshot,
@@ -221,8 +224,7 @@ where
             // witness in `such_that.rs`) can produce Int-sorted terms when
             // sort inference loses the Bool context through Deref+MethodCall.
             // Coercing through `!= 0` recovers the right Bool truth value
-            // because Bool is encoded as 0/1 Int. (#5, design
-            // 2026-05-19-such-that-strict-pass-residual.md Gap 1 §1)
+            // because Bool is encoded as 0/1 Int. (#5)
             let bool_term = encoder.coerce_bool_operand(term);
             encoder.assert_term(bool_term);
         }
@@ -294,8 +296,8 @@ where
     // prove them: substitute the trivial goal `true` so the standard slice
     // machinery checks `NOT(true AND obligations)` — i.e. the obligations
     // themselves — instead of returning the empty-obligation-set proof.
-    // Previously `#[ensures(true)]` over `1u8 >> 8` verified through this
-    // shortcut without ever consulting the collected obligations.
+    // Without this substitution `#[ensures(true)]` over `1u8 >> 8` verifies
+    // through the shortcut without ever consulting the collected obligations.
     let trivial_obligation_goal_storage: [PureExpr; 1];
     let ensures: &[PureExpr] = if ensures.is_empty() && !body_div_obligations.is_empty() {
         trivial_obligation_goal_storage = [PureExpr::Bool(true)];
@@ -318,27 +320,11 @@ where
         return Ok((result, provenance));
     }
 
-    if super::function::is_axiom_only_function(
-        requires,
-        ensures,
-        return_expr,
-        type_invariants,
-        ghost_context,
-        effective_logic_fns,
-    ) {
-        let reason = format!(
-            "axiom-only function: {} universal postcondition(s) with trivial body",
-            ensures.len()
-        );
-
-        debug!(
-            "  axiom-only {} detected: {reason} — \
-                 returning Assumed (#1753, #2365)",
-            options.axiom_debug_label,
-        );
-
-        return Ok((VerificationResult::Assumed(reason), None));
-    }
+    // A trivial body under universal postconditions is still an obligation:
+    // the ensures must follow from the theories its symbols are bound to, and
+    // Creusot discharges exactly this goal (`vc_f` of specification/forall.rs).
+    // Reporting it `Assumed` without a query proved nothing and left the
+    // universal live as an axiom (trivial_body_universal_false).
 
     debug!("  encoding postconditions, vars: {:?}", encoder.var_names());
     for ensure in ensures {
@@ -409,6 +395,7 @@ where
         mutation_continued_params: options.mutation_continued_params,
         body_div_obligations: &body_div_obligations,
         fresh_base_recheck: options.fresh_base_recheck,
+        literal_false_base_recheck: options.literal_false_base_recheck,
         slice_length_stable_vars: options.slice_length_stable_vars,
         base_recheck_pathology: std::cell::Cell::new(false),
     };
@@ -423,8 +410,8 @@ where
     }
     let per_slice_budget = if slices.len() > 1 {
         // Per-slice ground pool budget (#2674): distribute the global budget
-        // across obligation slices with a floor of 30 (reduced from 50).
-        // The floor reduction is safe because:
+        // across obligation slices with a floor of 30. A floor this low is safe
+        // because:
         // 1. The axiom-free probe (Phase 1) resolves simple obligations before
         //    ground pool instances are needed.
         // 2. Contract-critical axioms bypass the budget gate (#1296).
@@ -463,7 +450,17 @@ where
     // Literal-false obligations only need a satisfiable base witness to become
     // concrete failures. Classify them from a fresh base recheck instead of
     // spending the full obligation solver budget on quantified axiom context.
+    // The structural refutation shape that fired for the slice
+    // whose `Failed` this pipeline will report. A shape is a determination
+    // made from the PROGRAM TEXT, so it survives the injected-goal gate in a
+    // function whose goal set carries a fail-closed marker; a `Failed` that
+    // only a model supports does not. Set once, by the first refuting slice —
+    // the one the aggregate reports.
+    let mut deciding_refutation_shape: Option<&'static str> = None;
     let mut literal_false_result: Option<VerificationResult> = None;
+    // The validated base witness behind a literal-false `Failed`, taken at the
+    // slice that classified it and installed into the aggregate's provenance.
+    let mut literal_false_witness: Option<super::solver_tail::RefutationWitness> = None;
 
     // Adaptive per-function timeout budget (#2674): for functions with multiple
     // obligation slices, track wall-clock time and reduce per-slice solver
@@ -481,16 +478,22 @@ where
     let solve_start = Instant::now();
     super::solver_tail::clear_preferred_verified_solve_evidence();
     let mut proof_assert_certificates = Vec::with_capacity(slices.len());
+    // The first slice whose `Verified` lacks a full certificate, harvested at
+    // its own boundary. An aggregate over that slice is uncertified BECAUSE of
+    // it, so its diagnostics — not a sibling slice's certificate — are what the
+    // aggregate's provenance must report. Reporting only; see
+    // `install_uncertified_slice_diagnostics`.
+    let mut uncertified_slice: Option<UncertifiedSliceDiagnostics> = None;
     let original_solver_timeout = encoder.solver().timeout();
     let function_time_budget = original_solver_timeout.map(|t| {
-        // 1.5× solver timeout for the entire function (#2674): reduced from
-        // 2× to further tighten multi-slice function wall-clock budgets and
-        // fit within the compat harness limit (120s). For a 60s solver timeout,
-        // the budget is 90s. The first obligation slice gets the full solver
-        // timeout; subsequent slices share the remaining budget.
+        // 1.5× solver timeout for the entire function (#2674), so multi-slice
+        // function wall-clock budgets fit within the compat harness limit
+        // (120s). For a 60s solver timeout, the budget is 90s. The first
+        // obligation slice gets the full solver timeout; subsequent slices
+        // share the remaining budget.
         //
         // Combined with budget-aware retry skipping, tight base-recheck
-        // envelopes (15s cap), and the reduced hard-timeout multiplier
+        // envelopes (15s cap), and the hard-timeout multiplier
         // (1.5× + grace), this ensures that a single function cannot exceed
         // the harness wall-clock limit. The hard-timeout envelope (1.5× solver
         // timeout + grace = 90.1s) bounds each individual slice, and the
@@ -502,19 +505,19 @@ where
         // tight 26s envelope) = 90s, matching the budget.
         // For multi-slice: first slice may consume up to 90s of the budget,
         // subsequent slices get minimal timeout (MIN_SLICE_TIMEOUT).
-        // Previously at 2× (120s), this gave multi-slice functions too much
-        // wall-clock time that accumulated across all functions in a file.
+        // A 2× budget (120s) would give multi-slice functions too much
+        // wall-clock time, accumulating across all functions in a file.
         t + t / 2
     });
 
     // Minimum per-slice solver timeout (#2674): never reduce below this
-    // threshold. Reduced from 5s to 3s: the axiom-free probe (500ms)
-    // resolves most simple obligations, and the tiered probe (10s) is
-    // only triggered for solver timeouts >= 15s. At 3s, the solver can
+    // threshold. 3s suffices because the axiom-free probe (500ms)
+    // resolves most simple obligations and the tiered probe (10s) is
+    // only triggered for solver timeouts >= 15s; at 3s the solver can
     // still make meaningful progress on axiom-free obligations while
     // preserving budget for subsequent slices. Combined with the
-    // function time budget reduction (2× from 2.5×), this ensures
-    // multi-slice functions complete within the compat harness limit.
+    // function time budget, this keeps multi-slice functions within
+    // the compat harness limit.
     const MIN_SLICE_TIMEOUT: Duration = Duration::from_secs(3);
 
     for (slice_position, slice) in slices.iter().enumerate() {
@@ -525,6 +528,8 @@ where
         // quantifier-free slice's accepted certificate under the `forall`
         // slice's refusal.)
         encoder.begin_strict_replay_obligation_slice();
+        // A refutation witness belongs to the slice that records it.
+        super::solver_tail::clear_refutation_witness();
         let slice_ordinal = u64::try_from(slice_position).unwrap_or(u64::MAX);
         let prepared_claim = if proof_assert_mode {
             prepared_slice_claims[slice_position].clone()
@@ -779,6 +784,17 @@ where
                     .literal_false_base_recheck
                     .or(options.fresh_base_recheck),
             );
+            super::authority_trace(|| {
+                format!(
+                    "pipeline slice[{}] literal-false classified {} {}",
+                    slice.index,
+                    verification_result_tag(&result),
+                    super::authority_encoder_evidence_tag(&encoder)
+                )
+            });
+            if matches!(result, super::VerificationResult::Failed(_)) {
+                literal_false_witness = super::solver_tail::take_refutation_witness();
+            }
             literal_false_result = Some(result.clone());
             slice_results.push(SliceResult {
                 index: slice.index,
@@ -814,8 +830,18 @@ where
                     result: result.clone(),
                 });
                 if matches!(&result, super::VerificationResult::Failed(_)) {
+                    super::authority_trace(|| {
+                        format!(
+                            "pipeline slice[{}] unconstrained-closure-capture Failed {}",
+                            slice.index,
+                            super::authority_encoder_evidence_tag(&encoder)
+                        )
+                    });
                     encoder.ensure_structural_provenance("unconstrained-closure-capture");
-                    let provenance = Some(encoder.capture_provenance(solve_start.elapsed()));
+                    let mut result = result;
+                    let mut provenance = encoder.capture_provenance(solve_start.elapsed());
+                    install_refutation_witness(&mut result, &mut provenance, &encoder);
+                    let provenance = Some(provenance);
                     profile::emit_pipeline_end(
                         options.axiom_debug_label,
                         slices.len(),
@@ -850,6 +876,9 @@ where
         );
         let slice_wall_start = Instant::now();
 
+        super::solver_tail::begin_preferred_evidence_slice();
+        // No slice inherits a sibling's structural refutation shape.
+        super::solver_tail::clear_last_slice_refutation_shape();
         encoder.push_scope()?;
         let slice_result = slice_verify_fn(
             &mut encoder,
@@ -857,6 +886,9 @@ where
             slice.ensure.as_ref(),
             &shared_ctx,
         );
+        if deciding_refutation_shape.is_none() {
+            deciding_refutation_shape = super::solver_tail::last_slice_refutation_shape();
+        }
 
         // Restore original solver timeout after each slice so the adaptive
         // reduction does not leak into the next iteration's base computation.
@@ -877,6 +909,12 @@ where
                 );
                 if let Some(certificate) = certificate {
                     proof_assert_certificates.push(certificate);
+                }
+                if !proof_assert_mode
+                    && uncertified_slice.is_none()
+                    && verified_without_full_certificate(&result)
+                {
+                    uncertified_slice = Some(harvest_uncertified_slice_diagnostics(&mut encoder));
                 }
                 if let Err(error) = pop_scope_catching_ay_panic(&mut encoder) {
                     if matches!(&result, super::VerificationResult::Failed(_))
@@ -948,8 +986,22 @@ where
                     result,
                 });
                 if let Some(failed_result) = failed_result {
+                    super::authority_trace(|| {
+                        format!(
+                            "pipeline slice[{}] Failed shortcut {}",
+                            slice.index,
+                            super::authority_encoder_evidence_tag(&encoder)
+                        )
+                    });
                     encoder.ensure_structural_provenance("failed-obligation-shortcut");
-                    let provenance = Some(encoder.capture_provenance(solve_start.elapsed()));
+                    let mut failed_result = failed_result;
+                    let mut provenance = encoder.capture_provenance(solve_start.elapsed());
+                    install_refutation_witness(&mut failed_result, &mut provenance, &encoder);
+                    install_refutation_structural_shape(
+                        &failed_result,
+                        &mut provenance,
+                        deciding_refutation_shape,
+                    );
                     profile::emit_pipeline_end(
                         options.axiom_debug_label,
                         slices.len(),
@@ -958,7 +1010,7 @@ where
                     );
                     return Ok((
                         super::demote_if_unsound(&demotion_baseline, failed_result),
-                        provenance,
+                        Some(provenance),
                     ));
                 }
             }
@@ -1033,6 +1085,15 @@ where
                                 &mut provenance,
                                 proof_assert_certificates,
                             );
+                        } else if verified_without_full_certificate(&result) {
+                            super::solver_tail::clear_preferred_verified_solve_evidence();
+                            // The live encoder is gone; the rescued slice is the
+                            // current one, so its own retained solve is the
+                            // fallback when no earlier slice was harvested.
+                            let deciding = uncertified_slice
+                                .take()
+                                .unwrap_or_else(own_slice_preferred_solve_diagnostics);
+                            install_uncertified_slice_diagnostics(&mut provenance, Some(deciding));
                         } else {
                             install_preferred_verified_solve_diagnostics(&mut provenance, &encoder);
                         }
@@ -1085,11 +1146,24 @@ where
     }
     // Capture provenance from the encoder after all slices complete (#2729).
     encoder.ensure_structural_provenance("completed-obligation-slices");
-    let result = obligation_slices::aggregate_slice_results(slice_results);
+    let mut result = obligation_slices::aggregate_slice_results(slice_results);
     let mut provenance = encoder.capture_provenance(solve_start.elapsed());
+    if matches!(result, super::VerificationResult::Failed(_)) {
+        // A literal-false slice's `Failed` reaches the aggregate (later slices
+        // are skipped with the same verdict); its witness was taken at that
+        // slice. Re-arm the slot with it so the installer finds it.
+        if let Some(witness) = literal_false_witness.take() {
+            super::solver_tail::replace_refutation_witness(Some(witness));
+        }
+        install_refutation_witness(&mut result, &mut provenance, &encoder);
+        install_refutation_structural_shape(&result, &mut provenance, deciding_refutation_shape);
+    }
     if matches!(result, super::VerificationResult::Verified(_)) {
         if proof_assert_mode {
             install_proof_assert_certificates(&mut provenance, proof_assert_certificates);
+        } else if verified_without_full_certificate(&result) {
+            super::solver_tail::clear_preferred_verified_solve_evidence();
+            install_uncertified_slice_diagnostics(&mut provenance, uncertified_slice);
         } else {
             install_preferred_verified_solve_diagnostics(&mut provenance, &encoder);
         }
@@ -1165,6 +1239,24 @@ fn authorize_proof_assert_slice(
     }
 
     let diagnostics = super::solver_tail::take_preferred_verified_solve_diagnostics();
+    super::authority_trace(|| match &diagnostics {
+        None => format!("proof_assert ordinal {ordinal}: no preferred verified diagnostics"),
+        Some(d) => format!(
+            "proof_assert ordinal {ordinal}: stats={} native_json={} problem_hash={} \
+             claim_identity_matches={} evidence_unsat={} accepted={}",
+            d.statistics.is_some(),
+            d.native_problem_json.is_some(),
+            d.problem_hash.is_some(),
+            d.claim_identity
+                == Some(super::solver_tail::ProofAssertSliceIdentity::new(
+                    ordinal,
+                    prepared_claim_hash,
+                    normalized_claim_hash,
+                )),
+            d.evidence.result,
+            d.evidence.accepted_for_consumer,
+        ),
+    });
     let certificate = diagnostics.and_then(|diagnostics| {
         let statistics = diagnostics.statistics?;
         let native_problem_json = diagnostics.native_problem_json?;
@@ -1266,6 +1358,182 @@ fn install_preferred_verified_solve_diagnostics(
     provenance.solver_statistics = Some(statistics);
 }
 
+/// Record on the provenance that a structural refutation shape ALSO refuted
+/// the obligation this `Failed` reports.
+///
+/// Diagnostics plus one decision: the injected-goal refutation gate reads
+/// this to tell a violation the program TEXT forces (`ensures(result == x)`
+/// over a body returning `x + 1`, with an unmodelled call beside it) from one
+/// only a model over manufactured values supports (the same contract over a
+/// body that RETURNS the unmodelled call). Never set for a non-`Failed`
+/// verdict.
+fn install_refutation_structural_shape(
+    result: &VerificationResult,
+    provenance: &mut super::VerificationProvenance,
+    shape: Option<&'static str>,
+) {
+    let (VerificationResult::Failed(_), Some(shape)) = (result, shape) else {
+        return;
+    };
+    super::authority_trace(|| format!("refutation also refuted by structural shape `{shape}`"));
+    provenance.refutation_structural_shape = Some(shape.to_string());
+}
+
+/// Back a `Failed` verdict with the validated refutation witness its lane
+/// recorded, when the encoder's own last solve is not already a validated SAT.
+///
+/// The witness (`RefutationWitness`) is taken in the same code region that
+/// produced the `Failed`, so it describes exactly this refutation. Its
+/// evidence/statistics pair replaces the structural placeholder in
+/// `provenance`, its native replay is carried when present, and its model
+/// becomes the counterexample payload when the lane published an empty one
+/// (the clause tag, if any, is kept). Nothing here can create or widen an
+/// accept: it only lets a refutation that a VALIDATED model backs clear the
+/// mandatory refutation-authority boundary instead of being withheld.
+fn install_refutation_witness(
+    result: &mut VerificationResult,
+    provenance: &mut super::VerificationProvenance,
+    encoder: &AYEncoder,
+) {
+    let VerificationResult::Failed(counterexample) = result else {
+        super::solver_tail::clear_refutation_witness();
+        return;
+    };
+    if encoder
+        .last_solve_evidence()
+        .is_some_and(super::solver_tail::evidence_is_validated_sat)
+    {
+        // The live solve already backs this verdict; the witness is redundant.
+        super::solver_tail::clear_refutation_witness();
+        return;
+    }
+    let Some(witness) = super::solver_tail::take_refutation_witness() else {
+        return;
+    };
+    super::authority_trace(|| {
+        format!(
+            "install refutation witness: evidence={} validated={} statistics={} replay={}",
+            witness.evidence.result,
+            witness.evidence.model_validated,
+            witness.statistics.is_some(),
+            witness.native_replay_json.is_some()
+        )
+    });
+    provenance.solve_evidence = Some(witness.evidence);
+    if let Some(statistics) = witness.statistics {
+        provenance.solver_statistics = Some(statistics);
+    }
+    if witness.native_replay_json.is_some() {
+        provenance.native_replay_json = witness.native_replay_json;
+    }
+    if counterexample.values.is_empty() {
+        counterexample.values = witness.counterexample.values;
+    }
+}
+
+/// What one slice's own solve measured, for an aggregate it left uncertified.
+#[derive(Debug, Clone)]
+struct UncertifiedSliceDiagnostics {
+    evidence: Option<crate::shared_types::SolveEvidenceSnapshot>,
+    statistics: Option<crate::shared_types::SolveStatisticsSnapshot>,
+    strict_replay: Option<crate::shared_types::StrictProofReplayObservation>,
+}
+
+/// `Verified` without a fully verified certificate: the mandatory authority
+/// boundary will demote it to `Unknown(ProofTrusted)`.
+fn verified_without_full_certificate(result: &VerificationResult) -> bool {
+    match result {
+        VerificationResult::Verified(None) => true,
+        VerificationResult::Verified(Some(summary)) => !summary.is_fully_verified(),
+        _ => false,
+    }
+}
+
+/// Harvest a slice's diagnostics at its own boundary, before any sibling slice
+/// solves. The strict-replay observation is taken only if it is bound to this
+/// slice's current scope AND was refused; an accepted one is never carried.
+///
+/// Evidence comes from the preferred-evidence slot when THIS slice wrote it
+/// (its own accepted UNSAT, recorded before any base/vacuity recheck), else
+/// from the encoder cache. Evidence claiming an UNSAT proof artifact is never
+/// reported for an uncertified slice: whatever it certified, it was not this
+/// verdict.
+fn harvest_uncertified_slice_diagnostics(encoder: &mut AYEncoder) -> UncertifiedSliceDiagnostics {
+    let strict_replay = encoder.take_refused_strict_replay_observation_for_current_scope();
+    let own = own_slice_preferred_solve_diagnostics();
+    let (evidence, statistics) = if own.evidence.is_some() {
+        (own.evidence, own.statistics)
+    } else {
+        (
+            encoder.last_solve_evidence().cloned(),
+            encoder.last_solve_statistics().cloned(),
+        )
+    };
+    let (evidence, statistics) = without_proof_claiming_evidence(evidence, statistics);
+    UncertifiedSliceDiagnostics {
+        evidence,
+        statistics,
+        strict_replay,
+    }
+}
+
+/// The current slice's own retained solve, without an encoder (the hard-timeout
+/// rescue path has lost the live one).
+fn own_slice_preferred_solve_diagnostics() -> UncertifiedSliceDiagnostics {
+    let (evidence, statistics) =
+        super::solver_tail::clone_preferred_verified_solve_diagnostics_for_current_slice()
+            .map_or((None, None), |diagnostics| {
+                (Some(diagnostics.evidence), diagnostics.statistics)
+            });
+    let (evidence, statistics) = without_proof_claiming_evidence(evidence, statistics);
+    UncertifiedSliceDiagnostics {
+        evidence,
+        statistics,
+        strict_replay: None,
+    }
+}
+
+fn without_proof_claiming_evidence(
+    evidence: Option<crate::shared_types::SolveEvidenceSnapshot>,
+    statistics: Option<crate::shared_types::SolveStatisticsSnapshot>,
+) -> (
+    Option<crate::shared_types::SolveEvidenceSnapshot>,
+    Option<crate::shared_types::SolveStatisticsSnapshot>,
+) {
+    match evidence {
+        Some(evidence) if !evidence.verification.unsat_proof_available => {
+            (Some(evidence), statistics)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Report an uncertified aggregate by the slice that left it uncertified.
+///
+/// Before this, the aggregate's provenance kept whatever the encoder cached
+/// last — typically a LATER sibling slice's accepted strict replay — so the
+/// diagnostic line printed `unsat_proof_available=true
+/// verification_level=FullyVerified` beside `reason=proof-trusted`
+/// (`vector/09_capacity::change_capacity`, `closures/13_ref_box::test7`,
+/// `cc/seq::g`), pointing work at a certificate that was never missing.
+///
+/// Reporting only, and only in the refusing direction: the verdict is already
+/// certificate-free, so the boundary demotes it regardless, and the
+/// `Verified`-only evidence-gap checks never read an `Unknown`. With no
+/// harvested slice the fields are cleared rather than left describing a
+/// different query.
+fn install_uncertified_slice_diagnostics(
+    provenance: &mut super::VerificationProvenance,
+    deciding: Option<UncertifiedSliceDiagnostics>,
+) {
+    let (evidence, statistics, strict_replay) = deciding.map_or((None, None, None), |d| {
+        (d.evidence, d.statistics, d.strict_replay)
+    });
+    provenance.solve_evidence = evidence;
+    provenance.solver_statistics = statistics;
+    provenance.strict_proof_replay = strict_replay;
+}
+
 fn install_proof_assert_certificates(
     provenance: &mut super::VerificationProvenance,
     certificates: Vec<ProofAssertSliceCertificate>,
@@ -1344,18 +1612,24 @@ fn literal_false_after_verified_slice_result(
         // The fresh-base recheck reports Verified when the base context is
         // satisfiable. Since this slice's postcondition is literally false,
         // a satisfiable base is a real counterexample, not a proof.
-        Ok(VerificationResult::Verified(_)) => {
-            VerificationResult::Failed(super::Counterexample::empty())
-        }
-        Ok(VerificationResult::Unknown(reason)) if is_solver_limited_unknown(&reason) => {
+        Ok(VerificationResult::Verified(_)) => crate::verify::structural_failed_traced(),
+        Ok(VerificationResult::Unknown(reason)) => {
             // A literal `false` postcondition can only verify if the base is
-            // contradictory. If a fresh base probe cannot decide only because
-            // of solver resource limits, report the conservative failure
-            // instead of letting a quantified/timeout tail hide the concrete
-            // false obligation.
-            VerificationResult::Failed(super::Counterexample::empty())
+            // contradictory. When the fresh base probe cannot decide -- for a
+            // solver resource limit or anything else -- we do NOT know whether
+            // a reachable state exists, so there is no counterexample to
+            // report.
+            //
+            // Publishing `Failed(Counterexample::empty())` here for a
+            // solver-LIMITED unknown would not be conservative: a timeout on
+            // the base probe would print as `FAILED (counterexample)` with
+            // `ay_result=none`, asserting a refutation nothing computed
+            // (`partially_opaque`'s `g`, whose base probe hard-times out).
+            // Inconclusive is the honest verdict and is equally fail-closed --
+            // `Unknown` counts as an error, never as verified, and keeps the
+            // crate's exit non-zero.
+            VerificationResult::Unknown(reason)
         }
-        Ok(VerificationResult::Unknown(reason)) => VerificationResult::Unknown(reason),
         Ok(VerificationResult::Failed(counterexample)) => {
             VerificationResult::Failed(counterexample)
         }
@@ -1459,12 +1733,11 @@ fn failed_after_satisfiable_or_limited_base_result(
     };
 
     match fresh_base_recheck() {
-        Ok(VerificationResult::Verified(_)) => {
-            VerificationResult::Failed(super::Counterexample::empty())
-        }
-        Ok(VerificationResult::Unknown(reason)) if is_solver_limited_unknown(&reason) => {
-            VerificationResult::Failed(super::Counterexample::empty())
-        }
+        Ok(VerificationResult::Verified(_)) => crate::verify::structural_failed_traced(),
+        // A base probe that could not decide -- for a solver resource limit or
+        // anything else -- establishes NO reachable violating state, so there
+        // is no counterexample to report. See the twin comment in
+        // `literal_false_after_verified_slice_result`.
         Ok(VerificationResult::Unknown(reason)) => VerificationResult::Unknown(reason),
         Ok(VerificationResult::Failed(counterexample)) => {
             VerificationResult::Failed(counterexample)
@@ -1636,6 +1909,14 @@ fn bound_or_free_var_names_match(left: &str, right: &str, binders: &[(&str, &str
     !right_is_bound && left == right
 }
 
+/// True for an `Unknown` that names a solver RESOURCE limit rather than a
+/// semantic gap.
+///
+/// Not consulted by the literal-`false` / satisfiable-base classifiers: a
+/// solver-limited unknown there must stay `Unknown`, because turning it into
+/// `Failed(Counterexample::empty())` would publish a refutation nothing had
+/// computed. Kept as the named predicate for the distinction itself.
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_solver_limited_unknown(reason: &super::UnknownReason) -> bool {
     matches!(
         reason,
@@ -1697,8 +1978,11 @@ mod tests {
         PureExpr::BinOp(Arc::new(lhs), BinOp::Implies, Arc::new(rhs))
     }
 
+    /// An UNDECIDED base probe buys no counterexample, and it must not buy a
+    /// proof either: the literal-`false` slice stays inconclusive, carrying the
+    /// probe's own reason so the diagnostic names what actually happened.
     #[test]
-    fn literal_false_solver_limited_base_is_conservative_failure() {
+    fn literal_false_solver_limited_base_is_inconclusive_not_a_refutation() {
         let recheck: Box<FreshBaseRecheckFn<'_>> = Box::new(|| {
             Ok(VerificationResult::Unknown(
                 super::super::UnknownReason::QuantifierUnhandled,
@@ -1708,13 +1992,18 @@ mod tests {
         let result = literal_false_after_verified_slice_result(Some(recheck.as_ref()));
 
         assert!(
-            matches!(result, VerificationResult::Failed(_)),
-            "quantifier-limited base probe should not mask literal false: {result:?}"
+            matches!(
+                result,
+                VerificationResult::Unknown(super::super::UnknownReason::QuantifierUnhandled)
+            ),
+            "a quantifier-limited base probe computed no counterexample, so the literal-false              slice must report the probe's own inconclusive reason: {result:?}"
         );
     }
 
+    /// The `partially_opaque::g` shape: a hard-timed-out base probe must not
+    /// publish the slice as `FAILED (counterexample)` with `ay_result=none`.
     #[test]
-    fn literal_false_timeout_base_is_conservative_failure() {
+    fn literal_false_timeout_base_is_inconclusive_not_a_refutation() {
         let recheck: Box<FreshBaseRecheckFn<'_>> = Box::new(|| {
             Ok(VerificationResult::Unknown(
                 super::super::UnknownReason::Timeout,
@@ -1724,8 +2013,27 @@ mod tests {
         let result = literal_false_after_verified_slice_result(Some(recheck.as_ref()));
 
         assert!(
+            matches!(
+                result,
+                VerificationResult::Unknown(super::super::UnknownReason::Timeout)
+            ),
+            "a timed-out base probe refutes nothing: the literal-false slice must report the              timeout, never a counterexample: {result:?}"
+        );
+    }
+
+    /// The honest half, pinned in the same place: a base probe that DECIDED the
+    /// base satisfiable still refutes the literal-`false` slice. The gate above
+    /// must never become "withhold everything".
+    #[test]
+    fn literal_false_satisfiable_base_still_refutes() {
+        let recheck: Box<FreshBaseRecheckFn<'_>> =
+            Box::new(|| Ok(VerificationResult::Verified(None)));
+
+        let result = literal_false_after_verified_slice_result(Some(recheck.as_ref()));
+
+        assert!(
             matches!(result, VerificationResult::Failed(_)),
-            "timeout base probe should not mask literal false: {result:?}"
+            "a satisfiable base makes the literal-false slice a real counterexample: {result:?}"
         );
     }
 
@@ -1785,5 +2093,305 @@ mod tests {
             &[requirement],
             &postcondition
         ));
+    }
+}
+
+#[cfg(test)]
+mod refutation_witness_tests {
+    use std::time::Duration;
+
+    use super::{
+        super::{
+            solver_tail, types, Counterexample, CounterexampleType, CounterexampleValue,
+            VerificationOutcome, VerificationProvenance,
+        },
+        *,
+    };
+    use crate::shared_types::{
+        SolveEvidenceSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
+        SolveVerificationLevelSnapshot, SolveVerificationSnapshot,
+    };
+
+    fn validated_sat_evidence() -> SolveEvidenceSnapshot {
+        SolveEvidenceSnapshot {
+            result: "sat".to_string(),
+            model_validated: true,
+            accepted_for_consumer: true,
+            consumer_rejection: None,
+            verification: SolveVerificationSnapshot::default(),
+            verification_level: SolveVerificationLevelSnapshot::Unknown,
+            resource_usage: SolveResourceSnapshot::default(),
+        }
+    }
+
+    fn structural_failed_outcome(
+        encoder: &mut AYEncoder,
+    ) -> (VerificationResult, VerificationProvenance) {
+        encoder.ensure_structural_provenance("test-structural");
+        let provenance = encoder.capture_provenance(Duration::ZERO);
+        (
+            VerificationResult::Failed(Counterexample::empty()),
+            provenance,
+        )
+    }
+
+    /// A structural `Failed` whose lane recorded a validated witness is
+    /// published with that witness's evidence and model — and nothing else
+    /// about the verdict changes.
+    #[test]
+    fn witness_replaces_structural_placeholder_on_failed() {
+        let mut encoder = AYEncoder::new();
+        let (mut result, mut provenance) = structural_failed_outcome(&mut encoder);
+        assert_eq!(
+            provenance
+                .solve_evidence
+                .as_ref()
+                .map(|e| e.result.as_str()),
+            Some("trust-wp-structural-provenance")
+        );
+        let mut counterexample = Counterexample::empty();
+        counterexample.values.push(CounterexampleValue {
+            name: "x".to_string(),
+            value: CounterexampleType::Bool(true),
+            origin: None,
+        });
+        solver_tail::replace_refutation_witness(Some(solver_tail::RefutationWitness {
+            counterexample,
+            evidence: validated_sat_evidence(),
+            statistics: Some(SolveStatisticsSnapshot::default()),
+            native_replay_json: Some("{}".to_string()),
+        }));
+
+        install_refutation_witness(&mut result, &mut provenance, &encoder);
+
+        let VerificationResult::Failed(counterexample) = &result else {
+            panic!("verdict must stay Failed: {result:?}");
+        };
+        assert_eq!(counterexample.values.len(), 1);
+        let evidence = provenance.solve_evidence.expect("evidence installed");
+        assert!(evidence.model_validated && evidence.accepted_for_consumer);
+        assert_eq!(evidence.result, "sat");
+        assert_eq!(provenance.native_replay_json.as_deref(), Some("{}"));
+        assert!(solver_tail::take_refutation_witness().is_none());
+    }
+
+    /// No witness: the structural placeholder stays, so the authority boundary
+    /// withholds the verdict exactly as before.
+    #[test]
+    fn no_witness_leaves_the_structural_placeholder() {
+        solver_tail::clear_refutation_witness();
+        let mut encoder = AYEncoder::new();
+        let (mut result, mut provenance) = structural_failed_outcome(&mut encoder);
+        install_refutation_witness(&mut result, &mut provenance, &encoder);
+        assert_eq!(
+            provenance
+                .solve_evidence
+                .as_ref()
+                .map(|e| e.result.as_str()),
+            Some("trust-wp-structural-provenance")
+        );
+        let outcome = VerificationOutcome::new(result, Some(provenance));
+        assert!(types::refutation_evidence_gap_reason(&outcome).is_some());
+    }
+
+    /// A witness never touches a non-`Failed` verdict; it is dropped.
+    #[test]
+    fn witness_is_dropped_for_non_failed_verdicts() {
+        let mut encoder = AYEncoder::new();
+        encoder.ensure_structural_provenance("test-structural");
+        let mut provenance = encoder.capture_provenance(Duration::ZERO);
+        let mut result = VerificationResult::Verified(None);
+        solver_tail::replace_refutation_witness(Some(solver_tail::RefutationWitness {
+            counterexample: Counterexample::empty(),
+            evidence: validated_sat_evidence(),
+            statistics: None,
+            native_replay_json: None,
+        }));
+        install_refutation_witness(&mut result, &mut provenance, &encoder);
+        assert!(matches!(result, VerificationResult::Verified(None)));
+        assert_eq!(
+            provenance
+                .solve_evidence
+                .as_ref()
+                .map(|e| e.result.as_str()),
+            Some("trust-wp-structural-provenance")
+        );
+        assert!(solver_tail::take_refutation_witness().is_none());
+    }
+}
+
+#[cfg(test)]
+mod uncertified_slice_diagnostics_tests {
+    use ay_dpll::api::{SolveResult, Sort};
+
+    use super::*;
+
+    fn proved_unsat_encoder() -> AYEncoder {
+        let mut encoder = AYEncoder::new_pure();
+        encoder.begin_strict_replay_obligation();
+        encoder.begin_strict_replay_obligation_slice();
+        let x = encoder.solver_mut().declare_const("x", Sort::Int);
+        let zero = encoder.solver_mut().int_const(0);
+        let pos = encoder.solver_mut().gt(x, zero);
+        encoder.assert_term(pos);
+        let neg = encoder.solver_mut().lt(x, zero);
+        encoder.assert_term(neg);
+        assert_eq!(encoder.check_sat(), SolveResult::unsat());
+        encoder
+    }
+
+    /// A real observation of this stack, relabelled as ay's refusal.
+    fn refused_observation(
+        encoder: &mut AYEncoder,
+    ) -> crate::shared_types::StrictProofReplayObservation {
+        assert!(encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .is_some());
+        let mut observation = encoder
+            .capture_provenance(Duration::ZERO)
+            .strict_proof_replay
+            .expect("own-scope observation");
+        observation.authority_accepted = false;
+        observation.unknown_reason = Some("proof_trusted".to_string());
+        observation
+    }
+
+    #[test]
+    fn only_certificate_free_verdicts_count_as_uncertified() {
+        let mut encoder = proved_unsat_encoder();
+        let summary = encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .expect("certified");
+        assert!(summary.is_fully_verified());
+        assert!(!verified_without_full_certificate(
+            &VerificationResult::Verified(Some(summary))
+        ));
+        assert!(verified_without_full_certificate(
+            &VerificationResult::Verified(None)
+        ));
+        assert!(!verified_without_full_certificate(
+            &VerificationResult::Unknown(crate::verify::UnknownReason::Timeout)
+        ));
+    }
+
+    #[test]
+    fn an_accepted_observation_is_never_harvested_as_the_deciding_refusal() {
+        let mut encoder = proved_unsat_encoder();
+        assert!(encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .is_some());
+        let harvested = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert!(
+            harvested.strict_replay.is_none(),
+            "a certificate must never be reported beside a verdict it did not certify"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_harvested_only_by_the_slice_that_produced_it() {
+        let mut encoder = proved_unsat_encoder();
+        let refused = refused_observation(&mut encoder);
+
+        encoder.set_strict_proof_replay_observation_for_test(refused.clone());
+        let own = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert_eq!(own.strict_replay, Some(refused.clone()));
+
+        encoder.set_strict_proof_replay_observation_for_test(refused);
+        encoder.begin_strict_replay_obligation_slice();
+        let sibling = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert!(
+            sibling.strict_replay.is_none(),
+            "a sibling slice's refusal must not be attributed to this slice"
+        );
+    }
+
+    fn preferred_slot_with(
+        evidence: crate::shared_types::SolveEvidenceSnapshot,
+    ) -> super::super::solver_tail::PreferredVerifiedSolveDiagnostics {
+        super::super::solver_tail::PreferredVerifiedSolveDiagnostics {
+            evidence,
+            statistics: None,
+            claim_identity: None,
+            problem_hash: None,
+            native_problem_json: None,
+            slice_generation:
+                super::super::solver_tail::current_preferred_evidence_slice_generation(),
+        }
+    }
+
+    #[test]
+    fn harvest_reads_only_this_slices_retained_evidence() {
+        let mut encoder = proved_unsat_encoder();
+        let cache_evidence = encoder.last_solve_evidence().cloned().expect("cache");
+        let mut own = cache_evidence.clone();
+        own.result = "unsat (own slice marker)".to_string();
+
+        super::super::solver_tail::begin_preferred_evidence_slice();
+        super::super::solver_tail::replace_preferred_verified_solve_diagnostics(Some(
+            preferred_slot_with(own.clone()),
+        ));
+        let same_slice = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert_eq!(same_slice.evidence, Some(own.clone()));
+
+        // Next slice: the slot is now a SIBLING's and must not be reported.
+        super::super::solver_tail::begin_preferred_evidence_slice();
+        let sibling = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert_eq!(sibling.evidence, Some(cache_evidence));
+        assert!(own_slice_preferred_solve_diagnostics().evidence.is_none());
+        super::super::solver_tail::clear_preferred_verified_solve_evidence();
+    }
+
+    #[test]
+    fn harvest_never_reports_proof_claiming_evidence_for_an_uncertified_slice() {
+        let mut encoder = proved_unsat_encoder();
+        let mut certified = encoder.last_solve_evidence().cloned().expect("cache");
+        certified.verification.unsat_proof_available = true;
+
+        super::super::solver_tail::begin_preferred_evidence_slice();
+        super::super::solver_tail::replace_preferred_verified_solve_diagnostics(Some(
+            preferred_slot_with(certified),
+        ));
+        assert!(own_slice_preferred_solve_diagnostics().evidence.is_none());
+
+        // And the cache fallback is filtered the same way after an accepted replay.
+        super::super::solver_tail::clear_preferred_verified_solve_evidence();
+        assert!(encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .is_some());
+        let harvested = harvest_uncertified_slice_diagnostics(&mut encoder);
+        assert!(harvested.evidence.is_none());
+        assert!(harvested.statistics.is_none());
+    }
+
+    #[test]
+    fn an_uncertified_aggregate_does_not_report_a_sibling_certificate() {
+        let mut encoder = proved_unsat_encoder();
+        // The deciding slice's own incremental UNSAT carries no proof artifact.
+        let deciding = harvest_uncertified_slice_diagnostics(&mut encoder);
+        let deciding_evidence = deciding.evidence.clone().expect("deciding evidence");
+        assert!(!deciding_evidence.verification.unsat_proof_available);
+
+        // A sibling slice certifies, so the encoder now caches ITS authority.
+        assert!(encoder
+            .authorize_current_stack_unsat_with_strict_proof()
+            .is_some());
+        let mut provenance = encoder.capture_provenance(Duration::ZERO);
+        assert!(
+            provenance
+                .solve_evidence
+                .as_ref()
+                .expect("sibling evidence")
+                .verification
+                .unsat_proof_available
+        );
+
+        install_uncertified_slice_diagnostics(&mut provenance, Some(deciding));
+        assert_eq!(provenance.solve_evidence, Some(deciding_evidence));
+        assert!(provenance.strict_proof_replay.is_none());
+
+        let mut provenance = encoder.capture_provenance(Duration::ZERO);
+        install_uncertified_slice_diagnostics(&mut provenance, None);
+        assert!(provenance.solve_evidence.is_none());
+        assert!(provenance.solver_statistics.is_none());
     }
 }

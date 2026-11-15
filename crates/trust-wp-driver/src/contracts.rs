@@ -46,6 +46,16 @@ pub(crate) struct FunctionContract {
     /// If this method implements a trait method, the trait's DefId and method name.
     /// Used to look up inherited contracts from trait declarations.
     pub(crate) trait_origin: Option<TraitOrigin>,
+    /// This entry exists ONLY because the body builds a closure whose captures
+    /// hold a type-invariant grant, and somebody must pay for it.
+    ///
+    /// Such a body writes no clause, so a `verified` verdict for it would
+    /// claim what `partial_verdict` refuses to claim for any clause-free body.
+    /// It therefore gets no verdict at all when every obligation discharges:
+    /// the capture obligation is still raised and still refutes, and a verdict
+    /// that is not `verified` is still reported. Discovery sets this only for
+    /// entries no other lane had already claimed.
+    pub(crate) capture_owner_only: bool,
 }
 
 /// Links an impl method back to its trait declaration.
@@ -59,6 +69,13 @@ pub(crate) struct TraitOrigin {
     pub(crate) trait_def_id: DefId,
     /// Method name on the trait (e.g., "count")
     pub(crate) trait_method_name: String,
+    /// The impl declared no clause of its own and carries the trait method's.
+    ///
+    /// Once the identity registry is installed, such an impl's clauses are
+    /// restated as the trait method's call-site spec instantiated at the impl
+    /// (`restate_inherited_clauses`), so its body owes exactly what a caller
+    /// is handed, resolved in the trait's scope.
+    pub(crate) inherits_clauses: bool,
 }
 
 /// A trait method with associated contracts.

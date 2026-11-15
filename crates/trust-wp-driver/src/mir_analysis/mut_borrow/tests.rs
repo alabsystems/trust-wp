@@ -36,32 +36,35 @@ impl Callbacks for MutBorrowCallbacks {
     }
 
     #[allow(clippy::elidable_lifetime_names)] // Matches rustc_driver::Callbacks trait signature
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let suffix = format!("::{}", self.fn_name);
-        for owner in tcx.hir_body_owners() {
-            let def_id = owner.to_def_id();
-            let path = tcx.def_path_str(def_id);
-            if path != self.fn_name && !path.ends_with(&suffix) {
-                continue;
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let suffix = format!("::{}", self.fn_name);
+            for owner in tcx.hir_body_owners() {
+                let def_id = owner.to_def_id();
+                let path = tcx.def_path_str(def_id);
+                if path != self.fn_name && !path.ends_with(&suffix) {
+                    continue;
+                }
+                let root = tcx.typeck_root_def_id(def_id).expect_local();
+                let _ = tcx.mir_borrowck(root);
+                let body_with_facts = try_get_body_with_context(tcx, owner)
+                    .expect("borrowck-backed MIR body should be cached");
+                let body = super::super::get_mir_body(&body_with_facts);
+                self.result = Some(extract_mut_borrow_body(
+                    tcx,
+                    body,
+                    Some(&body_with_facts),
+                    &self.arg_names,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                ));
+                self.ran = true;
+                break;
             }
-            let root = tcx.typeck_root_def_id(def_id).expect_local();
-            let _ = tcx.mir_borrowck(root);
-            let body_with_facts = try_get_body_with_context(owner)
-                .expect("borrowck-backed MIR body should be cached");
-            let body = super::super::get_mir_body(body_with_facts);
-            self.result = Some(extract_mut_borrow_body(
-                tcx,
-                body,
-                Some(body_with_facts),
-                &self.arg_names,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
-            ));
-            self.ran = true;
-            break;
-        }
-        Compilation::Stop
+            Compilation::Stop
+        })
     }
 }
 
@@ -126,32 +129,39 @@ fn extract_from_first_closure_source(source: &str) -> MutBorrowBody {
         }
 
         #[allow(clippy::elidable_lifetime_names)] // Matches rustc_driver::Callbacks trait signature
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
 
-                let root = tcx.typeck_root_def_id(def_id).expect_local();
-                let _ = tcx.mir_borrowck(root);
-                let body_with_facts =
-                    try_get_body_with_context(owner).expect("closure MIR body should be cached");
-                let body = super::super::get_mir_body(body_with_facts);
-                let arg_names = vec!["self".to_string()];
-                self.result = Some(extract_mut_borrow_body(
-                    tcx,
-                    body,
-                    Some(body_with_facts),
-                    &arg_names,
-                    &HashMap::new(),
-                    &HashMap::new(),
-                    &HashMap::new(),
-                ));
-                self.ran = true;
-                break;
-            }
-            Compilation::Stop
+                    let root = tcx.typeck_root_def_id(def_id).expect_local();
+                    let _ = tcx.mir_borrowck(root);
+                    let body_with_facts = try_get_body_with_context(tcx, owner)
+                        .expect("closure MIR body should be cached");
+                    let body = super::super::get_mir_body(&body_with_facts);
+                    let arg_names = vec!["self".to_string()];
+                    self.result = Some(extract_mut_borrow_body(
+                        tcx,
+                        body,
+                        Some(&body_with_facts),
+                        &arg_names,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ));
+                    self.ran = true;
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -216,31 +226,38 @@ fn try_extract_from_first_closure_source(source: &str) -> Option<MutBorrowBody> 
         }
 
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
+                    let root = tcx.typeck_root_def_id(def_id).expect_local();
+                    let _ = tcx.mir_borrowck(root);
+                    let body_with_facts = try_get_body_with_context(tcx, owner)
+                        .expect("closure MIR body should be cached");
+                    let body = super::super::get_mir_body(&body_with_facts);
+                    let arg_names = vec!["self".to_string()];
+                    self.result = Some(extract_mut_borrow_body(
+                        tcx,
+                        body,
+                        Some(&body_with_facts),
+                        &arg_names,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ));
+                    self.ran = true;
+                    break;
                 }
-                let root = tcx.typeck_root_def_id(def_id).expect_local();
-                let _ = tcx.mir_borrowck(root);
-                let body_with_facts =
-                    try_get_body_with_context(owner).expect("closure MIR body should be cached");
-                let body = super::super::get_mir_body(body_with_facts);
-                let arg_names = vec!["self".to_string()];
-                self.result = Some(extract_mut_borrow_body(
-                    tcx,
-                    body,
-                    Some(body_with_facts),
-                    &arg_names,
-                    &HashMap::new(),
-                    &HashMap::new(),
-                    &HashMap::new(),
-                ));
-                self.ran = true;
-                break;
-            }
-            Compilation::Stop
+                Compilation::Stop
+            })
         }
     }
 
@@ -300,37 +317,44 @@ fn dump_closure_mir(source: &str) -> String {
         }
 
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
-                let root = tcx.typeck_root_def_id(def_id).expect_local();
-                let _ = tcx.mir_borrowck(root);
-                let body_with_facts =
-                    try_get_body_with_context(owner).expect("closure MIR body should be cached");
-                let body = super::super::get_mir_body(body_with_facts);
-                self.output.push_str(&format!("=== Closure MIR ===\n"));
-                self.output.push_str(&format!("Local declarations:\n"));
-                for (idx, decl) in body.local_decls.iter_enumerated() {
-                    self.output
-                        .push_str(&format!("  _{}: {:?}\n", idx.as_u32(), decl.ty));
-                }
-                self.output.push_str("\n");
-                for (bb_idx, bb) in body.basic_blocks.iter_enumerated() {
-                    self.output.push_str(&format!("bb{}:\n", bb_idx.as_u32()));
-                    for (stmt_idx, stmt) in bb.statements.iter().enumerate() {
-                        self.output
-                            .push_str(&format!("  s{}: {:?}\n", stmt_idx, stmt.kind));
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
                     }
-                    self.output
-                        .push_str(&format!("  term: {:?}\n\n", bb.terminator().kind));
+                    let root = tcx.typeck_root_def_id(def_id).expect_local();
+                    let _ = tcx.mir_borrowck(root);
+                    let body_with_facts = try_get_body_with_context(tcx, owner)
+                        .expect("closure MIR body should be cached");
+                    let body = super::super::get_mir_body(&body_with_facts);
+                    self.output.push_str(&format!("=== Closure MIR ===\n"));
+                    self.output.push_str(&format!("Local declarations:\n"));
+                    for (idx, decl) in body.local_decls.iter_enumerated() {
+                        self.output
+                            .push_str(&format!("  _{}: {:?}\n", idx.as_u32(), decl.ty));
+                    }
+                    self.output.push_str("\n");
+                    for (bb_idx, bb) in body.basic_blocks.iter_enumerated() {
+                        self.output.push_str(&format!("bb{}:\n", bb_idx.as_u32()));
+                        for (stmt_idx, stmt) in bb.statements.iter().enumerate() {
+                            self.output
+                                .push_str(&format!("  s{}: {:?}\n", stmt_idx, stmt.kind));
+                        }
+                        self.output
+                            .push_str(&format!("  term: {:?}\n\n", bb.terminator().kind));
+                    }
+                    self.ran = true;
+                    break;
                 }
-                self.ran = true;
-                break;
-            }
-            Compilation::Stop
+                Compilation::Stop
+            })
         }
     }
 
@@ -410,6 +434,7 @@ fn assert_deref_plus_int(expr: &PureExpr, var_name: &str, delta: i64) {
 
 fn install_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(
@@ -872,7 +897,7 @@ v.push(42);
 
 /// Spec-driven result binding: v.push(v.len()) — the two-phase borrow pattern.
 ///
-/// This is the core pattern from `bug/two_phase.rs`. The len() call's result
+/// This is the core `bug/two_phase` pattern. The len() call's result
 /// must be bound to a concrete expression (via its spec `result@ == self@.len()`)
 /// rather than an opaque variable, so that the push-back expression includes
 /// a meaningful length value.
@@ -977,7 +1002,7 @@ v.len()
 /// Recursively check if an expression contains opaque `_call_N` variables.
 fn contains_opaque_call_var(expr: &PureExpr) -> bool {
     match expr {
-        PureExpr::Var(name, _) => name.starts_with("_call_"),
+        PureExpr::Var(name, _) => name.starts_with("$_call_"),
         PureExpr::Deref(inner)
         | PureExpr::View(inner)
         | PureExpr::Final(inner)
@@ -1151,8 +1176,8 @@ a[0] = 42;
 /// to build `Deref(Var(name, sort))` with enriched sort metadata from MIR types.
 /// The fallback is defensive (unreachable in normal MIR because `PendingIndexMut`
 /// is only created when `deref_exprs` already has the receiver), so this test
-/// validates the helper directly to prove the fix is material. If anyone regresses
-/// the helper, this test catches it regardless of which call-site is affected.
+/// validates the helper directly; a regression in the helper is caught here
+/// regardless of which call-site is affected.
 #[test]
 fn test_make_typed_deref_expr_produces_enriched_sort() {
     struct HelperCallbacks {
@@ -1160,20 +1185,27 @@ fn test_make_typed_deref_expr_produces_enriched_sort() {
     }
     impl Callbacks for HelperCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                let path = tcx.def_path_str(def_id);
-                if path != "identity_vec" && !path.ends_with("::identity_vec") {
-                    continue;
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    let path = tcx.def_path_str(def_id);
+                    if path != "identity_vec" && !path.ends_with("::identity_vec") {
+                        continue;
+                    }
+                    let body = tcx.optimized_mir(def_id);
+                    // _1 is the first argument (a: &mut Vec<i32>)
+                    let local = rustc_middle::mir::Local::from_usize(1);
+                    self.result = Some(make_typed_deref_expr(tcx, body, local, "a"));
+                    break;
                 }
-                let body = tcx.optimized_mir(def_id);
-                // _1 is the first argument (a: &mut Vec<i32>)
-                let local = rustc_middle::mir::Local::from_usize(1);
-                self.result = Some(make_typed_deref_expr(tcx, body, local, "a"));
-                break;
-            }
-            Compilation::Stop
+                Compilation::Stop
+            })
         }
     }
 
@@ -1231,22 +1263,29 @@ fn test_direct_closure_field_seeds_preserve_capture_sort() {
 
     impl Callbacks for ClosureSeedCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                self.result = Some(type_analysis::direct_closure_field_seeds(
-                    tcx,
-                    body,
-                    CAPTURE_STRUCT_LOCAL,
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    self.result = Some(type_analysis::direct_closure_field_seeds(
+                        tcx,
+                        body,
+                        CAPTURE_STRUCT_LOCAL,
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -1329,8 +1368,8 @@ pub fn make_bool_closure(flag: &mut bool) {
 }
 
 /// Regression test (#2343): The IndexMut continuation fallback must preserve
-/// the receiver's `ExprSort` annotation. Before the fix, the fallback
-/// reconstructed `Deref(Var(name, None))` — dropping the sort from MIR types.
+/// the receiver's `ExprSort` annotation. A fallback that reconstructs
+/// `Deref(Var(name, None))` drops the sort from MIR types.
 /// The inner `Var` in `View(Deref(Var("a", sort))).set(...)` must carry
 /// `Some(ExprSort::Seq)` for `Vec<i32>`, not `None`.
 #[test]
@@ -1698,14 +1737,12 @@ pub fn test(x: HasMutRef<'_, u32>) {
     }
 }
 
-// ── Lane P1b: driver-backed MutRef sort annotation probes (#2141) ───────
+// ── Driver-backed MutRef sort annotation probes (#2141) ───────
 
 /// Verifies that `ExprSort::MutRef(Int)` survives through `extract_mut_borrow_body`
 /// into `final_values`. This is the driver-backed positive control for the whole-MutRef
 /// carrier path: if the Var node inside Deref loses its sort annotation, the ay
 /// encoder's whole-borrow gate (bindings.rs) will never activate.
-///
-/// Re: #2141, designs/2026-03-19-2141-post-gate-mutref-evidence-split.md Slice 1
 #[test]
 fn test_final_values_preserve_mutref_int_sort_annotation() {
     let source = r#"
@@ -1730,8 +1767,6 @@ pub fn increment_ref(v: &mut i32) {
 /// Verifies that `ExprSort::MutRef(Bool)` survives for boolean `&mut` parameters.
 /// Bool-sorted vars take a different inference path in the ay encoder; confirming
 /// the driver preserves the annotation avoids a fallback-to-Int demotion.
-///
-/// Re: #2141, designs/2026-03-19-2141-post-gate-mutref-evidence-split.md Slice 1
 #[test]
 fn test_final_values_preserve_mutref_bool_sort_annotation() {
     let source = r#"
@@ -1757,8 +1792,6 @@ pub fn toggle_ref(flag: &mut bool) {
 /// parent's final_values entry. When `y = &mut *x` creates a reborrow, the
 /// parent `x`'s final_values entry must still carry MutRef so the ay
 /// whole-borrow gate activates for the parent variable.
-///
-/// Re: #2141, designs/2026-03-19-2141-post-gate-mutref-evidence-split.md Slice 1
 #[test]
 fn test_reborrow_parent_preserves_mutref_sort_on_final_values() {
     let source = r#"
@@ -1788,38 +1821,37 @@ pub fn reborrow_increment(x: &mut i32) {
     );
 }
 
-/// Verifies that tuple-of-`&mut` parameters preserve `ExprSort::Tuple(2)` sort on the
-/// whole-tuple Var and produce per-field entries in `final_values`. This is the Lane A1
-/// tuple transport probe: when the driver processes `_x: (&mut u32, &mut u32)`, the
-/// encoder needs both the Tuple sort (for `tuple_get` axioms) and the field-level
-/// entries (for per-field final-value reasoning).
+/// A BY-VALUE tuple of `&mut` keeps its whole-carrier entry only as a
+/// DECLARATION, never as a premise: it joins `mutation_continued_params`.
 ///
-/// Unlike single-&mut probes (`test_final_values_preserve_mutref_int_sort_annotation`),
-/// the Var for `_x` carries `Tuple(2)`, not `MutRef(Int)` — the `MutRef` is on the
-/// *field types*, not the whole parameter.
-///
-/// Re: #2141, designs/2026-03-19-2141-post-gate-mutref-evidence-split.md Slice 1
+/// That entry is the identity `^_x == *_x`, which is true of the tuple's own
+/// value — a pair of references nothing reassigns — and therefore the most
+/// dangerous thing to say: the encoder reads a field back out of the carrier at
+/// the sort of the REFERENT, so the identity descends by congruence as
+/// `^_x.N == *_x.N` for every field and asserts, about a function that writes
+/// through them, both that the write did not happen and that the true
+/// post-state is false. Marking the carrier mutation-continued ties its
+/// `_current_final` alias to its own final symbol instead of to its entry
+/// value and suppresses the identity resolve, so nothing descends. The
+/// prophecy lives on the FIELDS, which keep their own entries. The cost is
+/// that an empty-bodied `drop_pair`'s `^_x.0 == *_x.0` is no longer provable
+/// through the carrier — a lost premise, which is the direction to lose in.
 #[test]
-fn test_tuple_of_mut_ref_preserves_tuple_sort_and_field_entries() {
+fn test_tuple_of_mut_ref_carrier_is_mutation_continued_with_field_entries() {
     let source = r#"
 pub fn drop_pair(_x: (&mut u32, &mut u32)) {}
 "#;
 
     let extracted = extract_from_source(source, "drop_pair", &["_x"]);
 
-    // 1. Whole-tuple Var should carry Tuple(2) sort
-    let x_final = extracted
-        .final_values
-        .get("_x")
-        .expect("_x should have a final value");
-
-    let expected_sort = Some(ExprSort::Tuple(2));
     assert!(
-        expr_contains_var_with_sort(x_final, "_x", &expected_sort),
-        "final_values[_x] should preserve Tuple(2) sort for tuple-of-&mut param: {x_final:?}"
+        extracted.mutation_continued_params.contains("_x"),
+        "a by-value carrier has no prophecy of its own, so its identity entry \
+         must not be asserted: {:?}",
+        extracted.mutation_continued_params
     );
 
-    // 2. Per-field entries should exist (field decomposition active)
+    // Per-field entries should exist (field decomposition active)
     assert!(
         extracted.final_values.contains_key("_x.0"),
         "final_values should contain per-field entry _x.0 for tuple field 0"
@@ -1905,8 +1937,9 @@ pub fn test_double_box_capture(by: Box<Box<&mut i32>>) {
 
 /// Regression test (#2318): A closure env type for FnOnce is passed by value
 /// (not `&mut Self`). `type_contains_mut_ref_with_tcx` won't detect nested
-/// `&mut` through wrapper chains. The fix in `find_mut_borrow_params` uses
-/// `closure_env_has_nested_mut_ref` to walk upvar types at arbitrary depth.
+/// `&mut` through wrapper chains, so `find_mut_borrow_params` uses
+/// `closure_capture_fields_with_eventual_mut_ref` to walk upvar types at
+/// arbitrary depth.
 ///
 /// This test verifies that `direct_closure_field_seeds` sees Box-wrapped
 /// mut-ref captures in the upvar metadata.
@@ -1918,22 +1951,29 @@ fn test_direct_closure_field_seeds_box_wrapped_mut_ref() {
 
     impl Callbacks for ClosureSeedCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                self.result = Some(type_analysis::direct_closure_field_seeds(
-                    tcx,
-                    body,
-                    CAPTURE_STRUCT_LOCAL,
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    self.result = Some(type_analysis::direct_closure_field_seeds(
+                        tcx,
+                        body,
+                        CAPTURE_STRUCT_LOCAL,
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -1985,8 +2025,12 @@ pub fn test_box_capture(bx: Box<&mut i32>) {
 /// closure env type is `ClosureEnv` (not `&mut ClosureEnv`). When a FnOnce
 /// closure captures `Box<&mut i32>`, `type_contains_mut_ref_with_tcx` returns
 /// false because the env type itself has no direct `&mut` at depth 0-1.
-/// The fix in `find_mut_borrow_params` uses `closure_env_has_nested_mut_ref`
-/// to walk upvar types at arbitrary depth through Box/Unique/NonNull wrappers.
+/// `find_mut_borrow_params` therefore uses
+/// `closure_capture_fields_with_eventual_mut_ref`, whose per-upvar
+/// `type_eventually_contains_mut_ref` walk reaches the `&mut` at arbitrary
+/// depth. It does not descend Box's own fields: `Unique`/`NonNull` internals
+/// are not a stable way to recover `T`, so a `Box<T>` is answered from its
+/// type argument instead.
 ///
 /// This test forces FnOnce semantics by consuming (dropping) the Box inside
 /// the closure body, which prevents the closure from implementing FnMut.
@@ -2035,37 +2079,44 @@ fn test_get_deref_target_box_wrapped_mut_ref_peels_to_capture_field() {
 
     impl Callbacks for TargetCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Fn {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Fn {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                let base_place =
-                    rustc_middle::mir::Place::from(rustc_middle::mir::Local::from_usize(1));
-                let projected = base_place.project_deeper(
-                    &[
-                        rustc_middle::mir::ProjectionElem::Deref,
-                        rustc_middle::mir::ProjectionElem::Field(
-                            rustc_abi::FieldIdx::from_u32(0),
-                            tcx.types.i32,
-                        ),
-                        rustc_middle::mir::ProjectionElem::Deref,
-                        rustc_middle::mir::ProjectionElem::Deref,
-                    ],
-                    tcx,
-                );
-                self.result = Some(super::place_utils::get_deref_target(
-                    &projected,
-                    body,
-                    &[rustc_middle::mir::Local::from_usize(1)],
-                    &std::collections::HashMap::new(),
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    let base_place =
+                        rustc_middle::mir::Place::from(rustc_middle::mir::Local::from_usize(1));
+                    let projected = base_place.project_deeper(
+                        &[
+                            rustc_middle::mir::ProjectionElem::Deref,
+                            rustc_middle::mir::ProjectionElem::Field(
+                                rustc_abi::FieldIdx::from_u32(0),
+                                tcx.types.i32,
+                            ),
+                            rustc_middle::mir::ProjectionElem::Deref,
+                            rustc_middle::mir::ProjectionElem::Deref,
+                        ],
+                        tcx,
+                    );
+                    self.result = Some(super::place_utils::get_deref_target(
+                        &projected,
+                        body,
+                        &[rustc_middle::mir::Local::from_usize(1)],
+                        &std::collections::HashMap::new(),
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -2117,38 +2168,45 @@ fn test_get_deref_target_double_box_wrapped_mut_ref_peels_to_capture_field() {
 
     impl Callbacks for TargetCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Fn {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Fn {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                let base_place =
-                    rustc_middle::mir::Place::from(rustc_middle::mir::Local::from_usize(1));
-                let projected = base_place.project_deeper(
-                    &[
-                        rustc_middle::mir::ProjectionElem::Deref,
-                        rustc_middle::mir::ProjectionElem::Field(
-                            rustc_abi::FieldIdx::from_u32(0),
-                            tcx.types.i32,
-                        ),
-                        rustc_middle::mir::ProjectionElem::Deref,
-                        rustc_middle::mir::ProjectionElem::Deref,
-                        rustc_middle::mir::ProjectionElem::Deref,
-                    ],
-                    tcx,
-                );
-                self.result = Some(super::place_utils::get_deref_target(
-                    &projected,
-                    body,
-                    &[rustc_middle::mir::Local::from_usize(1)],
-                    &std::collections::HashMap::new(),
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    let base_place =
+                        rustc_middle::mir::Place::from(rustc_middle::mir::Local::from_usize(1));
+                    let projected = base_place.project_deeper(
+                        &[
+                            rustc_middle::mir::ProjectionElem::Deref,
+                            rustc_middle::mir::ProjectionElem::Field(
+                                rustc_abi::FieldIdx::from_u32(0),
+                                tcx.types.i32,
+                            ),
+                            rustc_middle::mir::ProjectionElem::Deref,
+                            rustc_middle::mir::ProjectionElem::Deref,
+                            rustc_middle::mir::ProjectionElem::Deref,
+                        ],
+                        tcx,
+                    );
+                    self.result = Some(super::place_utils::get_deref_target(
+                        &projected,
+                        body,
+                        &[rustc_middle::mir::Local::from_usize(1)],
+                        &std::collections::HashMap::new(),
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -2191,9 +2249,11 @@ pub fn test_box_capture(x: &mut i32) {
 }
 
 /// Regression test (#2318): FnOnce closure with `Box<Box<&mut i32>>` — two
-/// levels of Box wrapping. Verifies that `closure_env_has_nested_mut_ref`
-/// correctly walks through arbitrarily deep Box chains (Box -> Unique ->
-/// NonNull -> *const -> Box -> Unique -> NonNull -> *const -> &mut).
+/// levels of Box wrapping. Verifies that the per-upvar
+/// `type_eventually_contains_mut_ref` walk behind
+/// `closure_capture_fields_with_eventual_mut_ref` descends both `Box` layers
+/// (its `is_box` branch recurses on the pointee type argument) to reach the
+/// `&mut`.
 /// Forces FnOnce by consuming the outer Box inside the closure.
 #[test]
 fn test_fnonce_closure_double_box_wrapped_mut_ref_capture_produces_final_values() {
@@ -2227,8 +2287,9 @@ pub fn test_fnonce_double_box_capture(by: Box<Box<&mut i32>>) {
 /// Regression test (#2318): FnOnce closure capturing multiple Box-wrapped
 /// `&mut` references. Both captures should be admitted through the mut-borrow
 /// pipeline. This exercises `direct_closure_field_seeds` returning multiple
-/// seeds (one per captured upvar) and `closure_env_has_nested_mut_ref`
-/// triggering for the env as a whole.
+/// seeds (one per captured upvar) and `find_mut_borrow_params` admitting the
+/// env local as a whole because `closure_capture_fields_with_eventual_mut_ref`
+/// is non-empty.
 /// Forces FnOnce by consuming both Boxes inside the closure via helper fns.
 #[test]
 fn test_fnonce_closure_multiple_box_wrapped_mut_ref_captures() {
@@ -2262,7 +2323,7 @@ pub fn test_multi_capture(bx: Box<&mut i32>, by: Box<&mut bool>) {
     );
 }
 
-/// Regression test (#2318 Slice 1): admit only the top-level capture fields
+/// Regression test (#2318): admit only the top-level capture fields
 /// whose types eventually contain `&mut`, even when the closure env also
 /// carries unrelated captures.
 ///
@@ -2276,14 +2337,13 @@ pub fn test_multi_capture(bx: Box<&mut i32>, by: Box<&mut bool>) {
 #[test]
 fn test_fnonce_closure_nested_box_captures_seed_only_mut_ref_fields() {
     let source = r#"
-fn consume_int(_b: Box<&mut i32>) {}
-fn consume_double_box(_b: Box<Box<&mut i32>>) {}
-
 pub fn test_nested_capture_fields(c: bool, bx: Box<&mut i32>, by: Box<Box<&mut i32>>) {
     let f = move || {
         let _keep_bool_capture = c;
-        consume_int(bx);
-        consume_double_box(by);
+        // Move the captures into locals (no callee): passing them to an
+        // unspecified function havocs their prophecy (s34).
+        let _bx = bx;
+        let _by = by;
     };
     f();
 }
@@ -2321,22 +2381,29 @@ fn test_direct_closure_field_seeds_multiple_box_wrapped_captures() {
 
     impl Callbacks for ClosureSeedCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                self.result = Some(type_analysis::direct_closure_field_seeds(
-                    tcx,
-                    body,
-                    CAPTURE_STRUCT_LOCAL,
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    self.result = Some(type_analysis::direct_closure_field_seeds(
+                        tcx,
+                        body,
+                        CAPTURE_STRUCT_LOCAL,
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -2400,22 +2467,29 @@ fn test_direct_closure_field_seeds_double_box_wrapped_mut_ref() {
 
     impl Callbacks for ClosureSeedCallbacks {
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                if tcx.def_kind(def_id) != DefKind::Closure {
-                    continue;
-                }
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    if tcx.def_kind(def_id) != DefKind::Closure {
+                        continue;
+                    }
 
-                let body = tcx.optimized_mir(def_id);
-                self.result = Some(type_analysis::direct_closure_field_seeds(
-                    tcx,
-                    body,
-                    CAPTURE_STRUCT_LOCAL,
-                ));
-                break;
-            }
-            Compilation::Stop
+                    let body = tcx.optimized_mir(def_id);
+                    self.result = Some(type_analysis::direct_closure_field_seeds(
+                        tcx,
+                        body,
+                        CAPTURE_STRUCT_LOCAL,
+                    ));
+                    break;
+                }
+                Compilation::Stop
+            })
         }
     }
 
@@ -2527,12 +2601,10 @@ pub fn test_conditional_capture(c: bool, bx: Box<&mut i32>, by: Box<Box<&mut i32
 #[test]
 fn test_fnonce_closure_box_mutation_single_branch_produces_updated_final() {
     let source = r#"
-fn consume_box(_b: Box<&mut i32>) {}
 pub fn test_single_branch(bx: Box<&mut i32>) {
     let f = move || {
         let bx2 = bx;
         **bx2 += 1;
-        consume_box(bx2);
     };
     f();
 }
@@ -2593,12 +2665,10 @@ pub fn test_single_branch(bx: Box<&mut i32>) {
 #[test]
 fn test_fnonce_closure_nested_box_mutation_produces_updated_final() {
     let source = r#"
-fn consume_boxbox(_b: Box<Box<&mut i32>>) {}
 pub fn test_nested_box(by: Box<Box<&mut i32>>) {
     let f = move || {
         let by2 = by;
         ***by2 += 1;
-        consume_boxbox(by2);
     };
     f();
 }
@@ -2695,6 +2765,17 @@ fn extract_with_callee_spec(
     callee_name: &str,
     callee_spec: StdSpec,
 ) -> MutBorrowBody {
+    try_extract_with_callee_spec(source, fn_name, arg_names, callee_name, callee_spec)
+        .expect("mut borrow extraction should succeed")
+}
+
+fn try_extract_with_callee_spec(
+    source: &str,
+    fn_name: &str,
+    arg_names: &[&str],
+    callee_name: &str,
+    callee_spec: StdSpec,
+) -> Option<MutBorrowBody> {
     #[allow(clippy::option_option)]
     struct SpecCallbacks {
         fn_name: String,
@@ -2711,42 +2792,49 @@ fn extract_with_callee_spec(
         }
 
         #[allow(clippy::elidable_lifetime_names)]
-        fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-            let callee_suffix = format!("::{}", self.callee_name);
-            let mut user_specs = HashMap::new();
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                let path = tcx.def_path_str(def_id);
-                if path == self.callee_name || path.ends_with(&callee_suffix) {
-                    user_specs.insert(def_id, self.callee_spec.clone());
+        fn after_expansion<'tcx>(
+            &mut self,
+            _compiler: &Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            crate::callbacks::thread_locals::with_mir_session(tcx, || {
+                let _ = tcx.analysis(());
+                let callee_suffix = format!("::{}", self.callee_name);
+                let mut user_specs = HashMap::new();
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    let path = tcx.def_path_str(def_id);
+                    if path == self.callee_name || path.ends_with(&callee_suffix) {
+                        user_specs.insert(def_id, self.callee_spec.clone());
+                    }
                 }
-            }
 
-            let suffix = format!("::{}", self.fn_name);
-            for owner in tcx.hir_body_owners() {
-                let def_id = owner.to_def_id();
-                let path = tcx.def_path_str(def_id);
-                if path != self.fn_name && !path.ends_with(&suffix) {
-                    continue;
+                let suffix = format!("::{}", self.fn_name);
+                for owner in tcx.hir_body_owners() {
+                    let def_id = owner.to_def_id();
+                    let path = tcx.def_path_str(def_id);
+                    if path != self.fn_name && !path.ends_with(&suffix) {
+                        continue;
+                    }
+                    let root = tcx.typeck_root_def_id(def_id).expect_local();
+                    let _ = tcx.mir_borrowck(root);
+                    let body_with_facts = try_get_body_with_context(tcx, owner)
+                        .expect("borrowck-backed MIR body should be cached");
+                    let body = super::super::get_mir_body(&body_with_facts);
+                    self.result = Some(extract_mut_borrow_body(
+                        tcx,
+                        body,
+                        Some(&body_with_facts),
+                        &self.arg_names,
+                        &user_specs,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ));
+                    self.ran = true;
+                    break;
                 }
-                let root = tcx.typeck_root_def_id(def_id).expect_local();
-                let _ = tcx.mir_borrowck(root);
-                let body_with_facts = try_get_body_with_context(owner)
-                    .expect("borrowck-backed MIR body should be cached");
-                let body = super::super::get_mir_body(body_with_facts);
-                self.result = Some(extract_mut_borrow_body(
-                    tcx,
-                    body,
-                    Some(body_with_facts),
-                    &self.arg_names,
-                    &user_specs,
-                    &HashMap::new(),
-                    &HashMap::new(),
-                ));
-                self.ran = true;
-                break;
-            }
-            Compilation::Stop
+                Compilation::Stop
+            })
         }
     }
 
@@ -2791,7 +2879,6 @@ fn extract_with_callee_spec(
     callbacks
         .result
         .expect("callback should capture extraction result")
-        .expect("mut borrow extraction should succeed")
 }
 
 const INC_MAX_3_SOURCE: &str = r#"
@@ -2816,6 +2903,8 @@ pub fn inc_max_3<'a>(mut ma: &'a mut u32, mut mb: &'a mut u32, mut mc: &'a mut u
 
 fn swap_spec() -> StdSpec {
     StdSpec {
+        inv_requires: Vec::new(),
+        capture_inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["^mma == *mmb && ^mmb == *mma".to_string()],
         param_names: None,
@@ -2923,21 +3012,168 @@ pub fn two_calls<'a>(mut ma: &'a mut u32, mut mb: &'a mut u32) {
 }
 
 /// Without a transfer-shaped callee spec nothing changes: no resolutions,
-/// no suppression beyond the legacy mutation-continuation behavior.
+/// no suppression beyond ordinary mutation continuation.
 #[test]
 fn test_nested_transfer_not_triggered_without_transfer_spec() {
-    let body = extract_with_callee_spec(
+    let body = try_extract_with_callee_spec(
         INC_MAX_3_SOURCE,
         "inc_max_3",
         &["ma", "mb", "mc"],
         "swap",
         StdSpec {
+            inv_requires: Vec::new(),
+            capture_inv_requires: Vec::new(),
             requires: vec![],
             // Value-level contract — NOT a whole-borrow transfer.
             ensures: vec!["(^mma)@ == (*mmb)@ && (^mmb)@ == (*mma)@".to_string()],
             param_names: None,
         },
     );
-    assert!(body.nested_slot_resolutions.is_empty());
-    assert!(body.nested_transfer_params.is_empty());
+    // Without a transfer spec the walk cannot follow the arms that call
+    // `swap`, and they return, so it refuses: taking the arm that skips the
+    // call as the final value on every path is what a divergent arm allows,
+    // and these arms do not diverge.
+    assert!(
+        body.is_none(),
+        "an arm the walk cannot follow must not be dropped: {body:?}"
+    );
+}
+
+/// A write through `&mut` to a field (any carrier shape) is reflected in
+/// the borrow's WHOLE final value, as a functional update in program order.
+/// A stale identity final value here is a false-accept premise
+/// (`s34_field_named_single.rs` and its `s34_field_*` siblings).
+#[test]
+fn test_s34_field_write_final_values_reflect_every_write() {
+    let cases: &[(&str, &str, &[(&str, &str)])] = &[
+        (
+            "pub fn f(t: &mut (u64, u64)) { t.0 += 1; }",
+            "t",
+            &[("t", "__trust_wp_tuple2((__trust_wp_tuple_get_0(*t) + 1), __trust_wp_tuple_get_1(*t))")],
+        ),
+        (
+            "pub struct S(pub u64);\npub fn f(s: &mut S) { s.0 = 7; }",
+            "s",
+            &[("s", "__trust_wp_tuple1(7)"), ("s.0", "7")],
+        ),
+        (
+            "pub struct S(pub u64);\npub fn f(s: &mut S) { s.0 += 1; }",
+            "s",
+            &[("s", "__trust_wp_tuple1((__trust_wp_tuple_get_0(*s) + 1))")],
+        ),
+        (
+            "pub struct Tp(pub (u64, u64));\npub fn f(t: &mut Tp) { t.0.0 += 1; }",
+            "t",
+            &[(
+                "t",
+                "__trust_wp_tuple1(__trust_wp_tuple2((__trust_wp_tuple_get_0(__trust_wp_tuple_get_0(*t)) + 1), __trust_wp_tuple_get_1(__trust_wp_tuple_get_0(*t))))",
+            )],
+        ),
+        (
+            "pub struct P { pub a: u64, pub b: u64 }\npub fn f(p: &mut P) { p.a += 1; }",
+            "p",
+            &[("p", "__trust_wp_tuple2((__trust_wp_tuple_get_0(*p) + 1), __trust_wp_tuple_get_1(*p))")],
+        ),
+        (
+            "pub struct N { pub a: u64 }\npub fn f(n: &mut N) { n.a += 1; }",
+            "n",
+            &[("n", "__trust_wp_tuple1((__trust_wp_tuple_get_0(*n) + 1))")],
+        ),
+        (
+            "pub struct In { pub x: u64 }\npub struct Out { pub i: In, pub k: u64 }\npub fn f(o: &mut Out) { o.i.x += 1; }",
+            "o",
+            &[(
+                "o",
+                "__trust_wp_tuple2(__trust_wp_tuple1((__trust_wp_tuple_get_0(__trust_wp_tuple_get_0(*o)) + 1)), __trust_wp_tuple_get_1(*o))",
+            )],
+        ),
+        (
+            "pub fn f(t: &mut (u64, u64)) { t.0 = 7; *t = (1, 2); }",
+            "t",
+            &[("t", "__trust_wp_tuple2(1, 2)"), ("t.0", "1")],
+        ),
+        (
+            "pub fn f(t: &mut (u64, u64)) { *t = (1, 2); t.0 = 7; }",
+            "t",
+            &[("t", "__trust_wp_tuple2(7, 2)")],
+        ),
+        (
+            "pub fn f(t: &mut (u64, u64)) { let v = t.1; t.0 = v; }",
+            "t",
+            &[("t", "__trust_wp_tuple2(__trust_wp_tuple_get_1(*t), __trust_wp_tuple_get_1(*t))")],
+        ),
+        (
+            "pub fn f(t: &mut (u64, u64)) { let r = &mut t.0; let r2 = r; *r2 = 9; }",
+            "t",
+            &[("t", "__trust_wp_tuple2(9, __trust_wp_tuple_get_1(*t))")],
+        ),
+        (
+            "pub fn f(t: &mut (u64, u64), c: bool) { if c { t.0 = 7; } }",
+            "t",
+            &[("t", "if c { __trust_wp_tuple2(7, __trust_wp_tuple_get_1(*t)) } else { *t }")],
+        ),
+    ];
+    for (src, arg, expected) in cases {
+        let names: Vec<&str> = if src.contains("c: bool") {
+            vec![arg, "c"]
+        } else {
+            vec![arg]
+        };
+        let body = extract_from_source(src, "f", &names);
+        assert!(
+            body.mutation_continued_params.is_empty(),
+            "{src}: exact field write must not havoc; continued={:?}",
+            body.mutation_continued_params
+        );
+        for (key, want) in *expected {
+            let got = body.final_values.get(*key).map(|e| e.to_string());
+            assert_eq!(got.as_deref(), Some(*want), "{src}: final value of {key}");
+        }
+    }
+}
+
+/// A mutating call through a FIELD reborrow of a carrier (`w.v.push(1)`)
+/// cannot be represented exactly: the parameter is havocked — no whole or
+/// per-field final premise survives, and the identity resolve is suppressed.
+#[test]
+fn test_s34_field_receiver_call_havocs_carrier() {
+    let src = "pub struct V { pub v: Vec<u64> }\npub fn f(w: &mut V) { w.v.push(1); }";
+    let body = extract_from_source(src, "f", &["w"]);
+    assert!(body.mutation_continued_params.contains("w"));
+    assert!(!body.final_values.keys().any(|k| k.starts_with("w.")));
+}
+
+/// A `Box<&mut i32>` capture moved into an UNSPECIFIED callee after a
+/// write must not keep the pre-call value as the borrow's final value: the
+/// callee owns the borrow and may write through it. The parameter is havocked
+/// (mutation-continued, per-field entries dropped).
+#[test]
+fn test_fnonce_closure_box_escape_into_callee_havocs_final_value() {
+    let source = r#"
+fn consume_box(_b: Box<&mut i32>) {}
+pub fn test_escape(bx: Box<&mut i32>) {
+    let f = move || {
+        let bx2 = bx;
+        **bx2 += 1;
+        consume_box(bx2);
+    };
+    f();
+}
+"#;
+
+    let extracted = extract_from_first_closure_source(source);
+
+    assert!(
+        extracted.mutation_continued_params.contains("self"),
+        "escaped capture must havoc the closure env; continued: {:?}",
+        extracted.mutation_continued_params
+    );
+    assert!(
+        !extracted
+            .final_values
+            .keys()
+            .any(|key| key.starts_with("self.")),
+        "no per-field final premise may survive the escape; keys: {:?}",
+        extracted.final_values.keys().collect::<Vec<_>>()
+    );
 }

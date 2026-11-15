@@ -1,0 +1,45 @@
+{
+  "schema": "trust-wp.trust-tmir.verify-bundle-perf-gate.v1",
+  "issue": 2749,
+  "fixture": {
+    "name": "compiler-adjacent-linear-vc-bundle",
+    "obligations": 18,
+    "preconditions": 6,
+    "postconditions": 6,
+    "loop_invariants": 6,
+    "source_locations": 18,
+    "summary_facts": 6
+  },
+  "adapter_budget": {
+    "max_obligations": 18,
+    "max_bindings": 36,
+    "max_expr_nodes": 162,
+    "max_expr_depth": 4,
+    "max_payload_bytes": 16384,
+    "max_summary_facts": 6,
+    "max_source_locations": 18
+  },
+  "adapter_metrics": {
+    "obligations": 18,
+    "bindings": 36,
+    "expr_nodes": 162,
+    "max_expr_depth": 4,
+    "payload_bytes": 5328,
+    "summary_facts": 6,
+    "source_locations": 18
+  },
+  "verify_bundle_metrics": {
+    "verification_on": true,
+    "request_json_bytes": 14330,
+    "result_json_bytes": 488928,
+    "obligation_results": 18,
+    "verified_obligations": 18,
+    "replayed_obligations": 18,
+    "proof_evidence_artifacts": 78,
+    "summary_evidence_artifacts": 6,
+    "aggregate_evidence_artifacts": 2,
+    "stable_evidence_wire_bytes": 61722,
+    "aggregate_evidence_wire_bytes": 1839,
+    "max_stable_evidence_wire_bytes": 3871
+  }
+}

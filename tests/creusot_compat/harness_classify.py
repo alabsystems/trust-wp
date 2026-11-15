@@ -10,6 +10,7 @@ from __future__ import annotations
 try:
     from tests.creusot_compat.harness_classify_fail import (
         BACKEND_PASS_PREFIX,
+        REJECTION_PASS_PREFIX,
         STRICT_PASS_PREFIX,
         _KNOWN_BACKEND_SUPERSEDED_TESTS,
         _KNOWN_STRICT_REJECTION_TESTS,
@@ -17,8 +18,11 @@ try:
         _is_should_fail_test,
         classify_error_category,
         classify_should_fail_result,
+        classify_should_fail_result_with_credit,
         classify_unknown_category,
         count_backend_superseded,
+        is_rejection_pass_message,
+        rejection_pass_message,
         count_known_false_accepts,
         get_false_accept_summary,
         get_residual_summary,
@@ -41,15 +45,19 @@ try:
     from tests.creusot_compat.harness_classify_succeed import (
         NO_REPLAY_PASS_PREFIX,
         NO_REPLAY_STRICT_ERROR_MESSAGE,
+        NO_REPLAY_VERIFIED_PREFIX,
+        _NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST,
         _all_contracts_axiomatized,
         _is_no_replay_source,
         _source_has_user_contracts,
         classify_failure,
         classify_no_replay_result,
+        classify_no_replay_result_with_mode,
     )
 except ModuleNotFoundError:
     from harness_classify_fail import (
         BACKEND_PASS_PREFIX,
+        REJECTION_PASS_PREFIX,
         STRICT_PASS_PREFIX,
         _KNOWN_BACKEND_SUPERSEDED_TESTS,
         _KNOWN_STRICT_REJECTION_TESTS,
@@ -57,8 +65,11 @@ except ModuleNotFoundError:
         _is_should_fail_test,
         classify_error_category,
         classify_should_fail_result,
+        classify_should_fail_result_with_credit,
         classify_unknown_category,
         count_backend_superseded,
+        is_rejection_pass_message,
+        rejection_pass_message,
         count_known_false_accepts,
         get_false_accept_summary,
         get_residual_summary,
@@ -81,11 +92,14 @@ except ModuleNotFoundError:
     from harness_classify_succeed import (
         NO_REPLAY_PASS_PREFIX,
         NO_REPLAY_STRICT_ERROR_MESSAGE,
+        NO_REPLAY_VERIFIED_PREFIX,
+        _NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST,
         _all_contracts_axiomatized,
         _is_no_replay_source,
         _source_has_user_contracts,
         classify_failure,
         classify_no_replay_result,
+        classify_no_replay_result_with_mode,
     )
 
 
@@ -94,7 +108,10 @@ def _module_exports() -> list[str]:
         "BACKEND_PASS_PREFIX",
         "NO_REPLAY_PASS_PREFIX",
         "NO_REPLAY_STRICT_ERROR_MESSAGE",
+        "NO_REPLAY_VERIFIED_PREFIX",
+        "REJECTION_PASS_PREFIX",
         "STRICT_PASS_PREFIX",
+        "_NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST",
         "_KNOWN_BACKEND_SUPERSEDED_TESTS",
         "_KNOWN_STRICT_REJECTION_TESTS",
         "_all_contracts_axiomatized",
@@ -118,11 +135,15 @@ def _module_exports() -> list[str]:
         "classify_error_category",
         "classify_failure",
         "classify_no_replay_result",
+        "classify_no_replay_result_with_mode",
         "classify_should_fail_result",
+        "classify_should_fail_result_with_credit",
         "classify_unknown_category",
         "count_backend_superseded",
         "count_known_false_accepts",
         "get_false_accept_summary",
+        "is_rejection_pass_message",
+        "rejection_pass_message",
         "get_residual_summary",
     ]
 

@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Closure body inlining for simple closures (#2151 Phases 2-3).
+//! Closure body inlining for simple closures (#2151).
 //!
 //! When the driver extracts a closure's MIR body as a `PureExpr`, this module
 //! enables the encoder to replace `postcondition(env, args, result)` UF calls
@@ -10,10 +10,9 @@
 //! load from closure axioms — the primary cause of closure-related solver
 //! timeouts (10/18 timeout failures per #1997).
 //!
-//! Phase 3 extends this to `postcondition_mut` with ensures: the body
-//! substitution (return value) is conjoined with ensures (side effects on
-//! mutable captures) to produce a complete ground assertion. This eliminates
-//! the UF fallback that previously required the enrichment mechanism.
+//! For `postcondition_mut` with ensures, the body substitution (return value)
+//! is conjoined with ensures (side effects on mutable captures) to produce a
+//! complete ground assertion instead of falling back to the UF encoding.
 //!
 //! ## Integration
 //!
@@ -30,10 +29,12 @@ use std::{collections::HashSet, sync::Arc};
 
 use ay_dpll::api::Term;
 use substitution::{
-    conjoin_with_ensures, extract_receiver_name, substitute_closure_body,
-    substitute_closure_body_mut, substitute_closure_ensures, substitute_closure_requires,
-    substitute_ensures_only, substitute_mutref_capture_currents,
+    bind_closure_contract_clauses, closure_clause_binding_is_unambiguous, conjoin_with_ensures,
+    extract_receiver_name, substitute_closure_body, substitute_closure_body_mut,
+    substitute_closure_ensures, substitute_closure_requires, substitute_ensures_only,
+    substitute_mutref_capture_currents,
 };
+use tracing::debug;
 use trust_wp_core::formula::PureExpr;
 
 use super::AYEncoder;
@@ -54,7 +55,7 @@ pub(crate) struct ClosureBodyInfo {
     pub(crate) param_names: Vec<String>,
     /// Capture field names, in order, for substitution.
     pub(crate) capture_names: Vec<String>,
-    /// User-annotated or synthesized ensures expressions (#2151 Phase 3).
+    /// User-annotated or synthesized ensures expressions (#2151).
     ///
     /// When available, these are conjoined with the body substitution for
     /// `postcondition_once` and `postcondition_mut` inlining. The body only
@@ -68,6 +69,10 @@ pub(crate) struct ClosureBodyInfo {
     /// evaluate precondition obligations at call sites of generic closure-accepting
     /// functions.
     pub(crate) requires_exprs: Option<Vec<PureExpr>>,
+    /// The capture count this closure is the SOLE owner of in its parent
+    /// body (`ClosureCaptureInfo::env_arity`): a `__trust_wp_tuple<N>(..)`
+    /// receiver of that arity denotes it, and nothing else does.
+    pub(crate) env_arity: Option<usize>,
 }
 
 impl AYEncoder {
@@ -98,6 +103,16 @@ impl AYEncoder {
             self.closure_state
                 .insert_param_mapping(param_name.to_string(), info.def_id().to_string());
         }
+        debug!(
+            "[TRUST_WP_DEBUG] closure body registered def_id={} param_name={:?} env_arity={:?} \
+             body={} ensures={} requires={}",
+            info.def_id(),
+            info.param_name(),
+            info.env_arity(),
+            body.is_some(),
+            info.ensures_exprs().is_some(),
+            info.requires_exprs().is_some(),
+        );
 
         self.closure_state.insert_body(
             info.def_id().to_string(),
@@ -108,6 +123,7 @@ impl AYEncoder {
                 capture_names,
                 ensures_exprs: info.ensures_exprs().map(<[PureExpr]>::to_vec),
                 requires_exprs: info.requires_exprs().map(<[PureExpr]>::to_vec),
+                env_arity: info.env_arity(),
             },
         );
     }
@@ -187,8 +203,8 @@ impl AYEncoder {
                 _ => unreachable!(),
             };
 
-            // Phase 3/4 (#2151): For postcondition_once and postcondition_mut on
-            // closures with ensures (synthesized from body effects or user-annotated),
+            // For postcondition_once and postcondition_mut on closures with
+            // ensures (synthesized from body effects or user-annotated),
             // conjoin the body substitution (return value) with the ensures (side
             // effects on mutable captures).
             //
@@ -222,6 +238,21 @@ impl AYEncoder {
                     } else {
                         PureExpr::Final(std::sync::Arc::new(receiver.clone()))
                     };
+                    // D-30: a clause's `result` and formal params are the
+                    // CLOSURE's, and they must be bound to this call's arguments
+                    // before the clause becomes an assumption in the caller's
+                    // scope. When that binding is ambiguous, nothing is inlined.
+                    if !closure_clause_binding_is_unambiguous(
+                        method,
+                        ensures,
+                        &param_names,
+                        &capture_names,
+                        args,
+                        &pre_state,
+                        &post_state,
+                    ) {
+                        return None;
+                    }
                     let mut substituted_ensures = substitute_closure_ensures(
                         ensures,
                         &capture_names,
@@ -239,6 +270,8 @@ impl AYEncoder {
                     ) {
                         substituted_ensures.extend(caller_ensures);
                     }
+                    let substituted_ensures =
+                        bind_closure_contract_clauses(&substituted_ensures, &param_names, args)?;
                     conjoin_with_ensures(&substituted, &substituted_ensures)
                 } else {
                     substituted
@@ -256,22 +289,36 @@ impl AYEncoder {
         Some(self.encode_pure_impl(&substituted, prefix))
     }
 
-    /// Find the body for a closure receiver expression.
+    /// Find the body for a closure receiver expression — by IDENTITY only.
     ///
-    /// Matches the receiver to a registered closure body by checking:
-    /// 1. Direct param_name -> def_id lookup
-    /// 2. Single-body shortcut (unambiguous when only one closure is registered)
-    /// 3. Unique-ensures shortcut: when multiple closures are registered but only
-    ///    one has ensures expressions (e.g., "real" closure + proof_assert lambda),
-    ///    return the one with ensures. This enables inlining for Skolem constants
-    ///    from `postcondition_mut` existentials in the presence of proof_assert
-    ///    lambdas. (#2668)
+    /// A receiver resolves when a name the driver emits for it (`c`, `*c`,
+    /// `^c`, `c@`, derived spellings) maps through `param_name` to a
+    /// registered closure, or when it is a closure-environment constructor
+    /// (`__trust_wp_tuple<N>(..)`, the lowered captures of a closure
+    /// aggregated in the verified body) whose arity exactly one registered
+    /// closure OWNS — the driver records that in `env_arity` only when the
+    /// body defines a single closure of that capture count, since the term
+    /// carries capture values and no identity (two capture-less closures
+    /// both lower to `__trust_wp_tuple0()`). Nothing else resolves: an
+    /// existential binder or its Skolem constant (`st1`), an environment
+    /// term of a shared arity, a path naming a function item (`T::rem`) or a
+    /// source-typed parameter (`f: F`, `&dyn Fn`) all yield `None`, and their
+    /// `postcondition*` / `precondition` calls stay uninterpreted.
+    ///
+    /// No shortcut binds a receiver WITHOUT name evidence — neither the single
+    /// registered body nor the unique ensures-bearing body (D-30). Either
+    /// guess hands an UNCONTRACTED sibling closure's call the contracted
+    /// closure's body and ensures: `__trust_wp_tuple0()` of `c2 = |_| 2`
+    /// receives `c1`'s `result == 1`, an exit-0 false accept
+    /// (`tests/adversarial/cases/s71_closure_ensures_sibling_fallback_tupled.rs`).
+    /// A guess with no identity behind it is not a proof step; a receiver the
+    /// driver cannot name gets nothing here.
     fn find_body_for_receiver(&self, receiver: &PureExpr) -> Option<ClosureBodyInfo> {
         if self.closure_state.is_empty() {
             return None;
         }
 
-        // Try direct param_name -> def_id lookup using the receiver names the
+        // Direct param_name -> def_id lookup using the receiver names the
         // driver actually emits. Preserve derived suffixes like `_view` and
         // `_current` before falling back to the bare base name. Some receiver
         // shapes nest `View` under `Deref`/`Final`, so also try a normalized
@@ -295,21 +342,48 @@ impl AYEncoder {
             }
         }
 
-        // Single-body shortcut: when only one closure is registered, it is
-        // unambiguous and we can return it directly.
-        if let Some(body) = self.closure_state.single_body() {
-            return Some(body.clone());
+        if let Some(arity) = closure_env_ctor_arity(receiver) {
+            let mut owners = self
+                .closure_state
+                .bodies_with_def_ids()
+                .filter(|(_, body)| body.env_arity == Some(arity));
+            if let (Some((def_id, body)), None) = (owners.next(), owners.next()) {
+                debug!(
+                    "[TRUST_WP_DEBUG] closure env receiver={receiver:?} owned by {def_id} \
+                     (sole closure of arity {arity} in its body)"
+                );
+                return Some(body.clone());
+            }
         }
 
-        // Unique-ensures shortcut (#2668): when multiple closures are registered
-        // but only one has ensures (e.g., the main closure has ensures while a
-        // proof_assert lambda does not), use the one with ensures. This is
-        // critical for Skolem constants from postcondition_mut existentials:
-        // the Skolem receiver (e.g., "sk_exists_st1_N") cannot be matched by
-        // param_name, and single_body fails because proof_assert lambdas also
-        // register bodies. The ensures-bearing closure is the only one that
-        // postcondition_mut can meaningfully refer to.
-        self.closure_state.unique_body_with_ensures().cloned()
+        debug!(
+            "[TRUST_WP_DEBUG] closure receiver not identified, no body inlined: \
+             receiver={receiver:?}"
+        );
+        None
+    }
+}
+
+/// The arity of a closure-environment constructor receiver
+/// (`__trust_wp_tuple<N>(..)` under any `Deref` / `Final` / `Old` / `View`
+/// wrappers), or `None` for any other receiver shape.
+fn closure_env_ctor_arity(expr: &PureExpr) -> Option<usize> {
+    match expr {
+        PureExpr::Deref(inner)
+        | PureExpr::Final(inner)
+        | PureExpr::Old(inner)
+        | PureExpr::View(inner) => closure_env_ctor_arity(inner),
+        // `tuple_logic_fn_arity` rejects arity 0 (the unit tuple has no fields
+        // to project), but a capture-less closure's environment IS
+        // `__trust_wp_tuple0()`, so arity 0 is a closure-environment arity here.
+        PureExpr::LogicFnCall { name, args } if args.is_empty() => (*name
+            == trust_wp_core::formula::internal::tuple_lowering::tuple_logic_fn_name(0))
+        .then_some(0),
+        PureExpr::LogicFnCall { name, args } => {
+            trust_wp_core::formula::internal::tuple_lowering::tuple_logic_fn_arity(name)
+                .filter(|arity| *arity == args.len())
+        }
+        _ => None,
     }
 }
 

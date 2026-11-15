@@ -51,14 +51,15 @@ impl ArithmeticModeState {
     /// position — a precondition, `LetAssume` assumption, or path-condition
     /// fact re-stating what an already-verified body execution established.
     ///
-    /// Shift-amount range obligations are NOT collected in assumption
-    /// position: the obligation for a body shift is collected (path-guarded)
-    /// when the body VALUE expression is encoded, and re-collecting it from a
+    /// Shift-amount range and divisor obligations are NOT collected in
+    /// assumption position: the obligation for a body shift is collected
+    /// (path-guarded) when the body VALUE expression is encoded, a body
+    /// division is charged at its MIR assert, and re-collecting either from a
     /// fact re-encoding would conjoin it into a foreign goal WITHOUT its
     /// execution-path guard (e.g. the bitwalker `poke` proof_assert VC, where
     /// `(length < 64) ==> !(value >= 1 << length)` arrives as a requires
     /// fact and an unguarded `length < 64` obligation would spuriously fail
-    /// at the legal `length == 64`). (ledger int-shift-full)
+    /// at the legal `length == 64`). (ledger int-shift-full, D-114)
     pub(crate) fn assumption_position(&self) -> bool {
         self.assumption_position_depth > 0
     }

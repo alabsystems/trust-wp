@@ -41,8 +41,21 @@ pub(super) fn print_verification_summary(
     if let Some(hint) = dropped_obligation_hint(counters.warnings, verbose) {
         eprintln!("{hint}");
     }
-    if pa_counters.verified > 0 || pa_counters.failed > 0 || pa_counters.errors > 0 {
-        eprintln!("{}", format_proof_assert_summary(pa_counters));
+    // Every assertion adjudicated is counted on the line, whatever the word:
+    // an inconclusive assertion in a contract-free body, or one whose proof
+    // lacked evidence, is unproved, and a run holding only such assertions
+    // printed no proof_assert line at all.
+    let logic_asserted = counters.logic_assertions_verified;
+    if pa_counters.verified + logic_asserted > 0
+        || pa_counters.failed > 0
+        || pa_counters.errors > 0
+        || pa_counters.inconclusive > 0
+        || pa_counters.evidence_gaps > 0
+    {
+        eprintln!(
+            "{}",
+            format_proof_assert_summary(pa_counters, logic_asserted)
+        );
     }
     let mut summary = VerificationSummary::from_counters(counters, pa_counters);
     summary.unverified_axioms = unverified_axioms.len();

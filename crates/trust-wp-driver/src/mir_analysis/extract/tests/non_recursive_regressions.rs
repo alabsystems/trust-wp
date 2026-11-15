@@ -244,7 +244,7 @@ impl Callbacks for ProgramPointStateCallbacks {
                     .iter()
                     .enumerate()
                     .find_map(|(idx, stmt)| match &stmt.kind {
-                        StatementKind::Assign(box (place, _))
+                        StatementKind::Assign((place, _))
                             if place.local == after_local && place.projection.is_empty() =>
                         {
                             Some(rustc_middle::mir::Location {
@@ -658,7 +658,7 @@ pub fn caller(x: usize) -> usize {
                     };
 
                     // Extract callee DefId from the func operand
-                    let Operand::Constant(box constant) = func else {
+                    let Operand::Constant(deref!(constant)) = func else {
                         continue;
                     };
                     let rustc_middle::ty::TyKind::FnDef(callee_def_id, _) = constant.ty().kind()
@@ -747,6 +747,8 @@ pub fn caller(mut x: i32) -> i32 {
 "#;
 
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["x == old(x) + 1".to_string()],
         param_names: Some(vec![]),
@@ -814,7 +816,7 @@ pub fn caller(x: usize) -> usize {
                         continue;
                     };
 
-                    let Operand::Constant(box constant) = func else {
+                    let Operand::Constant(deref!(constant)) = func else {
                         continue;
                     };
                     let rustc_middle::ty::TyKind::FnDef(callee_def_id, _) = constant.ty().kind()
@@ -951,7 +953,7 @@ pub fn write_through_result(x: &mut i32) {
 
                 for bb_data in body.basic_blocks.iter() {
                     for stmt in &bb_data.statements {
-                        let StatementKind::Assign(box (place, _)) = &stmt.kind else {
+                        let StatementKind::Assign((place, _)) = &stmt.kind else {
                             continue;
                         };
                         if !matches!(place.projection.as_ref(), [ProjectionElem::Deref]) {

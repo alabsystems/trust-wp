@@ -5,7 +5,7 @@
 //! Structured verification result protocol for `trust-wp-rustc` → `cargo-trust-wp`
 //! communication.
 //!
-//! Replaces brittle stderr text parsing with a fixed ASCII wire format.
+//! A fixed ASCII wire format instead of brittle stderr text parsing.
 //! The wire line is emitted by `trust-wp-rustc` when `TRUST_WP_RESULT_PROTOCOL=1`
 //! is set, and parsed by `cargo-trust-wp` to derive exit codes.
 //!
@@ -13,8 +13,6 @@
 //! ```text
 //! TRUST_WP_RESULT:v1 base_exit_code=1 verified=2 failed=1 errors=0 ...
 //! ```
-//!
-//! Design: `designs/2026-03-12-1690-structured-result-protocol.md`
 
 /// Wire line prefix. Reject lines with unknown schema versions.
 pub const WIRE_PREFIX: &str = "TRUST_WP_RESULT:v1";
@@ -44,18 +42,6 @@ pub enum WireFieldPresence {
     Optional,
 }
 
-/// Canonical `TRUST_WP_RESULT:v1` field manifest, in wire-emission order.
-///
-/// This is THE single declaration of the v1 field set:
-/// [`StructuredVerificationResult::to_wire_line`] renders exactly these keys in
-/// this order, [`StructuredVerificationResult::from_wire_line`] derives its
-/// known-key set and required-field mask from it, and the checked-in
-/// conformance fixture `tests/creusot_compat/wire_fields.v1.txt` is generated
-/// from it by [`wire_fields_v1_manifest`]. The two Python decoders
-/// (`tests/creusot_compat/harness_model.py`, `scripts/compare_baselines.py`)
-/// are pinned to that fixture by pytest, so a field added here without
-/// teaching the mirrors fails their suites instead of silently rejecting every
-/// fresh wire line (the drift class behind the 24-test misclassification day).
 /// Whether a rendered Alethe proof can be replayed by an independent checker.
 ///
 /// ay renders a step whose rule the pinned calculus does not implement as
@@ -81,6 +67,18 @@ pub fn alethe_proof_is_externally_checkable(alethe_text: &str) -> bool {
         .any(|tail| tail.trim_start().starts_with("hole"))
 }
 
+/// Canonical `TRUST_WP_RESULT:v1` field manifest, in wire-emission order.
+///
+/// This is THE single declaration of the v1 field set:
+/// [`StructuredVerificationResult::to_wire_line`] renders exactly these keys in
+/// this order, [`StructuredVerificationResult::from_wire_line`] derives its
+/// known-key set and required-field mask from it, and the checked-in
+/// conformance fixture `tests/creusot_compat/wire_fields.v1.txt` is generated
+/// from it by [`wire_fields_v1_manifest`]. The two Python decoders
+/// (`tests/creusot_compat/harness_model.py`, `scripts/compare_baselines.py`)
+/// are pinned to that fixture by pytest, so a field added here without
+/// teaching the mirrors fails their suites instead of silently rejecting every
+/// fresh wire line, which misclassifies every result the lane produced.
 pub const WIRE_FIELDS_V1: &[(&str, WireFieldPresence)] = &[
     ("base_exit_code", WireFieldPresence::Required),
     ("verified", WireFieldPresence::Required),
@@ -96,10 +94,10 @@ pub const WIRE_FIELDS_V1: &[(&str, WireFieldPresence)] = &[
     ("evidence_gaps", WireFieldPresence::Required),
     // Optional: absent from records emitted before this field existed.
     ("proof_assert_verified", WireFieldPresence::Optional),
-    // Optional for the same reason: contractless proof_asserts the solver could
-    // not decide. Counted as a soundness gap (#143) -- previously incremented a
-    // field that reached no outcome column, so a test could report a clean pass
-    // while carrying an undecided obligation.
+    // Optional for the same reason. Contractless proof_asserts the solver could
+    // not decide are a soundness gap (#143) and need their own outcome column:
+    // folded into a field that reaches none, a test reports a clean pass while
+    // carrying an undecided obligation.
     ("proof_assert_inconclusive", WireFieldPresence::Optional),
     // Optional for the same reason: absent from records emitted before it
     // existed, and absent from producers that cannot determine it.
@@ -125,7 +123,7 @@ const fn wire_required_mask() -> u32 {
         if matches!(WIRE_FIELDS_V1[index].1, WireFieldPresence::Required) {
             mask |= 1 << index;
         }
-        index += 1;
+        index = index.saturating_add(1);
     }
     mask
 }
@@ -145,7 +143,7 @@ pub fn wire_fields_v1_manifest() -> String {
          # Source of truth: trust_wp_core::result_protocol::WIRE_FIELDS_V1 (the same\n\
          # slice drives the Rust emitter and decoder). Regenerate and commit together\n\
          # with any manifest change:\n\
-         #   TRUST_WP_BLESS_WIRE_FIXTURE=1 cargo test -p trust-wp-core --lib wire_manifest\n\
+         #   TRUST_WP_BLESS_WIRE_FIXTURE=1 targo --unverified test -p trust-wp-core --lib wire_manifest\n\
          # Pinned consumers: tests/creusot_compat/harness_model.py and\n\
          # scripts/compare_baselines.py, via tests/creusot_compat/test_harness.py.\n",
     );
@@ -231,19 +229,18 @@ pub struct StructuredVerificationResult {
     pub panics: u64,
     /// Functions demoted from Verified to Unknown.
     pub demoted: u64,
-    /// Contract/logic parse errors (Slice 2: currently zero in Slice 1).
+    /// Contract/logic parse errors.
     pub parse_errors: u64,
-    /// Termination check errors (Slice 2: currently zero in Slice 1).
+    /// Termination check errors.
     pub termination_errors: u64,
-    /// Logic recursion errors (Slice 2: currently zero in Slice 1).
+    /// Logic recursion errors.
     pub logic_recursion_errors: u64,
-    /// `#[erasure(target)]` validation errors (Phase 5c THIR-equivalence scaffold).
+    /// `#[erasure(target)]` validation errors.
     ///
     /// Counts every `(lhs, rhs)` erasure pair where the driver-side check failed.
-    /// The current driver implementation performs a STUB check (target resolvable,
-    /// rhs has a non-empty body). Full Creusot-grade THIR-equivalence after
-    /// ghost-stripping + A-normal form is deferred. See
-    /// `crates/trust-wp-driver/src/callbacks/discovery/erasure.rs`.
+    /// That check is a STUB (target resolvable to a local fn with a body), not
+    /// Creusot-grade THIR equivalence after ghost-stripping and A-normal form;
+    /// see `trust_wp_driver::callbacks::discovery::erasure`.
     pub erasure_errors: u64,
 }
 
@@ -266,7 +263,7 @@ impl StructuredVerificationResult {
     /// Emitter-side value of a [`WIRE_FIELDS_V1`] field.
     ///
     /// Panics on a manifest name with no struct mapping — the manifest
-    /// round-trip unit test catches that at `cargo test` time, so a manifest
+    /// round-trip unit test catches that at `targo --unverified test` time, so a manifest
     /// entry cannot ship without its accessor arm.
     fn wire_field_value(&self, name: &str) -> String {
         match name {
@@ -370,27 +367,48 @@ impl StructuredVerificationResult {
         let producer_base_exit_code =
             preserve_nonzero_exit_code(self.base_exit_code, other.base_exit_code);
 
-        self.verified += other.verified;
-        self.failed += other.failed;
-        self.errors += other.errors;
-        self.warnings += other.warnings;
-        self.assumed += other.assumed;
-        self.trusted += other.trusted;
-        self.skipped += other.skipped;
-        self.verified_with_axiom_deps += other.verified_with_axiom_deps;
-        self.unverified_axioms += other.unverified_axioms;
-        self.vacuous += other.vacuous;
-        self.evidence_gaps += other.evidence_gaps;
-        self.proof_assert_verified += other.proof_assert_verified;
-        self.verified_native_only += other.verified_native_only;
-        self.proof_assert_failed += other.proof_assert_failed;
-        self.proof_assert_errors += other.proof_assert_errors;
-        self.panics += other.panics;
-        self.demoted += other.demoted;
-        self.parse_errors += other.parse_errors;
-        self.termination_errors += other.termination_errors;
-        self.logic_recursion_errors += other.logic_recursion_errors;
-        self.erasure_errors += other.erasure_errors;
+        // Counters, not arithmetic. These are u64 tallies of obligations and
+        // `+=` is a panic in debug and a silent wrap in release; Trust refuted
+        // all 21. Saturating is the honest reading — a tally that stops at
+        // u64::MAX is wrong by less than one that wraps to zero and then
+        // reports a clean run.
+        self.verified = self.verified.saturating_add(other.verified);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.warnings = self.warnings.saturating_add(other.warnings);
+        self.assumed = self.assumed.saturating_add(other.assumed);
+        self.trusted = self.trusted.saturating_add(other.trusted);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.verified_with_axiom_deps = self
+            .verified_with_axiom_deps
+            .saturating_add(other.verified_with_axiom_deps);
+        self.unverified_axioms = self
+            .unverified_axioms
+            .saturating_add(other.unverified_axioms);
+        self.vacuous = self.vacuous.saturating_add(other.vacuous);
+        self.evidence_gaps = self.evidence_gaps.saturating_add(other.evidence_gaps);
+        self.proof_assert_verified = self
+            .proof_assert_verified
+            .saturating_add(other.proof_assert_verified);
+        self.verified_native_only = self
+            .verified_native_only
+            .saturating_add(other.verified_native_only);
+        self.proof_assert_failed = self
+            .proof_assert_failed
+            .saturating_add(other.proof_assert_failed);
+        self.proof_assert_errors = self
+            .proof_assert_errors
+            .saturating_add(other.proof_assert_errors);
+        self.panics = self.panics.saturating_add(other.panics);
+        self.demoted = self.demoted.saturating_add(other.demoted);
+        self.parse_errors = self.parse_errors.saturating_add(other.parse_errors);
+        self.termination_errors = self
+            .termination_errors
+            .saturating_add(other.termination_errors);
+        self.logic_recursion_errors = self
+            .logic_recursion_errors
+            .saturating_add(other.logic_recursion_errors);
+        self.erasure_errors = self.erasure_errors.saturating_add(other.erasure_errors);
 
         self.base_exit_code = producer_base_exit_code;
         self.normalize_exit_code();
@@ -549,7 +567,7 @@ pub fn decode_wire_value(value: &str) -> String {
             }
         }
         decoded.push(bytes[i]);
-        i += 1;
+        i = i.saturating_add(1);
     }
     String::from_utf8(decoded)
         .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
@@ -682,8 +700,8 @@ mod tests {
     /// The checked-in fixture must equal the manifest the code is built from.
     ///
     /// Update path when a field change is intended: regenerate with
-    /// `TRUST_WP_BLESS_WIRE_FIXTURE=1 cargo test -p trust-wp-core --lib
-    /// wire_manifest`, commit the fixture TOGETHER with the manifest change,
+    /// `TRUST_WP_BLESS_WIRE_FIXTURE=1 targo --unverified test -p trust-wp-core
+    /// --lib wire_manifest`, commit the fixture TOGETHER with the manifest change,
     /// and teach the Python mirrors — their pytest pins against the same file
     /// name exactly what is missing.
     #[test]
@@ -697,15 +715,15 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap_or_else(|err| {
             panic!(
                 "cannot read {}: {err}\nregenerate: TRUST_WP_BLESS_WIRE_FIXTURE=1 \
-                 cargo test -p trust-wp-core --lib wire_manifest",
+                 targo --unverified test -p trust-wp-core --lib wire_manifest",
                 path.display()
             )
         });
         assert_eq!(
             on_disk, expected,
             "tests/creusot_compat/wire_fields.v1.txt no longer matches WIRE_FIELDS_V1. \
-             If the field change is intended: TRUST_WP_BLESS_WIRE_FIXTURE=1 cargo test \
-             -p trust-wp-core --lib wire_manifest, commit BOTH files, and update the \
+             If the field change is intended: TRUST_WP_BLESS_WIRE_FIXTURE=1 targo --unverified \
+             test -p trust-wp-core --lib wire_manifest, commit BOTH files, and update the \
              Python decoders (tests/creusot_compat/harness_model.py, \
              scripts/compare_baselines.py) — their pytest pins will fail until they \
              match this fixture."
@@ -868,6 +886,32 @@ mod tests {
     fn from_wire_line_rejects_malformed_value() {
         let line = "TRUST_WP_RESULT:v1 base_exit_code=abc";
         assert!(StructuredVerificationResult::from_wire_line(line).is_none());
+    }
+
+    /// At the u64 boundary `+=` wraps a tally to near zero in release, turning
+    /// a saturated run into a report of a nearly clean one. Saturating keeps the
+    /// count wrong in the safe direction.
+    #[test]
+    fn merge_saturates_counters_instead_of_wrapping_to_a_clean_run() {
+        let mut a = StructuredVerificationResult {
+            failed: u64::MAX,
+            verified: u64::MAX - 1,
+            ..Default::default()
+        };
+        let b = StructuredVerificationResult {
+            failed: 5,
+            verified: 4,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(
+            a.failed,
+            u64::MAX,
+            "a saturated failure count must not wrap to a small number"
+        );
+        assert_eq!(a.verified, u64::MAX);
+        // The verdict must still read as a failure, which is the whole point.
+        assert_ne!(a.base_exit_code, 0);
     }
 
     #[test]
@@ -1130,7 +1174,7 @@ mod tests {
 
     #[test]
     fn from_wire_line_rejects_legacy_payload_missing_erasure_errors() {
-        // Phase 5c: erasure_errors is a newly required field.
+        // erasure_errors is Required: a line that omits it must not parse.
         let line = "TRUST_WP_RESULT:v1 base_exit_code=0 verified=1 failed=0 errors=0 warnings=0 \
                     assumed=0 trusted=0 skipped=0 verified_with_axiom_deps=0 \
                     unverified_axioms=0 vacuous=0 evidence_gaps=0 proof_assert_failed=0 \
@@ -1141,7 +1185,7 @@ mod tests {
 
     #[test]
     fn effective_exit_code_fails_closed_for_erasure_errors() {
-        // Phase 5c: erasure_errors triggers exit code 2 (encoding/structural error).
+        // erasure_errors triggers exit code 2 (encoding/structural error).
         let erasure = StructuredVerificationResult {
             base_exit_code: 0,
             erasure_errors: 1,

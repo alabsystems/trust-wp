@@ -10,9 +10,9 @@
 //! centralizes that sequence so changes to the tail are made once. (#1576)
 //!
 //! Also owns the generic solve helpers (`assert_standard_axioms`,
-//! `resolve_sat_result`, `retry_check_sat_on_timeout`, etc.) that were
-//! previously scattered in `verify/mod.rs`. Root-module compatibility
-//! re-exports in `verify/mod.rs` preserve existing import paths. (#1576 Slice B)
+//! `resolve_sat_result`, `retry_check_sat_on_timeout`, etc.). Root-module
+//! re-exports in `verify/mod.rs` preserve the `crate::verify::*` import
+//! paths. (#1576)
 //!
 //! Split into submodules (#1988):
 //! - `solve_helpers`: Generic solve helpers, axiom-free probes, retry logic,
@@ -56,8 +56,8 @@ pub(super) use solve_helpers::{
 pub(in crate::verify) use solve_helpers::{
     axiom_free_solve_with_sat, base_recheck_long_budget_timeout,
     fresh_base_recheck_is_solver_limited, prefer_non_vacuous_core_on_incomplete_base,
-    resolve_base_sat_result_with_tight_timeout, run_base_recheck_with_tight_timeout,
-    tiered_check_sat, AxiomFreeOutcome,
+    resolve_base_sat_result_with_tight_timeout, resolve_base_sat_result_with_witness,
+    run_base_recheck_with_tight_timeout, tiered_check_sat, AxiomFreeOutcome,
 };
 use tracing::debug;
 use trust_wp_core::{
@@ -76,6 +76,15 @@ use crate::{
     shared_types::{SolveEvidenceSnapshot, SolveStatisticsSnapshot},
 };
 
+/// Demotion for a proof whose base is UNSAT once the encoder's axiom scope is
+/// KEPT (the ordinary base recheck pops it). Deliberately a distinct message:
+/// the fresh base rescue matches `VACUOUS_PROOF_MESSAGE` and rebuilds WITHOUT
+/// the axioms, which is exactly the blind spot this demotion closes.
+pub(crate) const VACUOUS_WITH_ENCODER_AXIOMS_MESSAGE: &str =
+    "vacuous proof: base assertions together with the encoder axiom scope are UNSAT without \
+     the negated postcondition (encoder axioms inconsistent with the base)";
+/// Wall-clock cap for the axiom-preserving base refutation replay.
+const AXIOM_BASE_REFUTATION_TIMEOUT_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const VACUOUS_PROOF_MESSAGE: &str =
     "vacuous proof: base assertions are UNSAT without the negated postcondition";
 /// Marker for a base recheck that was SKIPPED because the base solve is
@@ -101,6 +110,64 @@ thread_local! {
     static ACTIVE_PROOF_ASSERT_SLICE_IDENTITY:
         std::cell::Cell<Option<ProofAssertSliceIdentity>> =
         const { std::cell::Cell::new(None) };
+    /// Generation of the obligation slice currently being solved, stamped onto
+    /// every write of `PREFERRED_VERIFIED_SOLVE_EVIDENCE`. Diagnostics-only.
+    static PREFERRED_EVIDENCE_SLICE_GENERATION: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// The structural refutation shape that fired for the obligation slice the
+    /// caller has just finished, when that slice returned a `Failed`.
+    ///
+    /// A shape (`result-contradicts-return-expr`,
+    /// `postcondition-contradicts-requirements`, ...) is a determination made
+    /// from the PROGRAM TEXT: it reads the clause, the return expression and
+    /// the preconditions and finds them contradictory. It therefore does not
+    /// depend on any value trust-wp manufactured to stand in for a construct it
+    /// could not model, which is what makes it the one signal that can license
+    /// a refutation inside a function whose goal set carries a fail-closed
+    /// marker (D-27). The shape separates an unmodelled call beside a clause
+    /// the text itself violates (the clause keeps its FAILED) from the same
+    /// program returning that call's result (no shape fires; withheld).
+    static LAST_SLICE_REFUTATION_SHAPE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Forget any shape published by an earlier slice. Called by the pipeline
+/// before each slice so a stale value can never be read as this slice's.
+pub(crate) fn clear_last_slice_refutation_shape() {
+    LAST_SLICE_REFUTATION_SHAPE.with(|cell| cell.set(None));
+}
+
+/// Publish the structural refutation shape that refuted the slice just
+/// decided. `None` clears.
+pub(crate) fn publish_last_slice_refutation_shape(shape: Option<&'static str>) {
+    LAST_SLICE_REFUTATION_SHAPE.with(|cell| cell.set(shape));
+}
+
+/// The structural refutation shape published by the slice just decided.
+pub(crate) fn last_slice_refutation_shape() -> Option<&'static str> {
+    LAST_SLICE_REFUTATION_SHAPE.with(std::cell::Cell::get)
+}
+
+/// Open a new obligation slice for the preferred-evidence slot, so a later
+/// reader can tell this slice's retained evidence from an earlier sibling's.
+pub(super) fn begin_preferred_evidence_slice() {
+    PREFERRED_EVIDENCE_SLICE_GENERATION.with(|generation| {
+        generation.set(generation.get().wrapping_add(1));
+    });
+}
+
+pub(super) fn current_preferred_evidence_slice_generation() -> u64 {
+    PREFERRED_EVIDENCE_SLICE_GENERATION.with(std::cell::Cell::get)
+}
+
+/// Clone the retained verified-solve diagnostics ONLY if they were written
+/// during the current slice. For reporting an uncertified slice by its own
+/// solve; never consulted by any acceptance path.
+pub(super) fn clone_preferred_verified_solve_diagnostics_for_current_slice(
+) -> Option<PreferredVerifiedSolveDiagnostics> {
+    let generation = current_preferred_evidence_slice_generation();
+    clone_preferred_verified_solve_diagnostics()
+        .filter(|diagnostics| diagnostics.slice_generation == generation)
 }
 
 /// Exact source/normalized identity of the proof-assert slice currently being
@@ -134,6 +201,8 @@ pub(super) struct PreferredVerifiedSolveDiagnostics {
     pub(super) claim_identity: Option<ProofAssertSliceIdentity>,
     pub(super) problem_hash: Option<[u8; 32]>,
     pub(super) native_problem_json: Option<String>,
+    /// [`current_preferred_evidence_slice_generation`] at write time.
+    pub(super) slice_generation: u64,
 }
 
 /// Is the current thread verifying a proof_assert obligation? (#transpose)
@@ -184,6 +253,128 @@ impl Drop for ProofAssertModeGuard {
     fn drop(&mut self) {
         IN_PROOF_ASSERT_MODE.with(|flag| flag.set(self.previous));
     }
+}
+
+/// A VALIDATED counterexample for a refutation that some lane decided off the
+/// live encoder's own last solve: the literal-`false` base witness (a fresh
+/// AxiomLight encoder), the isolated QF_BV lane, or any solve whose SAT model
+/// ay validated. Mirror of [`PreferredVerifiedSolveDiagnostics`] in the
+/// refuting direction.
+///
+/// The pair `evidence` + `statistics` is read from ONE solve at ONE instant, so
+/// the driver's refutation-authority boundary judges the envelope that actually
+/// produced the model. `evidence` is guaranteed `sat`, `model_validated` and
+/// `accepted_for_consumer` at construction; nothing weaker is ever stored.
+#[derive(Clone)]
+pub(crate) struct RefutationWitness {
+    pub(crate) counterexample: Counterexample,
+    pub(crate) evidence: SolveEvidenceSnapshot,
+    pub(crate) statistics: Option<SolveStatisticsSnapshot>,
+    pub(crate) native_replay_json: Option<String>,
+}
+
+thread_local! {
+    static PREFERRED_REFUTATION_WITNESS: RefCell<Option<RefutationWitness>> =
+        const { RefCell::new(None) };
+}
+
+/// Evidence that clears the mandatory refutation-authority bar on its own.
+pub(crate) fn evidence_is_validated_sat(evidence: &SolveEvidenceSnapshot) -> bool {
+    evidence.accepted_for_consumer
+        && evidence.model_validated
+        && crate::verify::types::solve_evidence_result_is_sat(&evidence.result)
+}
+
+pub(crate) fn clear_refutation_witness() {
+    PREFERRED_REFUTATION_WITNESS.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+pub(crate) fn replace_refutation_witness(witness: Option<RefutationWitness>) {
+    PREFERRED_REFUTATION_WITNESS.with(|slot| {
+        *slot.borrow_mut() = witness;
+    });
+}
+
+/// Clone the recorded witness without consuming it (the pipeline's installer
+/// takes it at the `Failed` it backs).
+pub(crate) fn clone_refutation_witness() -> Option<RefutationWitness> {
+    PREFERRED_REFUTATION_WITNESS.with(|slot| slot.borrow().clone())
+}
+
+/// Take the witness recorded since the last [`clear_refutation_witness`].
+/// Callers take it in the SAME code region that produced the `Failed` it
+/// backs, so a stale witness can never be paired with a later verdict.
+pub(crate) fn take_refutation_witness() -> Option<RefutationWitness> {
+    PREFERRED_REFUTATION_WITNESS.with(|slot| slot.borrow_mut().take())
+}
+
+/// Record the live encoder's last solve as a refutation witness, if and only
+/// if ay reported a VALIDATED, consumer-accepted SAT. Returns the model's
+/// counterexample so the caller can publish it as the `Failed` payload.
+/// Anything weaker records nothing and returns `None` (fail closed: the
+/// caller's `Failed` then reaches the authority boundary unbacked and is
+/// withheld exactly as before).
+pub(in crate::verify) fn record_refutation_witness_from_encoder(
+    encoder: &mut AYEncoder,
+) -> Option<Counterexample> {
+    let evidence = encoder
+        .last_solve_evidence()
+        .cloned()
+        .filter(evidence_is_validated_sat)?;
+    let model = encoder.get_model();
+    let counterexample = Counterexample::from_encoder_model(encoder, model);
+    let statistics = encoder.last_solve_statistics().cloned();
+    encoder.refresh_native_replay_json();
+    let native_replay_json = encoder.native_replay_json().map(str::to_owned);
+    crate::verify::authority_trace(|| {
+        format!(
+            "refutation witness recorded from encoder: values={} statistics={}",
+            counterexample.values.len(),
+            statistics.is_some()
+        )
+    });
+    PREFERRED_REFUTATION_WITNESS.with(|slot| {
+        *slot.borrow_mut() = Some(RefutationWitness {
+            counterexample: counterexample.clone(),
+            evidence,
+            statistics,
+            native_replay_json,
+        });
+    });
+    Some(counterexample)
+}
+
+/// Record a refutation witness from an ISOLATED solver lane (native QF_BV)
+/// whose query is exact but never runs on the function encoder. Same bar as
+/// [`record_refutation_witness_from_encoder`]: validated, accepted SAT only.
+pub(in crate::verify) fn record_isolated_refutation_witness(
+    details: &ay_dpll::api::SolveDetails,
+    model: Option<ay_dpll::api::Model>,
+    native_replay_json: Option<String>,
+) -> Option<Counterexample> {
+    let evidence = SolveEvidenceSnapshot::from_solve_details(details);
+    if !evidence_is_validated_sat(&evidence) {
+        crate::verify::authority_trace(|| {
+            format!(
+                "isolated refutation witness refused: result={} validated={} accepted={}",
+                evidence.result, evidence.model_validated, evidence.accepted_for_consumer
+            )
+        });
+        return None;
+    }
+    let counterexample = Counterexample::from_model(model);
+    let statistics = SolveStatisticsSnapshot::from(&details.statistics);
+    PREFERRED_REFUTATION_WITNESS.with(|slot| {
+        *slot.borrow_mut() = Some(RefutationWitness {
+            counterexample: counterexample.clone(),
+            evidence,
+            statistics: Some(statistics),
+            native_replay_json,
+        });
+    });
+    Some(counterexample)
 }
 
 pub(super) fn clear_preferred_verified_solve_evidence() {
@@ -253,6 +444,14 @@ pub(super) fn record_preferred_verified_solve_evidence(
     if !matches!(result, VerificationResult::Verified(_)) {
         return;
     }
+    crate::verify::authority_trace(|| {
+        format!(
+            "record_preferred_verified_solve_evidence entry {} structural={} proof_assert_mode={}",
+            crate::verify::authority_result_tag(result),
+            encoder.has_structural_ground_consequences(),
+            in_proof_assert_mode()
+        )
+    });
     if encoder.has_structural_ground_consequences() {
         PREFERRED_VERIFIED_SOLVE_EVIDENCE.with(|slot| {
             *slot.borrow_mut() = None;
@@ -336,6 +535,7 @@ pub(super) fn record_preferred_verified_solve_evidence(
             claim_identity: active_proof_assert_slice_identity(),
             problem_hash,
             native_problem_json,
+            slice_generation: current_preferred_evidence_slice_generation(),
         });
     });
 }
@@ -350,6 +550,25 @@ pub(in crate::verify) fn record_isolated_strict_unsat_diagnostics(
     native_problem_json: Option<String>,
 ) -> bool {
     if !crate::encoder::ay_api::solve_details_have_complete_unsat_proof(details) {
+        crate::verify::authority_trace(|| {
+            let stat = |key: &str| details.statistics.get_int(key);
+            format!(
+                "isolated strict UNSAT refused: unsat={} consumer_ok={} proof_checking={} \
+                 proof_available={} proof_complete={} trust={:?} checked={:?} total={:?} \
+                 skipped_holes={:?} failures={:?} unknown={:?}",
+                details.result.is_unsat(),
+                details.accept_for_consumer().is_ok(),
+                details.verification_level.has_proof_checking(),
+                details.verification.unsat_proof_available,
+                details.statistics.proof_complete,
+                stat("proof_trust"),
+                stat("proof_checker_checked_steps"),
+                stat("proof_checker_total_steps"),
+                stat("proof_checker_skipped_hole_steps"),
+                stat("proof_checker_failures"),
+                details.unknown_summary().map(|s| s.reason_code.to_string()),
+            )
+        });
         clear_preferred_verified_solve_evidence();
         return false;
     }
@@ -372,6 +591,7 @@ pub(in crate::verify) fn record_isolated_strict_unsat_diagnostics(
             claim_identity: None,
             problem_hash,
             native_problem_json,
+            slice_generation: current_preferred_evidence_slice_generation(),
         });
     });
     true
@@ -639,10 +859,10 @@ fn iterator_produces_singleton_failure_result(
     let ensure = ctx.all_ensures.get(obligation_index)?;
     let (_, produced_var, expected) = var_int_equality(ensure)?;
     if let Some(observed) = iterator_produces_singleton_observed_value(ctx.requires, produced_var) {
-        return (observed != expected).then(|| VerificationResult::Failed(Counterexample::empty()));
+        return (observed != expected).then(|| crate::verify::structural_failed_traced());
     }
     iterator_produces_singleton_unconstrained(ctx.requires, produced_var)
-        .then(|| VerificationResult::Failed(Counterexample::empty()))
+        .then(|| crate::verify::structural_failed_traced())
 }
 
 fn iterator_produces_singleton_observed_value(
@@ -860,6 +1080,15 @@ pub(in crate::verify) fn mut_borrow_final_disequality_consequence(
     let left_name = final_expr_base_name(left)?;
     let right_name = final_expr_base_name(right)?;
     if left_name == right_name {
+        return None;
+    }
+    // A mutation-continued parameter's `final_values` entry is not asserted
+    // (the callee postcondition alone constrains its prophecy), so it cannot
+    // justify a structural consequence.
+    if ctx
+        .mutation_continued_params
+        .is_some_and(|params| params.contains(left_name) || params.contains(right_name))
+    {
         return None;
     }
     let left_final = final_values.get(left_name)?;
@@ -1724,6 +1953,12 @@ pub(super) struct ObligationSliceContext<'a> {
     pub(super) mutation_continued_params: Option<&'a HashSet<String>>,
     pub(super) body_div_obligations: &'a [Term],
     pub(super) fresh_base_recheck: Option<&'a FreshBaseRecheckFn<'a>>,
+    /// The AxiomLight fresh base recheck that records a refutation WITNESS on
+    /// a validated SAT (`resolve_base_sat_result_with_witness`). A structural
+    /// slice refutation the solver cannot confirm uses it: the shape proves
+    /// `requires ⟹ ¬ensure`, so a validated model of the base is a validated
+    /// counterexample.
+    pub(super) literal_false_base_recheck: Option<&'a FreshBaseRecheckFn<'a>>,
     pub(super) slice_length_stable_vars: Option<&'a Vec<String>>,
     /// Latched to `true` when a base recheck for one of this obligation's
     /// slices hit a pathological (hard-timeout) base solve. Later slices of
@@ -2106,11 +2341,11 @@ pub(super) fn verify_negated_obligation_slice(
     // Capture the pre-axiom ground pool state for the post-axiom fallback (#2692).
     // When axioms push a decidable QF_LIA problem into undecidable AUFLIA, the
     // fallback needs to restore to the pre-axiom state where no quantified
-    // formulas exist in the solver context. Previously, the axiom assertions
-    // were made directly in the outer scope, so `pop_scope` on the negated-goal
-    // scope left the quantified axioms visible to the fallback solver. Now, the
-    // axioms and negated goal are wrapped in a single scope that can be popped
-    // entirely for a clean axiom-free retry.
+    // formulas exist in the solver context. The axioms and negated goal are
+    // wrapped in a single scope that can be popped entirely for a clean
+    // axiom-free retry; asserting the axioms directly in the outer scope would
+    // leave them visible to the fallback solver after `pop_scope` on the
+    // negated-goal scope.
     let pre_axiom_ground_pool = encoder.ground_pool_snapshot();
 
     // Whether the full solve genuinely demanded quantified standard axioms
@@ -2130,6 +2365,7 @@ pub(super) fn verify_negated_obligation_slice(
     // axiom demand that pushes the solver from QF_LIA into AUFLIA, causing
     // Unknown(Incomplete). (#2692)
     encoder.push_scope()?;
+    let assertions_before_axiom_scope = encoder.solver().assertions().len();
 
     // Collect function symbols from the obligation for axiom relevance
     // filtering (#2674).
@@ -2186,6 +2422,8 @@ pub(super) fn verify_negated_obligation_slice(
     })();
     encoder.clear_ground_pool_relevance_filter();
     axiom_setup_result?;
+    let axiom_scope_is_nonempty =
+        encoder.solver().assertions().len() > assertions_before_axiom_scope;
 
     // Step 6: Solve the negated goal inside a nested scope so the slice-local
     // base context remains available for an explicit vacuity recheck. (#2414)
@@ -2299,6 +2537,33 @@ pub(super) fn verify_negated_obligation_slice(
         // Pop negated-goal scope.
         pop_or_abort_type_invariant!("negated-goal verified scope");
         encoder.restore_ground_pool(ground_pool_snapshot);
+        // Axiom-preserving vacuity refutation (vacuity shield for axioms): the
+        // ordinary base recheck below pops the axiom scope, and the fresh
+        // rescue rebuilds without it, so a base that is only contradictory
+        // TOGETHER WITH the encoder axioms reads as non-vacuous. While the
+        // axiom scope is still live (goal scope already popped, so the stack is
+        // exactly base ∧ axioms), solve it once on a fresh solver. UNSAT means
+        // the proof is vacuous: demote, bypassing the rescue. Refusal-only: a
+        // SAT/unknown/timeout result changes nothing below.
+        if core_result_is_verified(&core_result) && axiom_scope_is_nonempty {
+            let timeout = encoder
+                .solver()
+                .timeout()
+                .map_or(AXIOM_BASE_REFUTATION_TIMEOUT_CAP, |caller| {
+                    (caller / 4).min(AXIOM_BASE_REFUTATION_TIMEOUT_CAP)
+                });
+            if encoder.live_stack_refuted_by_fresh_replay(timeout) == Some(true) {
+                debug!(
+                    "[TRUST_WP_DEBUG] slice {obligation_index}: base with encoder axiom scope is \
+                     UNSAT on a fresh solver; demoting vacuous proof"
+                );
+                pop_or_abort_type_invariant!("axiom vacuous-with-axioms scope");
+                encoder.restore_ground_pool(pre_axiom_ground_pool.clone());
+                return Ok(ResolveContinuation::Continue(VerificationResult::Unknown(
+                    UnknownReason::SolverMessage(VACUOUS_WITH_ENCODER_AXIOMS_MESSAGE.to_string()),
+                )));
+            }
+        }
         // Pop axiom scope — base recheck should see the pre-axiom base context
         // for a clean vacuity assessment. The axioms are not needed for the base
         // recheck (which only tests whether preconditions are consistent). (#2692)
@@ -2387,9 +2652,9 @@ pub(super) fn verify_negated_obligation_slice(
             encoder.restore_ground_pool(ground_pool_snapshot);
             pop_or_abort_type_invariant!("axiom type-invariant timeout scope");
             encoder.restore_ground_pool(pre_axiom_ground_pool);
-            Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-                super::Counterexample::empty(),
-            )))
+            Ok(ResolveContinuation::Continue(
+                crate::verify::structural_failed_traced(),
+            ))
         }
         ResolveContinuation::Continue(VerificationResult::Unknown(ref reason))
             if has_validated_closure_unknown_counterexample(
@@ -2446,7 +2711,7 @@ pub(super) fn verify_negated_obligation_slice(
 
             // Re-enter a fresh scope and re-assert only the negated goal
             // (without axioms). The pre-axiom base context (preconditions,
-            // body constraints, alias constraints) is now the outer scope
+            // body constraints, alias constraints) is the outer scope
             // with no quantified formulas. This keeps the solver in a
             // decidable fragment (QF_LIA or QF_AUFLIA). (#2692)
             encoder.push_scope()?;
@@ -2514,9 +2779,9 @@ pub(super) fn verify_negated_obligation_slice(
                              obligation slice {obligation_index} timed out; \
                              classifying conservatively as Failed"
                         );
-                        Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-                            super::Counterexample::empty(),
-                        )))
+                        Ok(ResolveContinuation::Continue(
+                            crate::verify::structural_failed_traced(),
+                        ))
                     } else {
                         Ok(ResolveContinuation::Continue(fallback_unknown))
                     }
@@ -2533,9 +2798,9 @@ pub(super) fn verify_negated_obligation_slice(
                          obligation slice {obligation_index} hard-timed out; \
                          classifying conservatively as Failed"
                     );
-                    Ok(ResolveContinuation::Abort(VerificationResult::Failed(
-                        super::Counterexample::empty(),
-                    )))
+                    Ok(ResolveContinuation::Abort(
+                        crate::verify::structural_failed_traced(),
+                    ))
                 }
                 ResolveContinuation::Abort(result) => Ok(ResolveContinuation::Abort(result)),
             }
@@ -2588,9 +2853,9 @@ pub(super) fn verify_negated_obligation_slice(
                 "[TRUST_WP_DEBUG] type-invariant obligation slice {obligation_index} \
                  hard-timed out; classifying conservatively as Failed"
             );
-            Ok(ResolveContinuation::Abort(VerificationResult::Failed(
-                super::Counterexample::empty(),
-            )))
+            Ok(ResolveContinuation::Abort(
+                crate::verify::structural_failed_traced(),
+            ))
         }
         ResolveContinuation::Abort(result) => Ok(ResolveContinuation::Abort(result)),
     }
@@ -2874,7 +3139,7 @@ fn pop_scope_or_abort_failed_for_type_invariant_underflow(
                  as Failed and aborting without further cleanup pops"
             );
             Ok(Some(ResolveContinuation::Abort(
-                VerificationResult::Failed(Counterexample::empty()),
+                crate::verify::structural_failed_traced(),
             )))
         }
         Err(error) => Err(error),
@@ -2921,6 +3186,26 @@ fn collect_obligation_function_symbols(
 }
 
 fn assert_negated_goal_with_div_obligations(
+    encoder: &mut AYEncoder,
+    negated_ensure: Term,
+    body_div_obligations: &[Term],
+    post_div_obligations: &[Term],
+) {
+    encoder.with_goal_assertions(|encoder| {
+        assert_negated_goal_with_div_obligations_inner(
+            encoder,
+            negated_ensure,
+            body_div_obligations,
+            post_div_obligations,
+        );
+    });
+}
+
+fn core_result_is_verified(result: &VerificationResult) -> bool {
+    matches!(result, VerificationResult::Verified(_))
+}
+
+fn assert_negated_goal_with_div_obligations_inner(
     encoder: &mut AYEncoder,
     negated_ensure: Term,
     body_div_obligations: &[Term],

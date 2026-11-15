@@ -139,9 +139,9 @@ fn test_parse_index_with_ref() {
     }
 }
 
-/// Bulk test: all 157 unique contract expressions extracted from the 97
-/// Contract strings from the Creusot compat harness "error" set (at commit befa9c5).
-/// Tracks parser coverage of real-world Creusot contract syntax.
+/// Bulk test: the unique contract expressions extracted from the Creusot
+/// compat harness "error" set. Tracks parser coverage of real-world Creusot
+/// contract syntax.
 ///
 /// Commented-out entries are known unsupported: seq! macro, char literals,
 /// closure literals, pointer casts.
@@ -341,8 +341,8 @@ fn test_bulk_creusot_error_contracts() {
 #[test]
 fn test_bug_1538_forall_unit_type() {
     // bug/1538.rs: `forall<_x: ()> foo.bar == ()`
-    // Previously: "parse error at position 25: expected type name in quantifier"
-    // Now: parses with ExprSort::Unit, enabling quantifier elimination (#1065)
+    // `()` is a type name in a quantifier binder and parses to ExprSort::Unit,
+    // which is what makes the quantifier eliminable (#1065).
     let expr = parse_contract("forall<_x: ()> foo.bar == ()").unwrap();
     assert!(
         matches!(&expr, PureExpr::Forall { var, var_sort: Some(ExprSort::Unit), .. } if var == "_x"),
@@ -352,22 +352,23 @@ fn test_bug_1538_forall_unit_type() {
 
 #[test]
 fn test_forall_nested_tuple_type() {
-    // Ensure nested tuple types in quantifiers parse correctly
-    let expr = parse_contract("forall<p: (i32, (u8, u16))> true").unwrap();
+    // Ensure nested tuple types in quantifiers parse correctly (a machine
+    // integer inside one is refused, D-203, so the elements are generic)
+    let expr = parse_contract("forall<p: (T, (U, bool))> true").unwrap();
     assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "p"));
 }
 
 #[test]
 fn test_forall_trailing_comma_tuple_type() {
     // Singleton tuple type: `(T,)`
-    let expr = parse_contract("forall<x: (i32,)> true").unwrap();
+    let expr = parse_contract("forall<x: (T,)> true").unwrap();
     assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "x"));
 }
 
 #[test]
 fn test_multi_binding_with_tuple_types() {
     // Comma inside tuple type must not be confused with binding separator (#613)
-    let expr = parse_contract("forall<a: (i32, i32), b: ()> a == b").unwrap();
+    let expr = parse_contract("forall<a: (T, T), b: ()> a == b").unwrap();
     // Should produce nested Forall: forall a. forall b. a == b
     match &expr {
         PureExpr::Forall {
@@ -398,7 +399,7 @@ fn test_bug_1538_spanned_path() {
 #[test]
 fn test_forall_dyn_trait_type() {
     // unsound_dyn.rs: `forall<x: dyn False> x.falso() == ()` (#657)
-    // Previously: "parse error at position 14: expected '>' after type in quantifier"
+    // `dyn Trait` is a type in a quantifier binder; the `>` closes after it.
     let expr = parse_contract("forall<x: dyn False> x.falso() == ()").unwrap();
     assert!(matches!(&expr, PureExpr::Forall { var, .. } if var == "x"));
 }
@@ -492,7 +493,7 @@ fn test_other_macros_not_unwrapped() {
 
 #[test]
 fn test_spanned_pearlite_matches_unspanned() {
-    // Self-audit (#610): spanned parser must also unwrap pearlite!
+    // The spanned parser must unwrap pearlite! exactly as the unspanned one does (#610).
     for input in ["pearlite!{ x == x }", "pearlite!(x > 0)", "pearlite![true]"] {
         let unspanned = parse_ok(input);
         let spanned = parse_spanned_ok(input);

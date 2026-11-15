@@ -43,4 +43,6 @@ pub use extern_specs::{
     normalize_extern_spec_path, parse_extern_spec_docs, ExternSpecEntry, ExternSpecMergeReport,
     ParseExternSpecError,
 };
-pub use std_specs::{lookup_spec_with_extern, StdSpec};
+pub use std_specs::{
+    builtin_clause_texts, lookup_extern_spec_only, lookup_spec_with_extern, StdSpec,
+};

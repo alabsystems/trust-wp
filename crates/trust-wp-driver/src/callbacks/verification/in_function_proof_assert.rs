@@ -72,10 +72,10 @@ pub(in crate::callbacks) fn verify_in_function_proof_asserts(
     ctx: &InFunctionProofAssertContext<'_>,
     pa_counters: &mut ProofAssertCounters,
 ) {
-    let Some(body_with_facts) = try_get_body_with_context(ctx.contract.local_def_id) else {
+    let Some(body_with_facts) = try_get_body_with_context(tcx, ctx.contract.local_def_id) else {
         return;
     };
-    let mir_body = get_mir_body(body_with_facts);
+    let mir_body = get_mir_body(&body_with_facts);
     let fn_proof_asserts = find_proof_asserts_in_mir(tcx, mir_body, ctx.contract.local_def_id);
     if fn_proof_asserts.is_empty() {
         return;

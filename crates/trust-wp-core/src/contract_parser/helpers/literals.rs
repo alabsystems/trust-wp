@@ -4,7 +4,10 @@
 
 //! Integer/float literal and tuple field index parsing.
 
-use super::super::{ContractParser, ParseError};
+use super::{
+    super::{ContractParser, ParseError},
+    casts::literal_suffix_range,
+};
 use crate::formula::{FloatBits, PureExpr};
 
 impl ContractParser<'_> {
@@ -34,6 +37,7 @@ impl ContractParser<'_> {
     ///
     /// Patterns stay integer-only by continuing to call
     /// [`Self::try_parse_integer`] directly.
+    #[allow(clippy::too_many_lines)]
     pub(in crate::contract_parser) fn try_parse_number(
         &mut self,
     ) -> Result<Option<PureExpr>, ParseError> {
@@ -45,7 +49,10 @@ impl ContractParser<'_> {
         if self.peek() == Some('-') {
             // Only treat as a numeric sign if a digit follows; otherwise leave
             // it for the unary-minus path (handled by the caller).
-            if self.input[self.position..]
+            if self
+                .input
+                .get(self.position..)
+                .unwrap_or("")
                 .chars()
                 .nth(1)
                 .is_some_and(|c| c.is_ascii_digit())
@@ -65,13 +72,26 @@ impl ContractParser<'_> {
 
         // Hex prefix: `0x` / `0X`. Hex literals are integer-only.
         if self.peek() == Some('0') {
-            let after_zero = self.input[self.position..].chars().nth(1);
+            let after_zero = self.input.get(self.position..).unwrap_or("").chars().nth(1);
             if after_zero.is_some_and(|c| c == 'x' || c == 'X') {
                 // Delegate to the integer parser (which handles hex), but it
                 // does not consume a leading sign, so parse from here and apply
                 // the sign ourselves.
                 let hex = self.try_parse_integer()?;
-                return Ok(hex.map(|n| PureExpr::Int(if neg { -n } else { n })));
+                let value = match hex {
+                    // `-n` has no result at i64::MIN. The magnitude parser
+                    // cannot produce it today, but this function does not own
+                    // that invariant, and a wrapped literal would silently
+                    // change the constant a contract talks about.
+                    Some(n) if neg => Some(n.checked_neg().ok_or_else(|| {
+                        self.error("negated integer literal does not fit in i64")
+                    })?),
+                    other => other,
+                };
+                if let Some(value) = value {
+                    self.check_literal_suffix(value, start_pos)?;
+                }
+                return Ok(value.map(PureExpr::Int));
             }
         }
 
@@ -93,12 +113,15 @@ impl ContractParser<'_> {
 
         // Detect a float continuation: `.digit` or `e`/`E` exponent.
         let has_frac = self.peek() == Some('.')
-            && self.input[self.position..]
+            && self
+                .input
+                .get(self.position..)
+                .unwrap_or("")
                 .chars()
                 .nth(1)
                 .is_some_and(|c| c.is_ascii_digit());
         let has_exp = matches!(self.peek(), Some('e' | 'E'))
-            && Self::exponent_follows(&self.input[self.position..]);
+            && Self::exponent_follows(self.input.get(self.position..).unwrap_or(""));
 
         if has_frac || has_exp {
             let mut lit = int_part;
@@ -122,7 +145,7 @@ impl ContractParser<'_> {
             // Optional exponent (may follow either a fractional part or the
             // integer part directly, e.g. `1e10` or `1.5e-3`).
             if matches!(self.peek(), Some('e' | 'E'))
-                && Self::exponent_follows(&self.input[self.position..])
+                && Self::exponent_follows(self.input.get(self.position..).unwrap_or(""))
             {
                 lit.push('e');
                 self.advance(); // 'e' / 'E'
@@ -144,20 +167,28 @@ impl ContractParser<'_> {
                 }
             }
 
-            // Optional float type suffix (`f32` / `f64`), discarded — contract
-            // floats are mathematical reals.
-            self.try_consume_float_type_suffix();
-
-            return match lit.parse::<f64>() {
-                Ok(v) => Ok(Some(PureExpr::Float(FloatBits::from_f64(v)))),
-                Err(_) => Err(self.error(&format!("invalid float literal '{lit}'"))),
+            // A suffix fixes the literal's IEEE format, and the decimal is
+            // rounded to that format directly: rounding it to `f64` first and
+            // then to `f32` can land on a different value. Unsuffixed, the
+            // Rust context decides the format (`FloatBits::unsuffixed`).
+            let parsed = match self.try_consume_float_type_suffix() {
+                Some("f32") => lit.parse::<f32>().ok().map(FloatBits::from_f32),
+                Some(_) => lit.parse::<f64>().ok().map(FloatBits::from_f64),
+                None => FloatBits::unsuffixed(&lit),
+            };
+            return match parsed {
+                Some(bits) => Ok(Some(PureExpr::Float(bits))),
+                None => Err(self.error(&format!("invalid float literal '{lit}'"))),
             };
         }
 
         // Not a float — finish as an integer (consume any int type suffix).
         self.try_consume_integer_type_suffix();
         match int_part.parse::<i64>() {
-            Ok(n) => Ok(Some(PureExpr::Int(n))),
+            Ok(n) => {
+                self.check_literal_suffix(n, start_pos)?;
+                Ok(Some(PureExpr::Int(n)))
+            }
             Err(_) => Err(self.error(&format!(
                 "integer literal '{int_part}' overflows i64 (max {})",
                 i64::MAX
@@ -181,24 +212,26 @@ impl ContractParser<'_> {
     }
 
     /// Consume a float type suffix (`f32` / `f64`) if present. Discarded.
-    fn try_consume_float_type_suffix(&mut self) {
-        let remaining = &self.input[self.position..];
+    fn try_consume_float_type_suffix(&mut self) -> Option<&'static str> {
+        let remaining = self.input.get(self.position..).unwrap_or("");
         for suffix in ["f32", "f64"] {
             if let Some(rest) = remaining.strip_prefix(suffix) {
                 if !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
                     for _ in suffix.chars() {
                         self.advance();
                     }
-                    return;
+                    self.note_literal_suffix(suffix);
+                    return Some(suffix);
                 }
             }
         }
+        None
     }
 
     /// Reset the parser cursor to `pos`, rebuilding the char iterator.
     fn reset_to(&mut self, pos: usize) {
         self.position = pos;
-        self.chars = self.input[pos..].chars().peekable();
+        self.chars = self.input.get(pos..).unwrap_or("").chars().peekable();
     }
 
     pub(in crate::contract_parser) fn try_parse_integer(
@@ -248,7 +281,11 @@ impl ContractParser<'_> {
                 self.try_consume_integer_type_suffix();
                 let is_neg = s.starts_with('-');
                 return match i64::from_str_radix(&hex, 16) {
-                    Ok(n) => Ok(Some(if is_neg { -n } else { n })),
+                    Ok(n) => {
+                        let value = if is_neg { -n } else { n };
+                        self.check_literal_suffix(value, start_pos)?;
+                        Ok(Some(value))
+                    }
                     Err(_) => Err(self.error(&format!("hex literal '0x{hex}' overflows i64"))),
                 };
             }
@@ -274,7 +311,10 @@ impl ContractParser<'_> {
         self.try_consume_integer_type_suffix();
 
         match s.parse::<i64>() {
-            Ok(n) => Ok(Some(n)),
+            Ok(n) => {
+                self.check_literal_suffix(n, start_pos)?;
+                Ok(Some(n))
+            }
             Err(_) => Err(self.error(&format!(
                 "integer literal '{s}' overflows i64 (max {})",
                 i64::MAX
@@ -282,10 +322,37 @@ impl ContractParser<'_> {
         }
     }
 
+    /// Refuse a suffixed integer literal whose value its suffix's type cannot
+    /// hold (`256u8`, `-1u8`, `128i8`): rustc rejects it, so the literal
+    /// denotes no value. `start` is where the literal (with its sign) begins;
+    /// the suffix is the one the literal's own parse just consumed.
+    fn check_literal_suffix(&self, value: i64, start: usize) -> Result<(), ParseError> {
+        let Some(suffix) = self.last_int_suffix else {
+            return Ok(());
+        };
+        let Some((low, high)) = literal_suffix_range(suffix) else {
+            return Ok(());
+        };
+        if (low..=high).contains(&i128::from(value)) {
+            return Ok(());
+        }
+        let written = self.input[start..self.position].trim();
+        Err(ParseError {
+            message: format!(
+                "integer literal `{written}` is outside the range of `{suffix}`; rustc rejects it, \
+                 so it denotes no value"
+            ),
+            position: start,
+        })
+    }
+
     /// Consume an integer type suffix if present (e.g., `u32`, `usize`, `i64`, `int`).
-    /// The suffix is discarded — contract integers are untyped mathematical values.
+    /// The suffix is dropped from the AST — contract integers are untyped
+    /// mathematical values — and recorded, and the literal's value is checked
+    /// against it ([`Self::check_literal_suffix`]).
     fn try_consume_integer_type_suffix(&mut self) {
-        let remaining = &self.input[self.position..];
+        self.last_int_suffix = None;
+        let remaining = self.input.get(self.position..).unwrap_or("");
         let suffixes = [
             "u128", "u64", "u32", "u16", "u8", "usize", "i128", "i64", "i32", "i16", "i8", "isize",
             "int",
@@ -298,6 +365,8 @@ impl ContractParser<'_> {
                     for _ in suffix.chars() {
                         self.advance();
                     }
+                    self.note_literal_suffix(suffix);
+                    self.last_int_suffix = Some(*suffix);
                     return;
                 }
             }

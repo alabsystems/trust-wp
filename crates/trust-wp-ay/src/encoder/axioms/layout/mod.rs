@@ -919,18 +919,17 @@ fn extract_generic_inner_type<'a>(type_suffix: &'a str, prefix: &str) -> Option<
 /// The comma-space separator is `_C__S_` (comma `_C_` + space `_S_`).
 /// Returns `(T_suffix, E_suffix)` or `None` if parsing fails.
 fn extract_result_inner_types(type_suffix: &str) -> Option<(&str, &str)> {
-    let after_prefix = &type_suffix[RESULT_TYPE_PREFIX.len()..];
-    let gt_suffix = "_GT_";
-    if !after_prefix.ends_with(gt_suffix) {
-        return None;
-    }
-    let interior = &after_prefix[..after_prefix.len() - gt_suffix.len()];
+    // `strip_prefix`, not a slice by the prefix's LENGTH. The old form cut
+    // RESULT_TYPE_PREFIX.len() bytes off without checking the input started
+    // with that prefix — or was even that long — so a short or differently
+    // prefixed suffix panicked on a byte range instead of answering None.
+    // Every step below is now a total string operation.
+    let after_prefix = type_suffix.strip_prefix(RESULT_TYPE_PREFIX)?;
+    let interior = after_prefix.strip_suffix("_GT_")?;
 
     // Split on `_C_` (comma). The first comma separates T from E.
     // After the comma there may be `_S_` (space) before E.
-    let comma_pos = interior.find(COMMA_SEPARATOR)?;
-    let ok_part = &interior[..comma_pos];
-    let err_part = &interior[comma_pos + COMMA_SEPARATOR.len()..];
+    let (ok_part, err_part) = interior.split_once(COMMA_SEPARATOR)?;
     // Strip leading `_S_` (space) from err_part if present.
     let err_part = err_part.strip_prefix("_S_").unwrap_or(err_part);
 

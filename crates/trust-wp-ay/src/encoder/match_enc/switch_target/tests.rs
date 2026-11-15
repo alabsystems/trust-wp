@@ -239,31 +239,6 @@ fn test_from_arms_mixed_stdlib_returns_none() {
     assert_eq!(SwitchTarget::from_arms(&arms), None);
 }
 
-// -- SwitchTarget::value_constructor_name --
-
-#[test]
-fn test_value_constructor_name_option() {
-    assert_eq!(SwitchTarget::OptionInt.value_constructor_name(), "Some");
-}
-
-#[test]
-fn test_value_constructor_name_result() {
-    assert_eq!(SwitchTarget::ResultIntInt.value_constructor_name(), "Ok");
-}
-
-#[test]
-fn test_value_constructor_name_user_defined() {
-    let target = SwitchTarget::UserDefined {
-        adt_name: "Color".to_string(),
-        constructors: vec![
-            ("Color::Red".to_string(), vec![Sort::Int]),
-            ("Color::Blue".to_string(), vec![]),
-        ],
-    };
-    // First constructor with arity >= 1 is "Color::Red" → short name "Red"
-    assert_eq!(target.value_constructor_name(), "Red");
-}
-
 // -- SwitchTarget::datatype --
 
 #[test]
@@ -434,19 +409,6 @@ fn test_from_arms_constructor_with_wildcard_arm() {
 }
 
 // -- Edge case: User-defined enum with all-nullary constructors --
-
-#[test]
-fn test_value_constructor_name_user_defined_all_nullary() {
-    // All constructors are nullary — falls back to the first constructor
-    let target = SwitchTarget::UserDefined {
-        adt_name: "Direction".to_string(),
-        constructors: vec![
-            ("Direction::North".to_string(), vec![]),
-            ("Direction::South".to_string(), vec![]),
-        ],
-    };
-    assert_eq!(target.value_constructor_name(), "North");
-}
 
 #[test]
 fn test_datatype_option_none_constructor_is_nullary() {

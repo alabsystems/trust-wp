@@ -22,7 +22,10 @@ use super::{
 };
 use crate::{
     contract_parser::parse_contract,
-    formula::{BinOp, CaptureAvoidingSubstOptions, ExprSort, PureExpr, UnOp},
+    formula::{
+        elaborate::{dereferenced, elaborate, sort_of, Dereference},
+        BinOp, CaptureAvoidingSubstOptions, ExprSort, PureExpr, UnOp,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,9 +95,52 @@ pub(super) fn prove_native_pure_predicate(
     claim_format: NativeClaimFormat,
     summary_facts: &[BundleSummaryFact],
 ) -> NativePureProofOutcome {
+    // The rules below read each name at the sort the elaboration writes on
+    // it, so a claim reading one name at two sorts would be proved of two
+    // names: `(0 < 1 ==> b + 1 > b) && ((b : bool) || true)`. Replay refuses
+    // what the claim decoder refuses, by the same elaboration.
+    let elaboration = elaborate(predicate);
+    if let Some((name, first, second)) = elaboration.conflict {
+        return NativePureProofOutcome::Unsupported(format!(
+            "native pure replay cannot prove or refute predicate: it reads `{name}` at both \
+             {first} and {second}"
+        ));
+    }
     let normalized_predicate = predicate.to_string();
+    // The decoder bound each fact to the binders the claim opens with as
+    // written (`summary_fact_names`), before alias resolution moved any.
+    let predicate = elaboration.typed;
     let context = NativeReplayContext { summary_facts };
-    match prove_bool(predicate, &context) {
+    // Case splitting decides VALIDITY of the complete goal. A counterexample
+    // must never be fed back as the truth value of a subexpression: doing that
+    // to `p` inside `p ==> false` would prove the implication.
+    let truth = match prove_bool(&predicate, &context) {
+        unknown @ TruthValue::Unknown { .. } => match boolean_validity(&predicate) {
+            Some(true) => TruthValue::True {
+                rule: "boolean-case-split",
+            },
+            Some(false) => {
+                return NativePureProofOutcome::Failed(
+                    "typed Boolean goal has a counterexample under exhaustive case splitting"
+                        .into(),
+                )
+            }
+            None => match mixed_boolean_integer_validity(&predicate, &context) {
+                Some(true) => TruthValue::True {
+                    rule: "boolean-integer-case-split",
+                },
+                Some(false) => {
+                    return NativePureProofOutcome::Failed(
+                        "typed scalar goal has a counterexample under exhaustive Boolean case splitting"
+                            .into(),
+                    )
+                }
+                None => unknown,
+            },
+        },
+        truth => truth,
+    };
+    match truth {
         TruthValue::True { rule } => NativePureProofOutcome::Verified(NativePureProof {
             steps: vec![
                 NativeReplayStep::DecodeClaimFormat(claim_format),
@@ -107,9 +153,380 @@ pub(super) fn prove_native_pure_predicate(
         TruthValue::False { rule } => NativePureProofOutcome::Failed(format!(
             "typed predicate is false by native pure replay rule `{rule}`"
         )),
-        TruthValue::Unknown { reason } => NativePureProofOutcome::Unsupported(format!(
-            "native pure replay cannot prove or refute predicate: {reason}"
-        )),
+        TruthValue::Unknown { reason } => {
+            if let Some(assignment) = checked_scalar_counterexample(&predicate, &context) {
+                NativePureProofOutcome::Failed(format!(
+                    "typed scalar goal has a checked whole-predicate counterexample: {assignment}"
+                ))
+            } else {
+                NativePureProofOutcome::Unsupported(format!(
+                    "native pure replay cannot prove or refute predicate: {reason}"
+                ))
+            }
+        }
+    }
+}
+
+/// A bounded decision procedure for the explicitly typed Boolean fragment.
+/// Every valuation is checked; no solver verdict or external assumption enters.
+fn boolean_validity(predicate: &PureExpr) -> Option<bool> {
+    fn collect(
+        expr: &PureExpr,
+        names: &mut BTreeMap<String, bool>,
+        remaining: &mut usize,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        *remaining = remaining.checked_sub(1)?;
+        match expr {
+            PureExpr::Bool(_) => Some(()),
+            PureExpr::Var(name, Some(ExprSort::Bool)) => {
+                names.insert(name.clone(), false);
+                (names.len() <= 8).then_some(())
+            }
+            PureExpr::UnOp(UnOp::Not, inner) => collect(inner, names, remaining, depth + 1),
+            PureExpr::BinOp(
+                left,
+                BinOp::And | BinOp::Or | BinOp::Implies | BinOp::Eq | BinOp::Ne,
+                right,
+            ) => {
+                collect(left, names, remaining, depth + 1)?;
+                collect(right, names, remaining, depth + 1)
+            }
+            PureExpr::Ite(condition, left, right) => {
+                collect(condition, names, remaining, depth + 1)?;
+                collect(left, names, remaining, depth + 1)?;
+                collect(right, names, remaining, depth + 1)
+            }
+            _ => None,
+        }
+    }
+    fn evaluate(expr: &PureExpr, values: &BTreeMap<String, bool>) -> Option<bool> {
+        Some(match expr {
+            PureExpr::Bool(value) => *value,
+            PureExpr::Var(name, Some(ExprSort::Bool)) => *values.get(name)?,
+            PureExpr::UnOp(UnOp::Not, inner) => !evaluate(inner, values)?,
+            PureExpr::BinOp(left, op, right) => {
+                let left = evaluate(left, values)?;
+                let right = evaluate(right, values)?;
+                match op {
+                    BinOp::And => left && right,
+                    BinOp::Or => left || right,
+                    BinOp::Implies => !left || right,
+                    BinOp::Eq => left == right,
+                    BinOp::Ne => left != right,
+                    _ => return None,
+                }
+            }
+            PureExpr::Ite(condition, left, right) => {
+                if evaluate(condition, values)? {
+                    evaluate(left, values)?
+                } else {
+                    evaluate(right, values)?
+                }
+            }
+            _ => return None,
+        })
+    }
+    let mut values = BTreeMap::new();
+    collect(predicate, &mut values, &mut 4096, 0)?;
+    for bits in 0..(1usize << values.len()) {
+        for (index, value) in values.values_mut().enumerate() {
+            *value = bits & (1 << index) != 0;
+        }
+        if !evaluate(predicate, &values)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+// Both validity and countermodel discovery admit exactly this state-free typed
+// fragment. Binding/state constructs are deliberately not traversed by substitution.
+fn collect_scalar_case_inputs(
+    expr: &PureExpr,
+    names: &mut BTreeMap<String, bool>,
+    integers: &mut BTreeMap<String, ()>,
+    has_integer: &mut bool,
+    remaining: &mut usize,
+    depth: usize,
+) -> Option<()> {
+    if depth > 64 {
+        return None;
+    }
+    *remaining = remaining.checked_sub(1)?;
+    match expr {
+        PureExpr::Bool(_) => Some(()),
+        PureExpr::Int(_) => {
+            *has_integer = true;
+            Some(())
+        }
+        PureExpr::Var(name, Some(ExprSort::Int)) => {
+            *has_integer = true;
+            integers.insert(name.clone(), ());
+            Some(())
+        }
+        PureExpr::Var(name, Some(ExprSort::Bool)) => {
+            names.insert(name.clone(), false);
+            (names.len() <= 8).then_some(())
+        }
+        PureExpr::UnOp(op, inner) => {
+            let sort = match op {
+                UnOp::Not => ExprSort::Bool,
+                UnOp::Neg | UnOp::BitNot => ExprSort::Int,
+            };
+            (scalar_sort(inner) == Some(sort)).then_some(())?;
+            collect_scalar_case_inputs(inner, names, integers, has_integer, remaining, depth + 1)
+        }
+        PureExpr::BinOp(left, op, right) => {
+            let left_sort = scalar_sort(left)?;
+            let right_sort = scalar_sort(right)?;
+            let well_sorted = match op {
+                BinOp::And | BinOp::Or | BinOp::Implies => {
+                    left_sort == ExprSort::Bool && right_sort == ExprSort::Bool
+                }
+                BinOp::Eq | BinOp::Ne => left_sort == right_sort,
+                _ => left_sort == ExprSort::Int && right_sort == ExprSort::Int,
+            };
+            well_sorted.then_some(())?;
+            collect_scalar_case_inputs(left, names, integers, has_integer, remaining, depth + 1)?;
+            collect_scalar_case_inputs(right, names, integers, has_integer, remaining, depth + 1)
+        }
+        PureExpr::Ite(condition, left, right) => {
+            (scalar_sort(condition) == Some(ExprSort::Bool)
+                && scalar_sort(left).is_some()
+                && scalar_sort(left) == scalar_sort(right))
+            .then_some(())?;
+            collect_scalar_case_inputs(
+                condition,
+                names,
+                integers,
+                has_integer,
+                remaining,
+                depth + 1,
+            )?;
+            collect_scalar_case_inputs(left, names, integers, has_integer, remaining, depth + 1)?;
+            collect_scalar_case_inputs(right, names, integers, has_integer, remaining, depth + 1)
+        }
+        // Substitution must not identify current and old-state values or
+        // rewrite a bound name. Those constructs keep their existing rules.
+        _ => None,
+    }
+}
+
+/// Exhaust only Boolean inputs, then prove each complete residual goal with
+/// the ordinary scalar replay rules. Integer names remain universally symbolic;
+/// failure to prove one residual is not a counterexample to that residual.
+fn mixed_boolean_integer_validity(
+    predicate: &PureExpr,
+    context: &NativeReplayContext<'_>,
+) -> Option<bool> {
+    let mut values = BTreeMap::new();
+    let mut integers = BTreeMap::new();
+    let mut has_integer = false;
+    collect_scalar_case_inputs(
+        predicate,
+        &mut values,
+        &mut integers,
+        &mut has_integer,
+        &mut 4096,
+        0,
+    )?;
+    if values.is_empty() || !has_integer || scalar_sort(predicate) != Some(ExprSort::Bool) {
+        return None;
+    }
+    let mut all_proved = true;
+    for bits in 0..(1usize << values.len()) {
+        let mut substitutions = HashMap::new();
+        for (index, (name, value)) in values.iter_mut().enumerate() {
+            *value = bits & (1 << index) != 0;
+            substitutions.insert(name.clone(), PureExpr::Bool(*value));
+        }
+        let residual = predicate
+            .substitute_capture_avoiding(&substitutions, &CaptureAvoidingSubstOptions::default());
+        match prove_bool(&residual, context) {
+            TruthValue::True { .. } => {}
+            TruthValue::False { .. } => return Some(false),
+            TruthValue::Unknown { .. } => all_proved = false,
+        }
+    }
+    all_proved.then_some(true)
+}
+
+/// Search hints are not a decision procedure for integers. Only a total,
+/// sort-exact assignment making the entire original goal false can refute it.
+/// Failure to find one leaves the existing Unknown result unchanged.
+fn checked_scalar_counterexample(
+    predicate: &PureExpr,
+    context: &NativeReplayContext<'_>,
+) -> Option<String> {
+    // Summary facts may constrain candidate values. This fragment does not yet
+    // instantiate/check those facts, so it must not refute under an empty context.
+    if !context.summary_facts.is_empty() {
+        return None;
+    }
+    let mut booleans = BTreeMap::new();
+    let mut integers = BTreeMap::new();
+    let mut has_integer = false;
+    collect_scalar_case_inputs(
+        predicate,
+        &mut booleans,
+        &mut integers,
+        &mut has_integer,
+        &mut 4096,
+        0,
+    )?;
+    if integers.is_empty() || integers.len() > 8 || scalar_sort(predicate) != Some(ExprSort::Bool) {
+        return None;
+    }
+    // Zero, each individual one, and all ones find distinct unsigned inputs
+    // without enumerating an integer domain or changing the predicate's guards.
+    for bits in 0..(1usize << booleans.len()) {
+        for integer_case in 0..integers.len() + 2 {
+            let mut substitutions = HashMap::new();
+            for (index, name) in booleans.keys().enumerate() {
+                substitutions.insert(name.clone(), PureExpr::Bool(bits & (1 << index) != 0));
+            }
+            for (index, name) in integers.keys().enumerate() {
+                let value =
+                    i64::from(integer_case == index + 1 || integer_case == integers.len() + 1);
+                substitutions.insert(name.clone(), PureExpr::Int(value));
+            }
+            if check_scalar_counterexample(predicate, &substitutions) {
+                let mut assignments = substitutions.iter().collect::<Vec<_>>();
+                assignments.sort_by(|left, right| left.0.cmp(right.0));
+                return Some(
+                    assignments
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn check_scalar_counterexample(
+    predicate: &PureExpr,
+    substitutions: &HashMap<String, PureExpr>,
+) -> bool {
+    let mut booleans = BTreeMap::new();
+    let mut integers = BTreeMap::new();
+    let mut has_integer = false;
+    if collect_scalar_case_inputs(
+        predicate,
+        &mut booleans,
+        &mut integers,
+        &mut has_integer,
+        &mut 4096,
+        0,
+    )
+    .is_none()
+        || scalar_sort(predicate) != Some(ExprSort::Bool)
+    {
+        return false;
+    }
+    if substitutions.len() != booleans.len() + integers.len()
+        || booleans
+            .keys()
+            .any(|name| !matches!(substitutions.get(name), Some(PureExpr::Bool(_))))
+        || integers
+            .keys()
+            .any(|name| !matches!(substitutions.get(name), Some(PureExpr::Int(_))))
+    {
+        return false;
+    }
+    let ground = predicate
+        .substitute_capture_avoiding(substitutions, &CaptureAvoidingSubstOptions::default());
+    matches!(
+        prove_bool(&ground, &NativeReplayContext { summary_facts: &[] }),
+        TruthValue::False { .. }
+    )
+}
+
+#[cfg(test)]
+mod boolean_case_split_tests {
+    use super::*;
+
+    #[test]
+    fn complete_goal_validity_is_not_subexpression_truth() {
+        for text in ["(p : bool) ==> false", "(p : bool) == !(p : bool)"] {
+            let predicate = parse_contract(text).unwrap();
+            assert_eq!(boolean_validity(&predicate), Some(false));
+            assert!(!matches!(
+                prove_native_pure_predicate(&predicate, NativeClaimFormat::TrustWpPureExprV1, &[]),
+                NativePureProofOutcome::Verified(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn boolean_branch_identity_has_checked_cases() {
+        let predicate = parse_contract(
+            "((p : bool) ==> (false == !(p : bool))) && (!(p : bool) ==> (true == !(p : bool)))",
+        )
+        .unwrap();
+        assert_eq!(boolean_validity(&predicate), Some(true));
+        assert!(matches!(
+            prove_native_pure_predicate(&predicate, NativeClaimFormat::TrustWpPureExprV1, &[]),
+            NativePureProofOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn concrete_counterexample_checks_total_sort_exact_values_and_original_guards() {
+        let predicate = elaborate(
+            &parse_contract(
+                "((x : Int) >= 0 && x <= 255 && (y : Int) >= 0 && y <= 255) ==> \
+             (((c : bool) ==> y == x) && (!c ==> x == y))",
+            )
+            .unwrap(),
+        )
+        .typed;
+        let candidate = HashMap::from([
+            ("c".into(), PureExpr::Bool(false)),
+            ("x".into(), PureExpr::Int(0)),
+            ("y".into(), PureExpr::Int(1)),
+        ]);
+        assert!(check_scalar_counterexample(&predicate, &candidate));
+        let mut changed = candidate.clone();
+        changed.remove("y");
+        assert!(!check_scalar_counterexample(&predicate, &changed));
+        let mut changed = candidate.clone();
+        changed.insert("y".into(), PureExpr::Bool(true));
+        assert!(!check_scalar_counterexample(&predicate, &changed));
+        let mut changed = candidate.clone();
+        changed.insert("y".into(), PureExpr::Int(256));
+        assert!(!check_scalar_counterexample(&predicate, &changed));
+        let mut changed = candidate.clone();
+        changed.insert("y".into(), PureExpr::Int(0));
+        assert!(!check_scalar_counterexample(&predicate, &changed));
+        let mut changed = candidate;
+        changed.insert("unrelated".into(), PureExpr::Int(1));
+        assert!(!check_scalar_counterexample(&predicate, &changed));
+        let stateful = elaborate(&parse_contract("(p : bool) == old(p)").unwrap()).typed;
+        assert!(!check_scalar_counterexample(
+            &stateful,
+            &HashMap::from([("p".into(), PureExpr::Bool(false))])
+        ));
+    }
+
+    #[test]
+    fn untyped_integer_and_oversized_cases_are_not_boolean_proofs() {
+        assert_eq!(boolean_validity(&parse_contract("x == x").unwrap()), None);
+        assert_eq!(
+            boolean_validity(&parse_contract("(x : Int) == (x : Int)").unwrap()),
+            None
+        );
+        let names = (0..9)
+            .map(|index| format!("(p{index} : bool)"))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        assert_eq!(boolean_validity(&parse_contract(&names).unwrap()), None);
     }
 }
 
@@ -258,14 +675,16 @@ fn checked_native_pure_proof(
 /// Replay and validate aggregate verify-bundle evidence for a successful
 /// result.
 ///
-/// This checks the bundle-level aggregate manifest, then replays each native
-/// trust-wp per-obligation proof artifact. Non-native proof formats must still be
-/// proof-grade checked evidence, but are not interpreted by the native pure
-/// replay checker.
+/// This validates the request and bundle-level manifest, then re-proves each
+/// obligation with the native checker. Other proof formats are readable DATA,
+/// but this API has no checker for them and refuses them regardless of metadata.
 pub fn replay_verify_bundle_result_evidence(
     request: &VerifyBundleRequest,
     result: &VerifyBundleResult,
 ) -> Result<(), ProofReplayError> {
+    if let Some(diagnostic) = request.validation_diagnostics().into_iter().next() {
+        return Err(ProofReplayError::new(diagnostic.code, diagnostic.message));
+    }
     let aggregate = checked_aggregate_result_evidence(request, result)?;
     replay_result_obligation_evidence(request, result)?;
 
@@ -397,14 +816,7 @@ fn replay_result_obligation_evidence(
                 ),
             ));
         }
-        if evidence.format == ProofEvidenceFormat::TrustWpNativePureReplayV1 {
-            replay_native_pure_evidence(request, obligation, evidence)?;
-        } else if !evidence.is_proof_grade() {
-            return Err(ProofReplayError::new(
-                "proof_replay.aggregate_obligation_evidence",
-                format!("obligation `{}` evidence is not proof-grade", obligation.id),
-            ));
-        }
+        replay_native_pure_evidence(request, obligation, evidence)?;
     }
 
     Ok(())
@@ -1297,11 +1709,17 @@ fn stable_digest(material: &str) -> BundleDigest {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    // Formatting rather than a lookup table. The table indices are provably
+    // 0..=15 and the capacity product provably fits for any real slice, but
+    // both are obligations this function cannot discharge from its own body:
+    // the shift/mask range and the length bound belong to the caller. `{:02x}`
+    // has neither an index nor a product and emits the identical lowercase
+    // two-digit hex.
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        // Writing to a String cannot fail.
+        let _ = write!(encoded, "{byte:02x}");
     }
     encoded
 }
@@ -1354,64 +1772,77 @@ impl TruthValue {
     }
 }
 
+/// The truth native replay proves of an elaborated predicate: every name in
+/// it carries its sort (`formula::elaborate`), which the rules below read.
 fn prove_bool(expr: &PureExpr, context: &NativeReplayContext<'_>) -> TruthValue {
-    let mut env = HashMap::new();
-    prove_bool_with_env(expr, &mut env, context)
-}
-
-fn prove_bool_with_env(
-    expr: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
-    context: &NativeReplayContext<'_>,
-) -> TruthValue {
     match expr {
         PureExpr::Bool(value) => TruthValue::from_bool(*value, "bool-literal"),
-        PureExpr::UnOp(UnOp::Not, inner) => match prove_bool_with_env(inner, env, context) {
+        PureExpr::UnOp(UnOp::Not, inner) => match prove_bool(inner, context) {
             TruthValue::True { .. } => TruthValue::False { rule: "not-true" },
             TruthValue::False { .. } => TruthValue::True { rule: "not-false" },
             TruthValue::Unknown { reason } => TruthValue::Unknown { reason },
         },
-        PureExpr::BinOp(left, op, right) => prove_binary_bool(left, *op, right, env, context),
-        PureExpr::Ite(cond, then_expr, else_expr) => {
-            prove_ite(cond, then_expr, else_expr, env, context)
-        }
+        PureExpr::BinOp(left, op, right) => prove_binary_bool(left, *op, right, context),
+        PureExpr::Ite(cond, then_expr, else_expr) => prove_ite(cond, then_expr, else_expr, context),
         PureExpr::Forall {
             var,
             var_sort,
             body,
             ..
-        } => match with_bound_sort(env, var, var_sort.as_ref(), |env| {
-            prove_bool_with_env(body, env, context)
-        }) {
-            TruthValue::True { .. } => TruthValue::True {
-                rule: "forall-true-body",
-            },
-            TruthValue::False { .. } => TruthValue::False {
-                rule: "forall-false-body",
-            },
-            TruthValue::Unknown { reason } => TruthValue::Unknown { reason },
-        },
+        } => {
+            let domain = match replay_binder_domain(var, var_sort.as_ref()) {
+                Ok(domain) => domain,
+                Err(unknown) => return unknown,
+            };
+            match prove_bool(body, context) {
+                TruthValue::True { .. } => TruthValue::True {
+                    rule: "forall-true-body",
+                },
+                // A false body refutes `forall` only at a value of the
+                // domain: over an empty one the claim holds vacuously.
+                TruthValue::False { .. } if domain == BinderDomain::Inhabited => {
+                    TruthValue::False {
+                        rule: "forall-false-body",
+                    }
+                }
+                TruthValue::False { .. } => TruthValue::unknown(format!(
+                    "`forall` binder `{var}` ranges over a sort not known to be inhabited, so a \
+                     false body does not refute it"
+                )),
+                TruthValue::Unknown { reason } => TruthValue::Unknown { reason },
+            }
+        }
         PureExpr::Exists {
             var,
             var_sort,
             body,
             ..
-        } => match with_bound_sort(env, var, var_sort.as_ref(), |env| {
-            prove_bool_with_env(body, env, context)
-        }) {
-            TruthValue::True { .. } => TruthValue::True {
-                rule: "exists-true-body",
-            },
-            TruthValue::False { .. } => TruthValue::False {
-                rule: "exists-false-body",
-            },
-            TruthValue::Unknown { reason } => TruthValue::Unknown { reason },
-        },
+        } => {
+            let domain = match replay_binder_domain(var, var_sort.as_ref()) {
+                Ok(domain) => domain,
+                Err(unknown) => return unknown,
+            };
+            match prove_bool(body, context) {
+                // A true body proves `exists` only with a value to witness
+                // it: over an empty domain the claim is false.
+                TruthValue::True { .. } if domain == BinderDomain::Inhabited => TruthValue::True {
+                    rule: "exists-true-body",
+                },
+                TruthValue::True { .. } => TruthValue::unknown(format!(
+                    "`exists` binder `{var}` ranges over a sort not known to be inhabited, so a \
+                     true body does not prove it"
+                )),
+                TruthValue::False { .. } => TruthValue::False {
+                    rule: "exists-false-body",
+                },
+                TruthValue::Unknown { reason } => TruthValue::Unknown { reason },
+            }
+        }
         PureExpr::LetAssume { assumption, body } => {
-            prove_binary_bool(assumption, BinOp::Implies, body, env, context)
+            prove_binary_bool(assumption, BinOp::Implies, body, context)
         }
         PureExpr::LetObligation { obligation, body } => {
-            prove_binary_bool(obligation, BinOp::And, body, env, context)
+            prove_binary_bool(obligation, BinOp::And, body, context)
         }
         PureExpr::Let { var, value, body } => {
             let Some(inlined) = inline_let_binding_for_native_replay(var, value, body) else {
@@ -1419,7 +1850,7 @@ fn prove_bool_with_env(
                     "let binding crosses an old-state boundary outside the native replay fragment",
                 );
             };
-            prove_bool_with_env(&inlined, env, context)
+            prove_bool(&inlined, context)
         }
         PureExpr::Closure { .. }
         | PureExpr::Int(_)
@@ -1435,6 +1866,46 @@ fn prove_bool_with_env(
         | PureExpr::LogicFnCall { .. } => {
             TruthValue::unknown("predicate is outside the native replay fragment")
         }
+    }
+}
+
+/// What native replay knows of the values a quantifier binder ranges over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinderDomain {
+    /// `Int` or `Bool`: every body the binder reads is decided over a
+    /// non-empty range, so a body that is false (true) everywhere refutes
+    /// `forall` (proves `exists`).
+    Inhabited,
+    /// A reference: pointer replay models its values, but a reference to an
+    /// uninhabited type has none, so no witness exists.
+    MaybeEmpty,
+}
+
+/// The domain of a binder native replay models, or the `Unknown` refusing
+/// one it does not: a type parameter could be any type, a sequence is not a
+/// value the replay rules read, and an elided sort names no range at all.
+/// Each of these was read as an integer by the arithmetic rules.
+fn replay_binder_domain(
+    var: &str,
+    var_sort: Option<&ExprSort>,
+) -> Result<BinderDomain, TruthValue> {
+    match var_sort {
+        Some(ExprSort::Int | ExprSort::Bool) => Ok(BinderDomain::Inhabited),
+        Some(ExprSort::Ref(_) | ExprSort::MutRef(_)) => Ok(BinderDomain::MaybeEmpty),
+        Some(
+            sort @ (ExprSort::Seq
+            | ExprSort::Unit
+            | ExprSort::Datatype(_)
+            | ExprSort::FMap
+            | ExprSort::Tuple(_)
+            | ExprSort::TypeParam(_)
+            | ExprSort::Float(_)),
+        ) => Err(TruthValue::unknown(format!(
+            "quantifier binder `{var}` ranges over sort {sort}, which native replay does not model"
+        ))),
+        None => Err(TruthValue::unknown(format!(
+            "quantifier binder `{var}` has no sort, so native replay has no range to read it over"
+        ))),
     }
 }
 
@@ -1462,22 +1933,21 @@ fn prove_binary_bool(
     left: &PureExpr,
     op: BinOp,
     right: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
     context: &NativeReplayContext<'_>,
 ) -> TruthValue {
     match op {
-        BinOp::And => prove_and(left, right, env, context),
-        BinOp::Or => prove_or(left, right, env, context),
-        BinOp::Implies => prove_implies(left, right, env, context),
+        BinOp::And => prove_and(left, right, context),
+        BinOp::Or => prove_or(left, right, context),
+        BinOp::Implies => prove_implies(left, right, context),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             // Preserve the guard of a conditional operand instead of asking
             // the comparison prover to reason about an opaque value.  This is
             // the exact semantics of a total `if`: both guarded comparisons
             // must discharge independently.
             if let Some(rewritten) = split_comparison_ite(left, op, right) {
-                prove_bool_with_env(&rewritten, env, context)
+                prove_bool(&rewritten, context)
             } else {
-                prove_comparison(left, op, right, env, context)
+                prove_comparison(left, op, right, context)
             }
         }
         BinOp::Add
@@ -1495,16 +1965,8 @@ fn prove_binary_bool(
     }
 }
 
-fn prove_and(
-    left: &PureExpr,
-    right: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
-    context: &NativeReplayContext<'_>,
-) -> TruthValue {
-    match (
-        prove_bool_with_env(left, env, context),
-        prove_bool_with_env(right, env, context),
-    ) {
+fn prove_and(left: &PureExpr, right: &PureExpr, context: &NativeReplayContext<'_>) -> TruthValue {
+    match (prove_bool(left, context), prove_bool(right, context)) {
         (TruthValue::True { .. }, TruthValue::True { .. }) => TruthValue::True { rule: "and-true" },
         (TruthValue::False { .. }, _) | (_, TruthValue::False { .. }) => {
             TruthValue::False { rule: "and-false" }
@@ -1515,16 +1977,8 @@ fn prove_and(
     }
 }
 
-fn prove_or(
-    left: &PureExpr,
-    right: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
-    context: &NativeReplayContext<'_>,
-) -> TruthValue {
-    match (
-        prove_bool_with_env(left, env, context),
-        prove_bool_with_env(right, env, context),
-    ) {
+fn prove_or(left: &PureExpr, right: &PureExpr, context: &NativeReplayContext<'_>) -> TruthValue {
+    match (prove_bool(left, context), prove_bool(right, context)) {
         (TruthValue::True { .. }, _) | (_, TruthValue::True { .. }) => {
             TruthValue::True { rule: "or-true" }
         }
@@ -1540,7 +1994,6 @@ fn prove_or(
 fn prove_implies(
     left: &PureExpr,
     right: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
     context: &NativeReplayContext<'_>,
 ) -> TruthValue {
     if assumption_entails_predicate(left, right) {
@@ -1549,10 +2002,7 @@ fn prove_implies(
         };
     }
 
-    match (
-        prove_bool_with_env(left, env, context),
-        prove_bool_with_env(right, env, context),
-    ) {
+    match (prove_bool(left, context), prove_bool(right, context)) {
         (TruthValue::False { .. }, _) | (_, TruthValue::True { .. }) => TruthValue::True {
             rule: "implies-true",
         },
@@ -1633,7 +2083,7 @@ fn comparison_reverse(op: BinOp) -> Option<BinOp> {
 ///
 /// This is deliberately separate from [`comparison_reverse`].  It is valid
 /// only over a total order and therefore remains gated by
-/// [`is_ordered_integer_operand`] at its call site.
+/// [`is_int_sorted`] at its call site.
 fn negate_ordered_comparison(op: BinOp) -> Option<BinOp> {
     match op {
         BinOp::Lt => Some(BinOp::Ge),
@@ -1645,15 +2095,21 @@ fn negate_ordered_comparison(op: BinOp) -> Option<BinOp> {
     }
 }
 
-/// Whether an expression is inside the native replay engine's integer-order
-/// fragment.  An absent sort means `Int` by the formula AST's documented
-/// backwards-compatible convention.  Every other sort fails closed.
-fn is_ordered_integer_operand(expr: &PureExpr) -> bool {
+/// Whether native replay knows `expr` to be an integer: a literal, a name
+/// its elaboration makes an `Int` (or leaves unsorted), `*e` or
+/// `^e` of a reference to an `Int`, the view `e@` of an integer `e` (the view
+/// of any other sort is not modeled), and integer arithmetic, `old`, `if`
+/// branches and `let` bodies over those. Every integer rule below reads an
+/// operand as an integer only when this holds: a shape rule proves nothing
+/// about a value that is not an integer, and `e + k > e` was proved of `*p`
+/// for a `p: &bool`, a `&T` and a `&[Int]`.
+fn is_int_sorted(expr: &PureExpr) -> bool {
     match expr {
         PureExpr::Int(_) => true,
-        PureExpr::Float(_) => false,
         PureExpr::Var(_, sort) => sort.as_ref().is_none_or(|sort| *sort == ExprSort::Int),
-        PureExpr::UnOp(UnOp::Neg, inner) => is_ordered_integer_operand(inner),
+        PureExpr::UnOp(UnOp::Neg | UnOp::BitNot, inner)
+        | PureExpr::Old(inner)
+        | PureExpr::View(inner) => is_int_sorted(inner),
         PureExpr::BinOp(left, op, right) => {
             matches!(
                 op,
@@ -1664,15 +2120,65 @@ fn is_ordered_integer_operand(expr: &PureExpr) -> bool {
                     | BinOp::Mod
                     | BinOp::DivTrunc
                     | BinOp::RemTrunc
-            ) && is_ordered_integer_operand(left)
-                && is_ordered_integer_operand(right)
+                    | BinOp::Shl
+                    | BinOp::Shr
+                    | BinOp::BitAnd
+                    | BinOp::BitXor
+                    | BinOp::BitOr
+            ) && is_int_sorted(left)
+                && is_int_sorted(right)
         }
-        PureExpr::Old(inner)
-        | PureExpr::Deref(inner)
-        | PureExpr::Final(inner)
-        | PureExpr::View(inner) => is_ordered_integer_operand(inner),
-        _ => false,
+        PureExpr::Ite(_, then_expr, else_expr) => {
+            is_int_sorted(then_expr) && is_int_sorted(else_expr)
+        }
+        PureExpr::Deref(operand) => {
+            dereferenced(operand, Dereference::Current).referent() == Some(ExprSort::Int)
+        }
+        PureExpr::Final(operand) => {
+            dereferenced(operand, Dereference::Final).referent() == Some(ExprSort::Int)
+        }
+        PureExpr::Let { body, .. } => is_int_sorted(body),
+        PureExpr::Bool(_)
+        | PureExpr::Float(_)
+        | PureExpr::UnOp(UnOp::Not, _)
+        | PureExpr::MethodCall { .. }
+        | PureExpr::Forall { .. }
+        | PureExpr::Exists { .. }
+        | PureExpr::Match { .. }
+        | PureExpr::LogicFnCall { .. }
+        | PureExpr::LetAssume { .. }
+        | PureExpr::LetObligation { .. }
+        | PureExpr::Closure { .. } => false,
     }
+}
+
+/// `Int` when native replay reads `expr` as an integer ([`is_int_sorted`]),
+/// `Bool` when the claim fixes it as a boolean ([`sort_of`]) or it is a
+/// comparison, connective or quantifier, else `None`.
+fn scalar_sort(expr: &PureExpr) -> Option<ExprSort> {
+    if is_int_sorted(expr) {
+        return Some(ExprSort::Int);
+    }
+    let boolean = sort_of(expr) == Some(ExprSort::Bool)
+        || matches!(
+            expr,
+            PureExpr::BinOp(
+                _,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Implies,
+                _,
+            ) | PureExpr::UnOp(UnOp::Not, _)
+                | PureExpr::Forall { .. }
+                | PureExpr::Exists { .. }
+        );
+    boolean.then_some(ExprSort::Bool)
 }
 
 /// Rewrite `!(a op b)` to the equivalent ordered integer comparison.
@@ -1689,7 +2195,7 @@ fn denegate_ordered_integer_comparison(expr: &PureExpr) -> Option<PureExpr> {
         return None;
     };
     let negated = negate_ordered_comparison(*op)?;
-    if !is_ordered_integer_operand(left) || !is_ordered_integer_operand(right) {
+    if !is_int_sorted(left) || !is_int_sorted(right) {
         return None;
     }
     Some(PureExpr::BinOp(
@@ -1735,15 +2241,14 @@ fn prove_ite(
     cond: &PureExpr,
     then_expr: &PureExpr,
     else_expr: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
     context: &NativeReplayContext<'_>,
 ) -> TruthValue {
-    match prove_bool_with_env(cond, env, context) {
-        TruthValue::True { .. } => prove_bool_with_env(then_expr, env, context),
-        TruthValue::False { .. } => prove_bool_with_env(else_expr, env, context),
+    match prove_bool(cond, context) {
+        TruthValue::True { .. } => prove_bool(then_expr, context),
+        TruthValue::False { .. } => prove_bool(else_expr, context),
         TruthValue::Unknown { reason } => {
-            let then_truth = prove_bool_with_env(then_expr, env, context);
-            let else_truth = prove_bool_with_env(else_expr, env, context);
+            let then_truth = prove_bool(then_expr, context);
+            let else_truth = prove_bool(else_expr, context);
             match (then_truth, else_truth) {
                 (TruthValue::True { .. }, TruthValue::True { .. }) => TruthValue::True {
                     rule: "ite-branches-true",
@@ -1761,7 +2266,6 @@ fn prove_comparison(
     left: &PureExpr,
     op: BinOp,
     right: &PureExpr,
-    env: &mut HashMap<String, ExprSort>,
     context: &NativeReplayContext<'_>,
 ) -> TruthValue {
     if let Some(reason) =
@@ -1782,11 +2286,11 @@ fn prove_comparison(
         };
     }
 
-    if let Some(result) = prove_pointer_summary_comparison(left, op, right, env, context) {
+    if let Some(result) = prove_pointer_summary_comparison(left, op, right, context) {
         return result;
     }
 
-    if let Some(reason) = pointer_replay_diagnostic(left, right, env) {
+    if let Some(reason) = pointer_replay_diagnostic(left, right) {
         return TruthValue::unknown(reason);
     }
 
@@ -1796,10 +2300,59 @@ fn prove_comparison(
 
     match (eval_value(left), eval_value(right)) {
         (Some(left), Some(right)) => compare_known_values(left, op, right),
-        _ => prove_linear_comparison(left, op, right).unwrap_or_else(|| {
-            TruthValue::unknown("comparison contains symbolic or unsupported operands")
-        }),
+        _ => match (constant_int(left), constant_int(right)) {
+            (Some(first), Some(second)) if is_int_sorted(left) && is_int_sorted(right) => {
+                // Direct comparison never negates MIN. Values exist only when
+                // their closed integer constructors completed checked arithmetic.
+                compare_integer_constants(first, op, second, "checked-wide-int-constant-comparison")
+            }
+            _ => prove_linear_comparison(left, op, right)
+                .or_else(|| prove_boolean_scalar_comparison(left, op, right, context))
+                .unwrap_or_else(|| {
+                    TruthValue::unknown("comparison contains symbolic or unsupported operands")
+                }),
+        },
     }
+}
+
+/// Boolean operands may contain exact integer comparisons too wide for the
+/// small constant evaluator. Reuse the ordinary proof rules on each smaller
+/// operand; a validity counterexample is never used as an operand's truth.
+fn prove_boolean_scalar_comparison(
+    left: &PureExpr,
+    op: BinOp,
+    right: &PureExpr,
+    context: &NativeReplayContext<'_>,
+) -> Option<TruthValue> {
+    if !matches!(op, BinOp::Eq | BinOp::Ne)
+        || scalar_sort(left) != Some(ExprSort::Bool)
+        || scalar_sort(right) != Some(ExprSort::Bool)
+    {
+        return None;
+    }
+    let contains_integer = |expr: &PureExpr| {
+        expr.any_recursive(|node| {
+            matches!(
+                node,
+                PureExpr::Int(_) | PureExpr::Var(_, Some(ExprSort::Int))
+            )
+        })
+    };
+    // Preserve the existing pure-Boolean case-split trace, including goals
+    // whose smaller operands the structural prover can decide independently.
+    if !contains_integer(left) && !contains_integer(right) {
+        return None;
+    }
+    let truth = |expr| match prove_bool(expr, context) {
+        TruthValue::True { .. } => Some(true),
+        TruthValue::False { .. } => Some(false),
+        TruthValue::Unknown { .. } => None,
+    };
+    let equal = truth(left)? == truth(right)?;
+    Some(TruthValue::from_bool(
+        equal == (op == BinOp::Eq),
+        "boolean-scalar-comparison",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1812,10 +2365,9 @@ fn prove_pointer_summary_comparison(
     left: &PureExpr,
     op: BinOp,
     right: &PureExpr,
-    env: &HashMap<String, ExprSort>,
     context: &NativeReplayContext<'_>,
 ) -> Option<TruthValue> {
-    let pointer_kind = pointer_kind_for_expr(left, env).max(pointer_kind_for_expr(right, env))?;
+    let pointer_kind = pointer_kind_for_expr(left).max(pointer_kind_for_expr(right))?;
     let relation = context.summary_facts.iter().find_map(|fact| {
         let relation = pointer_summary_relation(fact, pointer_kind)?;
         summary_fact_matches_terms(fact, left, right).then_some(relation)
@@ -1878,6 +2430,32 @@ fn pointer_summary_relation(
     }
 }
 
+/// The names `summary_facts` relate: a binding fact's two names, and every
+/// name free in a textual fact's endpoints. The claim decoder binds these to
+/// the binders the claim opens with as written
+/// ([`crate::formula::elaborate::bind_facts_to_the_written_prefix`]), so a
+/// fact matched by name here meets only the value it is about.
+pub(super) fn summary_fact_names(summary_facts: &[BundleSummaryFact]) -> HashSet<String> {
+    let mut named: HashSet<String> = HashSet::new();
+    for fact in summary_facts {
+        match summary_fact_endpoints(fact) {
+            Some(SummaryFactEndpoints::Binding { left, right }) => {
+                named.insert(left.to_string());
+                named.insert(right.to_string());
+            }
+            Some(SummaryFactEndpoints::Textual { left, right }) => {
+                for text in [left, right] {
+                    if let Ok(endpoint) = parse_contract(text.trim()) {
+                        named.extend(endpoint.free_vars());
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    named
+}
+
 fn summary_fact_matches_terms(fact: &BundleSummaryFact, left: &PureExpr, right: &PureExpr) -> bool {
     let Some(endpoints) = summary_fact_endpoints(fact) else {
         return false;
@@ -1893,6 +2471,9 @@ fn summary_fact_matches_terms(fact: &BundleSummaryFact, left: &PureExpr, right: 
             let Ok(fact_right) = parse_contract(fact_right.trim()) else {
                 return false;
             };
+            // The fact's endpoints are text, parsed with no sorts: the terms
+            // are compared as written, not as elaborated.
+            let (left, right) = (&unsorted(left), &unsorted(right));
             (left == &fact_left && right == &fact_right)
                 || (left == &fact_right && right == &fact_left)
         }
@@ -1906,6 +2487,14 @@ fn summary_fact_matches_terms(fact: &BundleSummaryFact, left: &PureExpr, right: 
                     && expr_matches_summary_binding(right, fact_left))
         }
     }
+}
+
+/// `expr` with no name annotated.
+fn unsorted(expr: &PureExpr) -> PureExpr {
+    expr.rewrite_bottom_up(|node| match node {
+        PureExpr::Var(name, Some(_)) => PureExpr::Var(name, None),
+        node => node,
+    })
 }
 
 fn expr_matches_summary_binding(expr: &PureExpr, binding: &str) -> bool {
@@ -1934,12 +2523,8 @@ fn summary_fact_endpoints(fact: &BundleSummaryFact) -> Option<SummaryFactEndpoin
     }
 }
 
-fn pointer_replay_diagnostic(
-    left: &PureExpr,
-    right: &PureExpr,
-    env: &HashMap<String, ExprSort>,
-) -> Option<String> {
-    let kind = pointer_kind_for_expr(left, env).max(pointer_kind_for_expr(right, env))?;
+fn pointer_replay_diagnostic(left: &PureExpr, right: &PureExpr) -> Option<String> {
+    let kind = pointer_kind_for_expr(left).max(pointer_kind_for_expr(right))?;
     match kind {
         PointerReplayKind::Thin => Some(
             "pointer replay requires alias/provenance summary evidence before non-reflexive pointer comparison can be checked"
@@ -1952,31 +2537,34 @@ fn pointer_replay_diagnostic(
     }
 }
 
-fn pointer_kind_for_expr(
-    expr: &PureExpr,
-    env: &HashMap<String, ExprSort>,
-) -> Option<PointerReplayKind> {
+/// The pointer kind of the value `expr` denotes, which a summary fact must
+/// match: a name at its elaborated sort, `*e` and `^e` at the sort `e`
+/// references (`^p` of a `p: &mut &[Int]` is a fat pointer, and of a
+/// `p: &mut Int` no pointer at all: a thin fact about it proved `^p == ^q`
+/// of two integers), and `old(e)` at `e`'s. A view is no pointer: the view
+/// of a value is not the value, so a fact about pointers says nothing of it.
+fn pointer_kind_for_expr(expr: &PureExpr) -> Option<PointerReplayKind> {
     match expr {
-        PureExpr::Var(name, sort) => sort
+        PureExpr::Var(_, sort) => sort.as_ref().and_then(pointer_kind_from_sort),
+        PureExpr::Deref(operand) => dereferenced(operand, Dereference::Current)
+            .referent()
             .as_ref()
-            .or_else(|| env.get(name))
             .and_then(pointer_kind_from_sort),
-        PureExpr::Old(inner) | PureExpr::Final(inner) | PureExpr::View(inner) => {
-            pointer_kind_for_expr(inner, env)
-        }
+        PureExpr::Final(operand) => dereferenced(operand, Dereference::Final)
+            .referent()
+            .as_ref()
+            .and_then(pointer_kind_from_sort),
+        PureExpr::Old(inner) => pointer_kind_for_expr(inner),
         PureExpr::Ite(_, then_expr, else_expr) => {
-            pointer_kind_for_expr(then_expr, env).max(pointer_kind_for_expr(else_expr, env))
+            pointer_kind_for_expr(then_expr).max(pointer_kind_for_expr(else_expr))
         }
-        PureExpr::Let { var, value, body } => pointer_kind_for_expr(
-            &inline_let_binding_for_native_replay(var, value, body)?,
-            env,
-        ),
+        PureExpr::Let { body, .. } => pointer_kind_for_expr(body),
         PureExpr::Bool(_)
         | PureExpr::Int(_)
         | PureExpr::Float(_)
         | PureExpr::BinOp(_, _, _)
         | PureExpr::UnOp(_, _)
-        | PureExpr::Deref(_)
+        | PureExpr::View(_)
         | PureExpr::MethodCall { .. }
         | PureExpr::Forall { .. }
         | PureExpr::Exists { .. }
@@ -2002,28 +2590,6 @@ fn pointer_kind_from_referent_sort(sort: &ExprSort) -> PointerReplayKind {
         ExprSort::Seq | ExprSort::FMap => PointerReplayKind::Fat,
         _ => PointerReplayKind::Thin,
     }
-}
-
-fn with_bound_sort<T>(
-    env: &mut HashMap<String, ExprSort>,
-    var: &str,
-    var_sort: Option<&ExprSort>,
-    f: impl FnOnce(&mut HashMap<String, ExprSort>) -> T,
-) -> T {
-    let previous = match var_sort {
-        Some(sort) => env.insert(var.to_string(), sort.clone()),
-        None => env.remove(var),
-    };
-    let result = f(env);
-    match previous {
-        Some(sort) => {
-            env.insert(var.to_string(), sort);
-        }
-        None => {
-            env.remove(var);
-        }
-    }
-    result
 }
 
 fn prove_linear_implication(antecedent: &PureExpr, consequent: &PureExpr) -> Option<TruthValue> {
@@ -2089,32 +2655,164 @@ fn prove_int_arithmetic_predicate_with_constraints(
     expr: &PureExpr,
     constraints: &[LinearConstraint],
 ) -> Option<TruthValue> {
+    // This is proof search over the existing typed formula, not evaluation at
+    // selected integers. Every branch retains its enclosing linear premises.
+    prove_guarded_integer_predicate(expr, true, constraints, &mut 4096)?;
+    Some(TruthValue::True {
+        rule: "int-arithmetic-implication",
+    })
+}
+
+fn prove_guarded_integer_predicate(
+    expr: &PureExpr,
+    expected: bool,
+    constraints: &[LinearConstraint],
+    remaining: &mut usize,
+) -> Option<()> {
+    *remaining = remaining.checked_sub(1)?;
     match expr {
-        PureExpr::BinOp(left, BinOp::And, right) => {
-            prove_int_arithmetic_predicate_with_constraints(left, constraints)?;
-            prove_int_arithmetic_predicate_with_constraints(right, constraints)?;
-            Some(TruthValue::True {
-                rule: "int-arithmetic-implication",
-            })
+        PureExpr::Bool(value) => (*value == expected).then_some(()),
+        PureExpr::UnOp(UnOp::Not, inner) => {
+            prove_guarded_integer_predicate(inner, !expected, constraints, remaining)
         }
-        PureExpr::BinOp(guard, BinOp::Implies, conclusion) => {
-            // The conclusion of an implication is checked under both the
-            // enclosing constraints and its own guard.  This is what carries
-            // branch facts produced by `split_comparison_ite` into each arm.
+        PureExpr::BinOp(left, op @ (BinOp::And | BinOp::Or), right) => {
+            let both = expected == (*op == BinOp::And);
+            if both {
+                prove_guarded_integer_predicate(left, expected, constraints, remaining)?;
+                prove_guarded_integer_predicate(right, expected, constraints, remaining)
+            } else {
+                prove_guarded_integer_predicate(left, expected, constraints, remaining).or_else(
+                    || prove_guarded_integer_predicate(right, expected, constraints, remaining),
+                )
+            }
+        }
+        PureExpr::BinOp(guard, BinOp::Implies, conclusion) if expected => {
             let mut extended = constraints.to_vec();
-            collect_linear_constraints(guard, &mut extended);
-            prove_int_arithmetic_predicate_with_constraints(conclusion, &extended)
+            collect_guard_constraints(guard, true, &mut extended, &mut 4096);
+            prove_guarded_integer_predicate(conclusion, true, &extended, remaining)
+        }
+        PureExpr::BinOp(left, op @ (BinOp::Eq | BinOp::Ne), right) => {
+            // A Boolean equality to a literal is exactly its operand or its
+            // negation. Other Boolean equalities remain outside this rule.
+            let literal = match (&**left, &**right) {
+                (PureExpr::Bool(value), other) | (other, PureExpr::Bool(value)) => {
+                    Some((*value, other))
+                }
+                _ => None,
+            };
+            if let Some((value, other)) = literal {
+                return prove_guarded_integer_predicate(
+                    other,
+                    expected == (value == (*op == BinOp::Eq)),
+                    constraints,
+                    remaining,
+                );
+            }
+            if !is_int_sorted(left) || !is_int_sorted(right) {
+                return None;
+            }
+            if expected == (*op == BinOp::Eq) {
+                prove_int_arithmetic_comparison_with_constraints(
+                    left,
+                    BinOp::Le,
+                    right,
+                    constraints,
+                )?;
+                prove_int_arithmetic_comparison_with_constraints(
+                    left,
+                    BinOp::Ge,
+                    right,
+                    constraints,
+                )?;
+                Some(())
+            } else {
+                prove_int_arithmetic_comparison_with_constraints(
+                    left,
+                    BinOp::Lt,
+                    right,
+                    constraints,
+                )
+                .or_else(|| {
+                    prove_int_arithmetic_comparison_with_constraints(
+                        left,
+                        BinOp::Gt,
+                        right,
+                        constraints,
+                    )
+                })
+                .map(|_| ())
+            }
         }
         PureExpr::BinOp(left, op, right)
             if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
         {
-            if let Some(rewritten) = split_comparison_ite(left, *op, right) {
-                prove_int_arithmetic_predicate_with_constraints(&rewritten, constraints)
+            let op = if expected {
+                *op
             } else {
-                prove_int_arithmetic_comparison_with_constraints(left, *op, right, constraints)
+                negate_ordered_comparison(*op)?
+            };
+            if let Some(rewritten) = split_comparison_ite(left, op, right) {
+                prove_guarded_integer_predicate(&rewritten, true, constraints, remaining)
+            } else {
+                prove_int_arithmetic_comparison_with_constraints(left, op, right, constraints)
+                    .map(|_| ())
             }
         }
         _ => None,
+    }
+}
+
+/// Add only necessary consequences of the guard. Unsupported/disjunctive
+/// facts contribute nothing; they never become assumed alternatives.
+fn collect_guard_constraints(
+    expr: &PureExpr,
+    expected: bool,
+    constraints: &mut Vec<LinearConstraint>,
+    remaining: &mut usize,
+) {
+    let Some(next) = remaining.checked_sub(1) else {
+        return;
+    };
+    *remaining = next;
+    match expr {
+        PureExpr::UnOp(UnOp::Not, inner) => {
+            collect_guard_constraints(inner, !expected, constraints, remaining);
+        }
+        PureExpr::BinOp(left, op @ (BinOp::And | BinOp::Or), right)
+            if expected == (*op == BinOp::And) =>
+        {
+            collect_guard_constraints(left, expected, constraints, remaining);
+            collect_guard_constraints(right, expected, constraints, remaining);
+        }
+        PureExpr::BinOp(left, op @ (BinOp::Eq | BinOp::Ne), right) => match (&**left, &**right) {
+            (PureExpr::Bool(value), other) | (other, PureExpr::Bool(value)) => {
+                collect_guard_constraints(
+                    other,
+                    expected == (*value == (*op == BinOp::Eq)),
+                    constraints,
+                    remaining,
+                );
+            }
+            _ if expected == (*op == BinOp::Eq) && is_int_sorted(left) && is_int_sorted(right) => {
+                for op in [BinOp::Le, BinOp::Ge] {
+                    if let Some((expr, strict)) = linear_goal(left, op, right) {
+                        constraints.push(LinearConstraint { expr, strict });
+                    }
+                }
+            }
+            _ => {}
+        },
+        PureExpr::BinOp(left, op, right) if is_int_sorted(left) && is_int_sorted(right) => {
+            let op = if expected {
+                Some(*op)
+            } else {
+                negate_ordered_comparison(*op)
+            };
+            if let Some((expr, strict)) = op.and_then(|op| linear_goal(left, op, right)) {
+                constraints.push(LinearConstraint { expr, strict });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2171,15 +2869,25 @@ fn collect_equality_substitutions(expr: &PureExpr, substitutions: &mut HashMap<S
     }
 }
 
+/// Record `candidate_var := replacement` for an equality the assumption
+/// states. Only an `Int` or `Bool` name is replaced, and only by a value of
+/// that same sort. Replacing a `bool` binder by an integer (`v == x` for
+/// `forall<v: bool>`), or a `&bool` by a `&Int` (`p == q`), handed the
+/// integer rules a goal about a value they must not read; and `==` of two
+/// references does not say which: the pointer rules read it as the same
+/// address, whose final values (`^p`, `^q`) need not agree.
 fn insert_equality_substitution(
     candidate_var: &PureExpr,
     replacement: &PureExpr,
     substitutions: &mut HashMap<String, PureExpr>,
 ) {
-    let PureExpr::Var(name, sort) = candidate_var else {
+    let PureExpr::Var(name, _) = candidate_var else {
         return;
     };
-    if !matches!(sort.as_ref(), None | Some(ExprSort::Int | ExprSort::Bool)) {
+    let Some(sort) = scalar_sort(candidate_var) else {
+        return;
+    };
+    if scalar_sort(replacement) != Some(sort) {
         return;
     }
     if contains_var(replacement, name) {
@@ -2234,7 +2942,10 @@ fn contains_var(expr: &PureExpr, name: &str) -> bool {
     }
 }
 
-fn upper_bound_int_expr(expr: &PureExpr, constraints: &[LinearConstraint]) -> Option<i64> {
+fn upper_bound_int_expr(expr: &PureExpr, constraints: &[LinearConstraint]) -> Option<i128> {
+    if !is_int_sorted(expr) {
+        return None;
+    }
     if let Some(linear) = LinearInt::from_expr(expr) {
         return linear.maximum_with_linear_constraints(constraints);
     }
@@ -2279,7 +2990,10 @@ fn upper_bound_int_difference(
     left: &PureExpr,
     right: &PureExpr,
     constraints: &[LinearConstraint],
-) -> Option<i64> {
+) -> Option<i128> {
+    if !is_int_sorted(left) || !is_int_sorted(right) {
+        return None;
+    }
     if left == right {
         return Some(0);
     }
@@ -2298,7 +3012,10 @@ fn lower_bound_int_difference(
     left: &PureExpr,
     right: &PureExpr,
     constraints: &[LinearConstraint],
-) -> Option<i64> {
+) -> Option<i128> {
+    if !is_int_sorted(left) || !is_int_sorted(right) {
+        return None;
+    }
     if left == right {
         return Some(0);
     }
@@ -2337,10 +3054,10 @@ fn lower_bound_int_difference(
 
     if let PureExpr::BinOp(r_left, BinOp::Add, r_right) = right {
         if r_left.as_ref() == left {
-            return upper_bound_int_expr(r_right, constraints).map(|v| -v);
+            return upper_bound_int_expr(r_right, constraints).and_then(i128::checked_neg);
         }
         if r_right.as_ref() == left {
-            return upper_bound_int_expr(r_left, constraints).map(|v| -v);
+            return upper_bound_int_expr(r_left, constraints).and_then(i128::checked_neg);
         }
         // Handle hi - (lo + (hi - lo) / 2)
         if let Some(linear_diff) = LinearInt::from_expr(&PureExpr::BinOp(
@@ -2367,7 +3084,10 @@ fn lower_bound_int_difference(
     None
 }
 
-fn lower_bound_int_expr(expr: &PureExpr, constraints: &[LinearConstraint]) -> Option<i64> {
+fn lower_bound_int_expr(expr: &PureExpr, constraints: &[LinearConstraint]) -> Option<i128> {
+    if !is_int_sorted(expr) {
+        return None;
+    }
     if let Some(linear) = LinearInt::from_expr(expr) {
         return linear.minimum_with_linear_constraints(constraints);
     }
@@ -2415,19 +3135,22 @@ fn lower_bound_int_expr(expr: &PureExpr, constraints: &[LinearConstraint]) -> Op
 }
 
 fn lower_bound_scaled_expr(
-    factor: i64,
+    factor: i128,
     expr: &PureExpr,
     constraints: &[LinearConstraint],
-) -> Option<i64> {
+) -> Option<i128> {
     if factor < 0 {
         return None;
     }
     lower_bound_int_expr(expr, constraints)?.checked_mul(factor)
 }
 
-fn constant_int(expr: &PureExpr) -> Option<i64> {
+fn constant_int(expr: &PureExpr) -> Option<i128> {
+    if let Some(value) = LinearInt::from_expr(expr).and_then(|linear| linear.constant_value()) {
+        return Some(value);
+    }
     match eval_value(expr)? {
-        KnownValue::Int(value) => Some(value),
+        KnownValue::Int(value) => Some(i128::from(value)),
         KnownValue::Bool(_) => None,
     }
 }
@@ -2440,6 +3163,9 @@ fn linear_goal_from_comparison(expr: &PureExpr) -> Option<(LinearInt, bool)> {
 }
 
 fn linear_goal(left: &PureExpr, op: BinOp, right: &PureExpr) -> Option<(LinearInt, bool)> {
+    if !is_int_sorted(left) || !is_int_sorted(right) {
+        return None;
+    }
     match op {
         BinOp::Gt => Some((
             LinearInt::from_expr(left)?.sub(LinearInt::from_expr(right)?)?,
@@ -2526,25 +3252,10 @@ fn linear_constraints_from_assumption(expr: &PureExpr) -> Vec<LinearConstraint> 
 }
 
 fn collect_linear_constraints(expr: &PureExpr, constraints: &mut Vec<LinearConstraint>) {
-    match expr {
-        PureExpr::BinOp(left, BinOp::And, right) => {
-            collect_linear_constraints(left, constraints);
-            collect_linear_constraints(right, constraints);
-        }
-        _ => {
-            if let Some(normalized) = denegate_ordered_integer_comparison(expr) {
-                collect_linear_constraints(&normalized, constraints);
-            } else if let Some((linear, strict)) = linear_goal_from_comparison(expr) {
-                constraints.push(LinearConstraint {
-                    expr: linear,
-                    strict,
-                });
-            }
-        }
-    }
+    collect_guard_constraints(expr, true, constraints, &mut 4096);
 }
 
-fn single_linear_term(terms: &BTreeMap<String, i64>) -> Option<(&str, i64)> {
+fn single_linear_term(terms: &BTreeMap<String, i128>) -> Option<(&str, i128)> {
     let mut iter = terms.iter();
     let (var, coefficient) = iter.next()?;
     iter.next()
@@ -2562,7 +3273,7 @@ struct LinearConstraint {
 struct IntegerBound {
     var: String,
     kind: IntegerBoundKind,
-    value: i64,
+    value: i128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2573,12 +3284,12 @@ enum IntegerBoundKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinearInt {
-    constant: i64,
-    terms: BTreeMap<String, i64>,
+    constant: i128,
+    terms: BTreeMap<String, i128>,
 }
 
 impl LinearInt {
-    fn constant(value: i64) -> Self {
+    fn constant(value: i128) -> Self {
         Self {
             constant: value,
             terms: BTreeMap::new(),
@@ -2593,7 +3304,7 @@ impl LinearInt {
 
     fn from_expr(expr: &PureExpr) -> Option<Self> {
         match expr {
-            PureExpr::Int(value) => Some(Self::constant(*value)),
+            PureExpr::Int(value) => Some(Self::constant(i128::from(*value))),
             PureExpr::Var(name, sort)
                 if sort
                     .as_ref()
@@ -2636,7 +3347,7 @@ impl LinearInt {
         }
     }
 
-    fn constant_value(&self) -> Option<i64> {
+    fn constant_value(&self) -> Option<i128> {
         self.terms.is_empty().then_some(self.constant)
     }
 
@@ -2663,7 +3374,7 @@ impl LinearInt {
         Some(self)
     }
 
-    fn add_term(&mut self, var: String, coefficient: i64) -> Option<()> {
+    fn add_term(&mut self, var: String, coefficient: i128) -> Option<()> {
         let updated = self
             .terms
             .get(&var)
@@ -2678,7 +3389,7 @@ impl LinearInt {
         Some(())
     }
 
-    fn mul_constant(mut self, factor: i64) -> Option<Self> {
+    fn mul_constant(mut self, factor: i128) -> Option<Self> {
         self.constant = self.constant.checked_mul(factor)?;
         for coefficient in self.terms.values_mut() {
             *coefficient = coefficient.checked_mul(factor)?;
@@ -2687,7 +3398,7 @@ impl LinearInt {
         Some(self)
     }
 
-    fn minimum_with_bound(&self, bound: &IntegerBound) -> Option<i64> {
+    fn minimum_with_bound(&self, bound: &IntegerBound) -> Option<i128> {
         let (var, coefficient) = single_linear_term(&self.terms)?;
         if var != bound.var {
             return None;
@@ -2706,7 +3417,7 @@ impl LinearInt {
             .checked_add(self.constant)
     }
 
-    fn maximum_with_linear_constraints(&self, constraints: &[LinearConstraint]) -> Option<i64> {
+    fn maximum_with_linear_constraints(&self, constraints: &[LinearConstraint]) -> Option<i128> {
         if self.terms.is_empty() {
             return Some(self.constant);
         }
@@ -2715,32 +3426,101 @@ impl LinearInt {
         for val in neg.terms.values_mut() {
             *val = (*val).checked_neg()?;
         }
-        neg.minimum_with_linear_constraints(constraints).map(|v| -v)
+        neg.minimum_with_linear_constraints(constraints)
+            .and_then(i128::checked_neg)
     }
 
-    fn minimum_with_linear_constraints(&self, constraints: &[LinearConstraint]) -> Option<i64> {
+    fn minimum_with_linear_constraints(&self, constraints: &[LinearConstraint]) -> Option<i128> {
         if self.terms.is_empty() {
             return Some(self.constant);
         }
-        constraints
+        let direct = constraints
             .iter()
-            .find_map(|constraint| self.minimum_with_linear_constraint(constraint))
+            .filter_map(|constraint| self.minimum_with_linear_constraint(constraint))
+            .max();
+        direct
+            .into_iter()
+            .chain(self.minimum_with_constraint_combinations(constraints, &mut 4096, 0))
+            .max()
     }
 
-    fn minimum_with_linear_constraint(&self, constraint: &LinearConstraint) -> Option<i64> {
+    /// Derive bounds by nonnegative integer combinations of the original
+    /// constraints. Each step preserves `self = scale * constraint + residual`.
+    /// A failed search proves nothing about satisfiability or a lower bound.
+    fn minimum_with_constraint_combinations(
+        &self,
+        constraints: &[LinearConstraint],
+        remaining: &mut usize,
+        depth: usize,
+    ) -> Option<i128> {
+        if self.terms.is_empty() {
+            return Some(self.constant);
+        }
+        if depth >= 64 {
+            return None;
+        }
+        let mut best = None;
+        for constraint in constraints {
+            let Some(next) = remaining.checked_sub(1) else {
+                return best;
+            };
+            *remaining = next;
+            if let Some(bound) = self.minimum_with_linear_constraint(constraint) {
+                best = best.into_iter().chain(Some(bound)).max();
+            }
+        }
+        for constraint in constraints {
+            for (name, coefficient) in &self.terms {
+                let Some(next) = remaining.checked_sub(1) else {
+                    return best;
+                };
+                *remaining = next;
+                let Some(divisor) = constraint.expr.terms.get(name) else {
+                    continue;
+                };
+                if coefficient.checked_rem(*divisor) != Some(0) {
+                    continue;
+                }
+                let Some(scale) = coefficient.checked_div(*divisor).filter(|scale| *scale > 0)
+                else {
+                    continue;
+                };
+                let Some(residual) = constraint
+                    .expr
+                    .clone()
+                    .mul_constant(scale)
+                    .and_then(|scaled| self.clone().sub(scaled))
+                else {
+                    continue;
+                };
+                let Some(bound) = residual
+                    .minimum_with_constraint_combinations(constraints, remaining, depth + 1)
+                    .and_then(|bound| {
+                        bound.checked_add(scale.checked_mul(i128::from(constraint.strict))?)
+                    })
+                else {
+                    continue;
+                };
+                best = best.into_iter().chain(Some(bound)).max();
+            }
+        }
+        best
+    }
+
+    fn minimum_with_linear_constraint(&self, constraint: &LinearConstraint) -> Option<i128> {
         let factor = positive_term_scale(&self.terms, &constraint.expr.terms)?;
         let residual = self
             .constant
             .checked_sub(constraint.expr.constant.checked_mul(factor)?)?;
-        let constraint_min = i64::from(constraint.strict);
+        let constraint_min = i128::from(constraint.strict);
         factor.checked_mul(constraint_min)?.checked_add(residual)
     }
 }
 
 fn positive_term_scale(
-    goal_terms: &BTreeMap<String, i64>,
-    constraint_terms: &BTreeMap<String, i64>,
-) -> Option<i64> {
+    goal_terms: &BTreeMap<String, i128>,
+    constraint_terms: &BTreeMap<String, i128>,
+) -> Option<i128> {
     if constraint_terms.is_empty() || goal_terms.len() != constraint_terms.len() {
         return None;
     }
@@ -2751,10 +3531,10 @@ fn positive_term_scale(
             return None;
         }
         let goal_coefficient = *goal_terms.get(var)?;
-        if goal_coefficient % constraint_coefficient != 0 {
+        if goal_coefficient.checked_rem(*constraint_coefficient)? != 0 {
             return None;
         }
-        let candidate = goal_coefficient / constraint_coefficient;
+        let candidate = goal_coefficient.checked_div(*constraint_coefficient)?;
         if candidate <= 0 {
             return None;
         }
@@ -2769,6 +3549,9 @@ fn positive_term_scale(
 
 fn prove_bitwise_comparison(left: &PureExpr, op: BinOp, right: &PureExpr) -> Option<TruthValue> {
     if !matches!(op, BinOp::Eq | BinOp::Ne) {
+        return None;
+    }
+    if !is_int_sorted(left) || !is_int_sorted(right) {
         return None;
     }
     if !contains_bitwise_expr(left) && !contains_bitwise_expr(right) {
@@ -3034,8 +3817,9 @@ fn eval_binary_value(left: &PureExpr, op: BinOp, right: &PureExpr) -> Option<Kno
         BinOp::Add => eval_int_binop(left, right, i64::checked_add),
         BinOp::Sub => eval_int_binop(left, right, i64::checked_sub),
         BinOp::Mul => eval_int_binop(left, right, i64::checked_mul),
-        BinOp::Div => eval_int_binop(left, right, i64::checked_div),
-        BinOp::Mod => eval_int_binop(left, right, i64::checked_rem),
+        // `Div`/`Mod` are EUCLIDEAN; only the `*Trunc` ops truncate.
+        BinOp::Div => eval_int_binop(left, right, i64::checked_div_euclid),
+        BinOp::Mod => eval_int_binop(left, right, i64::checked_rem_euclid),
         // Truncated machine ops: Rust's `/`/`%` are exactly i64 checked_div/rem
         // (toward-zero, remainder takes the dividend's sign).
         BinOp::DivTrunc => eval_int_binop(left, right, i64::checked_div),
@@ -3116,19 +3900,23 @@ fn compare_known_values_with_int_rule(
             _ => TruthValue::unknown("non-equality comparison over boolean constants"),
         },
         (KnownValue::Int(left), KnownValue::Int(right)) => {
-            let value = match op {
-                BinOp::Eq => left == right,
-                BinOp::Ne => left != right,
-                BinOp::Lt => left < right,
-                BinOp::Le => left <= right,
-                BinOp::Gt => left > right,
-                BinOp::Ge => left >= right,
-                _ => unreachable!("comparison operators handled by caller"),
-            };
-            TruthValue::from_bool(value, int_rule)
+            compare_integer_constants(i128::from(left), op, i128::from(right), int_rule)
         }
         _ => TruthValue::unknown("comparison mixes incompatible constant sorts"),
     }
+}
+
+fn compare_integer_constants(left: i128, op: BinOp, right: i128, rule: &'static str) -> TruthValue {
+    let value = match op {
+        BinOp::Eq => left == right,
+        BinOp::Ne => left != right,
+        BinOp::Lt => left < right,
+        BinOp::Le => left <= right,
+        BinOp::Gt => left > right,
+        BinOp::Ge => left >= right,
+        _ => unreachable!("comparison operators handled by caller"),
+    };
+    TruthValue::from_bool(value, rule)
 }
 
 #[cfg(test)]
@@ -3254,8 +4042,14 @@ mod guarded_ite_comparison_tests {
         );
         assert!(verified(&integer_predicate));
 
-        let float_x = PureExpr::Var("float_x".to_string(), Some(ExprSort::Float));
-        let float_y = PureExpr::Var("float_y".to_string(), Some(ExprSort::Float));
+        let float_x = PureExpr::Var(
+            "float_x".to_string(),
+            Some(ExprSort::Float(crate::formula::FloatWidth::F64)),
+        );
+        let float_y = PureExpr::Var(
+            "float_y".to_string(),
+            Some(ExprSort::Float(crate::formula::FloatWidth::F64)),
+        );
         let float_predicate = bin(
             not(bin(float_x.clone(), BinOp::Lt, float_y.clone())),
             BinOp::Implies,
@@ -3523,5 +4317,232 @@ mod truncated_bound_tests {
             ),
         );
         assert!(verified(&pred), "m>=1 ==> 7 /trunc m >= 0");
+    }
+}
+
+#[cfg(test)]
+mod binder_domain_tests {
+    use super::*;
+
+    fn quantifier(exists: bool, var: &str, sort: ExprSort, body: PureExpr) -> PureExpr {
+        let (var, var_sort, body, triggers) =
+            (var.to_string(), Some(sort), Arc::new(body), Vec::new());
+        if exists {
+            PureExpr::Exists {
+                var,
+                var_sort,
+                body,
+                triggers,
+            }
+        } else {
+            PureExpr::Forall {
+                var,
+                var_sort,
+                body,
+                triggers,
+            }
+        }
+    }
+
+    fn not(expr: PureExpr) -> PureExpr {
+        PureExpr::UnOp(UnOp::Not, Arc::new(expr))
+    }
+
+    fn type_param(name: &str) -> ExprSort {
+        ExprSort::TypeParam(crate::formula::intern_sort_name(name))
+    }
+
+    fn v_plus_one_gt_v() -> PureExpr {
+        let v = || Arc::new(PureExpr::Var("v".to_string(), None));
+        PureExpr::BinOp(
+            Arc::new(PureExpr::BinOp(v(), BinOp::Add, Arc::new(PureExpr::Int(1)))),
+            BinOp::Gt,
+            v(),
+        )
+    }
+
+    fn outcome(expr: &PureExpr) -> TruthValue {
+        prove_bool(expr, &NativeReplayContext { summary_facts: &[] })
+    }
+
+    /// Measured: `exists<p: &T> true` and `!(forall<p: &T> false)` verified,
+    /// and each is false when `T` is uninhabited (so is `&T`). A rule that
+    /// needs a value of the binder's sort fires over `Int` and `Bool` only.
+    #[test]
+    fn a_witness_is_assumed_only_over_a_sort_known_inhabited() {
+        let reference = ExprSort::Ref(Box::new(type_param("T")));
+        for (label, expr) in [
+            (
+                "exists<p: &T> true",
+                quantifier(true, "p", reference.clone(), PureExpr::Bool(true)),
+            ),
+            (
+                "!(forall<p: &T> false)",
+                not(quantifier(
+                    false,
+                    "p",
+                    reference.clone(),
+                    PureExpr::Bool(false),
+                )),
+            ),
+            (
+                "forall<p: &mut T> false",
+                quantifier(
+                    false,
+                    "p",
+                    ExprSort::MutRef(Box::new(type_param("T"))),
+                    PureExpr::Bool(false),
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(outcome(&expr), TruthValue::Unknown { ref reason } if reason.contains("not known to be inhabited")),
+                "{label}: {:?}",
+                outcome(&expr)
+            );
+        }
+        // Controls: over `Int` and `Bool` a witness exists.
+        for sort in [ExprSort::Int, ExprSort::Bool] {
+            assert!(matches!(
+                outcome(&quantifier(true, "v", sort.clone(), PureExpr::Bool(true))),
+                TruthValue::True {
+                    rule: "exists-true-body"
+                }
+            ));
+            assert!(matches!(
+                outcome(&quantifier(false, "v", sort.clone(), PureExpr::Bool(false))),
+                TruthValue::False {
+                    rule: "forall-false-body"
+                }
+            ));
+        }
+        // A true `forall` body and a false `exists` body need no witness.
+        assert!(matches!(
+            outcome(&quantifier(
+                false,
+                "p",
+                reference.clone(),
+                PureExpr::Bool(true)
+            )),
+            TruthValue::True {
+                rule: "forall-true-body"
+            }
+        ));
+        assert!(matches!(
+            outcome(&quantifier(true, "p", reference, PureExpr::Bool(false))),
+            TruthValue::False {
+                rule: "exists-false-body"
+            }
+        ));
+    }
+
+    /// Measured: `forall<v: T> v + 1 > v` and `forall<s: [Int]> s + 1 > s`
+    /// verified, the binder read as an integer. A binder over a sort native
+    /// replay does not model decides nothing.
+    #[test]
+    fn a_binder_over_an_unmodeled_sort_decides_nothing() {
+        for sort in [
+            type_param("T"),
+            ExprSort::Seq,
+            ExprSort::Unit,
+            ExprSort::Float(crate::formula::FloatWidth::F64),
+            ExprSort::Float(crate::formula::FloatWidth::F32),
+        ] {
+            for exists in [false, true] {
+                for body in [
+                    v_plus_one_gt_v(),
+                    PureExpr::Bool(true),
+                    PureExpr::Bool(false),
+                ] {
+                    let expr = quantifier(exists, "v", sort.clone(), body);
+                    assert!(
+                        matches!(outcome(&expr), TruthValue::Unknown { ref reason } if reason.contains("does not model")),
+                        "{expr}: {:?}",
+                        outcome(&expr)
+                    );
+                }
+            }
+        }
+        let untyped = PureExpr::Forall {
+            var: "v".to_string(),
+            var_sort: None,
+            body: Arc::new(v_plus_one_gt_v()),
+            triggers: Vec::new(),
+        };
+        assert!(matches!(outcome(&untyped), TruthValue::Unknown { .. }));
+        // Control: over `Int` it proves.
+        assert!(matches!(
+            outcome(&quantifier(false, "v", ExprSort::Int, v_plus_one_gt_v())),
+            TruthValue::True {
+                rule: "forall-true-body"
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod guarded_unsigned_tests {
+    use super::*;
+    fn proved(text: &str) -> bool {
+        let expr = parse_contract(text).expect("typed scalar predicate");
+        matches!(
+            prove_native_pure_predicate(&expr, NativeClaimFormat::TrustWpPureExprV1, &[]),
+            NativePureProofOutcome::Verified(_)
+        )
+    }
+    #[test]
+    fn literal_boolean_guards_preserve_integer_equality() {
+        assert!(proved("(x >= 0 && x <= 4294967295) ==> (((x == 8) == false) ==> 0 <= x) && (!((x == 8) == false) ==> 7 <= x)"));
+        assert!(proved(
+            "(x >= 0 && y >= 0) ==> ((x == 8 && y == 32) ==> (24 <= y && x <= 32))"
+        ));
+        assert!(proved(
+            "(x >= 0 && x <= 4294967295) ==> ((x >= 0 && x <= 4294967295) || (!(x >= 0) && false))"
+        ));
+        // This unbounded tautology also needs complementary inequality case
+        // splitting. A sufficient rule may leave it unsupported, never false.
+        let unbounded = parse_contract(
+            "x >= 0 ==> ((x >= 0 && x <= 4294967295) || (!(x >= 0) && false)) || x > 4294967295",
+        )
+        .unwrap();
+        assert!(!matches!(
+            prove_native_pure_predicate(&unbounded, NativeClaimFormat::TrustWpPureExprV1, &[]),
+            NativePureProofOutcome::Failed(_)
+        ));
+        for guard in [
+            "true == (x == 8)",
+            "(x == 8) == true",
+            "false != (x == 8)",
+            "(x == 8) != false",
+            "!(false == (x == 8))",
+            "!(true != (x == 8))",
+        ] {
+            assert!(proved(&format!("x >= 0 ==> ({guard} ==> x >= 8)")));
+            assert!(!proved(&format!("x >= 0 ==> ({guard} ==> x >= 9)")));
+        }
+    }
+    #[test]
+    fn stronger_later_constraint_and_exhausted_search() {
+        assert!(proved("(x >= 0 && x >= 8) ==> x >= 7"));
+        assert!(proved("(x >= 8 && x >= 0) ==> x >= 7"));
+        assert!(!proved("(x >= 0 && x >= 8) ==> x >= 9"));
+        let expr = parse_contract("x >= 8").unwrap();
+        assert!(prove_guarded_integer_predicate(&expr, true, &[], &mut 0).is_none());
+        let mut constraints = Vec::new();
+        collect_guard_constraints(&expr, true, &mut constraints, &mut 0);
+        assert!(constraints.is_empty());
+    }
+
+    #[test]
+    fn false_arms_and_disequalities_do_not_become_premises() {
+        for goal in [
+            "x >= 0 ==> ((x == 0) ==> 1 <= x)",
+            "x >= 0 ==> ((x != 8) ==> x >= 9)",
+            "x >= 0 ==> ((x == 8 || x == 0) ==> x >= 8)",
+            "x >= 0 ==> ((x == 8) ==> false)",
+            "(x >= 0 && y >= 0) ==> ((x == 8 && y == 32) ==> x >= 9)",
+        ] {
+            assert!(!proved(goal), "{goal}");
+        }
     }
 }

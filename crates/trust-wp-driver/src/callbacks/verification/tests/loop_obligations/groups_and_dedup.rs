@@ -32,6 +32,11 @@ fn multi_loop_per_group_condition_both_verify() {
     ];
     let groups = [
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![PureExpr::BinOp(
                 Arc::new(PureExpr::Var("i".to_string(), None)),
@@ -45,6 +50,11 @@ fn multi_loop_per_group_condition_both_verify() {
             )),
         },
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![PureExpr::BinOp(
                 Arc::new(PureExpr::Var("j".to_string(), None)),
@@ -61,7 +71,7 @@ fn multi_loop_per_group_condition_both_verify() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -69,6 +79,7 @@ fn multi_loop_per_group_condition_both_verify() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -100,6 +111,11 @@ fn multi_loop_second_group_fails_independently() {
     ];
     let groups = [
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![PureExpr::BinOp(
                 Arc::new(PureExpr::Var("i".to_string(), None)),
@@ -113,6 +129,11 @@ fn multi_loop_second_group_fails_independently() {
             )),
         },
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![PureExpr::BinOp(
                 Arc::new(PureExpr::Var("j".to_string(), None)),
@@ -125,7 +146,7 @@ fn multi_loop_second_group_fails_independently() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -133,6 +154,7 @@ fn multi_loop_second_group_fails_independently() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -149,11 +171,21 @@ fn multi_loop_second_group_fails_independently() {
 fn multi_loop_empty_groups_verify() {
     let groups = [
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![],
             condition: Some(PureExpr::Var("cond".to_string(), None)),
         },
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![],
             condition: None,
@@ -162,7 +194,7 @@ fn multi_loop_empty_groups_verify() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &[],
+        per_loop_invariants: &[],
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -170,6 +202,7 @@ fn multi_loop_empty_groups_verify() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -180,8 +213,8 @@ fn multi_loop_empty_groups_verify() {
     );
 }
 
-/// Single-loop backward compatibility: one group with condition produces
-/// identical results to the old flat in_loop_obligations + loop_condition (#752).
+/// Single loop: one group carrying the loop condition is discharged by that
+/// loop's invariant exactly as an ungrouped in-loop obligation is (#752).
 #[test]
 fn single_loop_backward_compat_with_condition() {
     let invariants = vec![PureExpr::BinOp(
@@ -191,6 +224,11 @@ fn single_loop_backward_compat_with_condition() {
     )];
     // Obligation: i >= 0 (trivially implied by invariant, verified with or without condition)
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: vec![PureExpr::BinOp(
             Arc::new(PureExpr::Var("i".to_string(), None)),
@@ -206,7 +244,7 @@ fn single_loop_backward_compat_with_condition() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -214,6 +252,7 @@ fn single_loop_backward_compat_with_condition() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -245,6 +284,11 @@ fn pre_loop_dedup_filters_exact_match_from_loop_group() {
         Arc::new(PureExpr::Int(0)),
     );
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: vec![shared_obl.clone()],
         condition: Some(PureExpr::BinOp(
@@ -256,7 +300,7 @@ fn pre_loop_dedup_filters_exact_match_from_loop_group() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[shared_obl],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -264,6 +308,7 @@ fn pre_loop_dedup_filters_exact_match_from_loop_group() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -297,6 +342,11 @@ fn pre_loop_dedup_filters_implies_rhs_match() {
         Arc::new(raw_obl.clone()),
     );
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: vec![guarded_obl],
         condition: None,
@@ -304,7 +354,7 @@ fn pre_loop_dedup_filters_implies_rhs_match() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[raw_obl],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -312,6 +362,7 @@ fn pre_loop_dedup_filters_implies_rhs_match() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -340,6 +391,11 @@ fn nested_loop_identical_obligations_dedup_preserves_coverage() {
     // Outer loop group and inner loop group both have the same obligation.
     let groups = [
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![shared_obl.clone()],
             condition: Some(PureExpr::BinOp(
@@ -349,6 +405,11 @@ fn nested_loop_identical_obligations_dedup_preserves_coverage() {
             )),
         },
         LoopObligationGroup {
+            loop_index: Some(0),
+            condition_unstated: None,
+            pre_loop_stored_names: Default::default(),
+            unstated_entry_values: Default::default(),
+            injected_fail_closed: false,
             assumptions: Vec::new(),
             obligations: vec![shared_obl.clone()],
             condition: Some(PureExpr::BinOp(
@@ -362,7 +423,7 @@ fn nested_loop_identical_obligations_dedup_preserves_coverage() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[shared_obl],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -370,6 +431,7 @@ fn nested_loop_identical_obligations_dedup_preserves_coverage() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -403,6 +465,11 @@ fn pre_loop_dedup_preserves_genuinely_pre_loop_obligations() {
         Arc::new(PureExpr::Int(0)),
     );
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: vec![in_loop_obl],
         condition: None,
@@ -410,7 +477,7 @@ fn pre_loop_dedup_preserves_genuinely_pre_loop_obligations() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[pre_only_obl],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -418,6 +485,7 @@ fn pre_loop_dedup_preserves_genuinely_pre_loop_obligations() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -427,5 +495,103 @@ fn pre_loop_dedup_preserves_genuinely_pre_loop_obligations() {
     assert!(
         matches!(result, VerificationResult::Failed(_)),
         "genuinely pre-loop obligation should NOT be deduped, got {result:?}"
+    );
+}
+
+fn gt_zero(name: &str) -> PureExpr {
+    PureExpr::BinOp(
+        Arc::new(PureExpr::Var(name.to_string(), None)),
+        BinOp::Gt,
+        Arc::new(PureExpr::Int(0)),
+    )
+}
+
+fn per_loop_ctx<'a>(
+    per_loop_invariants: &'a [Vec<PureExpr>],
+    groups: &'a [LoopObligationGroup],
+) -> LoopCallObligationContext<'a> {
+    LoopCallObligationContext {
+        base_requires: &[],
+        pre_loop_assumptions: &[],
+        per_loop_invariants,
+        pre_loop_obligations: &[],
+        loop_obligation_groups: groups,
+        logic_fns_opt: None,
+        mode_overrides_opt: None,
+        type_invariants_opt: None,
+        type_constants_opt: None,
+        adt_decls_opt: None,
+        adt_field_ranges_opt: None,
+        track_level: TrackLevel::Auto,
+        timeout: None,
+    }
+}
+
+/// Structural guard: a group's VC never assumes ANOTHER loop's effective
+/// invariants. Loop 1's `x > 0` (true at loop 1's header, e.g. after
+/// `x = 5`) must not discharge loop 0's condition-free exit-tail obligation.
+#[test]
+fn group_does_not_assume_other_loops_invariants() {
+    let per_loop = vec![Vec::new(), vec![gt_zero("x")]];
+    let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
+        assumptions: vec![],
+        obligations: vec![gt_zero("x")],
+        condition: None,
+    }];
+    let result = verify_loop_call_obligations(&per_loop_ctx(&per_loop, &groups))
+        .expect("loop obligation verification should encode");
+    assert!(
+        matches!(result, VerificationResult::Failed(_)),
+        "loop 0's group must not assume loop 1's invariant, got {result:?}"
+    );
+}
+
+/// Control: the same obligation in loop 1's own group is discharged by loop 1's
+/// invariant.
+#[test]
+fn group_assumes_its_own_loops_invariants() {
+    let per_loop = vec![Vec::new(), vec![gt_zero("x")]];
+    let groups = [LoopObligationGroup {
+        loop_index: Some(1),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
+        assumptions: vec![],
+        obligations: vec![gt_zero("x")],
+        condition: None,
+    }];
+    let result = verify_loop_call_obligations(&per_loop_ctx(&per_loop, &groups))
+        .expect("loop obligation verification should encode");
+    assert!(
+        matches!(result, VerificationResult::Verified(_)),
+        "loop 1's group should assume loop 1's invariant, got {result:?}"
+    );
+}
+
+/// A group with no loop index assumes no loop invariant at all.
+#[test]
+fn group_without_loop_index_assumes_no_invariant() {
+    let per_loop = vec![vec![gt_zero("x")]];
+    let groups = [LoopObligationGroup {
+        loop_index: None,
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
+        assumptions: vec![],
+        obligations: vec![gt_zero("x")],
+        condition: None,
+    }];
+    let result = verify_loop_call_obligations(&per_loop_ctx(&per_loop, &groups))
+        .expect("loop obligation verification should encode");
+    assert!(
+        matches!(result, VerificationResult::Failed(_)),
+        "an unindexed group must not assume any loop invariant, got {result:?}"
     );
 }

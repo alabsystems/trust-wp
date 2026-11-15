@@ -115,10 +115,10 @@ fn test_fset_disjoint() {
 #[test]
 fn test_fset_peek() {
     let empty: FSet<i32> = FSet::empty();
-    assert!(empty.peek().is_none());
+    assert!(std::panic::catch_unwind(|| empty.peek()).is_err());
 
     let singleton = FSet::singleton(42);
-    assert_eq!(singleton.peek(), Some(42));
+    assert_eq!(singleton.peek(), 42);
 }
 
 #[test]

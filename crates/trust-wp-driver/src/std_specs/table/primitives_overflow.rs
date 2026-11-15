@@ -291,8 +291,7 @@ pub(super) static SPECS: &[SpecEntry] = &[
         primitives::specs::CHECKED_NEG,
     ),
     // Checked remainder — `Some(self % rhs)` when rhs != 0, `None` on
-    // division-by-zero. Like CHECKED_DIV, the signed `MIN % -1` case is
-    // omitted (logic-level integer arithmetic is over unbounded Int).
+    // division-by-zero and on signed `MIN % -1` overflow, like CHECKED_DIV.
     (
         &[
             "core::num::checked_rem",
@@ -324,7 +323,7 @@ pub(super) static SPECS: &[SpecEntry] = &[
         primitives::specs::CHECKED_REM,
     ),
     // Wrapping remainder — `self % rhs` (panics on rhs == 0). Mirrors
-    // WRAPPING_DIV semantics: signed MIN % -1 overflow case is omitted.
+    // Signed MIN % -1 wraps to 0, which is the Int remainder.
     (
         &[
             "core::num::wrapping_rem",

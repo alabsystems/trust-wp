@@ -136,7 +136,7 @@ fn test_bool_eq_postcondition_uses_iff_encoding() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "result == false with body = true should fail: {result:?}"
     );
 
@@ -147,7 +147,7 @@ fn test_bool_eq_postcondition_uses_iff_encoding() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "result != true with body = true should fail: {result:?}"
     );
 
@@ -181,7 +181,7 @@ fn test_bool_ne_postcondition_uses_iff_encoding() {
         verify_function_with_modes(VerificationRequest::new(&pre, &[ens]).return_expr(Some(&body)))
             .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "result != true with call_0=true body should fail: {result:?}"
     );
 
@@ -231,7 +231,7 @@ fn test_bool_eq_postcondition_bool_sorted_lhs_exercises_iff_path() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "(x > 0) != result with x=5, body=(x > 0) should fail: {result:?}"
     );
 }
@@ -269,7 +269,7 @@ fn test_bool_ne_postcondition_bool_sorted_lhs_exercises_iff_path() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "(x > 0) == result with x=5, body=NOT(x > 0) should fail: {result:?}"
     );
 
@@ -283,7 +283,7 @@ fn test_bool_ne_postcondition_bool_sorted_lhs_exercises_iff_path() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "(x > 0) != result with x=5, body=(x > 0) should fail (both true): {result:?}"
     );
 }

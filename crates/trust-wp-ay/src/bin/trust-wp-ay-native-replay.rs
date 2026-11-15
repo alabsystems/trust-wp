@@ -21,10 +21,14 @@ const USAGE: &str = "\
 Usage:
   trust-wp-ay-native-replay replay [--expect stored|replay|sat|unsat|unknown] <artifact.json>
   trust-wp-ay-native-replay shrink [--expect stored|replay|sat|unsat|unknown] [--min-assertions N] [-o <out.json>] <artifact.json>
+  trust-wp-ay-native-replay strict [--timeout-ms N] <artifact.json>
 
 Commands:
   replay   Load and replay a AY native replay JSON artifact.
   shrink   Deterministically remove active assertions while preserving the target status.
+  strict   Replay through the proof-checked strict path (the driver's proof-authority
+           replay) with ay's certificate diagnostics on; print the verdict, the
+           recorded withholding reason, and the proof counters. Diagnostic only.
 
 Defaults:
   --expect stored      Preserve the artifact's stored solve.result when present.
@@ -37,6 +41,7 @@ type CliResult<T> = Result<T, String>;
 enum CommandKind {
     Replay,
     Shrink,
+    Strict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -54,6 +59,7 @@ struct Command {
     output: Option<PathBuf>,
     expect: Expected,
     min_assertions: usize,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +100,82 @@ fn run(args: Vec<String>) -> CliResult<()> {
     match command.kind {
         CommandKind::Replay => replay_command(&command, &artifact),
         CommandKind::Shrink => shrink_command(&command, artifact),
+        CommandKind::Strict => strict_command(&command, artifact),
+    }
+}
+
+/// Replay the artifact through `replay_native_replay_artifact_with_checked_proof`
+/// — the exact API the driver's strict proof-authority replay calls — with
+/// ay's `--debug-cert` certificate diagnostics enabled so a refused
+/// certificate names the step and clause it refused.
+fn strict_command(command: &Command, mut artifact: NativeReplayArtifact) -> CliResult<()> {
+    let flags = ay_core::debug_channel::MiscCliFlags {
+        debug_cert: true,
+        ..ay_core::debug_channel::misc_cli_flags().clone()
+    };
+    let _guard = ay_core::debug_channel::misc_test_override::set(flags);
+    let timeout_ms = command
+        .timeout_ms
+        .or_else(|| {
+            artifact
+                .timeout_ms
+                .map(|ms| ms.min(u128::from(u64::MAX)) as u64)
+        })
+        .unwrap_or(30_000);
+    artifact.timeout_ms = Some(u128::from(timeout_ms));
+    artifact.replay_gaps.clear();
+    let stored = stored_status(&artifact).unwrap_or_else(|| "none".to_string());
+    let started = std::time::Instant::now();
+    match Solver::replay_native_replay_artifact_with_checked_proof(
+        &artifact,
+        std::time::Duration::from_millis(timeout_ms),
+    ) {
+        Ok((details, proof)) => {
+            let summary = details.unknown_summary();
+            let mut proof_stats: Vec<(String, String)> = details
+                .statistics
+                .extra
+                .iter()
+                .filter(|(k, _)| k.starts_with("proof"))
+                .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                .collect();
+            proof_stats.sort();
+            println!(
+                "status=ok command=strict input={} stored={} result={} elapsed_ms={} \
+                 unknown_reason={:?} unknown_detail={:?} proof_artifact={} \
+                 unsat_proof_available={} strictly_verified={} checker_failures={} \
+                 proof_complete={} assertions={} terms={}",
+                command.input.display(),
+                stored,
+                details.result.result(),
+                started.elapsed().as_millis(),
+                summary.as_ref().map(|s| s.reason_code.to_string()),
+                summary.as_ref().and_then(|s| s.detail.clone()),
+                proof.is_some(),
+                details.verification.unsat_proof_available,
+                details.verification.unsat_proof_strictly_verified,
+                details.verification.unsat_proof_checker_failures,
+                details.statistics.proof_complete,
+                artifact.assertions.len(),
+                artifact.terms.len(),
+            );
+            for (k, v) in proof_stats {
+                println!("  {k}={v}");
+            }
+            if let Some(diag) = &details.unknown_diagnostic {
+                println!("  diagnostic={diag:?}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            println!(
+                "status=refused command=strict input={} stored={} elapsed_ms={} error={err}",
+                command.input.display(),
+                stored,
+                started.elapsed().as_millis(),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -198,12 +280,14 @@ fn parse_args(args: Vec<String>) -> CliResult<Command> {
     let kind = match command.as_str() {
         "replay" => CommandKind::Replay,
         "shrink" | "minimize" | "reduce" => CommandKind::Shrink,
+        "strict" => CommandKind::Strict,
         other => return Err(format!("unknown command `{other}`")),
     };
 
     let mut expect = Expected::default();
     let mut output = None;
     let mut min_assertions = 1usize;
+    let mut timeout_ms = None;
     let mut input = None;
     let mut i = 0usize;
     while i < rest.len() {
@@ -213,14 +297,14 @@ fn parse_args(args: Vec<String>) -> CliResult<Command> {
                 std::process::exit(0);
             }
             "--expect" => {
-                i += 1;
+                i = i.saturating_add(1);
                 let value = rest
                     .get(i)
                     .ok_or_else(|| "--expect requires a value".to_string())?;
                 expect = parse_expected(value)?;
             }
             "--min-assertions" => {
-                i += 1;
+                i = i.saturating_add(1);
                 let value = rest
                     .get(i)
                     .ok_or_else(|| "--min-assertions requires a value".to_string())?;
@@ -228,11 +312,22 @@ fn parse_args(args: Vec<String>) -> CliResult<Command> {
                     .parse::<usize>()
                     .map_err(|err| format!("invalid --min-assertions `{value}`: {err}"))?;
             }
+            "--timeout-ms" => {
+                i += 1;
+                let value = rest
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a value".to_string())?;
+                timeout_ms = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid --timeout-ms `{value}`: {err}"))?,
+                );
+            }
             "-o" | "--output" => {
                 if kind != CommandKind::Shrink {
                     return Err("--output is only valid for shrink".to_string());
                 }
-                i += 1;
+                i = i.saturating_add(1);
                 let value = rest
                     .get(i)
                     .ok_or_else(|| "--output requires a path".to_string())?;
@@ -246,7 +341,7 @@ fn parse_args(args: Vec<String>) -> CliResult<Command> {
                 input = Some(PathBuf::from(value));
             }
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
 
     let input = input.ok_or_else(|| "missing artifact path".to_string())?;
@@ -256,6 +351,7 @@ fn parse_args(args: Vec<String>) -> CliResult<Command> {
         output,
         expect,
         min_assertions,
+        timeout_ms,
     })
 }
 
@@ -342,12 +438,17 @@ fn shrink_assertions(
             let mut candidate = artifact.clone();
             candidate.assertions.drain(start..end);
             normalize_assertions(&mut candidate);
-            stats.attempts += 1;
+            stats.attempts = stats.attempts.saturating_add(1);
             if replay_status(&candidate)? == *target {
-                stats.removed_assertions += end - start;
+                // `end >= start` holds because the drain above would have
+                // panicked otherwise, but that is the drain's invariant, not
+                // this line's; saturating states it locally.
+                stats.removed_assertions = stats
+                    .removed_assertions
+                    .saturating_add(end.saturating_sub(start));
                 *artifact = candidate;
             } else {
-                start += chunk;
+                start = start.saturating_add(chunk);
             }
         }
 

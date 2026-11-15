@@ -34,7 +34,36 @@ pub(crate) fn any_expr_matches(
 }
 
 fn expr_needs_custom_sorts(expr: &PureExpr) -> bool {
-    expr_has_match_constructor_pattern(expr) || expr_has_datatype_spec_method(expr)
+    expr_has_match_constructor_pattern(expr)
+        || expr_has_datatype_spec_method(expr)
+        || expr_mentions_float(expr)
+}
+
+fn sort_mentions_float(sort: &trust_wp_core::formula::ExprSort) -> bool {
+    use trust_wp_core::formula::ExprSort;
+    match sort {
+        ExprSort::Float(_) => true,
+        ExprSort::Ref(inner) | ExprSort::MutRef(inner) => sort_mentions_float(inner),
+        _ => false,
+    }
+}
+
+/// A float literal, a reserved IEEE operation (or an `f16`/`f128` one with an
+/// `f32`/`f64` side) or a float-sorted name. Only
+/// `Logic::All` gives ay's floating-point theory: under the narrower logics a
+/// float term is uninterpreted, which decides nothing about its IEEE value
+/// (sound, but every float fact would come back `unknown`).
+fn expr_mentions_float(expr: &PureExpr) -> bool {
+    expr.any_recursive(|node| match node {
+        PureExpr::Float(_) => true,
+        PureExpr::Var(_, Some(sort)) => sort_mentions_float(sort),
+        PureExpr::LogicFnCall { name, .. } => {
+            trust_wp_core::formula::ieee::IeeeFn::parse(name).is_some()
+                || trust_wp_core::formula::ieee::OpaqueFloatFn::parse(name)
+                    .is_some_and(trust_wp_core::formula::ieee::OpaqueFloatFn::mentions_ieee_sort)
+        }
+        _ => false,
+    })
 }
 
 fn logic_fns_need_custom_sorts(filtered_logic_fns: Option<&[LogicFnDef]>) -> bool {
@@ -90,7 +119,7 @@ fn any_goal_expr_has_logic_fn_call(
 }
 
 fn is_direct_view_filter_candidate(logic_fn: &LogicFnDef, _effective_mode: LogicMode) -> bool {
-    logic_fn.name() == "view"
+    logic_fn.short_name() == "view"
         && logic_fn.params().len() == 1
         && logic_fn.requires().is_empty()
         && !logic_fn.is_opaque()
@@ -98,7 +127,9 @@ fn is_direct_view_filter_candidate(logic_fn: &LogicFnDef, _effective_mode: Logic
 }
 
 fn is_view_return_sort_filter_candidate(logic_fn: &LogicFnDef) -> bool {
-    logic_fn.name() == "view" && logic_fn.params().len() == 1 && logic_fn.return_sort().is_some()
+    logic_fn.short_name() == "view"
+        && logic_fn.params().len() == 1
+        && logic_fn.return_sort().is_some()
 }
 
 /// Detect whether the contract expressions require quantifier-capable,
@@ -204,6 +235,7 @@ pub(crate) fn detect_logic_requirements(
     // will register before solving. (#994, #1944)
     let needs_custom_sorts = has_match_constructors
         || has_datatype_specs
+        || any_expr_matches(requires, ensures, context_exprs, expr_mentions_float)
         || logic_fn_custom_sorts
         || type_invariant_custom_sorts
         || adt_decls.is_some_and(|decls| !decls.is_empty());

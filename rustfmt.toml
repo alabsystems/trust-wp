@@ -4,7 +4,9 @@
 # Based on Rust project style guidelines with minor adjustments
 # for readability in formal verification context.
 
-# Stable options
+# Format with trustfmt (`targo fmt`). Several options below (imports_granularity,
+# group_imports, format_code_in_doc_comments, ...) are unstable rustfmt options
+# that trustfmt honours.
 edition = "2021"
 max_width = 100
 tab_spaces = 4

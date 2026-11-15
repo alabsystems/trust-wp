@@ -44,14 +44,14 @@ def _lane(lockfile: Path) -> str:
 
 def test_tracked_lockfile_census_covers_every_live_lane() -> None:
     lockfiles = LOCK_GATE.discover_lockfiles(WORKSPACE_ROOT)
-    assert len(lockfiles) == 61
+    assert len(lockfiles) == 68
     assert Counter(map(_lane, lockfiles)) == {
         "root": 1,
         "dependency-mode": 1,
         "example": 1,
         "interface": 1,
         "spike": 41,
-        "fixture": 16,
+        "fixture": 23,
     }
 
 
@@ -59,6 +59,25 @@ def test_fixed_point_check_resolves_the_complete_dependency_graph() -> None:
     command = LOCK_GATE.cargo_metadata_command(locked=True, offline=False)
     assert command[-4:] == ["metadata", "--locked", "--format-version", "1"]
     assert "--no-deps" not in command
+
+
+def test_metadata_runs_the_trust_build_tool_unless_the_caller_names_one(monkeypatch) -> None:
+    monkeypatch.delenv("CARGO", raising=False)
+    assert LOCK_GATE.cargo_metadata_command(locked=True, offline=False)[:2] == ["targo", "metadata"]
+    monkeypatch.setenv("CARGO", "/opt/trust/bin/targo")
+    assert LOCK_GATE.cargo_metadata_command(locked=True, offline=False)[:2] == [
+        "/opt/trust/bin/targo",
+        "metadata",
+    ]
+
+
+def test_metadata_environment_drops_caller_rustflags_without_assigning_any(monkeypatch) -> None:
+    monkeypatch.setenv("RUSTFLAGS", "--cfg caller_flag")
+    monkeypatch.setenv("CARGO_ENCODED_RUSTFLAGS", "--cfg\x1fcaller_flag")
+    environment = LOCK_GATE.cargo_environment()
+    assert "RUSTFLAGS" not in environment
+    assert "CARGO_ENCODED_RUSTFLAGS" not in environment
+    assert environment["RUSTC_WRAPPER"] == ""
 
 
 def test_repair_preserves_existing_resolutions_before_locked_recheck() -> None:
@@ -97,7 +116,7 @@ def _patch_transaction_inputs(
     monkeypatch.setattr(LOCK_GATE, "WORKSPACE_ROOT", tmp_path)
     monkeypatch.setattr(LOCK_GATE, "discover_lockfiles", lambda: lockfiles)
     monkeypatch.setattr(LOCK_GATE, "read_pins", lambda: {"ay": "a" * 40})
-    monkeypatch.setattr(LOCK_GATE, "HermeticRoot", _FakeHermeticRoot)
+    monkeypatch.setattr(LOCK_GATE, "LockContexts", _FakeHermeticRoot)
     monkeypatch.setattr(
         LOCK_GATE,
         "workspace_repair_lock",
@@ -210,7 +229,7 @@ def test_repair_rolls_back_when_hermetic_close_raises_after_repair(
             (tmp_path / lockfile).write_text("new\n", encoding="utf-8")
         return [LOCK_GATE.Outcome(lockfile, LOCK_GATE.VERIFIED, True)]
 
-    monkeypatch.setattr(LOCK_GATE, "HermeticRoot", FailingClose)
+    monkeypatch.setattr(LOCK_GATE, "LockContexts", FailingClose)
     monkeypatch.setattr(LOCK_GATE, "run_sweep", sweep)
     with pytest.raises(RuntimeError, match="close failure"):
         LOCK_GATE.main(["--repair"])
@@ -365,7 +384,7 @@ def test_in_place_locks_are_exactly_the_ones_that_never_leave_the_repository() -
         if not LOCK_GATE.escaping_references(lockfile, WORKSPACE_ROOT)
         and lockfile != LOCK_GATE.TRUST_MODE_LOCK
     ]
-    assert Counter(map(_lane, in_place)) == {"fixture": 16, "example": 1}
+    assert Counter(map(_lane, in_place)) == {"fixture": 23, "example": 1}
 
 
 def test_trust_dependency_mode_resolves_at_the_repository_root() -> None:
@@ -592,37 +611,96 @@ def test_package_moves_report_direction_per_package() -> None:
     assert LOCK_GATE.package_moves(before, after) == ["ay-core 0.11.0 -> 0.15.0"]
 
 
-def test_direction_follows_history_not_version_numbers() -> None:
-    """A first-party sibling may renumber; semver then orders nothing.
+def _renumbered_sibling(root: Path) -> Path:
+    """A repository whose workspace version walks clean's renumbering.
 
-    ``clean`` ran 1.2.0 -> 1.3.0 -> ... -> 1.6.0 and was reset to 0.1.0 by
-    "the 1.x line is reserved for public-readiness", then climbed to 0.4.0. So
-    clean-kernel 0.4.0 is FIVE releases newer than 1.4.0 while comparing lower
-    under semver, and the mistake runs both ways: 0.4.0 -> 1.2.0 looks like an
-    upgrade and is nine releases backwards.
-
-    Calling either one wrong is expensive. A false rollback blocks a refresh
-    that should happen; a false forward waves through the downgrade the guard
-    exists to catch.
+    The manifest also pins a dependency on a ``version =`` line of its own, at
+    a value the workspace only reaches at the end: a content search would date
+    that value from the first commit, so only a log anchored on the workspace's
+    own line orders it. One commit moves the dependency alone, which must not
+    enter the timeline either.
     """
 
-    timeline = LOCK_GATE.workspace_version_timeline(
-        LOCK_GATE.object_source("clean", LOCK_GATE.first_party_root())
+    checkout = root / "clean"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(checkout)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    if not timeline:
-        return  # no clean object store on this machine; nothing to assert
-    assert "0.4.0" in timeline and "1.4.0" in timeline, timeline
-    assert timeline.index("0.4.0") < timeline.index("1.4.0"), (
-        f"0.4.0 must be newer than 1.4.0 in clean's history: {timeline}"
-    )
+    git = ["git", "-C", str(checkout)]
+    subprocess.run([*git, "config", "user.email", "history-test@example.invalid"], check=True)
+    subprocess.run([*git, "config", "user.name", "Renumbered Sibling"], check=True)
+    for workspace, dependency in [
+        ("1.2.0", "0.4.0"),
+        ("1.3.0", "0.4.0"),
+        ("1.4.0", "0.4.0"),
+        ("1.4.0", "0.5.0"),
+        ("1.5.0", "0.5.0"),
+        ("1.6.0", "0.5.0"),
+        ("0.1.0", "0.5.0"),
+        ("0.4.0", "0.5.0"),
+    ]:
+        (checkout / "Cargo.toml").write_text(
+            "[workspace]\n"
+            'members = ["crates/clean-kernel"]\n'
+            "\n"
+            "[workspace.package]\n"
+            f'version = "{workspace}"\n'
+            'edition = "2021"\n'
+            "\n"
+            "[workspace.dependencies.ay-core]\n"
+            f'version = "{dependency}"\n'
+            'path = "../ay/crates/ay-core"\n',
+            encoding="utf-8",
+        )
+        subprocess.run([*git, "add", "Cargo.toml"], check=True)
+        subprocess.run(
+            [*git, "commit", "-q", "-m", f"version {workspace}, ay-core {dependency}"],
+            check=True,
+        )
+    return checkout
 
+
+def test_direction_follows_history_not_version_numbers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A first-party sibling may renumber; semver then orders nothing.
+
+    ``clean`` ran 1.2.0 up to 1.6.0, was reset to 0.1.0 because the 1.x line
+    is reserved for public-readiness, then climbed to 0.4.0. So 0.4.0 is newer
+    than 1.4.0 while comparing lower, and 0.4.0 -> 1.2.0 compares as an upgrade
+    while being a rollback. Either mistake is expensive: a false rollback
+    blocks a refresh that should happen; a false forward waves through the
+    downgrade the guard exists to catch.
+
+    The renumbering is replayed in a throwaway repository so the verdict is a
+    property of the gate, never of whichever clean checkout a machine has.
+    """
+
+    checkout = _renumbered_sibling(tmp_path)
+    monkeypatch.setenv("TRUST_WP_LOCK_FIRST_PARTY_ROOT", str(tmp_path))
+
+    source = LOCK_GATE.object_source("clean", LOCK_GATE.first_party_root())
+    assert source is not None and source.resolve() == checkout.resolve()
+    # Newest first, and the dependency's own pins never enter the timeline.
+    assert LOCK_GATE.workspace_version_timeline(source) == [
+        "0.4.0", "0.1.0", "1.6.0", "1.5.0", "1.4.0", "1.3.0", "1.2.0",
+    ]
+
+    forward = LOCK_GATE.move_is_forward_in_history
     # Forward despite comparing lower.
-    assert LOCK_GATE.move_is_forward_in_history("clean-kernel", "1.4.0", "0.4.0") is True
+    assert forward("clean-kernel", "1.4.0", "0.4.0") is True
     # Backwards despite comparing higher.
-    assert LOCK_GATE.move_is_forward_in_history("clean-kernel", "0.4.0", "1.2.0") is False
-    # Within one series, ordinary ordering still holds.
-    assert LOCK_GATE.move_is_forward_in_history("clean-kernel", "1.2.0", "1.4.0") is True
-
+    assert forward("clean-kernel", "0.4.0", "1.2.0") is False
+    # Within one series, ordinary ordering still holds in both directions.
+    assert forward("clean-kernel", "1.2.0", "1.4.0") is True
+    assert forward("clean-kernel", "1.4.0", "1.2.0") is False
+    # A value the workspace never held is unanswerable, even one a dependency
+    # entry was pinned at; so is a move that goes nowhere.
+    assert forward("clean-kernel", "1.4.0", "0.5.0") is None
+    assert forward("clean-kernel", "0.5.0", "1.4.0") is None
+    assert forward("clean-kernel", "1.4.0", "1.4.0") is None
 
 def test_unanswerable_direction_keeps_the_strict_verdict() -> None:
     """`None` means unknown, and unknown must not read as safe.
@@ -638,3 +716,39 @@ def test_unanswerable_direction_keeps_the_strict_verdict() -> None:
     before = '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
     after = '[[package]]\nname = "serde"\nversion = "0.9.0"\n'
     assert LOCK_GATE.detect_rollback(before, after), "third-party downgrade must still be caught"
+
+
+def test_live_locks_use_live_context_and_spikes_keep_historical_context(monkeypatch, tmp_path):
+    (tmp_path / "dependency-modes").mkdir()
+    (tmp_path / "dependency-modes/LIVE_DEPENDS.lock").write_text(
+        "ay main " + "a" * 40 + "\nclean main " + "b" * 40 + "\ntrust-ir main " + "c" * 40 + "\n")
+    roots = []
+    class Root:
+        def __init__(self, **kwargs):
+            self.pins = kwargs.get("pins", {"historical": "d" * 40})
+            self.healed = []
+            self.closed = False
+            roots.append(self)
+        def workspace_for(self, lockfile, escapes):
+            return self.pins
+        def heal(self, stderr):
+            self.healed.append(stderr)
+            return True
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr(LOCK_GATE, "HermeticRoot", Root)
+    contexts = LOCK_GATE.LockContexts(tmp_path)
+    for lock in (Path("Cargo.lock"), LOCK_GATE.TRUST_MODE_LOCK):
+        assert contexts.workspace_for(lock, []) == {"ay": "a" * 40, "clean": "b" * 40, "trust-ir": "c" * 40}
+        assert contexts.heal("live")
+    assert contexts.workspace_for(Path("spikes/case/Cargo.lock"), []) == {"historical": "d" * 40}
+    assert contexts.heal("historical")
+    assert roots[0].healed == ["live", "live"]
+    assert roots[1].healed == ["historical"]
+    contexts.close()
+    assert all(root.closed for root in roots)
+
+
+def test_missing_live_authority_refuses_instead_of_using_historical_pins(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        LOCK_GATE.LockContexts(tmp_path)

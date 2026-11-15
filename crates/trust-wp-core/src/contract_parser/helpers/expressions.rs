@@ -7,10 +7,8 @@
 
 use std::sync::Arc;
 
-use super::super::{ContractParser, ParseError};
-use crate::formula::{
-    internal::tuple_lowering::tuple_logic_fn_name, ExprSort, MatchArm, Pattern, PureExpr,
-};
+use super::super::{ContractParser, ParseError, PatternForm, WrittenTypeSite};
+use crate::formula::{internal::tuple_lowering::tuple_logic_fn_name, MatchArm, Pattern, PureExpr};
 
 impl ContractParser<'_> {
     /// Parse a match expression: `match expr { pattern => body, ... }`
@@ -48,6 +46,9 @@ impl ContractParser<'_> {
                 } else {
                     break;
                 }
+            }
+            if patterns.len() > 1 {
+                self.pattern_forms.push(PatternForm::Or);
             }
 
             // Reject integer-literal patterns inside match arms. Pearlite
@@ -328,8 +329,13 @@ impl ContractParser<'_> {
     /// Closure parameters may have optional type annotations, which are consumed
     /// and mapped to `ExprSort` where possible (same as quantifier bindings).
     ///
-    /// Also handles destructuring parameters like `|(x, y)| body` (#1513):
-    /// tuple patterns are flattened into individual named parameters.
+    /// A destructuring parameter (`|(x, y)| body`, `|&x| body`, #1513) is one
+    /// parameter, as in Rust: a fresh name `$cpN` whose value the body
+    /// matches against the pattern exactly as `let pattern = $cpN;` does.
+    /// Flattened into one parameter per bound name, `|(x @ y, _z)|` bound
+    /// `y` to the second field and `|((a, b), c)|` bound `b` to the second
+    /// field of the whole value, and a consumer binding the i-th parameter to
+    /// the i-th field read each at the wrong place.
     ///
     /// Returns `PureExpr::Closure { params, body }`.
     pub(in crate::contract_parser) fn parse_closure(&mut self) -> Result<PureExpr, ParseError> {
@@ -339,6 +345,7 @@ impl ContractParser<'_> {
         }
 
         let mut params = Vec::new();
+        let mut destructured: Vec<(String, Pattern)> = Vec::new();
 
         self.skip_whitespace();
 
@@ -351,11 +358,16 @@ impl ContractParser<'_> {
             loop {
                 self.skip_whitespace();
 
-                // Check for tuple destructuring pattern: `(a, b)`
-                if self.peek() == Some('(') {
-                    let pat = self.parse_pattern()?;
-                    // Flatten tuple/binding patterns into named params
-                    Self::flatten_pattern_to_params(&pat, &mut params);
+                // A destructuring parameter: `(a, b)`, `&x`.
+                if matches!(self.peek(), Some('(' | '&')) {
+                    let start = self.position;
+                    let pattern = self.parse_pattern()?;
+                    self.check_irrefutable_let(&pattern, start)?;
+                    self.note_elided_type(WrittenTypeSite::ClosureParam);
+                    let name = format!("$cp{}", self.closure_param_counter);
+                    self.closure_param_counter += 1;
+                    destructured.push((name.clone(), pattern));
+                    params.push((name, None));
                 } else {
                     let name = self
                         .try_parse_simple_identifier()
@@ -366,8 +378,9 @@ impl ContractParser<'_> {
                     // Optional type annotation: `: Type`
                     let sort = if self.try_consume(":") {
                         self.skip_whitespace();
-                        self.consume_type_annotation()?
+                        self.consume_written_type(WrittenTypeSite::ClosureParam)?
                     } else {
+                        self.note_elided_type(WrittenTypeSite::ClosureParam);
                         None
                     };
 
@@ -393,42 +406,15 @@ impl ContractParser<'_> {
         self.skip_whitespace();
 
         // Parse the closure body (a single expression)
-        let body = self.parse_expr()?;
+        let mut body = self.parse_expr()?;
+        for (name, pattern) in destructured.into_iter().rev() {
+            body = Self::desugar_let_pattern(pattern, PureExpr::Var(name, None), body)?;
+        }
 
         Ok(PureExpr::Closure {
             params,
             body: Arc::new(body),
         })
-    }
-
-    /// Flatten a pattern into closure parameter names.
-    ///
-    /// Used to desugar destructuring closure parameters like `|(x, y)|` into
-    /// flat parameter lists `[("x", None), ("y", None)]`. Wildcards are
-    /// converted to synthetic `_` names. (#1513)
-    fn flatten_pattern_to_params(pat: &Pattern, out: &mut Vec<(String, Option<ExprSort>)>) {
-        match pat {
-            Pattern::Binding(name) => out.push((name.clone(), None)),
-            Pattern::Alias { alias, pattern } => {
-                out.push((alias.clone(), None));
-                Self::flatten_pattern_to_params(pattern, out);
-            }
-            Pattern::Tuple(elements) => {
-                for elem in elements {
-                    Self::flatten_pattern_to_params(elem, out);
-                }
-            }
-            Pattern::Wildcard => out.push(("_".to_string(), None)),
-            Pattern::Constructor { inner, .. } => {
-                if let Some(inner_pat) = inner {
-                    Self::flatten_pattern_to_params(inner_pat, out);
-                }
-            }
-            Pattern::Literal(_) => {
-                // Literal in closure param position — unusual but not a parse error
-                out.push(("_".to_string(), None));
-            }
-        }
     }
 
     /// Parse a struct literal expression: `TypeName { field: expr, ... }`

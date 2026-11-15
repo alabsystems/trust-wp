@@ -26,81 +26,90 @@ impl Callbacks for TwoPhaseParsingProbe {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let contracts = find_contract_functions(tcx);
-        let trait_contracts = find_trait_contracts(tcx);
-        let trait_specs = build_trait_spec_table(&trait_contracts);
-        let Some(contract) = contracts.iter().find(|contract| {
-            tcx.def_path_str(contract.def_id)
-                .ends_with("push_len_contract")
-        }) else {
-            return Compilation::Stop;
-        };
-        let user_specs = HashMap::new();
-        let extern_specs = HashMap::new();
-        let extraction_ctx =
-            ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, false, false);
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let contracts = find_contract_functions(tcx);
+            let trait_contracts = find_trait_contracts(tcx);
+            let trait_specs = build_trait_spec_table(tcx, &trait_contracts, &[]);
+            let Some(contract) = contracts.iter().find(|contract| {
+                tcx.def_path_str(contract.def_id)
+                    .ends_with("push_len_contract")
+            }) else {
+                return Compilation::Stop;
+            };
+            let user_specs = HashMap::new();
+            let extern_specs = HashMap::new();
+            let extraction_ctx =
+                ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, &[], false, false);
 
-        let parsed = parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
-            .expect("push_len_contract should parse and extract");
+            let parsed =
+                parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
+                    .expect("push_len_contract should parse and extract");
 
-        self.call_assumptions = parsed.call_assumptions.clone();
-        self.writebacks = parsed
-            .mut_borrow
-            .mut_borrow_body
-            .as_ref()
-            .and_then(|body| body.resolve_results.as_ref())
-            .map(|results| results.writebacks.clone())
-            .unwrap_or_default();
-        self.ran = true;
-        Compilation::Stop
+            self.call_assumptions = parsed.call_assumptions.clone();
+            self.writebacks = parsed
+                .mut_borrow
+                .mut_borrow_body
+                .as_ref()
+                .and_then(|body| body.resolve_results.as_ref())
+                .map(|results| results.writebacks.clone())
+                .unwrap_or_default();
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 
 impl Callbacks for BodylessTraitParsingProbe {
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let trait_contracts = find_trait_contracts(tcx);
-        let Some(trait_contract) = trait_contracts
-            .iter()
-            .find(|contract| contract.method_name == "required_spec")
-        else {
-            return Compilation::Stop;
-        };
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let trait_contracts = find_trait_contracts(tcx);
+            let Some(trait_contract) = trait_contracts
+                .iter()
+                .find(|contract| contract.method_name == "required_spec")
+            else {
+                return Compilation::Stop;
+            };
 
-        let local_def_id = trait_contract
-            .method_def_id
-            .as_local()
-            .expect("trait method contract should be local");
-        self.missing_hir_body = tcx.hir_node_by_def_id(local_def_id).body_id().is_none();
+            let local_def_id = trait_contract
+                .method_def_id
+                .as_local()
+                .expect("trait method contract should be local");
+            self.missing_hir_body = tcx.hir_node_by_def_id(local_def_id).body_id().is_none();
 
-        let contract = FunctionContract {
-            local_def_id,
-            def_id: trait_contract.method_def_id,
-            requires: trait_contract.requires.clone(),
-            ensures: trait_contract.ensures.clone(),
-            invariants: Vec::new(),
-            per_loop_invariants: Vec::new(),
-            per_loop_variants: Vec::new(),
-            all_loop_spans: Vec::new(),
-            variants: Vec::new(),
-            terminates: false,
-            ghost: false,
-            trusted: false,
-            trait_origin: None,
-        };
-        let trait_specs = build_trait_spec_table(&trait_contracts);
-        let user_specs = HashMap::new();
-        let extern_specs = HashMap::new();
-        let extraction_ctx =
-            ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, false, false);
-        let parsed = parse_and_extract_contract(tcx, &contract, &HashSet::new(), &extraction_ctx);
-        self.parsed_contract = parsed.is_some();
-        self.missing_result_expr = parsed
-            .as_ref()
-            .is_some_and(|parsed_contract| parsed_contract.result_expr.is_none());
-        self.ran = true;
-        Compilation::Stop
+            let contract = FunctionContract {
+                local_def_id,
+                def_id: trait_contract.method_def_id,
+                requires: trait_contract.requires.clone(),
+                ensures: trait_contract.ensures.clone(),
+                invariants: Vec::new(),
+                per_loop_invariants: Vec::new(),
+                per_loop_variants: Vec::new(),
+                all_loop_spans: Vec::new(),
+                variants: Vec::new(),
+                terminates: false,
+                ghost: false,
+                trusted: false,
+                trait_origin: None,
+                capture_owner_only: false,
+            };
+            let trait_specs = build_trait_spec_table(tcx, &trait_contracts, &[]);
+            let user_specs = HashMap::new();
+            let extern_specs = HashMap::new();
+            let extraction_ctx =
+                ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, &[], false, false);
+            let parsed =
+                parse_and_extract_contract(tcx, &contract, &HashSet::new(), &extraction_ctx);
+            self.parsed_contract = parsed.is_some();
+            self.missing_result_expr = parsed
+                .as_ref()
+                .is_some_and(|parsed_contract| parsed_contract.result_expr.is_none());
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 

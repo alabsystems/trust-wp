@@ -24,18 +24,28 @@ impl Callbacks for RecursiveSelfSpecCallbacks {
             return Compilation::Stop;
         };
 
-        let user_specs = crate::callbacks::parsing::build_user_spec_table(&contracts);
+        let user_specs = crate::callbacks::parsing::build_user_spec_table(tcx, &contracts, &[]);
         let arg_names = vec!["n".to_string()];
         let recursive_fns = HashSet::from([contract.def_id]);
 
-        let non_recursive_specs =
-            effective_user_specs_for_extraction(contract, &HashSet::new(), &arg_names, &user_specs);
+        let non_recursive_specs = effective_user_specs_for_extraction(
+            tcx,
+            contract,
+            &HashSet::new(),
+            &arg_names,
+            &user_specs,
+        );
         self.non_recursive_param_names = non_recursive_specs
             .get(&contract.def_id)
             .and_then(|spec| spec.param_names.clone());
 
-        let recursive_specs =
-            effective_user_specs_for_extraction(contract, &recursive_fns, &arg_names, &user_specs);
+        let recursive_specs = effective_user_specs_for_extraction(
+            tcx,
+            contract,
+            &recursive_fns,
+            &arg_names,
+            &user_specs,
+        );
         self.recursive_param_names = recursive_specs
             .get(&contract.def_id)
             .and_then(|spec| spec.param_names.clone());

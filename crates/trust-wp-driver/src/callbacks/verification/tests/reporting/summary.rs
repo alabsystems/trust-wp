@@ -321,7 +321,7 @@ fn format_proof_assert_summary_basic() {
         ..ProofAssertCounters::default()
     };
     assert_eq!(
-        format_proof_assert_summary(&pa),
+        format_proof_assert_summary(&pa, 0),
         "trust-wp: proof_assert: 3 verified, 0 failed, 2 errors"
     );
 }
@@ -341,7 +341,7 @@ fn format_proof_assert_summary_includes_inconclusive_when_nonzero() {
         ..ProofAssertCounters::default()
     };
     assert_eq!(
-        format_proof_assert_summary(&pa),
+        format_proof_assert_summary(&pa, 0),
         "trust-wp: proof_assert: 1 verified, 0 failed, 0 errors, 2 inconclusive"
     );
 }
@@ -356,7 +356,7 @@ fn format_proof_assert_summary_includes_evidence_gaps_when_nonzero() {
         ..ProofAssertCounters::default()
     };
     assert_eq!(
-        format_proof_assert_summary(&pa),
+        format_proof_assert_summary(&pa, 0),
         "trust-wp: proof_assert: 1 verified, 0 failed, 1 errors, 1 evidence gaps"
     );
 }
@@ -373,7 +373,7 @@ fn format_proof_assert_summary_omits_inconclusive_when_zero() {
         ..ProofAssertCounters::default()
     };
     assert_eq!(
-        format_proof_assert_summary(&pa),
+        format_proof_assert_summary(&pa, 0),
         "trust-wp: proof_assert: 1 verified, 0 failed, 0 errors"
     );
 }
@@ -392,7 +392,7 @@ fn format_proof_assert_summary_with_encoding_errors() {
         ..ProofAssertCounters::default()
     };
     assert_eq!(
-        format_proof_assert_summary(&pa),
+        format_proof_assert_summary(&pa, 0),
         "trust-wp: proof_assert: 3 verified, 0 failed, 2 errors, encoding-errors unsupported=2 sort-inference=0 solver=0"
     );
 }
@@ -423,4 +423,19 @@ fn summary_from_counters_maps_encoding_errors() {
     assert_eq!(summary.encoding_errors.solver, 2);
     assert_eq!(summary.proof_assert_encoding_errors.unsupported, 1);
     assert_eq!(summary.proof_assert_encoding_errors.solver, 2);
+}
+
+#[test]
+fn proved_logic_body_assertions_count_in_the_proof_assert_summary() {
+    // The logic lane prints `proof_assert in X verified` for a logic function whose
+    // own body assertions all proved; the summary must count that line, or the
+    // adversarial gate reads a credit the driver's total denies.
+    let pa = ProofAssertCounters {
+        verified: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_proof_assert_summary(&pa, 1),
+        "trust-wp: proof_assert: 3 verified, 0 failed, 0 errors"
+    );
 }

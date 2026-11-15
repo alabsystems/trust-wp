@@ -30,10 +30,10 @@ fn logic_fn_def_new_defaults() {
     assert_eq!(def.name(), "max");
     assert_eq!(def.full_path(), "crate::max");
     assert_eq!(def.params(), &["a", "b"]);
-    assert!(def.param_sorts().is_empty());
+    assert_eq!(def.param_sorts(), []);
     assert_eq!(def.return_sort(), None);
-    assert!(def.requires().is_empty());
-    assert!(def.ensures().is_empty());
+    assert_eq!(def.requires(), []);
+    assert_eq!(def.ensures(), []);
     assert!(!def.is_recursive());
     assert!(!def.is_opaque());
     assert_eq!(def.mode(), LogicMode::Default);
@@ -176,7 +176,7 @@ fn logic_fn_def_set_is_opaque() {
 #[test]
 fn logic_fn_def_set_param_sorts() {
     let mut def = LogicFnDef::new("f".into(), "f".into(), vec!["x".into()], PureExpr::Int(0));
-    assert!(def.param_sorts().is_empty());
+    assert_eq!(def.param_sorts(), []);
     def.set_param_sorts(vec![Some(ExprSort::Int)]);
     assert_eq!(def.param_sorts(), &[Some(ExprSort::Int)]);
 }
@@ -445,7 +445,7 @@ fn adt_constructor_decl_new() {
 #[test]
 fn adt_constructor_decl_empty_fields() {
     let ctor = AdtConstructorDecl::new("None".into(), "Option_None".into(), vec![]);
-    assert!(ctor.fields.is_empty());
+    assert_eq!(ctor.fields.as_slice(), []);
 }
 
 #[test]

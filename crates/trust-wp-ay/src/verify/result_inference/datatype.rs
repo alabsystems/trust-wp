@@ -113,33 +113,6 @@ where
     inferred
 }
 
-/// Detect the constructor name from a body expression.
-///
-/// When MIR preserves the enum constructor (e.g., the body is
-/// `LogicFnCall { name: "Err", args: [Int(42)] }`), this returns the short
-/// constructor name (`"Err"`). When MIR has unwrapped the constructor to a
-/// bare scalar, returns `None`.
-///
-/// Used at the datatype-wrapping call site to pick the correct constructor
-/// instead of always defaulting to `Ok`/`Some`. (#1811)
-pub(crate) fn detect_body_constructor_name(expr: &PureExpr) -> Option<&str> {
-    let name = if let PureExpr::LogicFnCall { name, .. } = expr {
-        name.as_str()
-    } else if let PureExpr::Var(name, _) = expr {
-        name.as_str()
-    } else {
-        return None;
-    };
-    let short = short_constructor_name(name);
-    if matches!(short, "Some" | "None" | "Ok" | "Err")
-        || short.chars().next().is_some_and(char::is_uppercase)
-    {
-        Some(short)
-    } else {
-        None
-    }
-}
-
 /// Infer a datatype requirement from constructor equalities that reference `result`.
 ///
 /// Examples:

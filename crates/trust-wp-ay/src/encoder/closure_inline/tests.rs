@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Unit tests for closure body inlining substitution (#2151 Phase 2).
+//! Unit tests for closure body inlining substitution (#2151).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -13,7 +13,8 @@ use trust_wp_core::formula::{
 
 use super::{
     substitution::{
-        apply_substitution, conjoin_with_ensures, extract_receiver_name, substitute_closure_body,
+        apply_substitution, bind_closure_contract_clauses, closure_clause_binding_is_unambiguous,
+        conjoin_with_ensures, extract_receiver_name, substitute_closure_body,
         substitute_closure_body_mut, substitute_closure_ensures,
     },
     AYEncoder,
@@ -328,9 +329,7 @@ fn test_substitute_closure_body_mut_nullary() {
 /// it to the caller-side `_count_final` variable.
 ///
 /// Without this test, `substitute_closure_body_mut` could be replaced by
-/// `substitute_closure_body` and all existing tests would still pass (P1-90 finding).
-///
-/// Part of #2007
+/// `substitute_closure_body` and all existing tests would still pass.
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_mut_preserves_final_var_capture() {
@@ -388,8 +387,6 @@ fn test_substitute_closure_body_mut_preserves_final_var_capture() {
 /// `result` maps to `args.last()` — not to `final_state`. This exercises the layout
 /// difference between postcondition (params..., result) and postcondition_mut
 /// (params..., final_state, result) with a body containing `Final(Var(capture))`.
-///
-/// Part of #2007
 #[test]
 #[timeout(30000)]
 fn test_substitute_mut_two_params_with_final_body() {
@@ -459,20 +456,17 @@ fn test_substitute_mut_two_params_with_final_body() {
     );
 }
 
-/// Documents the "result" param name collision in `substitute_closure_body`.
+/// The "result" param name collision in `substitute_closure_body`.
 ///
 /// When a closure has a formal parameter named "result" (valid Rust identifier),
-/// the parameter mapping `param_names[i] → args[i]` correctly maps it first.
-/// Then the "result" → `args.last()` mapping OVERWRITES the parameter binding,
-/// causing the formal parameter to be substituted with the result variable
-/// instead of its actual argument.
+/// a single-pass mapping `param_names[i] → args[i]` followed by
+/// `"result" → args.last()` OVERWRITES the parameter binding, substituting the
+/// formal parameter with the result variable instead of its actual argument.
 ///
 /// Closure: `|result: i32| result + 1`
 /// postcondition(env, arg_for_result, actual_result)
 /// Expected: actual_result == arg_for_result + 1
-/// Bug: actual_result == actual_result + 1  (result param overwritten by result var)
-///
-/// P1-95 algorithm_audit finding
+/// Single-pass: actual_result == actual_result + 1  (result param overwritten by result var)
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_result_param_name_collision() {
@@ -500,7 +494,7 @@ fn test_substitute_closure_body_result_param_name_collision() {
         &[param_arg, result_var],
     );
 
-    // FIXED (#2193): two-phase substitution disambiguates:
+    // Two-phase substitution (#2193) disambiguates:
     //   LHS "result" → Var("r") (return variable, args.last())
     //   RHS "result" → Int(5)   (param arg, args[0])
     // Result: r == (5 + 1)
@@ -521,9 +515,7 @@ fn test_substitute_closure_body_result_param_name_collision() {
     );
 }
 
-/// Same collision fix for `substitute_closure_body_mut` (#2193).
-///
-/// P1-95 algorithm_audit finding, fixed by #2193.
+/// Same collision handling for `substitute_closure_body_mut` (#2193).
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_mut_result_param_name_collision() {
@@ -549,7 +541,7 @@ fn test_substitute_closure_body_mut_result_param_name_collision() {
         &[param_arg, final_state, result_var],
     );
 
-    // FIXED (#2193): two-phase substitution. LHS → r, RHS → 5.
+    // Two-phase substitution (#2193): LHS → r, RHS → 5.
     let expected = PureExpr::BinOp(
         Arc::new(PureExpr::Var("r".to_string(), None)),
         BinOp::Eq,
@@ -567,7 +559,7 @@ fn test_substitute_closure_body_mut_result_param_name_collision() {
     );
 }
 
-/// Phase 4: conjoin_with_ensures augments body substitution with side effects.
+/// conjoin_with_ensures augments body substitution with side effects.
 ///
 /// For unannotated FnMut closure `|| { x += 1; 5 }` called via postcondition_once:
 /// - body substitution: `result == 5`
@@ -612,7 +604,7 @@ fn test_conjoin_with_ensures_adds_side_effects() {
     );
 }
 
-/// Phase 4: conjoin_with_ensures is identity when ensures is empty.
+/// conjoin_with_ensures is identity when ensures is empty.
 #[test]
 #[timeout(30000)]
 fn test_conjoin_with_ensures_empty_is_identity() {
@@ -710,9 +702,6 @@ fn test_register_closure_body_preserves_missing_body_without_unsoundness() {
 ///
 /// Closure: `|x| x + 1` with raw body `x + 1` (no `result == ...` wrapper).
 /// postcondition(env, 5, r) → should produce `r == (5 + 1)`.
-///
-/// P1-1193 proof_coverage finding: the `body_has_result == false` branch
-/// (closure_inline.rs:259-274) had no direct test.
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_raw_body_wraps_with_result_eq() {
@@ -746,8 +735,6 @@ fn test_substitute_closure_body_raw_body_wraps_with_result_eq() {
 
 /// Raw body substitution for postcondition_mut: same wrapping as postcondition
 /// but with the extra final_state argument in the layout.
-///
-/// P1-1193 proof_coverage finding.
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_mut_raw_body_wraps_with_result_eq() {
@@ -789,10 +776,8 @@ fn test_substitute_closure_body_mut_raw_body_wraps_with_result_eq() {
 /// `extract_receiver_name` strips `Final` wrappers in addition to `Deref`.
 ///
 /// The driver produces `Final(Var("f"))` for closure receivers in postcondition
-/// contexts. Without handling `Final`, `find_body_for_receiver` falls through
-/// to the single-body shortcut instead of doing a direct param_name lookup.
-///
-/// P1-1193 proof_coverage finding.
+/// contexts. Without handling `Final`, `find_body_for_receiver` would not
+/// find the closure by its param_name at all (it resolves by name only).
 #[test]
 #[timeout(30000)]
 fn test_extract_receiver_name_final_wrapper() {
@@ -827,8 +812,6 @@ fn test_extract_receiver_name_final_wrapper() {
 /// MethodCall, View, and other wrappers are not stripped — only Var, Deref,
 /// Final, and Old. View is intentionally excluded (it changes semantics, not
 /// identity).
-///
-/// P1-1193 proof_coverage finding. Updated for #2668 (Old handling added).
 #[test]
 #[timeout(30000)]
 fn test_extract_receiver_name_unsupported_wrappers_return_none() {
@@ -841,7 +824,7 @@ fn test_extract_receiver_name_unsupported_wrappers_return_none() {
         None
     );
 
-    // Old(Var("f")) → Some("f") since #2668 (Old is identity for receiver lookup)
+    // Old(Var("f")) → Some("f") (Old is identity for receiver lookup)
     assert_eq!(
         extract_receiver_name(&PureExpr::Old(Arc::new(PureExpr::Var(
             "f".to_string(),
@@ -865,8 +848,6 @@ fn test_extract_receiver_name_unsupported_wrappers_return_none() {
 ///
 /// In `forall x. (x + y)`, "x" is bound (should not be found as free),
 /// while "y" is free (should be found).
-///
-/// P1-1193 proof_coverage finding.
 #[test]
 #[timeout(30000)]
 fn test_expr_mentions_var_respects_quantifier_shadow() {
@@ -896,8 +877,6 @@ fn test_expr_mentions_var_respects_quantifier_shadow() {
 
 /// `expr_mentions_var` handles Let binding: finds var in value but not
 /// in shadowed body.
-///
-/// P1-1193 proof_coverage finding.
 #[test]
 #[timeout(30000)]
 fn test_expr_mentions_var_let_value_vs_body() {
@@ -985,10 +964,6 @@ fn test_expr_mentions_var_depth_guard_fails_closed_no_var() {
 /// formal param but the body doesn't have the expected `result == ...` top-level
 /// structure, the function falls back to applying param-only substitution to
 /// the whole body. The "result" → return variable mapping is NOT applied.
-///
-/// This exercises the fallback at closure_inline.rs:318-321.
-///
-/// P1-1193 proof_coverage finding.
 #[test]
 #[timeout(30000)]
 fn test_substitute_result_param_collision_non_eq_body_fallback() {
@@ -1027,10 +1002,8 @@ fn test_substitute_result_param_collision_non_eq_body_fallback() {
 
 /// Raw body with no params and no result: edge case where args is empty.
 ///
-/// This exercises the `else` branch at closure_inline.rs:271 where
+/// This exercises the `else` branch of `substitute_closure_body` where
 /// `args.last()` returns None, so the raw body is returned as-is.
-///
-/// P1-1193 proof_coverage finding.
 #[test]
 #[timeout(30000)]
 fn test_substitute_closure_body_raw_body_no_args_returns_body() {
@@ -1052,10 +1025,8 @@ fn test_substitute_closure_body_raw_body_no_args_returns_body() {
 ///
 /// Closure ensures clauses can reference `old(receiver)` for pre-state values.
 /// When the receiver appears inside `Old()`, the param_name lookup must still
-/// find the base variable name. Without this, `find_body_for_receiver` falls
-/// through to shortcut paths unnecessarily.
-///
-/// Part of #2668.
+/// find the base variable name. Without this, `find_body_for_receiver` finds
+/// nothing and the call stays uninterpreted.
 #[test]
 #[timeout(30000)]
 fn test_extract_receiver_name_old_wrapper() {
@@ -1108,9 +1079,6 @@ fn test_extract_receiver_name_old_wrapper() {
 ///
 /// The ay encoder normalizes Box deref layers so the receiver resolves to
 /// the base variable "c", which matches the registered closure body.
-///
-/// Part of #2668 — verifies encoder-level handling is correct.
-/// The remaining compat failures are in the driver MIR pipeline.
 #[test]
 #[timeout(30000)]
 fn test_postcondition_once_inline_double_box_receiver() {
@@ -1179,8 +1147,6 @@ fn test_postcondition_once_inline_double_box_receiver() {
 /// When the postcondition_once receiver is wrapped in Old() (e.g., from a
 /// spec that references `old(f).postcondition_once(...)`), the inline path
 /// should still match the registered closure body via `extract_receiver_name`.
-///
-/// Part of #2668.
 #[test]
 #[timeout(30000)]
 fn test_postcondition_once_inline_old_wrapped_receiver() {
@@ -1299,4 +1265,444 @@ fn test_find_body_for_receiver_view_nested_under_deref_lookup() {
         .find_body_for_receiver(&receiver)
         .expect("Deref(View(...)) receiver should resolve to the registered body");
     assert_eq!(body_info.body, Some(PureExpr::Int(13)));
+}
+
+// ── Receiver identity: no guessed body for an unnamed receiver ──────────
+// (`s43_closure_shortcut_receiver.rs`, `s43_rem_div_trait_call.rs`)
+
+/// A path receiver names a function item (`T::rem`, `core::ops::Add::add`),
+/// never a closure value, so nothing may bind it to a registered closure
+/// body — even when exactly one NAMED body is registered.
+///
+/// Otherwise `let r = (-7i32).rem(2); proof_assert!(r@ == 1)` verifies:
+/// `T::rem.postcondition((-7, 2), r)` is inlined with the lone registered
+/// closure body, pinning `r` to that body's value
+/// (`tests/adversarial/cases/s43_rem_div_trait_call.rs`).
+#[test]
+#[timeout(30000)]
+fn test_find_body_for_receiver_refuses_function_item_path_receiver() {
+    let mut encoder = AYEncoder::new_pure();
+    let named = crate::closure_capture_info! {
+        def_id: "shortcut_test::closure#0".to_string(),
+        captures: vec![],
+        param_name: Some("c".to_string()),
+        body_expr: Some(PureExpr::Int(1)),
+        param_names: Some(vec![]),
+        ensures_exprs: Some(vec![PureExpr::Bool(true)]),
+    };
+    encoder.register_closure_body(&named);
+
+    for path in [
+        "T::rem",
+        "T::add",
+        "core::ops::Rem::rem",
+        "core::default::Default::default",
+    ] {
+        for receiver in [
+            PureExpr::Var(path.to_string(), None),
+            PureExpr::Deref(Arc::new(PureExpr::Var(path.to_string(), None))),
+            PureExpr::Final(Arc::new(PureExpr::View(Arc::new(PureExpr::Var(
+                path.to_string(),
+                None,
+            ))))),
+        ] {
+            assert!(
+                encoder.find_body_for_receiver(&receiver).is_none(),
+                "function-item receiver {receiver:?} must not borrow a closure body"
+            );
+        }
+    }
+
+    // The named closure itself still resolves by direct lookup.
+    let own = encoder
+        .find_body_for_receiver(&PureExpr::Var("c".to_string(), None))
+        .expect("named closure resolves by its param_name");
+    assert_eq!(own.body, Some(PureExpr::Int(1)));
+}
+
+/// An unnamed registered body (no `param_name`: a closure temporary such as
+/// the `proof_assert!` marker lambda) is never a call receiver and, being the
+/// only body, is exactly what a single-body guess would hand out: an
+/// unresolved receiver (a generic `F` or `&dyn Fn` parameter, a
+/// closure-environment term) gets nothing.
+#[test]
+#[timeout(30000)]
+fn test_find_body_for_receiver_refuses_unnamed_only_body() {
+    let mut encoder = AYEncoder::new_pure();
+    let lambda = crate::closure_capture_info! {
+        def_id: "shortcut_test::{closure#0}".to_string(),
+        captures: vec![],
+        param_name: None,
+        body_expr: Some(PureExpr::Bool(true)),
+        param_names: Some(vec![]),
+        ensures_exprs: None,
+    };
+    encoder.register_closure_body(&lambda);
+
+    for receiver in [
+        PureExpr::Var("f".to_string(), None),
+        PureExpr::Deref(Arc::new(PureExpr::Var("f".to_string(), None))),
+        PureExpr::LogicFnCall {
+            name: "__trust_wp_tuple1".to_string(),
+            args: vec![PureExpr::Var("x".to_string(), None)],
+        },
+    ] {
+        assert!(
+            encoder.find_body_for_receiver(&receiver).is_none(),
+            "unnamed body must not stand in for receiver {receiver:?}"
+        );
+    }
+}
+
+/// Identity or nothing (D-30): a NAMED ensures-bearing closure resolves for
+/// its own name only. An existential binder / Skolem receiver (`st1`) and a
+/// closure-environment term (`__trust_wp_tuple0()`, which two capture-less
+/// sibling closures share) are not that closure by any evidence — a
+/// unique-ensures guess would hand `c2 = |_| 2`'s call `c1`'s `result == 1`
+/// (`tests/adversarial/cases/s71_closure_ensures_sibling_fallback_tupled.rs`).
+#[test]
+#[timeout(30000)]
+fn test_find_body_for_receiver_resolves_by_name_only() {
+    let mut encoder = AYEncoder::new_pure();
+    let named = crate::closure_capture_info! {
+        def_id: "shortcut_test::closure#named".to_string(),
+        captures: vec![],
+        param_name: Some("c".to_string()),
+        body_expr: Some(PureExpr::Int(5)),
+        param_names: Some(vec![]),
+        ensures_exprs: Some(vec![PureExpr::Bool(true)]),
+    };
+    let lambda = crate::closure_capture_info! {
+        def_id: "shortcut_test::closure#lambda".to_string(),
+        captures: vec![],
+        param_name: None,
+        body_expr: Some(PureExpr::Bool(true)),
+        param_names: Some(vec![]),
+        ensures_exprs: None,
+    };
+    encoder.register_closure_body(&named);
+    encoder.register_closure_body(&lambda);
+
+    let own = encoder
+        .find_body_for_receiver(&PureExpr::Deref(Arc::new(PureExpr::Final(Arc::new(
+            PureExpr::Var("c".to_string(), None),
+        )))))
+        .expect("the named closure resolves by its own name under Deref/Final");
+    assert_eq!(own.body, Some(PureExpr::Int(5)));
+
+    for receiver in [
+        PureExpr::Var("st1".to_string(), None),
+        PureExpr::Var("sk_exists_st1_3".to_string(), None),
+        PureExpr::Deref(Arc::new(PureExpr::LogicFnCall {
+            name: "__trust_wp_tuple0".to_string(),
+            args: vec![],
+        })),
+        PureExpr::Deref(Arc::new(PureExpr::Final(Arc::new(PureExpr::LogicFnCall {
+            name: "__trust_wp_tuple1".to_string(),
+            args: vec![PureExpr::Int(0)],
+        })))),
+    ] {
+        assert!(
+            encoder.find_body_for_receiver(&receiver).is_none(),
+            "receiver {receiver:?} names no registered closure and must get nothing"
+        );
+    }
+}
+
+/// A closure-environment constructor receiver resolves ONLY to the closure
+/// the driver recorded as the sole owner of that arity in its body
+/// (`env_arity`); an arity nobody owns, or that the body shares, resolves to
+/// nothing — even when a single ensures-bearing closure is registered.
+#[test]
+#[timeout(30000)]
+fn test_find_body_for_receiver_env_ctor_resolves_to_sole_arity_owner() {
+    let mut encoder = AYEncoder::new_pure();
+    let owner = crate::closure_capture_info! {
+        def_id: "env_test::closure#owner".to_string(),
+        captures: vec![],
+        param_name: Some("c".to_string()),
+        body_expr: Some(PureExpr::Int(1)),
+        param_names: Some(vec![]),
+        ensures_exprs: Some(vec![PureExpr::Bool(true)]),
+    }
+    .with_env_arity(Some(1));
+    let shared = crate::closure_capture_info! {
+        def_id: "env_test::closure#shared".to_string(),
+        captures: vec![],
+        param_name: Some("d".to_string()),
+        body_expr: Some(PureExpr::Int(2)),
+        param_names: Some(vec![]),
+        ensures_exprs: Some(vec![PureExpr::Bool(true)]),
+    };
+    encoder.register_closure_body(&owner);
+    encoder.register_closure_body(&shared);
+
+    let arity1 = PureExpr::Deref(Arc::new(PureExpr::Final(Arc::new(PureExpr::LogicFnCall {
+        name: "__trust_wp_tuple1".to_string(),
+        args: vec![PureExpr::Int(0)],
+    }))));
+    let found = encoder
+        .find_body_for_receiver(&arity1)
+        .expect("the sole owner of arity 1 serves a tuple1 environment receiver");
+    assert_eq!(found.body, Some(PureExpr::Int(1)));
+
+    let arity0 = PureExpr::Deref(Arc::new(PureExpr::LogicFnCall {
+        name: "__trust_wp_tuple0".to_string(),
+        args: vec![],
+    }));
+    assert!(
+        encoder.find_body_for_receiver(&arity0).is_none(),
+        "an environment arity no registered closure owns resolves to nothing"
+    );
+
+    let mut single = AYEncoder::new_pure();
+    single.register_closure_body(&shared);
+    assert!(
+        single.find_body_for_receiver(&arity0).is_none(),
+        "a lone registered closure without env_arity must not be handed a tuple0 receiver"
+    );
+}
+
+/// A source-typed variable receiver (a `&dyn Fn` or generic `F` parameter)
+/// and a path receiver naming a function item never borrow a sibling NAMED
+/// closure's body; they fail the name lookup and there is no other route.
+#[test]
+#[timeout(30000)]
+fn test_find_body_for_receiver_refuses_source_typed_var_receiver() {
+    use trust_wp_core::formula::ExprSort;
+    let mut encoder = AYEncoder::new_pure();
+    let named = crate::closure_capture_info! {
+        def_id: "shortcut_test::closure#c".to_string(),
+        captures: vec![],
+        param_name: Some("c".to_string()),
+        body_expr: Some(PureExpr::Int(6)),
+        param_names: Some(vec!["x".to_string()]),
+        ensures_exprs: Some(vec![PureExpr::Bool(true)]),
+    };
+    encoder.register_closure_body(&named);
+    for receiver in [
+        PureExpr::Var("f".to_string(), Some(ExprSort::Int)),
+        PureExpr::Deref(Arc::new(PureExpr::Var(
+            "f".to_string(),
+            Some(ExprSort::Ref(Box::new(ExprSort::Int))),
+        ))),
+        PureExpr::Var("core::ops::Add::add".to_string(), None),
+    ] {
+        assert!(
+            encoder.find_body_for_receiver(&receiver).is_none(),
+            "receiver {receiver:?} must not borrow `c`'s body"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D-30: an inlined closure clause's `result` is the CLOSURE's result
+// ---------------------------------------------------------------------------
+
+/// `#[ensures(result == 1)]` on a called closure must be bound to the call's
+/// RESULT ARGUMENT. Left free, `result` resolves against the enclosing
+/// function's result variable and the closure's postcondition becomes a claim
+/// about the caller's return value.
+#[test]
+#[timeout(30000)]
+fn test_bind_closure_contract_clauses_binds_result_to_the_call_result() {
+    let ensures = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Int(1)),
+    )];
+    // postcondition_mut(args_tuple, final_state, result) for `|_x: i32| 1`.
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("st".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+
+    let bound = bind_closure_contract_clauses(&ensures, &["_x".to_string()], &args)
+        .expect("a clause naming only `result` binds");
+
+    assert_eq!(
+        bound,
+        vec![PureExpr::BinOp(
+            Arc::new(PureExpr::Var("call_0".to_string(), None)),
+            BinOp::Eq,
+            Arc::new(PureExpr::Int(1)),
+        )],
+        "the closure's `result` must become the call's result argument"
+    );
+    assert!(
+        !expr_mentions_var(&bound[0], "result"),
+        "no free `result` may survive: it would read the ENCLOSING function's result"
+    );
+}
+
+/// A clause naming a formal param binds that param to its argument.
+#[test]
+#[timeout(30000)]
+fn test_bind_closure_contract_clauses_binds_formal_params() {
+    let ensures = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Var("x".to_string(), None)),
+    )];
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+
+    let bound = bind_closure_contract_clauses(&ensures, &["x".to_string()], &args)
+        .expect("a one-param clause binds under the flat layout");
+
+    assert_eq!(
+        bound,
+        vec![PureExpr::BinOp(
+            Arc::new(PureExpr::Var("call_0".to_string(), None)),
+            BinOp::Eq,
+            Arc::new(PureExpr::Var("arg".to_string(), None)),
+        )]
+    );
+}
+
+/// A formal param named `result` cannot be told from the result keyword:
+/// bind nothing and let the caller fall back to the UF encoding.
+#[test]
+#[timeout(30000)]
+fn test_bind_closure_contract_clauses_fails_closed_on_result_param() {
+    let ensures = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Int(1)),
+    )];
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+
+    assert_eq!(
+        bind_closure_contract_clauses(&ensures, &["result".to_string()], &args),
+        None,
+        "a closure whose formal param is named `result` must inline nothing"
+    );
+}
+
+/// The control shape — one formal param, the flat
+/// `[param, final_state, result]` layout, captures disjoint from params — binds.
+#[test]
+#[timeout(30000)]
+fn test_closure_clause_binding_is_unambiguous_accepts_the_control_shape() {
+    let ensures = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Int(1)),
+    )];
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("st".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+    let pre_state = PureExpr::Var("c".to_string(), None);
+    let post_state = PureExpr::Var("st".to_string(), None);
+
+    assert!(closure_clause_binding_is_unambiguous(
+        "postcondition_mut",
+        &ensures,
+        &["_x".to_string()],
+        &["y".to_string()],
+        &args,
+        &pre_state,
+        &post_state,
+    ));
+}
+
+/// A formal param that shadows a capture name: the capture substitution has
+/// already rewritten that name, so the binding would arrive too late.
+#[test]
+#[timeout(30000)]
+fn test_closure_clause_binding_refuses_param_shadowing_a_capture() {
+    let ensures = vec![PureExpr::Var("x".to_string(), None)];
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+
+    assert!(!closure_clause_binding_is_unambiguous(
+        "postcondition_once",
+        &ensures,
+        &["x".to_string()],
+        &["x".to_string()],
+        &args,
+        &PureExpr::Var("c".to_string(), None),
+        &PureExpr::Final(Arc::new(PureExpr::Var("c".to_string(), None))),
+    ));
+}
+
+/// A state term that itself mentions a name about to be bound: the capture
+/// substitution splices that term in, and the positional binding would then
+/// reach inside a term it did not come from.
+#[test]
+#[timeout(30000)]
+fn test_closure_clause_binding_refuses_state_mentioning_a_bound_name() {
+    let ensures = vec![PureExpr::Var("result".to_string(), None)];
+    let args = vec![
+        PureExpr::Var("arg".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+
+    assert!(!closure_clause_binding_is_unambiguous(
+        "postcondition_once",
+        &ensures,
+        &[],
+        &["cap".to_string()],
+        &args,
+        &PureExpr::Var("result".to_string(), None),
+        &PureExpr::Final(Arc::new(PureExpr::Var("result".to_string(), None))),
+    ));
+}
+
+/// A contract that passes a single args-tuple breaks the positional layout:
+/// a clause naming a formal param refuses, one naming only `result` (always
+/// the LAST argument under either layout) still binds.
+#[test]
+#[timeout(30000)]
+fn test_closure_clause_binding_refuses_param_mention_under_a_tupled_layout() {
+    // Two formal params, `postcondition_mut(args_tuple, final_state, result)`:
+    // 3 args, not 2 + 2.
+    let args = vec![
+        PureExpr::Var("args_tuple".to_string(), None),
+        PureExpr::Var("st".to_string(), None),
+        PureExpr::Var("call_0".to_string(), None),
+    ];
+    let params = vec!["a".to_string(), "b".to_string()];
+    let pre_state = PureExpr::Var("c".to_string(), None);
+    let post_state = PureExpr::Var("st".to_string(), None);
+
+    let names_a_param = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Var("a".to_string(), None)),
+    )];
+    assert!(!closure_clause_binding_is_unambiguous(
+        "postcondition_mut",
+        &names_a_param,
+        &params,
+        &[],
+        &args,
+        &pre_state,
+        &post_state,
+    ));
+
+    let names_result_only = vec![PureExpr::BinOp(
+        Arc::new(PureExpr::Var("result".to_string(), None)),
+        BinOp::Eq,
+        Arc::new(PureExpr::Int(1)),
+    )];
+    assert!(closure_clause_binding_is_unambiguous(
+        "postcondition_mut",
+        &names_result_only,
+        &params,
+        &[],
+        &args,
+        &pre_state,
+        &post_state,
+    ));
 }

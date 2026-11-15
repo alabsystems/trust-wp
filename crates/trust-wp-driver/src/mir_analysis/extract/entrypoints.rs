@@ -182,6 +182,7 @@ pub(in crate::mir_analysis) fn extract_return_expr_impl<'tcx>(
         cutoff_location: config.cutoff_location,
         diagnostics: config.diagnostics,
         loop_analysis: loop_ref,
+        skipped_loop_merges: std::cell::OnceCell::new(),
     };
     let mut block_effects = CallEffects::new();
     // Per-borrow prophecy carriers for locally-rooted borrows (#124): one
@@ -563,9 +564,9 @@ pub(crate) fn extract_program_point_state_until_location_detailed<'tcx>(
     }
 }
 
-/// Get the MIR body from a BodyWithBorrowckFacts.
+/// Borrow the MIR while the caller retains its owned borrow-check handle.
 pub(crate) fn get_mir_body<'a, 'tcx>(
-    body_with_facts: &'a rustc_borrowck::consumers::BodyWithBorrowckFacts<'tcx>,
+    body_with_facts: &'a crate::callbacks::thread_locals::RetainedBorrowckBody<'tcx>,
 ) -> &'a Body<'tcx> {
     &body_with_facts.body
 }

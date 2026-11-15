@@ -530,7 +530,7 @@ fn test_verify_function_with_closure_captures_wrong_postcondition_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, crate::VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "^x == x + 2 should fail when precondition only provides ^x == x + 1, got: {result:?}"
     );
 }
@@ -1055,6 +1055,12 @@ fn test_generic_clone_postcondition_ref_typaram_no_sort_mismatch() {
 /// term at the Unit-sorted args position of the UF.
 ///
 /// Part of #2151 (closure encoding sort mismatch in generic FnMut callers).
+///
+/// Not credited since D-127: the ensures resolves `st2`, a binder written
+/// without a sort, which ranges over closure states that may hold the
+/// caller's borrow, and the premise resolves `^^f`, a closure state held
+/// through `f`. Both are refused rather than collapsed; what this test still
+/// guards is that the refusal, not a sort mismatch, is what stops it.
 #[test]
 #[timeout(30000)]
 fn test_generic_call_fnmut_unit_args_no_panic() {
@@ -1065,14 +1071,14 @@ fn test_generic_call_fnmut_unit_args_no_panic() {
     );
 
     match result {
-        Ok(crate::VerificationResult::Verified(_)) => {}
+        Err(crate::EncodingError::Unsupported { message, .. }) if message.contains("D-127") => {}
         Err(e) => {
             panic!(
-                "call_fnmut encoding should not produce an error: {e:?}\n\
+                "call_fnmut encoding should stop only at the D-127 refusal: {e:?}\n\
                  This indicates a sort mismatch in solver.apply() that was not \
                  handled by the sort reconciliation in encode_closure_spec_method"
             );
         }
-        other => panic!("call_fnmut generic contract should verify, got: {other:?}"),
+        other => panic!("call_fnmut's resolve of a closure state must not be credited: {other:?}"),
     }
 }

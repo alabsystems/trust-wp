@@ -4,8 +4,7 @@
 //! Branching and switch extraction logic for MIR control flow.
 //!
 //! Contains handlers for boolean and integer `SwitchInt` terminators
-//! and switch guard assumption construction. Extracted from the
-//! monolithic `extract/mod.rs` as part of the decomposition in #1644.
+//! and switch guard assumption construction.
 //!
 //! Try-operator (`?`) pattern recognition lives in [`super::try_operator`].
 
@@ -15,19 +14,24 @@ use std::{
 };
 
 use rustc_middle::{
-    mir::{BasicBlock, Body, Local, SwitchTargets},
+    mir::{BasicBlock, Body, Local, SwitchTargets, TerminatorKind},
     ty::TyCtxt,
 };
 use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
 
 use super::{
-    super::{diagnostics::ExtractionDiagKind, effects::CallEffects},
+    super::{
+        diagnostics::ExtractionDiagKind,
+        effects::{fail_closed_marker, CallEffects},
+    },
     branching_diag::record_switch_diag,
     extract_from_block_with_context,
     helpers::{
-        block_can_reach_cutoff, block_can_reach_location, block_must_diverge,
-        block_must_early_return, join_with_and, join_with_or, wrap_projected_facts,
+        block_can_reach_cutoff, block_can_reach_location, block_diverges_via_panic,
+        block_must_diverge, block_must_early_return, join_with_and, join_with_or,
+        switch_discr_is_single_call_result, switch_discr_is_value_stable, wrap_projected_facts,
     },
+    panic_site_coverage::{record_switch_edge, walked_path},
     BlockExtractionContext,
 };
 use crate::mir_analysis::translate::{switch_value_to_expr, switch_value_to_i64, DiscrIntTy};
@@ -49,8 +53,11 @@ pub(super) struct BoolSwitchState {
 ///
 /// Bundles the per-block extraction state (`local_exprs`, `visited`,
 /// `projected_write_facts`) together with `discr_int_ty` (the integer
-/// type of the switch discriminant, needed for value decoding). (#2657)
+/// type of the switch discriminant, needed for value decoding).
 pub(super) struct IntSwitchState {
+    /// Source basic block of the switch, from which the discriminant operand
+    /// is recovered for the panic-arm value-stability check.
+    pub(super) bb: BasicBlock,
     pub(super) discr_int_ty: DiscrIntTy,
     pub(super) local_exprs: HashMap<Local, PureExpr>,
     pub(super) visited: HashSet<BasicBlock>,
@@ -69,10 +76,11 @@ fn diag_count(ctx: &BlockExtractionContext<'_>) -> usize {
 
 /// Whether a failed branch only emitted `ControlFlowCycle` diagnostics.
 ///
-/// `#2116` recovers the sibling branch when the failed branch is a pure
-/// loop-back-edge path. If extraction later records any other diagnostic, the
-/// failure is no longer attributable solely to the cycle and we must not
-/// collapse to the sibling branch.
+/// A branch that failed purely on a loop back-edge is treated like a
+/// diverging one and the sibling branch is recovered
+/// (`handle_bool_switch_with_context`). If extraction records any other
+/// diagnostic, the failure is not attributable solely to the cycle and the
+/// collapse to the sibling must not happen.
 #[allow(clippy::ref_option)] // &Option<PureExpr> matches call-site ownership
 fn failed_only_due_to_cycle(
     ctx: &BlockExtractionContext<'_>,
@@ -150,6 +158,250 @@ pub(super) fn switch_target_guard_assumption(
     join_with_or(guards)
 }
 
+/// The condition under which ONE walk of the arm `target` runs: `condition ==
+/// value` for the walk of a valued arm, and `!(condition == v)` for every
+/// value of the switch for the walk of the otherwise arm. Values are spelled by
+/// `switch_value_to_expr`, the spelling the arm's `Ite` uses, so a value
+/// outside `i64` still forms its equality.
+fn switch_walk_edge_condition(
+    condition: &PureExpr,
+    targets: &SwitchTargets,
+    walked_value: Option<u128>,
+    discr_int_ty: DiscrIntTy,
+) -> Option<PureExpr> {
+    let equals = |value: u128| -> Option<PureExpr> {
+        Some(PureExpr::BinOp(
+            Arc::new(condition.clone()),
+            BinOp::Eq,
+            Arc::new(switch_value_to_expr(value, discr_int_ty)?),
+        ))
+    };
+    match walked_value {
+        Some(value) => equals(value),
+        None => {
+            let mut excluded = Vec::new();
+            for (value, _) in targets.iter() {
+                excluded.push(PureExpr::UnOp(UnOp::Not, Arc::new(equals(value)?)));
+            }
+            Some(join_with_and(excluded).unwrap_or(PureExpr::Bool(true)))
+        }
+    }
+}
+
+/// The arm one walk of a switch ran, for the edge that scopes its premises.
+#[derive(Clone, Copy)]
+enum WalkedArm {
+    /// A boolean switch's true arm: `c`.
+    Then,
+    /// A boolean switch's false arm: `!c`.
+    Else,
+    /// An integer switch's arm for one value: `c == v`.
+    Value(u128),
+    /// An integer switch's otherwise arm: `!(c == v)` for every value.
+    Otherwise,
+}
+
+/// The condition that may scope one switch's arm premises, found at most once
+/// per switch and only when an arm recorded a premise.
+///
+/// It must denote the value the switch tests. The walk's translated condition
+/// does when the discriminant is value-stable (`switch_at_block_is_value_stable`,
+/// the test the arm's panic goal uses). When it is not, but the discriminant
+/// is a local whose only definition is one call
+/// (`switch_discr_is_single_call_result`), that call's result symbol does: it
+/// names the value the call returned, which is the value the switch reads,
+/// whatever memory the call's arguments read and however the call lane
+/// translated the result (`x.id_ghost() == y.id_ghost()` on `x: &mut _` is
+/// translated through `eq`'s postcondition to a condition over `x`).
+struct PremiseEdge<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    body: &'a Body<'tcx>,
+    switch_bb: BasicBlock,
+    targets: &'a SwitchTargets,
+    discr_int_ty: Option<DiscrIntTy>,
+    condition: &'a PureExpr,
+    faithful: Option<Option<PureExpr>>,
+}
+
+impl<'a, 'tcx> PremiseEdge<'a, 'tcx> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        switch_bb: BasicBlock,
+        targets: &'a SwitchTargets,
+        discr_int_ty: Option<DiscrIntTy>,
+        condition: &'a PureExpr,
+    ) -> Self {
+        Self {
+            tcx,
+            body,
+            switch_bb,
+            targets,
+            discr_int_ty,
+            condition,
+            faithful: None,
+        }
+    }
+
+    fn faithful_condition(&mut self) -> Option<PureExpr> {
+        self.faithful
+            .get_or_insert_with(|| {
+                if switch_at_block_is_value_stable(self.tcx, self.body, self.switch_bb) {
+                    return Some(self.condition.clone());
+                }
+                let TerminatorKind::SwitchInt { discr, .. } =
+                    &self.body.basic_blocks[self.switch_bb].terminator().kind
+                else {
+                    return None;
+                };
+                switch_discr_is_single_call_result(self.body, discr, self.switch_bb)
+                    .map(|local| super::call_args::call_result_symbol(self.body, local, self.tcx))
+            })
+            .clone()
+    }
+
+    /// The condition under which the walk of `arm` runs, spelled over the
+    /// faithful condition, or `None` when there is none.
+    fn edge(&mut self, arm: WalkedArm) -> Option<PureExpr> {
+        let condition = self.faithful_condition()?;
+        match arm {
+            WalkedArm::Then => Some(condition),
+            WalkedArm::Else => Some(PureExpr::UnOp(UnOp::Not, Arc::new(condition))),
+            WalkedArm::Value(value) => switch_walk_edge_condition(
+                &condition,
+                self.targets,
+                Some(value),
+                self.discr_int_ty?,
+            ),
+            WalkedArm::Otherwise => {
+                switch_walk_edge_condition(&condition, self.targets, None, self.discr_int_ty?)
+            }
+        }
+    }
+}
+
+/// Scope the assumptions ONE arm walk recorded (`assumptions[snapshot..]`) to
+/// that arm: each becomes `edge ==> assumption`.
+///
+/// The primary walk keeps assumptions in one flat list, and every goal of the
+/// function is proved under every assumption. A callee's postcondition
+/// assumed on one arm (`if flag { below(x) }`) holds only on executions that
+/// took the arm, so unscoped it discharges the goals the walk states on the
+/// sibling arms (`!flag ==> !(x >= 100)`) and a panic arm's unreachability
+/// goal, which is pushed after both arms are walked and so escapes the
+/// earlier-obligation guard a call puts on its postconditions
+/// (`assert!(x < 100); below(x);`). The arms' edge conditions are pairwise
+/// exclusive, so a premise scoped to one arm cannot discharge a goal owed only
+/// where a sibling's edge holds, whether or not that goal carries its own
+/// guard: an execution that takes another arm falsifies the edge and
+/// satisfies the premise.
+///
+/// The literal `false` is left alone: it is the `assert!(false)` marker the
+/// arm's gate turns into the unreachability OBLIGATION `!edge`, and assuming
+/// `edge ==> false`, i.e. `!edge`, would grant that goal instead of owing it.
+///
+/// The edge scopes a premise only if it denotes the branch the execution
+/// really takes: a condition read through memory the extractor cannot track
+/// may be stale, and `stale ==> a` hands `a` to an execution that took a
+/// sibling arm. So with no faithful condition (`PremiseEdge`), the arm's other
+/// assumptions are dropped, never kept unscoped. SOUND: `edge ==> a` is
+/// implied by `a`, and dropping `a` removes it, so this only removes
+/// derivations.
+fn guard_branch_assumptions(
+    effects: &mut CallEffects,
+    snapshot: usize,
+    arm: WalkedArm,
+    premise_edge: &mut PremiseEdge<'_, '_>,
+) {
+    if effects.assumptions.len() <= snapshot {
+        return;
+    }
+    let edge = premise_edge.edge(arm);
+    scope_arm_assumptions(effects, snapshot, edge.as_ref());
+}
+
+/// Guard the obligations ONE walk of a plain integer match arm recorded
+/// (`obligations[snapshot..]`) by that arm's edge: each becomes
+/// `edge ==> obligation`, the obligation being owed only on executions that
+/// take the arm.
+///
+/// The edge is the one the arm's premises are scoped by (`PremiseEdge`), so a
+/// premise the arm establishes and a goal the arm owes are read under the same
+/// condition: without it, `match pick(a) { 0 => { below(x); assert!(x < 100) }
+/// .. }` scoped `below`'s postcondition to `pick(a) == 0` and owed the assert on
+/// every path. The condition denotes the value the switch tests at every point
+/// of the body, so a term it shares with an obligation found later in the arm
+/// reads the same value there. With no faithful condition the obligations stay
+/// unconditional: stronger, never unsound.
+fn guard_int_arm_obligations(
+    effects: &mut CallEffects,
+    snapshot: usize,
+    arm: WalkedArm,
+    premise_edge: &mut PremiseEdge<'_, '_>,
+) {
+    if effects.obligations.len() <= snapshot {
+        return;
+    }
+    let edge = premise_edge.edge(arm);
+    guard_arm_obligations_by_edge(effects, snapshot, edge.as_ref());
+}
+
+/// `guard_int_arm_obligations` once the edge is known (`Some`) or refused
+/// (`None`, the obligations stay unconditional).
+///
+/// A literal `false` stays unconditional. It is either a fail-closed marker the
+/// walk owes for a construct it cannot model, or a callee's written
+/// `requires(false)`, and the verdict tells them apart by that literal alone
+/// (`fail_closed_marker_count`, `user_written_false_obligations`): wrapped in
+/// the edge, a marker no longer withholds the refutation it manufactures, and
+/// the count of written ones subtracts a marker instead. Unconditional, the
+/// goal is only stronger: never unsound, and an arm a precondition excludes
+/// still owes its `false`, as every integer arm did before the edge.
+fn guard_arm_obligations_by_edge(
+    effects: &mut CallEffects,
+    snapshot: usize,
+    edge: Option<&PureExpr>,
+) {
+    let Some(edge) = edge else {
+        return;
+    };
+    for obligation in effects.obligations.iter_mut().skip(snapshot) {
+        if pure_expr_is_literal_false(obligation) {
+            continue;
+        }
+        let owed = std::mem::replace(obligation, PureExpr::Bool(true));
+        *obligation = PureExpr::BinOp(Arc::new(edge.clone()), BinOp::Implies, Arc::new(owed));
+    }
+}
+
+/// `guard_branch_assumptions` once the edge is known to be faithful (`Some`)
+/// or not usable (`None`).
+fn scope_arm_assumptions(effects: &mut CallEffects, snapshot: usize, edge: Option<&PureExpr>) {
+    let Some(edge) = edge else {
+        let mut index = snapshot;
+        while index < effects.assumptions.len() {
+            if pure_expr_is_literal_false(&effects.assumptions[index]) {
+                index += 1;
+            } else {
+                effects.assumptions.remove(index);
+            }
+        }
+        return;
+    };
+    let mut start = snapshot;
+    while start < effects.assumptions.len() {
+        let end = effects.assumptions[start..]
+            .iter()
+            .position(pure_expr_is_literal_false)
+            .map_or(effects.assumptions.len(), |offset| start + offset);
+        crate::mir_analysis::effects::guard_assumptions(
+            &mut effects.assumptions[start..end],
+            Some(edge),
+        );
+        start = end + 1;
+    }
+}
+
 /// Whether a `SwitchInt` discriminant condition is an *enum discriminant* read
 /// (`discriminant(place)`), as opposed to a plain integer scrutinee.
 ///
@@ -157,9 +409,10 @@ pub(super) fn switch_target_guard_assumption(
 /// and `Rvalue::Discriminant` is translated to a
 /// `MethodCall { method: "discriminant" }` (see `translate/rvalue.rs`). This gate
 /// keeps the arm-path-condition obligation guarding (below) scoped to enum
-/// matches only, where the arm is entered under a genuine variant refinement;
-/// plain integer `match`es (and booleans, handled separately) keep their exact
-/// prior behavior. (#match-arm-discriminant)
+/// matches, where the arm is entered under a genuine variant refinement.
+/// Plain integer `match`es guard by the edge their premises are scoped by
+/// (`guard_int_arm_obligations`), booleans by their own condition; a refused
+/// guard is a completeness cost only (see `guard_branch_obligations`).
 fn condition_is_enum_discriminant(condition: &PureExpr) -> bool {
     matches!(
         condition,
@@ -207,16 +460,14 @@ fn condition_is_enum_discriminant(condition: &PureExpr) -> bool {
 /// its negation is UNSAT, and a function that genuinely calls `callee(-1)` on
 /// every reachable path through the branch verifies. That is a false accept —
 /// exactly the failure mode `invalidate_overlapping_projected_write_facts`
-/// (`primary.rs`, #1535) was added for: "stale facts survive calls that mutate
-/// the referenced path, producing vacuous verification".
+/// (`primary.rs`) exists for: stale facts that survive calls mutating the
+/// referenced path produce vacuous verification.
 ///
 /// Rather than assume the arm performs no such store, this refuses to guard at
 /// all whenever the condition reads memory the arm could have rewritten. A
-/// refused guard leaves the obligation unconditional, which is the behaviour
-/// that was in place before guarding existed: conservative, possibly
-/// incomplete, never unsound. A by-value comparison on a plain local — which is
-/// every shape in the reports that motivated this — carries no such read and is
-/// guarded normally.
+/// refused guard leaves the obligation unconditional: conservative, possibly
+/// incomplete, never unsound. A by-value comparison on a plain local carries
+/// no such read and is guarded normally.
 fn guard_reads_only_immutable_locals(guard: &PureExpr) -> bool {
     match guard {
         // A dereference or a field/tuple projection is a memory read whose
@@ -254,11 +505,127 @@ fn guard_reads_only_immutable_locals(guard: &PureExpr) -> bool {
     }
 }
 
+/// `!true` -> `false`, `!false` -> `true`; anything else unchanged.
+///
+/// A diverging THEN arm's fact is built as `!condition`, so on a literal
+/// switch it arrives as `!true` / `!false`, and the literal route in
+/// `push_returning_path_fact` must see the literal. Unfolded, the statically
+/// taken `if true { panic!() }` arm missed that route, and `!true` became a
+/// returning-path fact premising every postcondition with `false` while no
+/// lane charged the panic (`literal_true_switch_panic_arm*` adversarial
+/// cases).
+fn fold_negated_literal(fact: PureExpr) -> PureExpr {
+    match fact {
+        PureExpr::UnOp(UnOp::Not, inner) => match inner.as_ref() {
+            PureExpr::Bool(value) => PureExpr::Bool(!value),
+            _ => PureExpr::UnOp(UnOp::Not, inner),
+        },
+        other => other,
+    }
+}
+
+/// Record a #1075/#1401 surviving-path fact: the function only RETURNS through
+/// paths where `fact` holds. Facts premise only the function's own
+/// postconditions (see `CallEffects::returning_path_facts`), never obligations.
+///
+/// Dropped (a completeness cost only) when the switch condition may be stale
+/// (read through tracked-unstable memory) or the fact reads memory whose
+/// entry/final meaning differs from the postcondition's (a dereference, a
+/// projection, a method call).
+fn push_returning_path_fact<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    switch_bb: BasicBlock,
+    effects: &mut CallEffects,
+    fact: PureExpr,
+) {
+    // A literal fact comes from a switch on a constant. A literal `false` is
+    // the `assert!(false)` shape: it stays a literal-`false` ASSUMPTION,
+    // because the enclosing switch's `gate_constant_false_branch_assumptions`
+    // converts it into the unreachability OBLIGATION `!guard` (routed here
+    // instead, `if x > 0 { assert!(false) }` verifies). A literal `true` fact
+    // says nothing and is dropped.
+    let fact = fold_negated_literal(fact);
+    match fact {
+        PureExpr::Bool(false) => {
+            effects.assumptions.push(fact);
+            return;
+        }
+        PureExpr::Bool(true) => return,
+        _ => {}
+    }
+    if guard_reads_only_immutable_locals(&fact)
+        && switch_at_block_is_value_stable(tcx, body, switch_bb)
+    {
+        effects.returning_path_facts.push(fact);
+    }
+}
+
+/// Guard the returning-path facts an arm walk discovered with the arm's edge
+/// condition: `guard ==> fact`. A fact found inside one arm says nothing about
+/// paths through the sibling arms. When the guard is unavailable or may be
+/// stale, the arm's facts are DROPPED (never kept unguarded).
+fn guard_branch_returning_path_facts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    switch_bb: BasicBlock,
+    effects: &mut CallEffects,
+    snapshot: usize,
+    guard: Option<PureExpr>,
+) {
+    if effects.returning_path_facts.len() <= snapshot {
+        return;
+    }
+    match guard {
+        Some(guard)
+            if guard_reads_only_immutable_locals(&guard)
+                && switch_at_block_is_value_stable(tcx, body, switch_bb) =>
+        {
+            for fact in effects.returning_path_facts.iter_mut().skip(snapshot) {
+                let existing = std::mem::replace(fact, PureExpr::Bool(true));
+                *fact =
+                    PureExpr::BinOp(Arc::new(guard.clone()), BinOp::Implies, Arc::new(existing));
+            }
+        }
+        _ => effects.returning_path_facts.truncate(snapshot),
+    }
+}
+
 fn guard_branch_obligations(effects: &mut CallEffects, snapshot: usize, guard: Option<PureExpr>) {
+    guard_branch_obligations_if(effects, snapshot, guard, false);
+}
+
+/// [`guard_branch_obligations`] for a bool switch whose discriminant reads
+/// only frozen memory ([`switch_discr_reads_frozen_memory`]): a guard reading
+/// through a shared reference or a closure capture is then read at the same
+/// value where the obligation is, and guards it.
+fn guard_bool_branch_obligations<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    switch_bb: BasicBlock,
+    effects: &mut CallEffects,
+    snapshot: usize,
+    guard: PureExpr,
+) {
+    let frozen = match &body.basic_blocks[switch_bb].terminator().kind {
+        TerminatorKind::SwitchInt { discr, .. } => {
+            super::helpers::switch_discr_reads_frozen_memory(tcx, body, discr)
+        }
+        _ => false,
+    };
+    guard_branch_obligations_if(effects, snapshot, Some(guard), frozen);
+}
+
+fn guard_branch_obligations_if(
+    effects: &mut CallEffects,
+    snapshot: usize,
+    guard: Option<PureExpr>,
+    discr_reads_frozen_memory: bool,
+) {
     let Some(guard) = guard else {
         return;
     };
-    if !guard_reads_only_immutable_locals(&guard) {
+    if !discr_reads_frozen_memory && !guard_reads_only_immutable_locals(&guard) {
         return;
     }
     for obligation in effects.obligations.iter_mut().skip(snapshot) {
@@ -285,14 +652,14 @@ fn pure_expr_is_literal_false(expr: &PureExpr) -> bool {
 /// `wrap_continuation_with_assert_fact`). That literal `false` loses the
 /// *enclosing* branch guard `G` under which the assertion was reached.
 ///
-/// Two prior treatments were both wrong:
+/// Two tempting treatments are both wrong:
 ///
 /// * Leaving the `false` in place poisons the whole function context with an
 ///   unconditional contradiction: every obligation "proves" vacuously and the
 ///   vacuity guard then reports the function as `vacuous` rather than verifying
 ///   it (e.g. `peek_bit_array8`'s provably-unreachable `None` arm).
-/// * Rewriting `false` into a `!guard` *assumption* (commit a4440d5) is
-///   UNSOUND: it grants `!guard` for free without proving the branch is
+/// * Rewriting `false` into a `!guard` *assumption* is UNSOUND: it grants
+///   `!guard` for free without proving the branch is
 ///   unreachable. For a reachable branch (e.g. `if a == b { assert!(false); }`
 ///   with `#[ensures(a@ != b@)]`) it hands the solver `a != b` and the bogus
 ///   postcondition "verifies".
@@ -342,12 +709,45 @@ fn gate_constant_false_branch_assumptions(
     emitted_unreachability_obligation
 }
 
+/// Whether the `SwitchInt` at `bb` has a value-stable discriminant (see
+/// `switch_discr_is_value_stable`). Anything but a `SwitchInt` terminator is
+/// reported unstable, so callers fail closed.
+fn switch_at_block_is_value_stable<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    bb: BasicBlock,
+) -> bool {
+    match &body.basic_blocks[bb].terminator().kind {
+        TerminatorKind::SwitchInt { discr, .. } => {
+            switch_discr_is_value_stable(tcx, body, discr, false)
+        }
+        _ => false,
+    }
+}
+
+/// A match arm that diverges into a panic entry point
+/// (`unreachable!()`, `panic!()`, ...) must be PROVED unreachable, so push
+/// `!guard` as an obligation. The arm's recovery `LetAssume` over the surviving
+/// arms stays scoped to the result expression and is backed by this proof.
+/// A guard that cannot be reconstructed — or whose discriminant is not value
+/// stable — fails closed as the obligation `false`.
+///
+/// The caller then treats the arm like an `assert!(false)` arm: its negated
+/// guard is EXCLUDED from the surviving-arm recovery `LetAssume`, because ay
+/// hoists a result-position `LetAssume` into the unconditional premise set and
+/// assuming `!guard` there would make this obligation vacuous.
+fn push_panic_arm_unreachability_obligation(effects: &mut CallEffects, guard: Option<PureExpr>) {
+    effects.obligations.push(match guard {
+        Some(guard) => PureExpr::UnOp(UnOp::Not, Arc::new(guard)),
+        None => fail_closed_marker("panic-arm-guard-unreconstructed"),
+    });
+}
+
 /// Handle boolean `SwitchInt` in the context-aware extractor.
 ///
 /// Translates a MIR boolean branch (`if condition { ... } else { ... }`) into a
 /// `PureExpr::Ite` or `PureExpr::LetAssume` depending on cutoff scoping and
-/// branch divergence analysis. Extracted from `extract_from_block_with_context`
-/// to reduce function size. (#1644)
+/// branch divergence analysis.
 pub(super) fn handle_bool_switch_with_context<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -363,6 +763,7 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
         visited,
         projected_write_facts,
     } = state;
+    let walked = walked_path(body, &visited);
     let mut false_bb = None;
     let mut true_bb = None;
     for (value, target) in targets.iter() {
@@ -438,6 +839,7 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
             (true, true) => {}
         }
     }
+    let mut premise_edge = PremiseEdge::new(tcx, body, bb, targets, None, &condition);
     let then_diag_start = diag_count(ctx);
     let then_assumptions_snapshot = effects.assumptions.len();
     // Obligations discovered inside this arm are only required on this arm's
@@ -445,6 +847,7 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
     // `guard_branch_obligations` can tell them from obligations that were
     // already present.
     let then_obligations_snapshot = effects.obligations.len();
+    let then_facts_snapshot = effects.returning_path_facts.len();
     let then_expr = extract_from_block_with_context(
         tcx,
         body,
@@ -462,37 +865,162 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
     // `guard ==> false` obligation the gate is about to emit — that one is
     // already stated in terms of the guard and wrapping it again would make it
     // vacuous.
-    guard_branch_obligations(effects, then_obligations_snapshot, Some(condition.clone()));
+    guard_bool_branch_obligations(
+        tcx,
+        body,
+        bb,
+        effects,
+        then_obligations_snapshot,
+        condition.clone(),
+    );
+    guard_branch_returning_path_facts(
+        tcx,
+        body,
+        bb,
+        effects,
+        then_facts_snapshot,
+        Some(condition.clone()),
+    );
     let then_emitted_unreachability_obligation = gate_constant_false_branch_assumptions(
         effects,
         then_assumptions_snapshot,
         Some(&condition),
+    );
+    guard_branch_assumptions(
+        effects,
+        then_assumptions_snapshot,
+        WalkedArm::Then,
+        &mut premise_edge,
     );
     let then_expr = wrap_projected_facts(projected_write_facts.to_owned(), then_expr);
     let then_failed_only_due_to_cycle = failed_only_due_to_cycle(ctx, then_diag_start, &then_expr);
     let else_diag_start = diag_count(ctx);
     let else_assumptions_snapshot = effects.assumptions.len();
     let else_obligations_snapshot = effects.obligations.len();
+    let else_facts_snapshot = effects.returning_path_facts.len();
     let else_expr =
         extract_from_block_with_context(tcx, body, else_bb, local_exprs, visited, ctx, effects);
     // Else-branch guard is `!condition`.
     let else_guard = PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone()));
-    guard_branch_obligations(effects, else_obligations_snapshot, Some(else_guard.clone()));
+    guard_bool_branch_obligations(
+        tcx,
+        body,
+        bb,
+        effects,
+        else_obligations_snapshot,
+        else_guard.clone(),
+    );
+    guard_branch_returning_path_facts(
+        tcx,
+        body,
+        bb,
+        effects,
+        else_facts_snapshot,
+        Some(else_guard.clone()),
+    );
     let else_emitted_unreachability_obligation = gate_constant_false_branch_assumptions(
         effects,
         else_assumptions_snapshot,
         Some(&else_guard),
     );
+    guard_branch_assumptions(
+        effects,
+        else_assumptions_snapshot,
+        WalkedArm::Else,
+        &mut premise_edge,
+    );
     let else_expr = wrap_projected_facts(projected_write_facts.to_owned(), else_expr);
     let else_failed_only_due_to_cycle = failed_only_due_to_cycle(ctx, else_diag_start, &else_expr);
-    // Cache DFS traversal results to avoid redundant recomputation (#2101).
-    // Previously, block_must_diverge was called up to 8x and block_reaches_cutoff
-    // up to 2x for the same basic blocks.
+    // Compute each DFS answer once: both arms' divergence and cutoff results
+    // are consulted several times below.
     let then_diverges = block_must_diverge(body, then_bb, &mut HashSet::new());
     let else_diverges = block_must_diverge(body, else_bb, &mut HashSet::new());
     let is_cutoff = cutoff_mode(ctx);
     let then_cutoff = is_cutoff && block_reaches_cutoff(body, then_bb, ctx);
     let else_cutoff = is_cutoff && block_reaches_cutoff(body, else_bb, ctx);
+    // A plain `assert!(c)` lowers to `SwitchInt(c)` whose
+    // failing arm calls a panic entry point. That arm is Creusot's `Abort`: it
+    // must be PROVED unreachable, so its negated guard becomes an OBLIGATION
+    // (discharged under the function's preconditions) instead of an assumption
+    // pushed into `effects.assumptions` (an effective precondition — which is
+    // what let `#[ensures(true)] fn f(x: i32) { assert!(x > 0) }` verify).
+    // Enclosing switches guard this obligation through
+    // `guard_branch_obligations`.
+    //
+    // The asserted fact is deliberately NOT re-introduced for the continuation:
+    // not as an assumption, and not as a result-position `LetAssume` either —
+    // ay hoists a result-position `LetAssume` into the unconditional premise
+    // set (`LetAssume { x > 0, x }` puts `x > 0` beside the negated
+    // obligation `!(x > 0)` and the slice closes UNSAT), which would make this
+    // obligation circular. Continuation facts that need the assertion must
+    // re-derive it from the preconditions; that is a completeness cost only.
+    //
+    // Carve-outs that keep their existing (sound) lanes:
+    // * cutoff mode (proof_assert slices) — the function-level extraction owns
+    //   the obligation;
+    // * an arm whose literal-`false` assumption was already converted by
+    //   `gate_constant_false_branch_assumptions`;
+    // * a switch on a literal constant, whose would-be assumption is the
+    //   literal `false` that the ENCLOSING switch's gate turns into `!guard`.
+    // User `-> !` functions are not panic entry points and keep their
+    // returning-path fact (`push_returning_path_fact`).
+    let then_panic_obligation = !is_cutoff
+        && !then_emitted_unreachability_obligation
+        && !matches!(condition, PureExpr::Bool(_))
+        && block_diverges_via_panic(tcx, body, then_bb);
+    let else_panic_obligation = !is_cutoff
+        && !else_emitted_unreachability_obligation
+        && !matches!(condition, PureExpr::Bool(_))
+        && block_diverges_via_panic(tcx, body, else_bb);
+    if then_panic_obligation || else_panic_obligation {
+        // A condition read through memory the extractor cannot track (a write
+        // through a projection, a `&mut` borrow, or a `&mut`-typed local) may
+        // denote a STALE value; such an obligation fails closed as `false`.
+        let stable = switch_at_block_is_value_stable(tcx, body, bb);
+        if then_panic_obligation {
+            effects.obligations.push(if stable {
+                PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone()))
+            } else {
+                fail_closed_marker("panic-arm-guard-unstable")
+            });
+        }
+        if else_panic_obligation {
+            effects.obligations.push(if stable {
+                condition.clone()
+            } else {
+                fail_closed_marker("panic-arm-guard-unstable")
+            });
+        }
+    }
+    let then_emitted_unreachability_obligation =
+        then_emitted_unreachability_obligation || then_panic_obligation;
+    let else_emitted_unreachability_obligation =
+        else_emitted_unreachability_obligation || else_panic_obligation;
+    // D-142: an arm this walk just charged unreachable, or the arm a
+    // value-stable literal never selects, is not taken on this walk's path
+    // while the verdict holds. Only a stable discriminant proves it: over a
+    // stale read the charged `!guard` is about the wrong value.
+    if !is_cutoff {
+        let stable = switch_at_block_is_value_stable(tcx, body, bb);
+        record_switch_edge(
+            body,
+            bb,
+            then_bb,
+            stable
+                && (then_emitted_unreachability_obligation
+                    || matches!(condition, PureExpr::Bool(false))),
+            walked.as_ref(),
+        );
+        record_switch_edge(
+            body,
+            bb,
+            else_bb,
+            stable
+                && (else_emitted_unreachability_obligation
+                    || matches!(condition, PureExpr::Bool(true))),
+            walked.as_ref(),
+        );
+    }
     match (then_expr, else_expr) {
         (Some(then_expr), Some(else_expr)) => Some(PureExpr::Ite(
             Arc::new(condition),
@@ -521,69 +1049,76 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
         // `!`-returning function, panics, etc.), the function only
         // returns through the surviving branch.
         //
-        // Push the path condition as an assumption (which becomes
-        // an effective precondition) rather than wrapping in LetAssume.
-        // LetAssume in Bool context encodes as implication (A => body),
-        // which is vacuously true when A is false — the solver can then
-        // pick parameter values on the divergent path (e.g., b=true for
-        // `if b { never_returns(); }`). By asserting the condition as a
-        // precondition instead, we unconditionally constrain the solver
-        // to the non-divergent path. (#1075, #1401)
+        // That is a RETURNING-PATH fact, not an assumption. Pushed into
+        // `effects.assumptions` it would be an unguarded premise of every
+        // goal, which (a) discharges the diverging arm's own call-precondition
+        // obligations (`if x <= 0 { die(x) }` with `die: requires(x > 0)`), (b)
+        // discharges obligations emitted BEFORE the switch (`need(b); if b {
+        // spin() }` with `need: requires(!b)`;
+        // `s40_prior_obligation_before_spin`), and (c) escapes an enclosing
+        // arm (`if c { if b { spin() } }` proves `ensures(!b)`;
+        // `s40_nested_spin_fact_escapes`). The fact premises only the
+        // function's postconditions, and every enclosing arm guards it with
+        // its own condition.
         //
-        // EXCEPTION: when the branch diverges via `assert!(false)` we already
-        // emitted an unreachability OBLIGATION (`gate_*` returned true). The
-        // branch is NOT trusted-divergent — its unreachability must be PROVEN,
-        // not assumed. Assuming the path condition here would make that
-        // obligation vacuous and re-introduce the false-accept, so suppress it.
+        // EXCEPTION: when the branch diverges via a panic / `assert!(false)`
+        // we already emitted an unreachability OBLIGATION. The branch is NOT
+        // trusted-divergent — its unreachability must be PROVEN — so no fact.
         (Some(then_expr), None) if else_diverges => {
             if !else_emitted_unreachability_obligation {
-                effects.assumptions.push(condition.clone());
+                push_returning_path_fact(tcx, body, bb, effects, condition.clone());
             }
             Some(then_expr)
         }
         (None, Some(else_expr)) if then_diverges => {
             if !then_emitted_unreachability_obligation {
-                effects
-                    .assumptions
-                    .push(PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())));
+                push_returning_path_fact(
+                    tcx,
+                    body,
+                    bb,
+                    effects,
+                    PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())),
+                );
             }
             Some(else_expr)
         }
-        // Both branches return None (e.g., unit-returning function with
-        // one divergent branch). Push the reachability condition as an
-        // assumption so the verifier constrains parameters to the
-        // non-divergent path. Without this, functions like
-        // `fn g(b: bool) { if b { never_returns(); } }` with
-        // `#[ensures(!b)]` would fail because the solver could pick
-        // `b = true`. (#1075)
         // Loop-cycle recovery: when one branch returned None specifically
         // because its block walker hit a control-flow cycle (for-loop
         // back-edge), the function only returns through the surviving
         // branch. Treat cycles like divergence for result recovery. (#2116)
         (Some(then_expr), None) if else_failed_only_due_to_cycle => {
-            effects.assumptions.push(condition.clone());
+            push_returning_path_fact(tcx, body, bb, effects, condition.clone());
             Some(then_expr)
         }
         (None, Some(else_expr)) if then_failed_only_due_to_cycle => {
-            effects
-                .assumptions
-                .push(PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())));
+            push_returning_path_fact(
+                tcx,
+                body,
+                bb,
+                effects,
+                PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())),
+            );
             Some(else_expr)
         }
+        // Both branches return None (e.g., unit-returning function with
+        // one divergent branch). Record the returning-path fact so
+        // `fn g(b: bool) { if b { never_returns(); } }` with `#[ensures(!b)]`
+        // verifies. (#1075)
         (None, None) if then_diverges && !else_diverges => {
-            // See the `assert!(false)` exception above: suppress the assumed
-            // path condition when the divergent branch emitted an
-            // unreachability obligation.
             if !then_emitted_unreachability_obligation {
-                effects
-                    .assumptions
-                    .push(PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())));
+                push_returning_path_fact(
+                    tcx,
+                    body,
+                    bb,
+                    effects,
+                    PureExpr::UnOp(UnOp::Not, Arc::new(condition.clone())),
+                );
             }
             None
         }
         (None, None) if else_diverges && !then_diverges => {
             if !else_emitted_unreachability_obligation {
-                effects.assumptions.push(condition.clone());
+                push_returning_path_fact(tcx, body, bb, effects, condition.clone());
             }
             None
         }
@@ -604,8 +1139,7 @@ pub(super) fn handle_bool_switch_with_context<'tcx>(
 ///
 /// Translates a MIR integer or enum discriminant branch into an `ITE` chain,
 /// with support for cutoff-scoped extraction and try-operator recovery (skipping
-/// early-return branches from `?` desugaring). Extracted from
-/// `extract_from_block_with_context` to reduce function size. (#1644)
+/// early-return branches from `?` desugaring).
 pub(super) fn handle_int_switch_with_context<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -616,14 +1150,17 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
     effects: &mut CallEffects,
 ) -> Option<PureExpr> {
     let IntSwitchState {
+        bb: switch_bb,
         discr_int_ty,
         local_exprs,
         visited,
         projected_write_facts,
     } = state;
-    // Only enum-discriminant switches thread the arm's variant refinement into
-    // in-arm obligations (see `guard_branch_obligations`). Plain integer matches
-    // keep their exact prior behavior. (#match-arm-discriminant)
+    let walked = walked_path(body, &visited);
+    // Enum-discriminant switches thread the arm's variant refinement into
+    // in-arm obligations (see `guard_branch_obligations`); a plain integer
+    // match guards them by the edge its premises are scoped by
+    // (`guard_int_arm_obligations`).
     let guard_arm_obligations = condition_is_enum_discriminant(condition);
     if cutoff_mode(ctx) {
         let mut candidate_targets: Vec<BasicBlock> = targets
@@ -660,9 +1197,12 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
         }
     }
     let otherwise_bb = targets.otherwise();
+    let mut premise_edge =
+        PremiseEdge::new(tcx, body, switch_bb, targets, Some(discr_int_ty), condition);
     let otherwise_diag_start = diag_count(ctx);
     let otherwise_assumptions_snapshot = effects.assumptions.len();
     let otherwise_obligations_snapshot = effects.obligations.len();
+    let otherwise_facts_snapshot = effects.returning_path_facts.len();
     let otherwise_expr = extract_from_block_with_context(
         tcx,
         body,
@@ -683,12 +1223,59 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
             otherwise_obligations_snapshot,
             switch_target_guard_assumption(condition, targets, otherwise_bb, discr_int_ty),
         );
+    } else {
+        guard_int_arm_obligations(
+            effects,
+            otherwise_obligations_snapshot,
+            WalkedArm::Otherwise,
+            &mut premise_edge,
+        );
     }
+    guard_branch_returning_path_facts(
+        tcx,
+        body,
+        switch_bb,
+        effects,
+        otherwise_facts_snapshot,
+        switch_target_guard_assumption(condition, targets, otherwise_bb, discr_int_ty),
+    );
     let otherwise_emitted_unreachability_obligation = gate_constant_false_branch_assumptions(
         effects,
         otherwise_assumptions_snapshot,
         switch_target_guard_assumption(condition, targets, otherwise_bb, discr_int_ty).as_ref(),
     );
+    let otherwise_emitted_unreachability_obligation = if !cutoff_mode(ctx)
+        && !otherwise_emitted_unreachability_obligation
+        && block_diverges_via_panic(tcx, body, otherwise_bb)
+    {
+        push_panic_arm_unreachability_obligation(
+            effects,
+            switch_at_block_is_value_stable(tcx, body, switch_bb)
+                .then(|| {
+                    switch_target_guard_assumption(condition, targets, otherwise_bb, discr_int_ty)
+                })
+                .flatten(),
+        );
+        true
+    } else {
+        otherwise_emitted_unreachability_obligation
+    };
+    guard_branch_assumptions(
+        effects,
+        otherwise_assumptions_snapshot,
+        WalkedArm::Otherwise,
+        &mut premise_edge,
+    );
+    if !cutoff_mode(ctx) {
+        record_switch_edge(
+            body,
+            switch_bb,
+            otherwise_bb,
+            otherwise_emitted_unreachability_obligation
+                && switch_at_block_is_value_stable(tcx, body, switch_bb),
+            walked.as_ref(),
+        );
+    }
     let otherwise_expr = wrap_projected_facts(projected_write_facts.to_owned(), otherwise_expr);
     let otherwise_failed_only_due_to_cycle =
         failed_only_due_to_cycle(ctx, otherwise_diag_start, &otherwise_expr);
@@ -723,6 +1310,7 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
         let diag_start = diag_count(ctx);
         let branch_assumptions_snapshot = effects.assumptions.len();
         let branch_obligations_snapshot = effects.obligations.len();
+        let branch_facts_snapshot = effects.returning_path_facts.len();
         let branch_expr = extract_from_block_with_context(
             tcx,
             body,
@@ -741,12 +1329,59 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
                 branch_obligations_snapshot,
                 switch_target_guard_assumption(condition, targets, target, discr_int_ty),
             );
+        } else {
+            guard_int_arm_obligations(
+                effects,
+                branch_obligations_snapshot,
+                WalkedArm::Value(value),
+                &mut premise_edge,
+            );
         }
+        guard_branch_returning_path_facts(
+            tcx,
+            body,
+            switch_bb,
+            effects,
+            branch_facts_snapshot,
+            switch_target_guard_assumption(condition, targets, target, discr_int_ty),
+        );
         let branch_emitted_unreachability_obligation = gate_constant_false_branch_assumptions(
             effects,
             branch_assumptions_snapshot,
             switch_target_guard_assumption(condition, targets, target, discr_int_ty).as_ref(),
         );
+        let branch_emitted_unreachability_obligation = if !cutoff_mode(ctx)
+            && !branch_emitted_unreachability_obligation
+            && block_diverges_via_panic(tcx, body, target)
+        {
+            push_panic_arm_unreachability_obligation(
+                effects,
+                switch_at_block_is_value_stable(tcx, body, switch_bb)
+                    .then(|| {
+                        switch_target_guard_assumption(condition, targets, target, discr_int_ty)
+                    })
+                    .flatten(),
+            );
+            true
+        } else {
+            branch_emitted_unreachability_obligation
+        };
+        guard_branch_assumptions(
+            effects,
+            branch_assumptions_snapshot,
+            WalkedArm::Value(value),
+            &mut premise_edge,
+        );
+        if !cutoff_mode(ctx) {
+            record_switch_edge(
+                body,
+                switch_bb,
+                target,
+                branch_emitted_unreachability_obligation
+                    && switch_at_block_is_value_stable(tcx, body, switch_bb),
+                walked.as_ref(),
+            );
+        }
         let branch_expr = wrap_projected_facts(projected_write_facts.to_owned(), branch_expr);
         let failed_only_due_to_cycle = failed_only_due_to_cycle(ctx, diag_start, &branch_expr);
         branch_results.push((
@@ -760,7 +1395,7 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
 
     let all_succeeded = branch_results.iter().all(|(_, _, e, _, _)| e.is_some());
     if all_succeeded {
-        // Fast path: all branches extracted — build ITE chain as before.
+        // Fast path: all branches extracted — build the ITE chain directly.
         let mut acc = branch_results[0].2.clone().expect("all_succeeded ⇒ Some");
         for (value_expr_opt, _, expr_opt, _, _) in branch_results.iter().skip(1).rev() {
             let value_expr = value_expr_opt
@@ -829,7 +1464,23 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
         // Build the assumption: discr == v1 || discr == v2 || ...
         // If the otherwise branch survived (value_i64 == None), we
         // use the negation of all failed-branch conditions instead.
-        let assumption = if succeeded.iter().any(|(v, _, _, _, _)| v.is_none()) {
+        // The otherwise arm (`v == None`) has no single switch value, so it
+        // cannot join the surviving-arm disjunction below. When it failed with
+        // an unreachability OBLIGATION it must still stay inside the assumed
+        // set, so use the complement form: exclude only the valued arms that
+        // failed WITHOUT an obligation. (Otherwise `match x { 0 =>
+        // 1, _ => unreachable!() }` verifies under `LetAssume { x == 0 }`,
+        // which ay hoists into the premises and uses to discharge the
+        // otherwise obligation `!(x != 0)` circularly.)
+        let otherwise_failed_with_obligation =
+            branch_results
+                .iter()
+                .any(|(v, _, e, _, emitted_obligation)| {
+                    v.is_none() && e.is_none() && *emitted_obligation
+                });
+        let assumption = if otherwise_failed_with_obligation
+            || succeeded.iter().any(|(v, _, _, _, _)| v.is_none())
+        {
             // Otherwise branch survived — assume discr is NOT any of
             // the failed branches' values. EXCLUDE failed branches that
             // diverged via `assert!(false)`: their unreachability is already
@@ -856,11 +1507,29 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
             failed_values
                 .into_iter()
                 .reduce(|a, b| PureExpr::BinOp(Arc::new(a), BinOp::And, Arc::new(b)))
-        } else if surviving_conditions.len() == 1 {
-            surviving_conditions.into_iter().next() // len() == 1 ⇒ always Some
         } else {
+            // Surviving-arm disjunction. A failed arm that carries an
+            // unreachability OBLIGATION (`assert!(false)` gate, or a panic
+            // arm) must stay INSIDE the assumed disjunction: ay
+            // hoists a result-position `LetAssume` into the unconditional
+            // premise set, so assuming `discr == <surviving>` alone would imply
+            // `!(discr == <obligation arm>)` and discharge that obligation
+            // circularly (otherwise `match o { Some(_) => 0, None =>
+            // unreachable!() }` verifies under `LetAssume { discr == 1 }`).
+            // Only arms that failed WITHOUT an obligation (early return,
+            // non-panic divergence) are excluded, exactly as in the
+            // otherwise-survived form above.
+            let obligation_arm_conditions = branch_results
+                .iter()
+                .filter(|(_, _, e, _, emitted_obligation)| e.is_none() && *emitted_obligation)
+                .filter_map(|(v, _, _, _, _)| {
+                    v.clone().map(|val| {
+                        PureExpr::BinOp(Arc::new(condition.clone()), BinOp::Eq, Arc::new(val))
+                    })
+                });
             surviving_conditions
                 .into_iter()
+                .chain(obligation_arm_conditions)
                 .reduce(|a, b| PureExpr::BinOp(Arc::new(a), BinOp::Or, Arc::new(b)))
         };
 
@@ -868,7 +1537,7 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
         // Start with the otherwise branch (index 0) as the base
         // if it survived, then layer valued branches as ITE conditions.
         // This mirrors the fast path structure where branch_results[0]
-        // is the otherwise/default arm. (#1266 audit fix)
+        // is the otherwise/default arm.
         let mut acc: Option<PureExpr> = branch_results[0].2.clone(); // otherwise branch (may be None if it failed)
         for (value_expr_opt, _, expr_opt, _, _) in branch_results.iter().skip(1).rev() {
             if let Some(expr) = expr_opt {
@@ -890,12 +1559,21 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
             }
         }
 
-        // Wrap with LetAssume to constrain the solver.
+        // Cutoff mode (proof_assert slices) keeps the result-position
+        // LetAssume. Otherwise the surviving-arm condition is a RETURNING-PATH
+        // fact: ay hoists a result-position LetAssume into the unconditional
+        // premise set, where it would discharge the failed arms' own
+        // obligations (a `-> !` callee's precondition) and obligations emitted
+        // before the switch. See `push_returning_path_fact`.
         match (acc, assumption) {
-            (Some(body_expr), Some(assume)) => Some(PureExpr::LetAssume {
+            (Some(body_expr), Some(assume)) if cutoff_mode(ctx) => Some(PureExpr::LetAssume {
                 assumption: Arc::new(assume),
                 body: Arc::new(body_expr),
             }),
+            (Some(body_expr), Some(assume)) => {
+                push_returning_path_fact(tcx, body, switch_bb, effects, assume);
+                Some(body_expr)
+            }
             (Some(body_expr), None) => Some(body_expr),
             _ => None,
         }
@@ -905,6 +1583,125 @@ pub(super) fn handle_int_switch_with_context<'tcx>(
 #[cfg(test)]
 mod gate_assumption_tests {
     use super::*;
+
+    fn bool_var(name: &str) -> PureExpr {
+        PureExpr::Var(
+            name.to_string(),
+            Some(trust_wp_core::formula::ExprSort::Bool),
+        )
+    }
+
+    /// An arm's premises hold only where its edge does, the literal `false`
+    /// its gate owes as a goal stays unscoped, and premises recorded before
+    /// the arm's snapshot are not touched.
+    #[test]
+    fn arm_premises_are_scoped_to_the_arm_edge() {
+        let mut effects = CallEffects::new();
+        effects.assumptions.push(bool_var("before"));
+        let snapshot = effects.assumptions.len();
+        effects.assumptions.push(bool_var("post_1"));
+        effects.assumptions.push(PureExpr::Bool(false));
+        effects.assumptions.push(bool_var("post_2"));
+        let edge = bool_var("flag");
+
+        scope_arm_assumptions(&mut effects, snapshot, Some(&edge));
+
+        let scoped = |post: &str| {
+            PureExpr::BinOp(
+                Arc::new(edge.clone()),
+                BinOp::Implies,
+                Arc::new(bool_var(post)),
+            )
+        };
+        assert_eq!(
+            effects.assumptions,
+            vec![
+                bool_var("before"),
+                scoped("post_1"),
+                PureExpr::Bool(false),
+                scoped("post_2"),
+            ]
+        );
+    }
+
+    /// With no faithful edge an arm's premises are dropped, never kept
+    /// unscoped; the literal `false` stays for the gate.
+    #[test]
+    fn arm_premises_without_an_edge_are_dropped() {
+        let mut effects = CallEffects::new();
+        effects.assumptions.push(bool_var("before"));
+        let snapshot = effects.assumptions.len();
+        effects.assumptions.push(bool_var("post_1"));
+        effects.assumptions.push(PureExpr::Bool(false));
+        effects.assumptions.push(bool_var("post_2"));
+
+        scope_arm_assumptions(&mut effects, snapshot, None);
+
+        assert_eq!(
+            effects.assumptions,
+            vec![bool_var("before"), PureExpr::Bool(false)]
+        );
+    }
+
+    /// An integer arm's goals are owed only where its edge holds; goals
+    /// recorded before the arm's snapshot are not touched, and with no
+    /// faithful edge every goal stays unconditional.
+    #[test]
+    fn int_arm_obligations_are_owed_under_the_arm_edge() {
+        let mut effects = CallEffects::new();
+        effects.obligations.push(bool_var("before"));
+        let snapshot = effects.obligations.len();
+        effects.obligations.push(bool_var("pre_1"));
+        effects.obligations.push(bool_var("pre_2"));
+        let edge = bool_var("edge");
+
+        let mut refused = effects.clone();
+        guard_arm_obligations_by_edge(&mut refused, snapshot, None);
+        assert_eq!(refused.obligations, effects.obligations);
+
+        guard_arm_obligations_by_edge(&mut effects, snapshot, Some(&edge));
+        let owed = |pre: &str| {
+            PureExpr::BinOp(
+                Arc::new(edge.clone()),
+                BinOp::Implies,
+                Arc::new(bool_var(pre)),
+            )
+        };
+        assert_eq!(
+            effects.obligations,
+            vec![bool_var("before"), owed("pre_1"), owed("pre_2")]
+        );
+    }
+
+    /// A literal `false` an integer arm owes stays the bare literal the
+    /// verdict counts as a fail-closed marker or a written `requires(false)`;
+    /// the arm's other goals are still owed under its edge.
+    #[test]
+    fn int_arm_literal_false_obligation_stays_unconditional() {
+        let mut effects = CallEffects::new();
+        let snapshot = effects.obligations.len();
+        effects.obligations.push(bool_var("pre_1"));
+        effects.obligations.push(PureExpr::Bool(false));
+        let edge = bool_var("edge");
+
+        guard_arm_obligations_by_edge(&mut effects, snapshot, Some(&edge));
+
+        assert_eq!(
+            effects.obligations,
+            vec![
+                PureExpr::BinOp(
+                    Arc::new(edge.clone()),
+                    BinOp::Implies,
+                    Arc::new(bool_var("pre_1")),
+                ),
+                PureExpr::Bool(false),
+            ]
+        );
+        assert_eq!(
+            trust_wp_ay::fail_closed_marker_count(&effects.obligations),
+            1
+        );
+    }
 
     fn int_var(name: &str) -> PureExpr {
         PureExpr::Var(
@@ -936,10 +1733,10 @@ mod gate_assumption_tests {
         let emitted = gate_constant_false_branch_assumptions(&mut effects, snapshot, Some(&guard));
 
         assert!(emitted, "an unreachability obligation must be reported");
-        // The literal `false` is no longer an assumption (it neither poisons
+        // The literal `false` is not an assumption (it neither poisons
         // the context nor is silently granted as `!guard`).
         assert!(effects.assumptions.is_empty());
-        // It is now a proof obligation `!guard`, discharged under the
+        // It is a proof obligation `!guard`, discharged under the
         // function's preconditions.
         assert_eq!(effects.obligations.len(), 1);
         match &effects.obligations[0] {
@@ -953,7 +1750,7 @@ mod gate_assumption_tests {
         // A `Bool(false)` already present before the branch extraction (e.g.
         // genuinely contradictory user preconditions) must NOT be touched —
         // only assumptions added by *this* branch are converted. This preserves
-        // the vacuity guard for `#[ensures(false)]`-style contradictions (#2663).
+        // the vacuity guard for `#[ensures(false)]`-style contradictions.
         let mut effects = CallEffects::new();
         effects.assumptions.push(PureExpr::Bool(false));
         let snapshot = effects.assumptions.len();
@@ -986,6 +1783,25 @@ mod gate_assumption_tests {
         assert!(!emitted);
         assert_eq!(effects.assumptions, vec![real]);
         assert!(effects.obligations.is_empty());
+    }
+
+    /// The then-arm fact of a literal switch is `!literal`; it must reach the
+    /// literal route as the literal it denotes, and nothing else is rewritten.
+    #[test]
+    fn negated_literal_facts_fold_to_the_literal() {
+        let not = |inner: PureExpr| PureExpr::UnOp(UnOp::Not, Arc::new(inner));
+        assert_eq!(
+            fold_negated_literal(not(PureExpr::Bool(true))),
+            PureExpr::Bool(false)
+        );
+        assert_eq!(
+            fold_negated_literal(not(PureExpr::Bool(false))),
+            PureExpr::Bool(true)
+        );
+        let symbolic = not(discriminant_eq_zero());
+        assert_eq!(fold_negated_literal(symbolic.clone()), symbolic);
+        let double = not(not(PureExpr::Bool(true)));
+        assert_eq!(fold_negated_literal(double.clone()), double);
     }
 
     #[test]
@@ -1065,9 +1881,8 @@ mod guard_gate_tests {
         )));
     }
 
-    /// Refusing leaves the obligation exactly as it was — unconditional, which
-    /// is what shipped before guarding existed. Refusal costs completeness and
-    /// can never cost soundness.
+    /// Refusing leaves the obligation exactly as it was — unconditional.
+    /// Refusal costs completeness and can never cost soundness.
     #[test]
     fn a_refused_guard_leaves_the_obligation_untouched() {
         let mut effects = CallEffects::default();
@@ -1080,6 +1895,27 @@ mod guard_gate_tests {
         let mut effects = CallEffects::default();
         effects.obligations.push(ge_zero(var("x")));
         guard_branch_obligations(&mut effects, 0, Some(ge_zero(var("n"))));
+        assert!(matches!(
+            effects.obligations.first(),
+            Some(PureExpr::BinOp(_, BinOp::Implies, _))
+        ));
+    }
+
+    /// A guard that reads through a dereference wraps the arm's obligations
+    /// only when the switch operand reads frozen memory (D-118): the caller
+    /// proves that from the MIR, and without it the guard is refused exactly
+    /// as before.
+    #[test]
+    fn a_frozen_memory_guard_through_a_dereference_wraps() {
+        let deref_guard = ge_zero(PureExpr::Deref(Arc::new(var("p"))));
+        let mut effects = CallEffects::default();
+        effects.obligations.push(ge_zero(var("x")));
+        guard_branch_obligations_if(&mut effects, 0, Some(deref_guard.clone()), false);
+        assert_eq!(effects.obligations, vec![ge_zero(var("x"))]);
+
+        let mut effects = CallEffects::default();
+        effects.obligations.push(ge_zero(var("x")));
+        guard_branch_obligations_if(&mut effects, 0, Some(deref_guard), true);
         assert!(matches!(
             effects.obligations.first(),
             Some(PureExpr::BinOp(_, BinOp::Implies, _))

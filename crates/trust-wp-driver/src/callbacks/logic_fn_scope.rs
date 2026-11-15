@@ -146,6 +146,13 @@ pub(super) fn build_logic_fn_path_map(
         // Map full_path -> name (e.g., "creusot_test::x::transparent" -> "transparent")
         if lf.full_path() != lf.name() && lf.full_path().contains("::") {
             map.insert(lf.full_path().to_string(), lf.name().to_string());
+            // A short-name collision member is identified by its unique id. A
+            // crate-relative spelling (`x::k`) is only that path at the crate
+            // root; elsewhere it is resolved in the owner's scope
+            // (`logic::identity`), never here.
+            if lf.has_unique_id() {
+                continue;
+            }
 
             // Also map the module-relative path (without crate prefix) to the
             // short name. The contract parser preserves source-level paths like
@@ -183,7 +190,9 @@ pub(super) fn build_scoped_self_logic_fn_path_map(
     let mut map = HashMap::new();
     for lf in logic_fns {
         if parent_module(lf.full_path()) == caller_module {
-            map.insert(format!("Self::{}", lf.name()), lf.name().to_string());
+            // Same impl/type parent as the caller: `Self::<short>` is exactly
+            // this definition (its unique id when the short name collides).
+            map.insert(format!("Self::{}", lf.short_name()), lf.name().to_string());
         }
     }
     map
@@ -200,7 +209,22 @@ fn build_scoped_self_logic_fn_inline_map<'a>(
             && lf.requires().is_empty()
             && !lf.is_recursive()
         {
-            map.insert(format!("Self::{}", lf.name()), lf);
+            map.insert(format!("Self::{}", lf.short_name()), lf);
+            // Already resolved to this ASSOCIATED definition in the owner's
+            // scope (`Self::m`). Every local definition carries a unique id,
+            // so a free function's id must not make this `Self::`-only
+            // inliner expand ordinary free logic calls.
+            let associated = lf.has_unique_id()
+                && trust_wp_core::logic::identity::logic_fn_identity_registry().is_some_and(
+                    |registry| {
+                        registry.member(lf.name()).is_some_and(|member| {
+                            member.kind != trust_wp_core::logic::identity::LogicFnOwnerKind::Free
+                        })
+                    },
+                );
+            if associated {
+                map.insert(lf.name().to_string(), lf);
+            }
         }
     }
     map

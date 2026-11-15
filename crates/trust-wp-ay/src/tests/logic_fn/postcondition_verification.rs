@@ -119,7 +119,7 @@ fn test_logic_fn_postcondition_fails_when_body_mismatches() {
     );
     // ay rev 40ed0b restored E-matching — solver now finds the counterexample.
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Wrong postcondition double(n) == n*3 should fail: {result:?}"
     );
 }
@@ -158,7 +158,7 @@ fn test_logic_fn_postcondition_fails_without_axiom() {
     // Without the axiom, double(n) is uninterpreted — the solver finds a
     // counterexample. Pinned to Failed(_) per #774 convention.
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Without axiom, postcondition should fail with counterexample: {result:?}"
     );
 }
@@ -576,7 +576,7 @@ fn test_logic_fn_wrong_postcondition_rejected() {
             .logic_fns(Some(std::slice::from_ref(&double_fn))),
     );
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Wrong postcondition (result > x+x when body is x+x) should be rejected. Got: {result:?}"
     );
 }

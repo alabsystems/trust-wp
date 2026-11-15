@@ -423,8 +423,9 @@ def _wire_line_shows_pa_only_failure(output: str) -> bool:
 
     The check is deliberately limited to the aggregated ``TRUST_WP_RESULT`` line:
     if the driver produced valid telemetry showing clean function-level results
-    and non-zero ``proof_assert_failed`` or ``proof_assert_errors``, the
-    should-succeed classifier must not report a plain pass.
+    and non-zero ``proof_assert_failed``, ``proof_assert_errors`` or
+    ``proof_assert_inconclusive``, the should-succeed classifier must not
+    report a plain pass.
     """
     for line in reversed(output.split("\n")):
         stripped = line.strip()
@@ -441,6 +442,7 @@ def _wire_line_shows_pa_only_failure(output: str) -> bool:
             and (
                 telemetry.proof_assert_failed > 0
                 or telemetry.proof_assert_errors > 0
+                or telemetry.proof_assert_inconclusive > 0
             )
         )
     return False

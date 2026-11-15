@@ -7,12 +7,11 @@
 use std::{
     fs,
     path::Path,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let unique = SystemTime::now()
@@ -22,13 +21,13 @@ fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/logic_law_validation_tests")
         .join(format!("{bin}-{}-{unique}", std::process::id()));
-    let output = Command::new("cargo")
+    let output = nested_cargo("check")
         .current_dir(fixture_dir("logic_law_validation"))
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for logic law validation fixture");
+        .expect("failed to run targo check for logic law validation fixture");
     let _ = fs::remove_dir_all(&target_dir);
     output
 }
@@ -150,21 +149,24 @@ fn law_mode_validation_lenient_trait_logic_implemented_by_plain_fn() {
 
 #[test]
 #[timeout(120_000)]
-fn law_mode_validation_lenient_plain_trait_implemented_by_logic_fn() {
-    // Lenient mode: impl may add #[logic] to a plain trait method —
-    // matches Creusot pattern where trait declarations may be unmarked
-    // and impls opt into logic explicitly.
+fn law_mode_validation_rejects_logic_fn_implementing_plain_trait_method() {
+    // Creusot's `can_implement`: a logic function cannot implement a program
+    // trait method. The code that runs for the call is the logic function's
+    // erased body, and no program body owes the trait method's contract
+    // (trait_logic_impl_of_program_method_granted.rs).
     let output = run_fixture("should_fail_plain_trait_logic_impl");
     assert!(
-        output.status.success(),
-        "lenient mode should accept plain-trait/logic-impl; stdout: {}\nstderr: {}",
+        !output.status.success(),
+        "a logic impl of a program trait method must be refused; stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("should not be a `#[logic]`"),
-        "lenient mode should not emit unexpected-logic diagnostic; stderr: {stderr}",
+        stderr.contains(
+            "Expected `f` to be a program function as specified by the trait declaration"
+        ),
+        "missing program-function refusal; stderr: {stderr}",
     );
 }
 

@@ -8,10 +8,10 @@
 //! that `#[check(terminates)]` recursive functions provide a variant.
 //!
 //! Mutual recursion is detected via SCC analysis so it cannot silently bypass
-//! termination checks. A mutual-recursive `#[check(terminates)]` SCC is accepted
-//! structurally when every member declares a `#[variant(...)]`. Proving that the
-//! variant tuples decrease lexicographically at every call site is deferred —
-//! trust-wp currently accepts the structural shape and emits a TODO trace per SCC.
+//! termination checks. The variant-presence validator checks a necessary
+//! structural condition only. The separate unsupported-SCC validator refuses
+//! mutual-recursive `#[check(terminates)]` functions until per-edge measures can
+//! be compared; declaring variants does not establish termination.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,7 +21,7 @@ use std::{
 use rustc_hir::{def_id::DefId, Node, TraitFn, TraitItemKind};
 use rustc_middle::{
     mir::{Operand, TerminatorKind},
-    ty::{GenericArgKind, GenericArgs, GenericArgsRef, TyCtxt},
+    ty::{GenericArgKind, GenericArgs, TyCtxt},
 };
 
 use super::{
@@ -73,19 +73,19 @@ fn collect_direct_local_callees(tcx: TyCtxt<'_>, def_id: DefId) -> HashSet<DefId
     let _ = tcx.mir_borrowck(root);
 
     let mut callees = HashSet::new();
-    if let Some(body_with_facts) = try_get_body_with_context(local_def_id) {
-        let body = get_mir_body(body_with_facts);
+    if let Some(body_with_facts) = try_get_body_with_context(tcx, local_def_id) {
+        let body = get_mir_body(&body_with_facts);
         for bb_data in body.basic_blocks.iter() {
             if let TerminatorKind::Call { func, .. } = &bb_data.terminator().kind {
-                if let Operand::Constant(box constant) = func {
+                if let Operand::Constant(deref!(constant)) = func {
                     if let rustc_middle::ty::TyKind::FnDef(callee, substs) =
                         constant.const_.ty().kind()
                     {
                         // Try to resolve trait method calls to their concrete impl.
                         // MIR encodes `obj.method()` as FnDef(TraitMethod, [ConcreteType]),
                         // so without resolution, recursion through trait dispatch is invisible.
-                        let resolved =
-                            try_resolve_trait_impl(tcx, *callee, substs).unwrap_or(*callee);
+                        let resolved = try_resolve_trait_impl(tcx, *callee, substs.skip_binder())
+                            .unwrap_or(*callee);
                         if resolved.as_local().is_some() {
                             callees.insert(resolved);
                         }
@@ -107,7 +107,7 @@ fn collect_direct_local_callees(tcx: TyCtxt<'_>, def_id: DefId) -> HashSet<DefId
                         // detection can find cycles through generic dispatch
                         // (e.g., `bar<I>` calling `I::Item::foo()` where the
                         // impl of `foo` calls `bar`).
-                        let has_unresolved = substs.iter().any(|arg| {
+                        let has_unresolved = substs.skip_binder().iter().any(|arg| {
                             arg.as_type().is_some_and(|ty| {
                                 matches!(
                                     ty.kind(),
@@ -182,10 +182,10 @@ pub(super) fn detect_mutual_recursion(graph: &CallGraph) -> HashSet<DefId> {
 /// happens to participate in an unrelated cycle does not contaminate the
 /// terminates SCC analysis.
 ///
-/// TODO: lex-tuple decrease at every call site within an SCC is not yet
-/// enforced — `validate_recursive_termination_nodes` accepts an SCC as soon as
-/// every member declares a `#[variant(...)]`. Solving variant values per call
-/// site is multi-day work tracked separately.
+/// This helper is not a termination proof: per-call decrease across an SCC is
+/// unsupported. The production validator refuses those SCCs through
+/// `validate_terminates_mutual_recursion_unsupported` over the full graph,
+/// including unannotated helpers.
 ///
 /// Currently exercised only by unit tests; wired into the structural validator
 /// once the lex-tuple decrease proof is implemented (trust-wp#7).
@@ -428,7 +428,9 @@ pub(super) fn validate_terminates_callee_requirements(
                             tcx.associated_items(impl_def_id)
                                 .in_definition_order()
                                 .any(|item| {
-                                    item.name() == method_name
+                                    // An async trait method's synthesized return
+                                    // type is an associated item with no name.
+                                    item.opt_name() == Some(method_name)
                                         && has_check_mode(
                                             tcx.get_all_attrs(item.def_id),
                                             "terminates",
@@ -497,29 +499,29 @@ fn polymorphic_self_call_changes_args(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         .expect_local();
     let _ = tcx.mir_borrowck(root);
 
-    let Some(body_with_facts) = try_get_body_with_context(local_def_id) else {
+    let Some(body_with_facts) = try_get_body_with_context(tcx, local_def_id) else {
         return false;
     };
-    let body = get_mir_body(body_with_facts);
+    let body = get_mir_body(&body_with_facts);
     let identity_args = GenericArgs::identity_for_item(tcx, def_id);
 
     body.basic_blocks.iter().any(|bb_data| {
         let TerminatorKind::Call { func, .. } = &bb_data.terminator().kind else {
             return false;
         };
-        let Operand::Constant(box constant) = func else {
+        let Operand::Constant(deref!(constant)) = func else {
             return false;
         };
         let rustc_middle::ty::TyKind::FnDef(callee, args) = constant.const_.ty().kind() else {
             return false;
         };
-        *callee == def_id && non_region_generic_args_differ(args, identity_args)
+        *callee == def_id && non_region_generic_args_differ(args.skip_binder(), identity_args)
     })
 }
 
 fn non_region_generic_args_differ<'tcx>(
-    actual: GenericArgsRef<'tcx>,
-    expected: GenericArgsRef<'tcx>,
+    actual: GenericArgs<'tcx>,
+    expected: GenericArgs<'tcx>,
 ) -> bool {
     let mut actual_non_region = actual
         .iter()
@@ -614,7 +616,12 @@ pub(super) fn validate_trait_impl_check_mode_agreement(
         let trait_method_def_id = tcx
             .associated_items(origin.trait_def_id)
             .in_definition_order()
-            .find(|item| item.name().as_str() == origin.trait_method_name)
+            // An async trait method's synthesized return type is an
+            // associated item with no name.
+            .find(|item| {
+                item.opt_name()
+                    .is_some_and(|name| name.as_str() == origin.trait_method_name)
+            })
             .map(|item| item.def_id);
 
         let Some(trait_method_def_id) = trait_method_def_id else {
@@ -758,7 +765,7 @@ pub(super) fn validate_default_trait_method_mutual_recursion(
 fn try_resolve_trait_impl<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: DefId,
-    substs: GenericArgsRef<'tcx>,
+    substs: GenericArgs<'tcx>,
 ) -> Option<DefId> {
     // Only trait method calls need resolution.
     let assoc_item = tcx.opt_associated_item(callee_def_id)?;
@@ -823,7 +830,9 @@ fn try_resolve_trait_impl<'tcx>(
             continue;
         }
         for assoc in tcx.associated_items(impl_def_id).in_definition_order() {
-            if assoc.name() == method_name
+            // An async trait method's synthesized return type is an
+            // associated item with no name.
+            if assoc.opt_name() == Some(method_name)
                 && matches!(tcx.def_kind(assoc.def_id), rustc_hir::def::DefKind::AssocFn)
                 && assoc.def_id.as_local().is_some()
             {
@@ -873,7 +882,9 @@ fn find_all_local_impl_methods(tcx: TyCtxt<'_>, callee_def_id: DefId) -> Vec<Def
             continue;
         }
         for assoc in tcx.associated_items(impl_def_id).in_definition_order() {
-            if assoc.name() == method_name
+            // An async trait method's synthesized return type is an
+            // associated item with no name.
+            if assoc.opt_name() == Some(method_name)
                 && matches!(tcx.def_kind(assoc.def_id), rustc_hir::def::DefKind::AssocFn)
                 && assoc.def_id.as_local().is_some()
             {
@@ -1067,9 +1078,9 @@ where
     // already members of `recursive_nodes`, so the single per-node variant
     // check applies uniformly to direct and mutual recursion.
     //
-    // TODO(trust-wp#7): prove lex-tuple decrease per call site. Until then we
-    // accept the structural shape and let the obligation generator emit the
-    // per-call-site variant-decrease lemmas when it gains SCC awareness.
+    // This checks variant presence only. The caller separately rejects mutual
+    // cycles through `validate_terminates_mutual_recursion_unsupported`; the
+    // per-function obligation generator currently extracts self calls only.
     let mut errors = HashMap::new();
 
     for node in nodes {
@@ -1197,11 +1208,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_mutual_terminates_accepts_when_all_have_variants() {
-        // Phase 7 (trust-wp#7): a mutual-recursion SCC where every member declares
-        // a `#[variant(...)]` is accepted structurally. The per-call-site
-        // lex-tuple decrease proof is deferred — see the TODO at
-        // `validate_recursive_termination_nodes`.
+    fn variant_presence_check_succeeds_when_all_mutual_members_have_variants() {
+        // This validator checks presence, not decrease. The production SCC
+        // validator still rejects mutual recursion independently.
         let nodes = vec![
             TerminationNode {
                 id: 1u8,
@@ -1224,7 +1233,7 @@ mod tests {
 
         assert!(
             errors.is_empty(),
-            "mutual-recursive SCC with variants on every member should be accepted, got {errors:?}"
+            "every member supplies the required variant, got {errors:?}"
         );
     }
 
@@ -1294,6 +1303,7 @@ mod tests {
             ghost: false,
             trusted: false,
             trait_origin: None,
+            capture_owner_only: false,
         };
 
         let errors = validate_terminates_loop_variant_requirements(&[contract]);
@@ -1335,6 +1345,8 @@ mod tests {
             trusted: false,
 
             trait_origin: None,
+
+            capture_owner_only: false,
         };
 
         let errors = validate_terminates_loop_variant_requirements(&[contract]);
@@ -1371,6 +1383,8 @@ mod tests {
             trusted: false,
 
             trait_origin: None,
+
+            capture_owner_only: false,
         };
 
         let errors = validate_terminates_loop_variant_requirements(&[contract]);
@@ -1407,6 +1421,8 @@ mod tests {
             trusted: false,
 
             trait_origin: None,
+
+            capture_owner_only: false,
         };
 
         let errors = validate_terminates_loop_variant_requirements(&[contract]);

@@ -16,9 +16,6 @@ use crate::std_specs::StdSpec;
 /// sourced from `trust_wp_std::std::lookup_registry` instead of from
 /// `expand_builtin_path_aliases()`. This eliminates independent alias
 /// maintenance for those domains.
-///
-/// See: `designs/2026-03-12-1672-extern-spec-registry-bridge.md`
-/// See: `designs/2026-03-19-2524-std-spec-path-authority-unification.md`
 pub fn builtin_trust_wp_std_specs() -> HashMap<String, StdSpec> {
     use trust_wp_std::std::{builtin_registry::BUILTIN_EXTERN_SPECS, lookup_registry};
 

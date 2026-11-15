@@ -100,7 +100,7 @@ impl TryFrom<ExprSort> for VarSort {
             | ExprSort::Ref(_)
             | ExprSort::MutRef(_)
             | ExprSort::TypeParam(_)
-            | ExprSort::Float => Err(SortConversionError::NoVarSortEquivalent),
+            | ExprSort::Float(_) => Err(SortConversionError::NoVarSortEquivalent),
         }
     }
 }

@@ -7,7 +7,7 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //!
 //! This file demonstrates the contract syntax supported by trust-wp.
-//! Compile with: cargo build -p trust-wp-examples (once examples crate exists)
+//! Compile with: targo --unverified build -p trust-wp-examples (once examples crate exists)
 //! Or include trust-wp as a dependency in your project.
 
 use trust_wp::{ensures, requires};

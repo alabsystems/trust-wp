@@ -26,6 +26,9 @@ pub(super) struct DerefLookup<'a> {
     pub(super) locals: &'a HashMap<Local, PureExpr>,
     pub(super) deref_exprs: &'a HashMap<Local, PureExpr>,
     pub(super) field_deref_exprs: &'a HashMap<(Local, u32), PureExpr>,
+    /// Locals whose referent is (a field path of) a value carrier: reads of
+    /// `(*local).f..` project the tracked whole value. (s34)
+    pub(super) carrier_read_locals: Option<&'a HashSet<Local>>,
 }
 
 impl ExprLookup for DerefLookup<'_> {
@@ -43,6 +46,27 @@ impl ExprLookup for DerefLookup<'_> {
 
     fn rich_field_projections(&self) -> bool {
         false
+    }
+
+    fn resolve_carrier_projection(&self, place: &rustc_middle::mir::Place<'_>) -> Option<PureExpr> {
+        use rustc_middle::mir::ProjectionElem;
+        if !self.carrier_read_locals?.contains(&place.local) {
+            return None;
+        }
+        let projections: Vec<_> = place.projection.iter().collect();
+        let (first, rest) = projections.split_first()?;
+        if !matches!(first, ProjectionElem::Deref) || rest.is_empty() {
+            return None;
+        }
+        let mut path = Vec::with_capacity(rest.len());
+        for proj in rest {
+            let ProjectionElem::Field(field, _) = proj else {
+                return None;
+            };
+            path.push(field.as_u32());
+        }
+        let base = self.deref_exprs.get(&place.local)?;
+        Some(super::field_writes::project_path(base, &path))
     }
 }
 
@@ -152,6 +176,10 @@ pub(crate) struct MutBorrowBody {
     /// transfer call. Used to filter the (unguarded, level-collapsed) call-site
     /// spec instantiations that would otherwise mis-constrain `<p>_final`.
     pub(crate) nested_transfer_params: HashSet<String>,
+    /// Path-gated RustHorn resolutions for `&mut` params lent into the return
+    /// value on SOME paths: `path_cond ==> Final(p) == <pointee at exit>` for
+    /// each path on which `p` is provably not returned. Premises.
+    pub(crate) lent_path_resolutions: Vec<PureExpr>,
 }
 
 /// Return type for block extraction:
@@ -204,6 +232,20 @@ pub(super) struct MutBorrowAccumulators {
     /// `nested_slot_resolutions` are emitted (fail-closed: the affected params
     /// keep only their suppressed/unresolved state).
     pub(super) nested_transfer_poisoned: bool,
+    /// Tracked params whose referent could not be tracked exactly: their final
+    /// value premise is removed at assembly (fail-closed). (s34)
+    pub(super) havoc_params: HashSet<Local>,
+    /// `(carrier param, top-level field)` pairs written through a field path. (s34)
+    pub(super) carrier_written_fields: HashSet<(Local, u32)>,
+    /// Non-carrier, non-closure params written through a per-field entry. (s34)
+    pub(super) field_written_params: HashSet<Local>,
+    /// Non-carrier params written as a whole. (s34)
+    pub(super) whole_written_params: HashSet<Local>,
+    /// Non-closure `&mut` params whose referent holds a borrow written THROUGH
+    /// (`*x.m = e` of `x: &mut M { m: &mut i32 }`): the value `x` is left with
+    /// holds that borrow with a new current value, which no premise can state
+    /// at the referent's sort, so `^x` gets none. (D-184)
+    pub(super) held_pointee_written_params: HashSet<Local>,
 }
 
 /// Mutable traversal state threaded through `extract_mut_borrow_from_block` recursion.
@@ -231,12 +273,29 @@ pub(super) struct MutBorrowTraversalState {
     /// to the borrowed slot local. Used to recognize nested-reborrow transfer
     /// calls like `swap(&mut ma, &mut mb)`.
     pub(super) slot_borrow_map: HashMap<Local, Local>,
+    /// Pointers into the SLOT of a local that holds a tracked borrow:
+    /// `_N = &mut q` where `q` itself holds a reborrow of a `&mut` parameter,
+    /// mapped to that parameter. `slot_borrow_map` covers only the case where
+    /// the borrowed slot IS a parameter; every other tracked slot reaches the
+    /// same referent through one more reference layer, and a write through
+    /// `**_N` names no lane that would see it. Invalidation only: consulted by
+    /// `tracked_root`, which every caller uses to havoc.
+    pub(super) slot_alias_roots: HashMap<Local, Local>,
     /// Current content of rebindable mut-ref parameter slots, as mutref-sorted
     /// expressions over the ENTRY borrows. Absent = identity (slot holds its
     /// entry borrow). Updated by nested-reborrow transfer advancement.
     pub(super) slot_exprs: HashMap<Local, PureExpr>,
+    /// Carrier field reborrows: `_N = &mut (*p).f..` for a value carrier `p`,
+    /// mapped to `(p, field path)`. (s34)
+    pub(super) carrier_field_reborrows: HashMap<Local, (Local, Vec<u32>)>,
+    /// Locals whose referent reads project a value carrier's whole value:
+    /// carrier params, their whole reborrows, and carrier field reborrows. (s34)
+    pub(super) carrier_read_locals: HashSet<Local>,
     /// Set of visited basic blocks (loop detection).
     pub(super) visited: HashSet<BasicBlock>,
+    /// Path-sensitive: which argument borrows each local may carry, replayed
+    /// over direct statement assignments (see `lent::LentAnalysis::refinable`).
+    pub(super) borrow_taint: HashMap<Local, HashSet<Local>>,
 }
 
 /// Immutable context for `extract_mut_borrow_from_block` recursive traversal.
@@ -252,4 +311,6 @@ pub(super) struct MutBorrowBlockContext<'a, 'tcx> {
     pub(super) user_specs: &'a HashMap<DefId, StdSpec>,
     pub(super) trait_specs: &'a HashMap<DefId, StdSpec>,
     pub(super) extern_specs: &'a HashMap<String, StdSpec>,
+    /// Per local: may a value of its type carry a borrow? (lent analysis)
+    pub(super) borrow_carrying: &'a [bool],
 }

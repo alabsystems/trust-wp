@@ -63,6 +63,7 @@ pub(crate) fn emit_logic_function(
 
     let body_text = extract_block_body_text(&func.block);
     let body_marker = format!("trust-wp:logic_body:{body_text}");
+    let tc = logic_body_type_check(&func.block, &sig.output);
 
     quote! {
         #[doc = #doc_marker]
@@ -71,6 +72,7 @@ pub(crate) fn emit_logic_function(
         #[allow(unused_variables, dead_code)]
         #(#attrs)*
         #vis #sig {
+            #tc
             unreachable!("logic functions are erased at runtime")
         }
     }
@@ -86,6 +88,16 @@ pub(crate) fn emit_logic_function(
 fn extract_block_body_text(block: &syn::Block) -> String {
     use syn::Stmt;
 
+    // A contract attribute written BEFORE `#[logic]` has already inserted its
+    // type-check statement into this block; it is not part of the body.
+    if block.stmts.iter().any(crate::spec_tc::is_spec_tc_stmt) {
+        let mut filtered = block.clone();
+        filtered
+            .stmts
+            .retain(|s| !crate::spec_tc::is_spec_tc_stmt(s));
+        return extract_block_body_text(&filtered);
+    }
+
     match block.stmts.as_slice() {
         // `{}` represents unit.
         [] => "()".to_string(),
@@ -96,6 +108,19 @@ fn extract_block_body_text(block: &syn::Block) -> String {
         // Keep complex blocks intact until block parsing support is complete.
         _ => quote!(#block).to_string(),
     }
+}
+
+/// Type-check statements for a logic body: the body itself (as Creusot
+/// type-checks logic function bodies) plus any contract type-check
+/// statements a preceding contract attribute already inserted.
+fn logic_body_type_check(block: &syn::Block, output: &syn::ReturnType) -> proc_macro2::TokenStream {
+    let inherited = block
+        .stmts
+        .iter()
+        .filter(|s| crate::spec_tc::is_spec_tc_stmt(s))
+        .map(quote::ToTokens::to_token_stream);
+    let own = crate::spec_tc::logic_body_statement(block, output);
+    quote! { #(#inherited)* #own }
 }
 
 /// Emit a trait method declaration with a logic doc marker.
@@ -119,6 +144,7 @@ pub(crate) fn emit_trait_logic_method(
     if let Some(body) = default {
         let body_text = extract_block_body_text(body);
         let body_marker = format!("trust-wp:logic_body:{body_text}");
+        let tc = logic_body_type_check(body, &sig.output);
         quote! {
             #[doc = #doc_marker]
             #(#extra_docs)*
@@ -126,6 +152,7 @@ pub(crate) fn emit_trait_logic_method(
             #[allow(unused_variables, dead_code)]
             #(#attrs)*
             #sig {
+                #tc
                 unreachable!("logic functions are erased at runtime")
             }
         }

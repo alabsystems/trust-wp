@@ -4,7 +4,6 @@
 
 use std::{
     fs,
-    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -13,69 +12,24 @@ use rustc_driver::{run_compiler, Callbacks};
 pub(super) const TEST_CRATE_NAME: &str = "trust_wp_struct_field_map_test";
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn dependency_dir() -> PathBuf {
-    std::env::current_exe()
-        .expect("current test executable path")
-        .parent()
-        .expect("test executable should live under deps/")
-        .to_path_buf()
-}
-
-fn dependency_artifact(crate_name: &str, extensions: &[&str]) -> PathBuf {
-    let prefix = format!("lib{crate_name}-");
-    let mut candidates: Vec<_> = fs::read_dir(dependency_dir())
-        .expect("read dependency dir")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let file_name = path.file_name()?.to_string_lossy();
-            if !file_name.starts_with(&prefix) {
-                return None;
-            }
-            match path.extension().and_then(|ext| ext.to_str()) {
-                Some(ext) if extensions.contains(&ext) => Some(path),
-                _ => None,
-            }
-        })
-        .collect();
-    // Sort by: 1) prefer rlib over rmeta, 2) most recently modified first.
-    // With stale build artifacts, the newest matching the current compilation
-    // is the correct one.
-    candidates.sort_by_key(|path| {
-        let ext_priority: u8 = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rlib") => 0,
-            Some("rmeta") => 1,
-            _ => 2,
-        };
-        let mtime = fs::metadata(path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        (ext_priority, std::cmp::Reverse(mtime))
-    });
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("missing dependency artifact for {crate_name}"))
-}
-
 pub(super) fn trust_wp_probe_args() -> Vec<String> {
-    let deps_dir = dependency_dir();
+    let units = trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe();
     // Artifacts are named with underscores (`libtrust_wp-*.rmeta`) — rustc
     // crate names are valid Rust identifiers, so the hyphenated package name
     // `trust-wp` maps to crate name `trust_wp`. Same for `--cfg` and `--extern`
     // which both consume crate-name form, not package-name form.
-    let trust_wp_artifact = dependency_artifact("trust_wp", &["rmeta", "rlib"]);
-    let trust_wp_std_artifact = dependency_artifact("trust_wp_std", &["rmeta", "rlib"]);
-    vec![
+    let trust_wp_artifact = units.artifact("trust_wp", &["rmeta", "rlib"]);
+    let trust_wp_std_artifact = units.artifact("trust_wp_std", &["rmeta", "rlib"]);
+    let mut args = vec![
         "--cfg".to_string(),
         "trust_wp".to_string(),
-        "-L".to_string(),
-        format!("dependency={}", deps_dir.display()),
         "--extern".to_string(),
         format!("trust_wp={}", trust_wp_artifact.display()),
         "--extern".to_string(),
         format!("trust_wp_std={}", trust_wp_std_artifact.display()),
-    ]
+    ];
+    args.extend(units.search_args());
+    args
 }
 
 pub(super) fn run_test_compiler_with_args(

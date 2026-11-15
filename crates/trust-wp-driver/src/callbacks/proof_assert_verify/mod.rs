@@ -27,7 +27,13 @@ use tracing::debug;
 use trust_wp_core::{
     closure::ClosureCaptureInfo,
     contract_parser::parse_contract_body,
-    formula::{BinOp, PureExpr},
+    formula::{
+        elaborate::{
+            first_final_held_through_a_reference_parameter,
+            first_final_of_a_value_not_named_as_a_borrow,
+        },
+        BinOp, PureExpr,
+    },
     logic::LogicMode,
 };
 use trust_wp_driver::StdSpec;
@@ -60,7 +66,7 @@ use super::{
     type_invariants::build_type_invariant_clauses,
 };
 
-/// Shared setup used to prepare individual `proof_assert` checks.
+/// Shared setup for preparing individual `proof_assert` checks.
 pub(super) struct ProofAssertSetup<'a> {
     fn_preconditions: HashMap<LocalDefId, Vec<PureExpr>>,
     const_item_substitutions: HashMap<String, PureExpr>,
@@ -247,6 +253,533 @@ fn derive_has_mutating_call_effect(
         || call_effect_expr.is_some_and(contains_mutating_call_effect)
 }
 
+/// Source names of by-reference parameters whose ENTRY facts a loop has
+/// invalidated by the time `pa` is reached (D-38).
+///
+/// `#[requires((*a)@ == 0)]` describes the pointee at entry, and the encoder
+/// names the entry pointee and the current pointee with the SAME symbol
+/// (`a_current`). A straight-line write is walked by the extraction, which
+/// records the written value against that symbol; a write inside a loop body is
+/// not walked at all, so left in place the entry fact survives to an assertion
+/// after the loop and discharges `proof_assert!((*a)@ == 0)` against a pointee
+/// the loop has already set to 7 (s53_pa_stale_param_pointee_after_loop.rs).
+///
+/// Reporting a name only removes premises from the assertion's context, so an
+/// imprecise answer costs provability, never soundness. An assertion with no
+/// recorded program point asks the question with none, and every parameter any
+/// loop writes is reported.
+fn loop_invalidated_param_names(
+    tcx: TyCtxt<'_>,
+    pa: &crate::proof_assert::ProofAssert,
+) -> crate::mir_analysis::InvalidatedEntryNames {
+    let Some(body_with_facts) = crate::callbacks::try_get_body_with_context(tcx, pa.containing_fn)
+    else {
+        return crate::mir_analysis::InvalidatedEntryNames::default();
+    };
+    let body = crate::mir_analysis::get_mir_body(&body_with_facts);
+    let at = pa.location.map(|location| location.block);
+    let invalidated = crate::mir_analysis::params_invalidated_by_loops(body, at);
+    if invalidated.is_empty() {
+        return crate::mir_analysis::InvalidatedEntryNames::default();
+    }
+    let def_id = pa.containing_fn.to_def_id();
+    let arg_names = get_arg_names_from_def_id(tcx, def_id).unwrap_or_default();
+    crate::mir_analysis::name_invalidated_args(
+        &invalidated,
+        tcx.is_closure_like(def_id),
+        &arg_names,
+    )
+}
+
+/// The parameters whose own storage may be written before the assertion
+/// ([`crate::mir_analysis::param_writes_before`], D-241): `whole` names those
+/// a write may change as a whole (or that have no name of their own, a
+/// closure's environment), `fields` those only some of whose first-level
+/// fields are written, with each written field's index and name.
+#[derive(Debug, Default)]
+pub(super) struct WrittenParams {
+    whole: crate::mir_analysis::InvalidatedEntryNames,
+    fields: HashMap<String, Vec<(usize, Option<String>)>>,
+    /// The parameters a store reaches, not only a `&mut` borrow.
+    stored: HashSet<String>,
+}
+
+impl WrittenParams {
+    /// Whether any part of the parameter `name` may be written.
+    fn names(&self, name: &str) -> bool {
+        self.whole.invalidates(std::iter::once(name)) || self.fields.contains_key(name)
+    }
+
+    /// Whether `fact` reads a part of a parameter that may be written: the
+    /// parameter whole, or a written field. A read of an unwritten field
+    /// (`p.a` after `set7(&mut p.b)`) is still the entry value.
+    fn stale(&self, fact: &PureExpr) -> bool {
+        if self
+            .whole
+            .invalidates(fact.free_vars().iter().map(String::as_str))
+        {
+            return true;
+        }
+        self.fields.iter().any(|(name, written)| {
+            let reads_unwritten_field = |expr: &PureExpr| {
+                use trust_wp_core::formula::internal::tuple_lowering::{
+                    tuple_field_logic_fn_index, NAMED_FIELD_LOGIC_FN_PREFIX,
+                };
+                let PureExpr::LogicFnCall {
+                    name: accessor,
+                    args,
+                } = expr
+                else {
+                    return false;
+                };
+                if !matches!(args.as_slice(), [PureExpr::Var(var, _)] if var == name) {
+                    return false;
+                }
+                if let Some(index) = tuple_field_logic_fn_index(accessor) {
+                    return written
+                        .iter()
+                        .all(|(written_index, _)| *written_index != index);
+                }
+                if let Some(field) = accessor.strip_prefix(NAMED_FIELD_LOGIC_FN_PREFIX) {
+                    return written.iter().all(|(_, written_name)| {
+                        written_name
+                            .as_deref()
+                            .is_some_and(|written_name| written_name != field)
+                    });
+                }
+                false
+            };
+            let masked = fact.rewrite_bottom_up_prune(
+                |expr| !reads_unwritten_field(expr),
+                |expr| {
+                    if reads_unwritten_field(&expr) {
+                        PureExpr::Bool(true)
+                    } else {
+                        expr
+                    }
+                },
+            );
+            masked.free_vars().contains(name)
+        })
+    }
+
+    /// Stop naming a SCALAR parameter whose binding at the assertion is its
+    /// own prophecy (`x -> ^x`, what the walk records for a `&mut x` a call
+    /// or a closure capture hands back) and that no store reaches before the
+    /// assertion. There the current value is `^x`, a symbol of its own, and
+    /// `x` in an entry fact, and in the callee's fact about the borrow's
+    /// current value, is the entry value the fact is about. Past a store
+    /// (`x = 5; inc(&mut x)`) the walk still names the borrowed place `x`,
+    /// whose current value at the borrow is the stored one, not the entry
+    /// value. A datatype parameter is not exempt: the encoder collapses `^p`
+    /// of a datatype value onto `p`
+    /// (s48_uncontracted_helper_param_field_direct.rs).
+    fn keep_scalars_advanced_to_their_prophecy(
+        &mut self,
+        substitutions: &HashMap<String, PureExpr>,
+    ) {
+        fn own_prophecy(name: &str, value: &PureExpr, under_final: bool) -> bool {
+            match value {
+                PureExpr::Var(bound, sort) => {
+                    under_final
+                        && bound == name
+                        && matches!(
+                            sort,
+                            Some(
+                                trust_wp_core::formula::ExprSort::Int
+                                    | trust_wp_core::formula::ExprSort::Bool
+                                    | trust_wp_core::formula::ExprSort::Float(_)
+                            )
+                        )
+                }
+                PureExpr::Final(inner) => own_prophecy(name, inner, true),
+                _ => false,
+            }
+        }
+        let stored = &self.stored;
+        let advanced = |name: &String| {
+            !stored.contains(name)
+                && substitutions
+                    .get(name)
+                    .is_some_and(|value| own_prophecy(name, value, false))
+        };
+        self.whole.params.retain(|name| !advanced(name));
+        self.fields.retain(|name, _| !advanced(name));
+    }
+
+    /// Stop naming the parameters in `names`, whose entry value has a
+    /// symbol of its own (D-241).
+    fn forget(&mut self, names: &HashSet<String>) {
+        self.whole.params.retain(|name| !names.contains(name));
+        self.fields.retain(|name, _| !names.contains(name));
+    }
+
+    /// Drop the top-level conjuncts of `facts` that [`Self::stale`] names.
+    /// Returns how many were dropped.
+    fn drop_stale_facts(&self, facts: &mut Vec<PureExpr>) -> usize {
+        fn split_conjuncts(expr: &PureExpr, out: &mut Vec<PureExpr>) {
+            if let PureExpr::BinOp(lhs, BinOp::And, rhs) = expr {
+                split_conjuncts(lhs, out);
+                split_conjuncts(rhs, out);
+            } else {
+                out.push(expr.clone());
+            }
+        }
+        if !facts.iter().any(|fact| self.stale(fact)) {
+            return 0;
+        }
+        let mut dropped = 0;
+        let mut kept = Vec::with_capacity(facts.len());
+        for fact in facts.drain(..) {
+            if !self.stale(&fact) {
+                kept.push(fact);
+                continue;
+            }
+            let mut conjuncts = Vec::new();
+            split_conjuncts(&fact, &mut conjuncts);
+            for conjunct in conjuncts {
+                if self.stale(&conjunct) {
+                    dropped += 1;
+                } else {
+                    kept.push(conjunct);
+                }
+            }
+        }
+        *facts = kept;
+        dropped
+    }
+}
+
+/// [`WrittenParams`] at the assertion of `pa`.
+fn written_params(tcx: TyCtxt<'_>, pa: &crate::proof_assert::ProofAssert) -> WrittenParams {
+    let Some(body_with_facts) = crate::callbacks::try_get_body_with_context(tcx, pa.containing_fn)
+    else {
+        return WrittenParams::default();
+    };
+    let body = crate::mir_analysis::get_mir_body(&body_with_facts);
+    let writes = crate::mir_analysis::param_writes_before(body, pa.location);
+    if writes.is_empty() {
+        return WrittenParams::default();
+    }
+    let def_id = pa.containing_fn.to_def_id();
+    let is_closure = tcx.is_closure_like(def_id);
+    let first_param = if is_closure { 2 } else { 1 };
+    let arg_names = get_arg_names_from_def_id(tcx, def_id).unwrap_or_default();
+    let mut written = WrittenParams::default();
+    for (local, write) in writes {
+        let name = local
+            .as_usize()
+            .checked_sub(first_param)
+            .and_then(|index| arg_names.get(index));
+        let Some(name) = name else {
+            written.whole.unnamed = true;
+            continue;
+        };
+        if write.stored {
+            written.stored.insert(name.clone());
+        }
+        if write.whole {
+            written.whole.params.insert(name.clone());
+            continue;
+        }
+        let field_names: Vec<Option<String>> = match body.local_decls[local].ty.kind() {
+            rustc_middle::ty::TyKind::Adt(adt, _) if adt.is_struct() => adt
+                .non_enum_variant()
+                .fields
+                .iter()
+                .map(|field| Some(field.name.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        written.fields.insert(
+            name.clone(),
+            write
+                .fields
+                .iter()
+                .map(|&index| (index, field_names.get(index).cloned().flatten()))
+                .collect(),
+        );
+    }
+    written
+}
+
+/// The first name the assertion reads whose local a write through a holder
+/// of its borrow may have changed before the assertion
+/// ([`crate::mir_analysis::deref_store_staleness::first_name_written_through_a_holder`]).
+fn name_read_after_a_holder_write(
+    tcx: TyCtxt<'_>,
+    pa: &crate::proof_assert::ProofAssert,
+    assertion: &PureExpr,
+) -> Option<String> {
+    let location = pa.location?;
+    let body_with_facts = crate::callbacks::try_get_body_with_context(tcx, pa.containing_fn)?;
+    let body = crate::mir_analysis::get_mir_body(&body_with_facts);
+    let names = assertion.free_vars();
+    crate::mir_analysis::deref_store_staleness::first_name_written_through_a_holder(
+        tcx, body, location, &names,
+    )
+}
+
+/// The first name the assertion reads at a state this lane cannot give its
+/// current value (D-185), with why.
+///
+/// The encoders name the memory behind a reference by ONE symbol, the entry
+/// pointee (`Deref(Var x)` is `x_current`), and a `#[requires]` speaks of it.
+/// An assertion reads the memory as it is at the assertion's program point,
+/// so a read of memory a write may have changed before that point is the
+/// entry value unless the program-point substitution replaces it with the
+/// value the walk recorded: `*x.m = 5; proof_assert!(*x.m == 0)` under
+/// `#[requires(*x.m == 0)]` read the precondition back. Only a whole-pointee
+/// read `*x` whose every preceding write is a store `*x = v` through `x`
+/// itself has a recorded value (the `*x` substitution); a read through a held
+/// borrow, a field, an alias, or after a call or drop handed the borrow has
+/// none, and is refused. A read under `old(..)` or `^..` names the entry or
+/// the final value and is not a current read.
+fn name_read_at_an_unknown_current_state(
+    tcx: TyCtxt<'_>,
+    pa: &crate::proof_assert::ProofAssert,
+    assertion: &PureExpr,
+    substitutions: &HashMap<String, PureExpr>,
+) -> Option<(String, &'static str)> {
+    use crate::mir_analysis::deref_store_staleness::{
+        names_read_through_written_memory, CurrentState,
+    };
+    let location = pa.location?;
+    let body_with_facts = crate::callbacks::try_get_body_with_context(tcx, pa.containing_fn)?;
+    let body = crate::mir_analysis::get_mir_body(&body_with_facts);
+    let current_reads = assertion.rewrite_bottom_up_prune(
+        |expr| !matches!(expr, PureExpr::Old(_) | PureExpr::Final(_)),
+        |expr| match expr {
+            PureExpr::Old(_) | PureExpr::Final(_) => PureExpr::Bool(true),
+            other => other,
+        },
+    );
+    let read_names = current_reads.free_vars();
+    if read_names.is_empty() {
+        return None;
+    }
+    let states = names_read_through_written_memory(tcx, body, location);
+    // A raw pointer's own value is its address, which no write through it
+    // changes: only a dereference of it reads memory (`p1 != p2` compares
+    // two addresses).
+    let mut reads_its_memory: HashSet<String> = HashSet::new();
+    let mut read_only_through_a_dereference: HashSet<String> = HashSet::new();
+    for debug in &body.var_debug_info {
+        let rustc_middle::mir::VarDebugInfoContents::Place(place) = &debug.value else {
+            continue;
+        };
+        if place.projection.is_empty() && body.local_decls[place.local].ty.is_raw_ptr() {
+            read_only_through_a_dereference.insert(debug.name.to_string());
+        } else {
+            reads_its_memory.insert(debug.name.to_string());
+        }
+    }
+    // A name one binding of which reads memory by its own name is read so.
+    read_only_through_a_dereference.retain(|name| !reads_its_memory.contains(name));
+    let read_through_a_pointer = |name: &str| {
+        let mut found = false;
+        current_reads.rewrite_bottom_up_prune(
+            |expr| !matches!(expr, PureExpr::Deref(_)),
+            |expr| {
+                if let PureExpr::Deref(inner) = &expr {
+                    found |= inner.free_vars().contains(name);
+                }
+                expr
+            },
+        );
+        found
+    };
+    let mut names: Vec<&String> = read_names
+        .iter()
+        .filter(|n| states.contains_key(*n))
+        .filter(|n| !read_only_through_a_dereference.contains(*n) || read_through_a_pointer(n))
+        .collect();
+    names.sort();
+    for name in names {
+        match states[name] {
+            CurrentState::Unwritten => {}
+            CurrentState::Untracked => {
+                return Some((
+                    name.clone(),
+                    "the memory it reads is not the value of ONE write the walk records: \
+                     two writes (or a write and the entry value) join before the assertion, a \
+                     back edge carries a write round, or a write goes through a held borrow, a \
+                     field, an alias, or a call or drop handed the borrow",
+                ));
+            }
+            CurrentState::DirectPlaceStores => {
+                let rebound = substitutions.get(name).is_some_and(
+                    |value| !matches!(value, PureExpr::Var(bound, _) if bound == name),
+                );
+                if !rebound {
+                    return Some((name.clone(), "the stores to it recorded no value for it"));
+                }
+            }
+            CurrentState::DirectPointeeStores => {
+                let is_whole_pointee = |expr: &PureExpr| {
+                    matches!(expr, PureExpr::Deref(inner)
+                        if matches!(inner.as_ref(), PureExpr::Var(var, _) if var == name))
+                };
+                let other_reads = current_reads.rewrite_bottom_up_prune(
+                    |expr| !is_whole_pointee(expr),
+                    |expr| {
+                        if is_whole_pointee(&expr) {
+                            PureExpr::Bool(true)
+                        } else {
+                            expr
+                        }
+                    },
+                );
+                let recorded = substitutions.contains_key(&format!("*{name}"));
+                if !recorded || other_reads.free_vars().contains(name) {
+                    return Some((
+                        name.clone(),
+                        "it is read other than as the whole pointee `*name` the stores \
+                         through it record, or no stored value was recorded for it",
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Source names of parameters the body may have RE-BOUND by the time the
+/// assertion of `snapshot` is reached, whose entry facts this lane must not
+/// read (D-140).
+///
+/// This lane equates a parameter's name with its binding at the assertion
+/// (the substitution fact `x == v`), and a `#[requires]` over that name is a
+/// fact about its ENTRY value. Once the body re-binds the parameter, the two
+/// together make the entry fact a premise about `v`:
+///
+/// - a hand-off (a `Drop`, or a call whose drop glue may write) re-binds every
+///   local its glue reaches to a fresh symbol, a by-value parameter, a
+///   `&mut` parameter's pointee and a field alike, so `proof_assert!(x@ == 0)`
+///   under `#[requires(x@ == 0)]` would be proved after `G::drop` stored 5
+///   (proof_assert_entry_requires_pins_param_after_drop_glue.rs,
+///   proof_assert_param_entry_requires_revived_by_drop_glue.rs). Which
+///   hand-offs re-bind is asked of every one that may run before the
+///   assertion, which names every parameter the walk re-binds and possibly
+///   more;
+/// - a plain write re-binds a BY-VALUE parameter to the value written
+///   (`x = y`, `x = any()`), and the entry fact then constrains `y` or the
+///   call's result (proof_assert_param_rebind_reads_entry_requires.rs). That
+///   is read from the walk's own substitution, the map that emits `x == v`.
+///   A binding the walk keeps naming by the parameter itself (the parameter,
+///   its view, or the prophecy `^x` a `&mut x` call leaves, whose fact this
+///   lane does not emit) is no re-binding. Not asked, and so not withdrawn:
+///   a `&mut` parameter's pointee written by a plain store, a reference
+///   parameter re-bound, a pattern parameter's binding and a store through a
+///   `Box` parameter, whose entry facts are read beside the new binding
+///   (proof_assert_mut_param_pointee_store_reads_entry_requires.rs,
+///   proof_assert_ref_param_rebind_reads_entry_requires.rs,
+///   proof_assert_pattern_or_box_param_write_reads_entry_requires.rs). For
+///   memory behind a reference (a `&mut` parameter's pointee, a `Box`'s
+///   contents) D-185 names the entry and the current value apart instead:
+///   the entry facts stay, and the current value is no fact about them
+///   ([`name_read_at_an_unknown_current_state`]).
+///
+/// Reporting a name only removes premises, so an over-report costs
+/// provability, never soundness. An assertion with no recorded program point
+/// asks the hand-off question with none, and every parameter any hand-off
+/// re-binds is reported.
+pub(super) fn rebound_param_names(
+    tcx: TyCtxt<'_>,
+    snapshot: &AssertionSnapshot,
+) -> crate::mir_analysis::InvalidatedEntryNames {
+    let pa = &snapshot.assertion;
+    let Some(body_with_facts) = crate::callbacks::try_get_body_with_context(tcx, pa.containing_fn)
+    else {
+        return crate::mir_analysis::InvalidatedEntryNames::default();
+    };
+    let body = crate::mir_analysis::get_mir_body(&body_with_facts);
+    let def_id = pa.containing_fn.to_def_id();
+    let is_closure = tcx.is_closure_like(def_id);
+    let arg_names = get_arg_names_from_def_id(tcx, def_id).unwrap_or_default();
+    let at = pa.location.map(|location| location.block);
+    let mut names = crate::mir_analysis::name_invalidated_args(
+        &crate::mir_analysis::params_rebound_by_handoffs(tcx, body, at),
+        is_closure,
+        &arg_names,
+    );
+    let first_param = if is_closure { 2 } else { 1 };
+    for (index, name) in arg_names.iter().enumerate() {
+        let local = rustc_middle::mir::Local::from_usize(first_param + index);
+        if local.as_usize() > body.arg_count
+            || matches!(
+                body.local_decls[local].ty.kind(),
+                rustc_middle::ty::TyKind::Ref(..) | rustc_middle::ty::TyKind::RawPtr(..)
+            )
+        {
+            continue;
+        }
+        if snapshot
+            .substitutions
+            .get(name)
+            .is_some_and(|value| !names_its_own_binding(name, value))
+        {
+            names.params.insert(name.clone());
+        }
+    }
+    names
+}
+
+/// Whether the substitution value `value` of `name` still names `name`'s own
+/// binding: the parameter itself, its view or deref, or its prophecy `^name`.
+pub(super) fn names_its_own_binding(name: &str, value: &PureExpr) -> bool {
+    match value {
+        PureExpr::Var(bound, _) => bound == name,
+        PureExpr::View(inner) | PureExpr::Deref(inner) | PureExpr::Final(inner) => {
+            names_its_own_binding(name, inner)
+        }
+        _ => false,
+    }
+}
+
+/// Drop the facts that name a parameter in `stale` (one a loop invalidated,
+/// or one the body re-bound). A fact is judged by its top-level `&&`
+/// conjuncts: `x@ == 1 && y@ == 2` with `x` stale keeps `y@ == 2`, which a
+/// conjunction implies on its own; a conjunct under an `||`, an implication
+/// or an `if` guards its branch and goes whole. Returns how many conjuncts
+/// were dropped.
+pub(super) fn drop_stale_param_facts(
+    facts: &mut Vec<PureExpr>,
+    stale: &crate::mir_analysis::InvalidatedEntryNames,
+) -> usize {
+    fn split_conjuncts(expr: &PureExpr, out: &mut Vec<PureExpr>) {
+        if let PureExpr::BinOp(lhs, BinOp::And, rhs) = expr {
+            split_conjuncts(lhs, out);
+            split_conjuncts(rhs, out);
+        } else {
+            out.push(expr.clone());
+        }
+    }
+    let is_stale = |fact: &PureExpr| stale.invalidates(fact.free_vars().iter().map(String::as_str));
+    if stale.is_empty() || !facts.iter().any(is_stale) {
+        return 0;
+    }
+    let mut dropped = 0;
+    let mut kept = Vec::with_capacity(facts.len());
+    for fact in facts.drain(..) {
+        if !is_stale(&fact) {
+            kept.push(fact);
+            continue;
+        }
+        let mut conjuncts = Vec::new();
+        split_conjuncts(&fact, &mut conjuncts);
+        for conjunct in conjuncts {
+            if is_stale(&conjunct) {
+                dropped += 1;
+            } else {
+                kept.push(conjunct);
+            }
+        }
+    }
+    *facts = kept;
+    dropped
+}
+
 /// Prepare a single `proof_assert` for verification.
 ///
 /// Returns:
@@ -292,6 +825,34 @@ pub(super) fn prepare_proof_assert(
         }
     };
 
+    // Creusot type-checks the assertion body as `bool` (`proof_assert! { 1 }`
+    // is `error[E0308]: mismatched types`). A body that is structurally not a
+    // boolean is a frontend refusal, never an obligation to hand to the solver.
+    if assertion.is_definitely_non_boolean() {
+        crate::result_protocol_state::record_parse_error();
+        eprintln!(
+            "trust-wp: frontend diagnostic: mismatched types in proof_assert \
+             '{expr_text}' at {loc}: expected `bool`, found a non-boolean expression"
+        );
+        return Err(());
+    }
+
+    // The assertion names bindings by source name; a name the body binds
+    // more than once means the binding visible at the assertion, and every
+    // later reader keys on that binding's own name (D-237).
+    assertion = match crate::mir_analysis::binding_identity::resolve_proof_assert_bindings(
+        tcx, pa, &assertion,
+    ) {
+        Ok(resolved) => resolved,
+        Err(name) => {
+            eprintln!(
+                "trust-wp: proof_assert in {fn_path} error: `{name}` is bound more than once in \
+                 the body and the binding the assertion names cannot be told (fail-closed)"
+            );
+            return Err(());
+        }
+    };
+
     // Normalize `view(expr)` → View(expr) and `final_value(expr)` → Final(expr).
     // When proof_assert! is inside ghost!, the ghost macro's preprocess_view_syntax
     // transforms `expr@` to `view(expr)` at the token level, causing the contract
@@ -299,11 +860,88 @@ pub(super) fn prepare_proof_assert(
     assertion = normalize_view_fn_calls(assertion);
     assertion = collapse_idempotent_views(assertion);
 
+    // `^x[0]`, `^x.m`, `^(^x).m`, `^(if c { x } else { x }).m` written in the
+    // assertion read the final value of a borrow the value holds, which its
+    // holder decides; the encoder would read each as the place the outer
+    // borrow is left with (D-129). Read here, before the driver substitutes
+    // its own images of reborrowed places into the assertion.
+    if let Some(why) = first_final_of_a_value_not_named_as_a_borrow(
+        &assertion,
+        &trust_wp_core::logic::final_reads::FinalReaders::default(),
+    ) {
+        eprintln!(
+            "trust-wp: proof_assert in {fn_path} error: final value refused (fail-closed): {why}"
+        );
+        return Err(());
+    }
+
+    // `^*x`, `^x.m`, `^x[0]` of a reference PARAMETER `x` reads the final
+    // value of a borrow `x`'s referent holds, which its holder decides after
+    // the call; `*x` of `x: &mut &mut i32` is a name's dereference to the
+    // text guard above. The parameter's type decides it, as it does for a
+    // clause of the contract (D-183).
+    {
+        let def_id = pa.containing_fn.to_def_id();
+        let names = get_arg_names_from_def_id(tcx, def_id).unwrap_or_default();
+        let signature = crate::mir_analysis::contract_signature(tcx, def_id, &names);
+        if let Some(why) = first_final_held_through_a_reference_parameter(
+            &assertion,
+            &|name| signature.reference(name),
+            signature.final_readers(),
+        ) {
+            eprintln!(
+                "trust-wp: proof_assert in {fn_path} error: final value refused (fail-closed): \
+                 {why}"
+            );
+            return Err(());
+        }
+    }
+
+    // A local whose borrow a tuple, struct, enum or array holds is written
+    // by a store through the holder, and by a call or drop handed it, which
+    // this lane does not carry to the local: the assertion would read it at
+    // its value from before the write, as the result, postcondition and
+    // call-precondition lanes did (D-127 item 5, D-129).
+    if let Some(name) = name_read_after_a_holder_write(tcx, pa, &assertion) {
+        eprintln!(
+            "trust-wp: proof_assert in {fn_path} error: stale read refused (fail-closed): `{name}` \
+             is read after a write through a value that holds a borrow of it, which this lane \
+             does not apply to `{name}`"
+        );
+        return Err(());
+    }
+
+    // The assertion reads memory as it is at its program point; memory a
+    // write may have changed is read at its entry value unless the walk
+    // recorded the value the write left (D-185).
+    if let Some((name, why)) =
+        name_read_at_an_unknown_current_state(tcx, pa, &assertion, &snapshot.substitutions)
+    {
+        eprintln!(
+            "trust-wp: proof_assert in {fn_path} error: stale read refused (fail-closed): `{name}` \
+             is read at the assertion, but {why}; its current value is not known to this lane"
+        );
+        return Err(());
+    }
+
     // Normalize module-qualified logic function names in the assertion.
     // The contract parser preserves paths like `x::transparent()`, but
     // logic functions are registered by short name (`transparent`). Without
     // normalization, the SMT encoder creates a free placeholder function
     // instead of finding the registered axiomatized function. (#746)
+    // Resolve colliding logic-function names in the containing fn's scope.
+    assertion = crate::logic::identity::resolve_logic_fn_paths_in_scope(
+        tcx,
+        pa.containing_fn.to_def_id(),
+        &assertion,
+        crate::logic::identity::ClausePosition::Body,
+        &crate::logic::spec_calls::ClauseRef::written("proof_assert", expr_text),
+    );
+    assertion = crate::logic::ptr_casts::classify_pointer_casts(
+        tcx,
+        pa.containing_fn.to_def_id(),
+        &assertion,
+    );
     assertion = normalize_logic_fn_names(assertion, &setup.logic_fn_path_map);
     assertion = rewrite_logic_method_calls_expr(&assertion, &setup.logic_method_names);
     // Apply sound tautology simplifications before SMT encoding. This avoids
@@ -326,21 +964,97 @@ pub(super) fn prepare_proof_assert(
         assertion = assertion.substitute(&setup.const_item_substitutions);
     }
 
-    // For proof_assert inside closures, inherit contracts from the typeck
-    // root owner (the enclosing function item) instead of the closure body.
+    // The typeck root owner is the enclosing function item. It is consulted
+    // ONLY for the closure capture layout it defines (the wiring below), never
+    // for the assertion's environment: a closure is a function of its own, and
+    // its assertion is a goal of the closure's VC, whose premises are the
+    // closure's own `requires`, the same environment its contract lane proves
+    // it in. The enclosing function's `requires` are facts about the parent's
+    // parameters at the parent's entry; a closure parameter may shadow one, a
+    // capture may be taken after the parent overwrote it, and an `FnMut`
+    // capture changes between calls (closure_assertion_inherits_parent_*.rs).
     let owner_local = tcx
         .typeck_root_def_id(pa.containing_fn.to_def_id())
         .expect_local();
 
-    // Get preconditions for the containing function (if any)
     let fn_precond_vec = setup
         .fn_preconditions
         .get(&pa.containing_fn)
-        .or_else(|| setup.fn_preconditions.get(&owner_local))
         .cloned()
         .unwrap_or_default();
     let fn_precond_count = fn_precond_vec.len();
+    // fact-source: entry_requires
     let mut preconditions = fn_precond_vec;
+    // A loop that writes a by-reference parameter's pointee invalidates the
+    // `#[requires]` facts about it; the encoder cannot tell the entry value
+    // from the current one, so a stale fact would discharge assertions the
+    // loop has already falsified (D-38).
+    let loop_invalidated = loop_invalidated_param_names(tcx, pa);
+    {
+        // fact-source: entry_fact_withdrawal
+        let dropped = drop_stale_param_facts(&mut preconditions, &loop_invalidated);
+        if dropped > 0 {
+            debug!(
+                "trust-wp:   (proof_assert in {fn_path}: {dropped} entry fact(s) dropped — \
+                 a loop writes the pointee of {loop_invalidated:?})"
+            );
+        }
+    }
+    // A by-value parameter whose every write before the assertion the walks
+    // record has its entry value read by a symbol of its own in every value
+    // they recorded (`ParamEntryVersions`), so its entry facts are stated of
+    // that symbol below rather than withdrawn (D-241).
+    let versioned: HashSet<String> = snapshot
+        .entry_versions
+        .versioned
+        .iter()
+        .filter(|name| !loop_invalidated.invalidates(std::iter::once(name.as_str())))
+        .cloned()
+        .collect();
+    // A parameter the body re-binds is equated with its new binding by this
+    // lane, so an entry fact over its name would describe the new value
+    // (D-140). The loop-exit facts below are withdrawn for the same names.
+    let rebound = rebound_param_names(tcx, snapshot);
+    {
+        let rebound_unversioned = crate::mir_analysis::InvalidatedEntryNames {
+            params: rebound
+                .params
+                .iter()
+                .filter(|name| !versioned.contains(*name))
+                .cloned()
+                .collect(),
+            unnamed: rebound.unnamed,
+        };
+        // fact-source: entry_fact_withdrawal
+        let dropped = drop_stale_param_facts(&mut preconditions, &rebound_unversioned);
+        if dropped > 0 {
+            debug!(
+                "trust-wp:   (proof_assert in {fn_path}: {dropped} entry fact(s) dropped — \
+                 the body re-binds {rebound_unversioned:?} before the assertion)"
+            );
+        }
+    }
+    // A write to a parameter's own storage the walks do not record as a
+    // value of its own (a `&mut` borrow of it or of a field handed to a
+    // call, a write in a loop, a reference parameter re-bound) leaves its
+    // name standing for the entry value while the program has moved on; an
+    // entry fact over it would describe the current value (D-241).
+    let mut written = written_params(tcx, pa);
+    written.keep_scalars_advanced_to_their_prophecy(&snapshot.substitutions);
+    written.forget(&snapshot.entry_versions.exact);
+    {
+        // fact-source: entry_fact_withdrawal
+        let dropped = written.drop_stale_facts(&mut preconditions);
+        if dropped > 0 {
+            debug!(
+                "trust-wp:   (proof_assert in {fn_path}: {dropped} entry fact(s) dropped — \
+                 the body writes {written:?} before the assertion)"
+            );
+        }
+    }
+    // The `#[requires]` facts end here; the lemma calls below speak of the
+    // assertion's own state.
+    let entry_fact_count = preconditions.len();
     let (leading_call_assumptions, leading_has_mutating_call_effect) =
         collect_leading_proof_assert_assumptions(
             tcx,
@@ -360,20 +1074,22 @@ pub(super) fn prepare_proof_assert(
             leading_call_assumptions.len()
         );
     }
-    preconditions.extend(leading_call_assumptions);
+    // The lemma calls are written beside the assertion and name its
+    // bindings; one whose binding cannot be told is no fact (D-237).
+    // fact-source: lemma_calls_in_the_assertion
+    preconditions.extend(leading_call_assumptions.into_iter().filter_map(|fact| {
+        crate::mir_analysis::binding_identity::resolve_proof_assert_bindings(tcx, pa, &fact).ok()
+    }));
 
     let body_arg_names = get_arg_names_for_proof_assert_body(tcx, pa.containing_fn);
-    let containing_contract = setup
-        .contract_by_local
-        .get(&pa.containing_fn)
-        .or_else(|| setup.contract_by_local.get(&owner_local));
+    let containing_contract = setup.contract_by_local.get(&pa.containing_fn);
     // Whether the containing function carries an explicit user-authored
     // `#[requires(false)]`. Keyed to the PRECONDITION position only via the raw
     // source clause text, so `#[ensures(false)]` is not credited here.
     let containing_requires_false = containing_contract
         .is_some_and(|contract| super::reporting::user_authored_requires_false(contract));
-    let containing_def_id =
-        containing_contract.map_or_else(|| owner_local.to_def_id(), |contract| contract.def_id);
+    let containing_def_id = containing_contract
+        .map_or_else(|| pa.containing_fn.to_def_id(), |contract| contract.def_id);
     let contract_arg_names =
         get_arg_names_from_def_id(tcx, containing_def_id).unwrap_or_else(|| {
             let path = tcx.def_path_str(containing_def_id);
@@ -383,40 +1099,71 @@ pub(super) fn prepare_proof_assert(
             );
             Vec::new()
         });
-    // Rewrite type invariant methods + struct field access in assertion and preconditions.
-    apply_type_and_field_rewrites(
+    // Rewrite type invariant methods + struct field access in assertion and
+    // preconditions. A named-field pattern whose declared field positions
+    // cannot be established is REFUSED (D-31) rather than read in source order.
+    if let Err(why) = apply_type_and_field_rewrites(
         tcx,
         containing_def_id,
         &contract_arg_names,
         ctx.type_invariant_defs,
         ctx.verbose,
         &mut assertion,
+        // fact-source: field_rewrites
         &mut preconditions,
-    );
+    ) {
+        eprintln!(
+            "trust-wp: proof_assert in {fn_path} error: {why}; refusing instead of binding \
+             the fields in the order they were written, which would bind one field as another"
+        );
+        return Err(());
+    }
+    // An entry fact of a versioned parameter speaks of its entry symbol
+    // (D-241). The facts are the `entry_requires` ones, renamed in place.
+    if !versioned.is_empty() {
+        for fact in &mut preconditions[..entry_fact_count] {
+            *fact = super::proof_assert_snapshot::rename_to_entry_values(fact, &versioned);
+        }
+    }
     if !snapshot.post_loop_assumptions.is_empty() {
+        // fact-source: loop_fact_handoff
         let mut post_loop_assumptions = snapshot.post_loop_assumptions.clone();
+        // A loop's invariants and exit condition hold of the names at the
+        // loop's exit; a parameter re-bound since reads them as facts about
+        // its new binding (D-140).
+        // fact-source: entry_fact_withdrawal
+        drop_stale_param_facts(&mut post_loop_assumptions, &rebound);
         for assumption in &mut post_loop_assumptions {
             *assumption = normalize_logic_fn_names(assumption.clone(), &setup.logic_fn_path_map);
             *assumption = rewrite_logic_method_calls_expr(assumption, &setup.logic_method_names);
         }
         let mut dummy_assertion = PureExpr::Bool(true);
-        apply_type_and_field_rewrites(
+        if let Err(why) = apply_type_and_field_rewrites(
             tcx,
             containing_def_id,
             &contract_arg_names,
             ctx.type_invariant_defs,
             ctx.verbose,
             &mut dummy_assertion,
+            // fact-source: field_rewrites
             &mut post_loop_assumptions,
-        );
+        ) {
+            eprintln!(
+                "trust-wp: proof_assert in {fn_path} error: {why} (in a post-loop \
+                 assumption); refusing instead of binding the fields in the order they \
+                 were written, which would bind one field as another"
+            );
+            return Err(());
+        }
+        // fact-source: loop_fact_handoff
         preconditions.extend(post_loop_assumptions);
     }
 
     // Inject type-invariant preconditions for the containing function's
     // parameters. Normal contract verification gets these through
-    // `enrich_effective_clauses`, but proof_assert was missing this step,
-    // causing inv(x) and container element invariant assertions to fail
-    // due to under-constrained VCs. (#2244)
+    // `enrich_effective_clauses`; proof_assert needs them too, or inv(x) and
+    // container element invariant assertions fail on under-constrained VCs.
+    // (#2244)
     //
     // Scope the injection to only parameters whose names appear as free
     // variables in the rewritten assertion. Injecting invariants for all
@@ -432,9 +1179,31 @@ pub(super) fn prepare_proof_assert(
     for obligation in &snapshot.call_obligations {
         type_invariant_relevance_vars.extend(obligation.free_vars());
     }
+    // A parameter's type invariant is an entry fact like its `#[requires]`:
+    // it goes with them for every parameter a withdrawal names, and is stated
+    // of the entry symbol of a versioned one, whose value the assertion may
+    // read through a copy (D-241).
+    let entry_fact_withdrawn = |name: &String| {
+        !versioned.contains(name)
+            && ([&loop_invalidated, &rebound]
+                .iter()
+                .any(|stale| stale.invalidates(std::iter::once(name.as_str())))
+                || written.names(name))
+    };
+    let entry_symbols_read: HashSet<String> = assertion_free_vars
+        .iter()
+        .filter_map(|name| snapshot.substitutions.get(name))
+        .flat_map(PureExpr::free_vars)
+        .collect();
     let relevant_invariant_arg_names: Vec<String> = invariant_arg_names
         .into_iter()
-        .filter(|name| type_invariant_relevance_vars.contains(name))
+        .filter(|name| {
+            type_invariant_relevance_vars.contains(name)
+                || (versioned.contains(name)
+                    && entry_symbols_read
+                        .contains(&super::proof_assert_snapshot::param_entry_value_name(name)))
+        })
+        .filter(|name| !entry_fact_withdrawn(name))
         .collect();
     let (inv_requires, _) = build_type_invariant_clauses(
         tcx,
@@ -442,6 +1211,10 @@ pub(super) fn prepare_proof_assert(
         &relevant_invariant_arg_names,
         ctx.type_invariant_defs,
     );
+    let inv_requires: Vec<PureExpr> = inv_requires
+        .iter()
+        .map(|fact| super::proof_assert_snapshot::rename_to_entry_values(fact, &versioned))
+        .collect();
     if !inv_requires.is_empty() {
         if ctx.verbose {
             debug!(
@@ -449,6 +1222,7 @@ pub(super) fn prepare_proof_assert(
                 inv_requires.len()
             );
         }
+        // fact-source: parameter_type_invariants
         preconditions.extend(inv_requires);
     }
 
@@ -461,6 +1235,7 @@ pub(super) fn prepare_proof_assert(
     }
 
     let mut local_substitutions = snapshot.substitutions.clone();
+    // fact-source: assumed_fact_handoff
     let mut assumed_facts = snapshot.assumed_facts.clone();
     let before_assumed_facts = assumed_facts.len();
     assumed_facts.retain(|fact| {
@@ -557,6 +1332,7 @@ pub(super) fn prepare_proof_assert(
             }
         }
         if !has_mutating_call_effect {
+            // fact-source: stale_alias_withdrawal
             filter_consumed_final_update_facts(&mut assumed_facts, &assertion, &call_obligations);
         }
     }
@@ -584,6 +1360,7 @@ pub(super) fn prepare_proof_assert(
                 debug!("trust-wp:     ground_instance[{i}]: {gi:?}");
             }
         }
+        // fact-source: mapping_closure_ground_instances
         preconditions.extend(ground_instances);
     }
 
@@ -614,6 +1391,7 @@ pub(super) fn prepare_proof_assert(
                     debug!("trust-wp:     assertion_ground[{i}]: {gi:?}");
                 }
             }
+            // fact-source: mapping_closure_ground_instances
             preconditions.extend(assertion_ground);
         }
     }
@@ -703,6 +1481,7 @@ pub(super) fn prepare_proof_assert(
                     synthesized.len(),
                 );
             }
+            // fact-source: constructor_facts
             assumed_facts.extend(synthesized);
         }
         let normalized_old_facts: Vec<PureExpr> = assumed_facts
@@ -716,6 +1495,7 @@ pub(super) fn prepare_proof_assert(
                     normalized_old_facts.len(),
                 );
             }
+            // fact-source: constructor_facts
             assumed_facts.extend(normalized_old_facts);
         }
         let ctor_tester_selector_facts: Vec<PureExpr> = assumed_facts
@@ -729,6 +1509,7 @@ pub(super) fn prepare_proof_assert(
                     ctor_tester_selector_facts.len(),
                 );
             }
+            // fact-source: constructor_facts
             assumed_facts.extend(ctor_tester_selector_facts);
         }
     }
@@ -770,6 +1551,7 @@ pub(super) fn prepare_proof_assert(
                     ground_instances.len(),
                 );
             }
+            // fact-source: ground_equality_facts
             assumed_facts.extend(ground_instances);
         }
     }
@@ -785,10 +1567,12 @@ pub(super) fn prepare_proof_assert(
                     transitive_disequalities.len(),
                 );
             }
+            // fact-source: transitive_disequalities
             assumed_facts.extend(transitive_disequalities);
         }
     }
 
+    // fact-source: irrelevant_fact_withdrawal
     let filtered_mapping_foralls = retain_relevant_mapping_closure_foralls(
         &mut assumed_facts,
         &snapshot.mapping_closures,
@@ -803,6 +1587,7 @@ pub(super) fn prepare_proof_assert(
         );
     }
 
+    // fact-source: irrelevant_fact_withdrawal
     let filtered_len_facts = filter_len_only_irrelevant_facts(&assertion, &mut assumed_facts);
     if filtered_len_facts > 0 && ctx.verbose {
         debug!(
@@ -876,6 +1661,7 @@ pub(super) fn prepare_proof_assert(
     // Call postconditions are part of the proof_assert premises. Add them
     // before closure wiring so existential enrichment can see closure
     // postcondition facts synthesized from preceding calls.
+    // fact-source: assumed_fact_handoff
     preconditions.extend(assumed_facts.iter().cloned());
     let wiring_ctx = super::proof_assert_wiring::ClosureWiringContext {
         tcx,
@@ -884,11 +1670,11 @@ pub(super) fn prepare_proof_assert(
         user_specs: &setup.user_specs,
         const_item_substitutions: &setup.const_item_substitutions,
         logic_fn_defs: ctx.logic_fn_defs,
-        type_invariant_defs: ctx.type_invariant_defs,
         verbose: ctx.verbose,
         body_arg_names: &body_arg_names,
         fn_path: &fn_path,
     };
+    // fact-source: closure_wiring
     let wiring = apply_closure_wiring(
         &wiring_ctx,
         &mut preconditions,
@@ -906,6 +1692,7 @@ pub(super) fn prepare_proof_assert(
             .map(|expr| expr.substitute(&snapshot.assoc_const_substitutions))
             .collect();
     }
+    // fact-source: field_rewrites
     rewrite_iterator_spec_proof_assert_clauses(&mut preconditions, &mut ensures);
     preconditions = preconditions
         .into_iter()
@@ -935,6 +1722,7 @@ pub(super) fn prepare_proof_assert(
         .into_iter()
         .map(preserve_transparent_adapter_views)
         .collect();
+    // fact-source: field_rewrites
     normalize_scalar_proof_assert_boundary(&mut preconditions, &mut ensures, &mut return_expr);
     preconditions = preconditions
         .into_iter()
@@ -1332,6 +2120,7 @@ fn derive_assertion_final_alias_substitution_from_side(
         return;
     }
     if is_bare_final_carrier(final_side) {
+        // fact-source: final_alias_substitutions
         substitutions.insert(name.clone(), final_side.clone());
     }
 }
@@ -1686,9 +2475,82 @@ fn final_base_and_depth(expr: &PureExpr) -> Option<(String, usize)> {
 mod tests {
     use std::sync::Arc;
 
-    use trust_wp_core::formula::PureExpr;
+    use trust_wp_core::formula::{BinOp, PureExpr};
 
-    use super::derive_has_mutating_call_effect;
+    use super::{derive_has_mutating_call_effect, drop_stale_param_facts, names_its_own_binding};
+
+    fn var(name: &str) -> PureExpr {
+        PureExpr::Var(name.to_string(), None)
+    }
+
+    fn eq(lhs: PureExpr, value: i64) -> PureExpr {
+        PureExpr::BinOp(Arc::new(lhs), BinOp::Eq, Arc::new(PureExpr::Int(value)))
+    }
+
+    fn stale(names: &[&str]) -> crate::mir_analysis::InvalidatedEntryNames {
+        crate::mir_analysis::InvalidatedEntryNames {
+            params: names.iter().map(|name| (*name).to_string()).collect(),
+            unnamed: false,
+        }
+    }
+
+    /// `#[requires(x@ == 1 && y@ == 2)]` with `x` re-bound keeps `y@ == 2`,
+    /// which the conjunction implies alone
+    /// (proof_assert_param_rebind_keeps_other_entry_facts_control.rs).
+    #[test]
+    fn a_stale_conjunct_is_dropped_and_its_sibling_kept() {
+        let mut facts = vec![PureExpr::BinOp(
+            Arc::new(eq(var("x"), 1)),
+            BinOp::And,
+            Arc::new(eq(var("y"), 2)),
+        )];
+        assert_eq!(drop_stale_param_facts(&mut facts, &stale(&["x"])), 1);
+        assert_eq!(facts, vec![eq(var("y"), 2)]);
+    }
+
+    /// A disjunct guards its branch: `x@ == 1 || y@ == 2` is not `y@ == 2`.
+    #[test]
+    fn a_disjunction_naming_a_stale_parameter_goes_whole() {
+        let mut facts = vec![
+            PureExpr::BinOp(
+                Arc::new(eq(var("x"), 1)),
+                BinOp::Or,
+                Arc::new(eq(var("y"), 2)),
+            ),
+            eq(var("z"), 3),
+        ];
+        assert_eq!(drop_stale_param_facts(&mut facts, &stale(&["x"])), 1);
+        assert_eq!(facts, vec![eq(var("z"), 3)]);
+    }
+
+    /// An argument with no name of its own (a closure's environment) makes
+    /// every fact stale.
+    #[test]
+    fn an_unnamed_stale_argument_drops_every_fact() {
+        let mut facts = vec![eq(var("y"), 2), eq(var("z"), 3)];
+        let mut names = stale(&[]);
+        names.unnamed = true;
+        assert_eq!(drop_stale_param_facts(&mut facts, &names), 2);
+        assert!(facts.is_empty());
+    }
+
+    /// `x -> y`, `x -> 7` and `x -> call_N` re-bind `x`; `x -> x`, its view
+    /// and the prophecy `^x` a `&mut x` call leaves do not.
+    #[test]
+    fn only_a_value_other_than_the_parameter_itself_re_binds_it() {
+        assert!(names_its_own_binding("x", &var("x")));
+        assert!(names_its_own_binding(
+            "x",
+            &PureExpr::View(Arc::new(var("x")))
+        ));
+        assert!(names_its_own_binding(
+            "x",
+            &PureExpr::Final(Arc::new(var("x")))
+        ));
+        assert!(!names_its_own_binding("x", &var("y")));
+        assert!(!names_its_own_binding("x", &PureExpr::Int(7)));
+        assert!(!names_its_own_binding("x", &var("$call_4")));
+    }
 
     #[test]
     fn wrapped_postcondition_mut_recovers_mutating_provenance() {

@@ -3,13 +3,57 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+
+/// The former axiom-only shortcut returned `Assumed` with no solver query.
+/// These shapes are now ordinary obligations whose claim is unprovable from
+/// the uninterpreted symbols involved: they must be refused (Failed or
+/// Unknown), never Verified and never the unqueried Assumed.
+fn is_real_unproved_obligation(result: &VerificationResult) -> bool {
+    matches!(
+        result,
+        VerificationResult::Failed(_) | VerificationResult::Unknown(_)
+    )
+}
+
+/// A true universal lemma with a trivial body is proved, not assumed.
+#[test]
+#[timeout(30000)]
+fn test_former_axiom_only_true_universal_lemma_verifies() {
+    let ens = forall("i", eq(var("i"), var("i")));
+    let unit_body = logic_fn_call("__trust_wp_tuple0", vec![]);
+    let result = verify_function_with_modes(
+        VerificationRequest::new(&[], &[ens]).return_expr(Some(&unit_body)),
+    )
+    .expect("true universal lemma encoding should not error");
+    assert!(
+        matches!(result, VerificationResult::Verified(_)),
+        "forall i. i == i with a trivial body must verify with a real proof: {result:?}"
+    );
+}
+
+/// A false universal lemma with a trivial body is refuted, not assumed.
+#[test]
+#[timeout(30000)]
+fn test_former_axiom_only_false_universal_lemma_fails() {
+    let ens = forall("i", eq(var("i"), int(5)));
+    let unit_body = logic_fn_call("__trust_wp_tuple0", vec![]);
+    let result = verify_function_with_modes(
+        VerificationRequest::new(&[], &[ens]).return_expr(Some(&unit_body)),
+    )
+    .expect("false universal lemma encoding should not error");
+    assert!(
+        matches!(result, VerificationResult::Failed(_)),
+        "forall i. i == 5 with a trivial body must be refuted: {result:?}"
+    );
+}
 // ── Axiom-only postcondition tests (#1753) ─────────────────────────
 
-/// Axiom-only function: unit body, no requires, forall postcondition.
+/// Former axiom-only shape: unit body, no requires, forall postcondition.
 ///
-/// This is the cc/fset.rs pattern: an empty function with a universally
-/// quantified postcondition that defines an algebraic property. These
-/// should be treated as axiom declarations and return Assumed. (#1753)
+/// This is the cc/fset.rs pattern. It used to short-circuit to `Assumed`
+/// without a solver query (#1753); it now carries a real obligation. Over an
+/// uninterpreted `interval`/`contains` the claim is not provable, so it must
+/// be neither `Verified` nor the old unqueried `Assumed`.
 #[test]
 #[timeout(30000)]
 fn test_axiom_only_forall_unit_body_verified() {
@@ -37,12 +81,13 @@ fn test_axiom_only_forall_unit_body_verified() {
     )
     .expect("axiom-only encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "axiom-only function with forall ensures + unit body should be Assumed: {result:?}"
+        is_real_unproved_obligation(&result),
+        "former axiom-only shape must reach the solver and not verify: axiom-only function with forall ensures + unit body : {result:?}"
     );
 }
 
-/// Axiom-only function: None body, forall postcondition -> Assumed.
+/// Former axiom-only shape: None body, forall postcondition over an
+/// uninterpreted method. Not provable, so not Verified and never Assumed.
 #[test]
 #[timeout(30000)]
 fn test_axiom_only_forall_none_body_verified() {
@@ -51,8 +96,8 @@ fn test_axiom_only_forall_none_body_verified() {
     let result = verify_function_with_modes(VerificationRequest::new(&[], &[ens]))
         .expect("axiom-only encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "axiom-only function with forall ensures + None body should be Assumed: {result:?}"
+        is_real_unproved_obligation(&result),
+        "former axiom-only shape must reach the solver and not verify: axiom-only function with forall ensures + None body : {result:?}"
     );
 }
 
@@ -122,7 +167,8 @@ fn test_non_axiom_forall_mentions_result_not_shortcutted() {
     );
 }
 
-/// Axiom-only with multiple forall ensures -> all treated as axioms.
+/// Former axiom-only shape with multiple forall ensures: each is a real
+/// obligation. `x.abs() >= 0` over an uninterpreted `abs` is not provable.
 #[test]
 #[timeout(30000)]
 fn test_axiom_only_multiple_forall_ensures_verified() {
@@ -132,8 +178,8 @@ fn test_axiom_only_multiple_forall_ensures_verified() {
     let result = verify_function_with_modes(VerificationRequest::new(&[], &[ens1, ens2]))
         .expect("axiom-only encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "multiple forall ensures with no body should all be Assumed as axioms: {result:?}"
+        is_real_unproved_obligation(&result),
+        "former axiom-only shape must reach the solver and not verify: multiple forall ensures with no body : {result:?}"
     );
 }
 
@@ -224,8 +270,8 @@ fn test_axiom_only_fset_map_spec_pattern() {
     )
     .expect("map_spec axiom-only encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "cc/fset.rs map_spec pattern (forall with nested exists) should be Assumed: {result:?}"
+        is_real_unproved_obligation(&result),
+        "former axiom-only shape must reach the solver and not verify: cc/fset.rs map_spec pattern (forall with nested exists) : {result:?}"
     );
 }
 
@@ -267,8 +313,8 @@ fn test_axiom_only_fset_filter_spec_pattern() {
     )
     .expect("filter_spec axiom-only encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "cc/fset.rs filter_spec pattern should be Assumed: {result:?}"
+        is_real_unproved_obligation(&result),
+        "former axiom-only shape must reach the solver and not verify: cc/fset.rs filter_spec pattern : {result:?}"
     );
 }
 

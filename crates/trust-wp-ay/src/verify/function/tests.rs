@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Tests for function verification — extracted from inline tests (#1669).
+//! Tests for function verification.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use trust_wp_core::{
         internal::tuple_lowering::{tuple_field_logic_fn_name, tuple_logic_fn_name},
         named_struct_ctor_name, ExprSort, MatchArm, Pattern, PureExpr,
     },
-    logic::{LogicFnDef, LogicMode, TypeInvariantDef},
+    logic::{LogicFnDef, LogicMode},
     TrackLevel,
 };
 
@@ -22,16 +22,16 @@ use super::{
     super::setup::{setup_verification_encoder, VerificationSetup},
     assert_by_value_alias_constraints, expr_contains_embedded_existential,
     expr_contains_embedded_universal, extract_invariant_receiver_var, has_open_logic_fns,
-    instantiate_embedded_existentials_with_body_witness, is_axiom_only_function,
-    is_universal_quantifier,
+    instantiate_embedded_existentials_with_body_witness, is_universal_quantifier,
     obligation::{
         sequence_tail_reverse_push_front_index_proof_assert_follows_requires,
         sequence_tail_reverse_push_front_index_proof_assert_matches,
     },
     precheck_ghost_context_postconditions, precheck_logic_body_postconditions,
     precheck_result_constructor_match_postconditions,
-    precheck_result_match_ite_constructor_postconditions, skolemize_negated_universal,
-    verify_function_with_modes, verify_function_with_modes_outcome,
+    precheck_result_match_ite_constructor_postconditions, precheck_short_circuit,
+    reconcile_precheck_refutation, skolemize_negated_universal, verify_function_with_modes,
+    verify_function_with_modes_outcome,
 };
 use crate::{
     encoder::AYEncoder,
@@ -39,7 +39,9 @@ use crate::{
         add, and, bool_expr, deref, eq, exists, final_expr, forall, ge, gt, implies, int, ite, le,
         logic_fn_call, lt, match_expr, mul, not, or, sub, var, var_with_sort, view,
     },
-    verify::{expr_contains_result_var, VerificationRequest, VerificationResult},
+    verify::{
+        Counterexample, PostconditionInfo, UnknownReason, VerificationRequest, VerificationResult,
+    },
 };
 
 fn method_call(receiver: PureExpr, method: &str) -> PureExpr {
@@ -519,11 +521,14 @@ fn literal_false_after_verified_slice_uses_fresh_base_state() {
 
     match &result {
         VerificationResult::Failed(_) => {}
+        other if crate::is_withheld_refutation(other) => {}
         VerificationResult::Verified(_) => {
             panic!("literal false obligation must not verify");
         }
         other => {
-            panic!("expected Failed for literal false slice on satisfiable base, got: {other:?}")
+            panic!(
+                "expected a rejection for literal false slice on satisfiable base, got: {other:?}"
+            )
         }
     }
 }
@@ -624,7 +629,7 @@ fn result_constructor_precheck_accepts_multi_field_tuple_arm() {
 
 #[test]
 #[timeout(30000)]
-fn result_match_ite_precheck_rejects_false_selected_branch() {
+fn result_match_ite_precheck_declines_single_branch_refutation() {
     let ensures = vec![result_match_ensure(eq(var("n"), int(1)), bool_expr(true))];
     let return_expr = ite(
         var_with_sort("flag", ExprSort::Bool),
@@ -636,8 +641,59 @@ fn result_match_ite_precheck_rejects_false_selected_branch() {
         precheck_result_match_ite_constructor_postconditions(&[], &ensures, Some(&return_expr));
 
     assert!(
-        !matches!(result, Some(VerificationResult::Verified(_))),
-        "ITE result-match precheck must not verify a branch whose selected arm is false: {result:?}"
+        result.is_none(),
+        "one bad branch neither proves nor universally refutes the clause: {result:?}"
+    );
+}
+
+#[test]
+fn result_match_ite_precheck_refutes_a_uniformly_false_clause() {
+    let ensures = vec![result_match_ensure(bool_expr(false), bool_expr(false))];
+    for some_on_true in [true, false] {
+        let some = logic_fn_call("Some", vec![int(2)]);
+        let none = logic_fn_call("None", vec![]);
+        let return_expr = if some_on_true {
+            ite(var_with_sort("flag", ExprSort::Bool), some, none)
+        } else {
+            ite(var_with_sort("flag", ExprSort::Bool), none, some)
+        };
+        let result =
+            precheck_result_match_ite_constructor_postconditions(&[], &ensures, Some(&return_expr));
+        assert!(
+            matches!(result, Some(VerificationResult::Failed(_))),
+            "both constructor branches violate the clause: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn result_match_ite_precheck_declines_a_boundary_counterexample_hint() {
+    let ensures = vec![result_match_ensure(gt(var("n"), int(0)), bool_expr(false))];
+    let return_expr = ite(
+        ge(var("n"), int(0)),
+        logic_fn_call("Some", vec![int(2)]),
+        logic_fn_call("None", vec![]),
+    );
+    assert!(
+        precheck_result_match_ite_constructor_postconditions(&[], &ensures, Some(&return_expr))
+            .is_none(),
+        "n=0 refutes the clause, but a base witness n=1 satisfies it"
+    );
+}
+
+#[test]
+fn result_match_ite_precheck_preserves_prophecy_in_refutation_hints() {
+    let prophecy = eq(final_expr(var("x")), add(var("x"), int(1)));
+    let ensures = vec![result_match_ensure(prophecy.clone(), prophecy)];
+    let return_expr = ite(
+        var_with_sort("flag", ExprSort::Bool),
+        logic_fn_call("Some", vec![int(2)]),
+        logic_fn_call("None", vec![]),
+    );
+    assert!(
+        precheck_result_match_ite_constructor_postconditions(&[], &ensures, Some(&return_expr))
+            .is_none(),
+        "a future value may be one greater than the entry value"
     );
 }
 
@@ -1114,8 +1170,6 @@ mod alias_constraints;
 #[cfg(test)]
 mod axiom_detection;
 #[cfg(test)]
-mod axiom_only;
-#[cfg(test)]
 mod deep_model;
 #[cfg(test)]
 mod ghost_context_consumption;
@@ -1125,6 +1179,8 @@ mod ghost_context_logic;
 mod ghost_data_structure;
 #[cfg(test)]
 mod instantiate_embedded_existentials;
+#[cfg(test)]
+mod open_logic_inline;
 #[cfg(test)]
 mod skolemize;
 #[cfg(test)]
@@ -1186,19 +1242,14 @@ fn prophecy_is_opaque_to_the_accepting_literal_folders() {
     }
 }
 
-/// `postcondition_true_under_context`'s OWN literal folders no longer see
+/// `postcondition_true_under_context`'s OWN literal folders do not see
 /// through a prophecy. A `true` from this function returns `Verified` with no
 /// solver call.
 ///
-/// ★ RESIDUAL, pinned honestly: its first disjunct is
-/// `is_trivially_true_postcondition`, whose evaluators live in
-/// `verify/postcondition.rs` and DO still fold `^e`. They are deliberately
-/// left folding — see the `★ RESIDUAL` comment on `eval_int_literal_expr`
-/// there: at that layer `Final(<literal>)` is ambiguous between the driver's
-/// borrowed-place substitution (dangerous) and binder-erasing substitution of a
-/// logic-fn formal or quantifier binder (licensed by Phase 1, and measurably
-/// load-bearing). The probe below therefore uses a division shape, which
-/// `is_trivially_true_postcondition` refuses outright
+/// Its first disjunct is `is_trivially_true_postcondition`, whose evaluators
+/// live in `verify/postcondition.rs` and refuse `Final` on their own (see
+/// `eval_int_literal_expr` there). The probe below therefore uses a division
+/// shape, which `is_trivially_true_postcondition` refuses outright
 /// (`expr_contains_div_or_mod`), so it isolates this function's own folders.
 #[test]
 #[timeout(10000)]
@@ -1209,7 +1260,8 @@ fn postcondition_true_under_context_does_not_see_through_a_prophecy() {
 
     use super::{postcondition_true_under_context, ProphecyFold};
 
-    // `(^6)@ / 2 == 3` — true under the old collapse, refused now.
+    // `(^6)@ / 2 == 3` — `ProphecyFold::Collapse` folds it to `true`;
+    // `postcondition_true_under_context` must refuse it.
     let prophecy_div = eq(
         view(PureExpr::BinOp(
             Arc::new(final_expr(int(6))),
@@ -1267,7 +1319,7 @@ fn expr_equiv_for_arithmetic_refuses_the_asymmetric_prophecy_collapse() {
 fn strict_positivity_does_not_transfer_through_a_prophecy() {
     use super::expr_is_strictly_positive_under_requirements;
 
-    let requires = vec![gt(var("x"), int(0))];
+    let requires = [gt(var("x"), int(0))];
     assert!(
         expr_is_strictly_positive_under_requirements(&var("x"), requires.iter()),
         "`x > 0` discharges `x > 0`"
@@ -1286,22 +1338,21 @@ fn vacuity_precheck_keeps_the_refusal_only_prophecy_fold() {
     // The refusal-only fold over `^<constant>` is RETAINED: a premise set
     // containing `(^1)@ == 7` is still flagged obviously contradictory,
     // because the only outcome of this function is a vacuity DEMOTION — a
-    // refusal, never a proof. (Historical note: the driver used to MINT this
-    // very premise for `bug/final_borrows::not_final_borrow_works` by
-    // advancing borrow-chain bases as `Final(<their constant value>)`; #124
-    // fixed the driver to mint per-borrow prophecy carriers instead, so the
-    // shape no longer occurs on the honest path — but if it ever reappears,
-    // demoting remains the correct fail-closed answer.)
+    // refusal, never a proof. The honest driver path never mints this
+    // premise — it mints per-borrow prophecy carriers, not
+    // `Final(<constant value>)` advanced from a borrow-chain base — so the
+    // shape is reachable only through a driver defect, and demoting is the
+    // correct fail-closed answer if it appears.
     assert!(requirements_are_obviously_contradictory(&[eq(
         view(final_expr(int(1))),
         int(7)
     )]));
 
-    // ★#124 — the HONEST path: the driver now mints the premise with a real
-    // per-borrow carrier (`(^r1)@ == 7` over a MutRef-sorted variable). That
-    // premise is satisfiable and must NOT be flagged contradictory — the
-    // fabricated vacuity demotion is gone and the obligation gets a real
-    // solve (`not_final_borrow_works` verifies honestly).
+    // The HONEST path: the driver mints the premise with a real per-borrow
+    // carrier (`(^r1)@ == 7` over a MutRef-sorted variable). That premise is
+    // satisfiable and must NOT be flagged contradictory — the obligation gets
+    // a real solve (`bug/final_borrows::not_final_borrow_works` verifies
+    // honestly).
     {
         use trust_wp_core::formula::ExprSort;
         let carrier = PureExpr::Var(
@@ -1317,4 +1368,136 @@ fn vacuity_precheck_keeps_the_refusal_only_prophecy_fold() {
              it must reach the solver, not the vacuity demotion"
         );
     }
+}
+
+// ── Validated refutations (D-28) ───────────────────────────────────────
+//
+// The rule: no `Failed` without a VALIDATED counterexample model. A
+// structural precheck that refutes the contract therefore must not be the
+// verdict; the solver's model is.
+
+/// `requires(x >= 0) ensures(result > x) { x }` — the simplest wrong program
+/// (cargo e2e `buggy_increment`). The precheck refutes it syntactically; the
+/// published verdict must still be a `Failed` whose provenance carries a
+/// consumer-accepted, model-validated SAT, or the driver's refutation
+/// authority withholds it as `unknown`.
+#[test]
+#[timeout(60000)]
+fn structural_precheck_refutation_is_published_with_a_validated_model() {
+    let requires = vec![ge(var("x"), int(0))];
+    let ensures = vec![gt(var("result"), var("x"))];
+    let return_expr = var("x");
+
+    let outcome = verify_function_with_modes_outcome(
+        VerificationRequest::new(&requires, &ensures).return_expr(Some(&return_expr)),
+    )
+    .expect("buggy increment should encode");
+
+    assert!(
+        matches!(outcome.result, VerificationResult::Failed(_)),
+        "the wrong program must be refuted, not withheld: {:?}",
+        outcome.result
+    );
+    assert_eq!(
+        crate::verify::types::refutation_evidence_gap_reason(&outcome),
+        None,
+        "the refutation must clear the mandatory authority bar: {:?}",
+        outcome.provenance
+    );
+    let evidence = outcome
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.solve_evidence.as_ref())
+        .expect("refutation carries solve evidence");
+    assert!(evidence.model_validated && evidence.accepted_for_consumer);
+    assert!(
+        crate::verify::types::solve_evidence_result_is_sat(&evidence.result),
+        "evidence must be a SAT model: {}",
+        evidence.result
+    );
+}
+
+#[test]
+fn precheck_failed_is_a_hint_not_a_verdict() {
+    let mut hint = None;
+    let failed = VerificationResult::Failed(Counterexample::empty());
+    assert!(precheck_short_circuit(failed, &mut hint).is_none());
+    assert!(matches!(hint, Some(VerificationResult::Failed(_))));
+
+    // Every other non-verified result still ends verification.
+    let mut hint = None;
+    let unknown = VerificationResult::Unknown(UnknownReason::Timeout);
+    assert!(matches!(
+        precheck_short_circuit(unknown, &mut hint),
+        Some(VerificationResult::Unknown(UnknownReason::Timeout))
+    ));
+    assert!(hint.is_none());
+}
+
+#[test]
+fn solver_proof_disagreeing_with_a_precheck_refutation_is_withheld() {
+    let hint = Some(
+        VerificationResult::Failed(Counterexample::empty()).tag_violated_postcondition(
+            PostconditionInfo {
+                clause_idx: 1,
+                contract_text: "result > x".to_string(),
+                span: None,
+            },
+        ),
+    );
+    let reconciled =
+        reconcile_precheck_refutation(VerificationResult::Verified(None), hint, None, &mut None);
+    match reconciled {
+        VerificationResult::Unknown(UnknownReason::SolverMessage(message)) => {
+            assert!(message.contains("ensures #1"), "{message}");
+            assert!(message.contains("verdict withheld"), "{message}");
+        }
+        other => panic!("a disagreement must fail closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn solver_refutation_inherits_the_precheck_clause_tag() {
+    let hint = Some(
+        VerificationResult::Failed(Counterexample::empty()).tag_violated_postcondition(
+            PostconditionInfo {
+                clause_idx: 2,
+                contract_text: "result > x".to_string(),
+                span: None,
+            },
+        ),
+    );
+    let reconciled = reconcile_precheck_refutation(
+        VerificationResult::Failed(Counterexample::empty()),
+        hint,
+        None,
+        &mut None,
+    );
+    let VerificationResult::Failed(counterexample) = reconciled else {
+        panic!("a solver Failed stays Failed");
+    };
+    assert_eq!(
+        counterexample
+            .violated_postcondition
+            .as_ref()
+            .map(|info| info.clause_idx),
+        Some(2)
+    );
+    // No hint: pass-through.
+    assert!(matches!(
+        reconcile_precheck_refutation(VerificationResult::Verified(None), None, None, &mut None),
+        VerificationResult::Verified(None)
+    ));
+    // Solver inconclusive: the structural refutation stands (and is withheld
+    // at the public boundary, as before).
+    let hint = Some(VerificationResult::Failed(Counterexample::empty()));
+    assert!(matches!(
+        reconcile_precheck_refutation(
+            VerificationResult::Unknown(UnknownReason::Timeout),
+            hint,
+            None,
+            &mut None
+        ),
+        VerificationResult::Failed(_)
+    ));
 }

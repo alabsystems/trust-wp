@@ -257,7 +257,7 @@ fn direct_method_call_usage_sort(
     // through View wrappers would incorrectly upgrade `b` from Int to Seq,
     // breaking the view-variable separation (#579).
     let receiver_sort = if is_bare_qvar_reference(receiver, qvar) {
-        receiver_method_usage_sort(method)
+        receiver_method_usage_sort(method, args.len())
     } else {
         None
     };
@@ -266,8 +266,13 @@ fn direct_method_call_usage_sort(
     // View wrappers) since View-wrapping an argument doesn't change the
     // expected argument sort (e.g., `seq.get(v@)` still expects Int index).
     let arg_sort = args.iter().enumerate().fold(None, |best, (idx, arg)| {
-        if arg_is_qvar_reference(arg, qvar) {
-            combine_usage_sorts(best, method_arg_usage_sort(method, idx))
+        let matches = if method == "exchange" && idx == 0 {
+            is_bare_qvar_reference(arg, qvar)
+        } else {
+            arg_is_qvar_reference(arg, qvar)
+        };
+        if matches {
+            combine_usage_sorts(best, method_arg_usage_sort(method, idx, args.len()))
         } else {
             best
         }
@@ -286,14 +291,19 @@ fn record_direct_method_call_usage_sorts<'a>(
     // Same bare-reference restriction as direct_method_call_usage_sort:
     // View-wrapped receivers must not infer receiver sort (#579).
     if let Some(var_name) = is_bare_any_qvar_reference(receiver, qvar_set) {
-        if let Some(sort) = receiver_method_usage_sort(method) {
+        if let Some(sort) = receiver_method_usage_sort(method, args.len()) {
             record_usage_sort(result, var_name, sort);
         }
     }
 
     for (idx, arg) in args.iter().enumerate() {
-        if let Some(var_name) = arg_is_any_qvar_reference(arg, qvar_set) {
-            if let Some(sort) = method_arg_usage_sort(method, idx) {
+        let var_name = if method == "exchange" && idx == 0 {
+            is_bare_any_qvar_reference(arg, qvar_set)
+        } else {
+            arg_is_any_qvar_reference(arg, qvar_set)
+        };
+        if let Some(var_name) = var_name {
+            if let Some(sort) = method_arg_usage_sort(method, idx, args.len()) {
                 record_usage_sort(result, var_name, sort);
             }
         }
@@ -330,7 +340,12 @@ fn is_bare_any_qvar_reference<'a>(expr: &PureExpr, qvars: &HashSet<&'a str>) -> 
     }
 }
 
-fn receiver_method_usage_sort(method: &str) -> Option<Sort> {
+fn receiver_method_usage_sort(method: &str, arg_count: usize) -> Option<Sort> {
+    // A well-formed exchange takes another sequence and two indices. Do not
+    // infer a collection carrier from an invalid call that must be refused.
+    if method == "exchange" {
+        return (arg_count == 3).then(|| Sort::seq(Sort::Int));
+    }
     if matches!(
         method,
         "contains_key" | "lookup" | "insert" | "insert_ghost" | "merge"
@@ -382,7 +397,14 @@ fn receiver_method_usage_sort(method: &str) -> Option<Sort> {
     }
 }
 
-fn method_arg_usage_sort(method: &str, arg_idx: usize) -> Option<Sort> {
+fn method_arg_usage_sort(method: &str, arg_idx: usize, arg_count: usize) -> Option<Sort> {
+    if method == "exchange" {
+        return match (arg_count, arg_idx) {
+            (3, 0) => Some(Sort::seq(Sort::Int)),
+            (3, 1 | 2) => Some(Sort::Int),
+            _ => None,
+        };
+    }
     match (method, arg_idx) {
         (
             "get" | "get_mut_ghost" | "index" | "index_logic" | "lookup" | "contains"

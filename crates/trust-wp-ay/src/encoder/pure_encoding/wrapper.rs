@@ -8,7 +8,7 @@ use ay_dpll::api::{Sort, Term};
 use trust_wp_core::formula::{ExprSort, MatchArm, PureExpr};
 
 use super::super::{
-    final_collapse_guard::expr_sort_is_post_state_container,
+    final_collapse_guard::{expr_sort_is_post_state_container, sort_holds_no_borrow},
     sort_context::{
         apply_name_prefix, effective_expr_annotation, extract_base_var_name, resolve_nameable_expr,
         DerivedKind,
@@ -39,11 +39,11 @@ impl WrapperKind {
 ///
 /// `expr` is the inside of an outer wrapper, so base depth starts at 1.
 fn peel_wrapper_depth(mut expr: &PureExpr, kind: WrapperKind) -> (usize, &PureExpr) {
-    let mut depth = 1;
+    let mut depth = 1usize;
     while let (WrapperKind::Deref, PureExpr::Deref(inner))
     | (WrapperKind::Final, PureExpr::Final(inner)) = (kind, expr)
     {
-        depth += 1;
+        depth = depth.saturating_add(1);
         expr = inner.as_ref();
     }
     (depth, expr)
@@ -134,7 +134,11 @@ impl AYEncoder {
         // unscoped). No lowering in this commit makes a formal MutRef-sorted
         // where it was not before, so the formal lane's exposure is
         // unchanged; the M2 negative corpus must add a carrier-formal probe
-        // if that class ever becomes constructible.
+        // if that class ever becomes constructible. The legacy collapse of
+        // `^v` onto any other bound variable is refused where the binder is
+        // annotated at a sort whose shape may hold a borrow (D-126), and onto
+        // a binder a written `forall`/`exists` binds unless its annotation
+        // certifies a sort holding none (D-127).
         //
         // Final-collapse audit Fix A guard (below the projection arm): the
         // Final collapse is exact only when the bound value is a PURE value.
@@ -166,6 +170,33 @@ impl AYEncoder {
                         {
                             return Err(self.refuse_final_collapse(name, ann.as_ref()));
                         }
+                    } else if kind == WrapperKind::Final
+                        && (ann.as_ref().is_some_and(|sort| !sort_holds_no_borrow(sort))
+                            || (ann.is_none()
+                                && self.written_binder_sort(name).is_some_and(|written| {
+                                    match written {
+                                        crate::encoder::state::WrittenBinderSort::Unannotated => {
+                                            true
+                                        }
+                                        crate::encoder::state::WrittenBinderSort::Annotated(
+                                            sort,
+                                        ) => !sort_holds_no_borrow(sort),
+                                    }
+                                })))
+                    {
+                        // A binder annotated at a sort that may hold a borrow
+                        // (`forall<q: &mut i32>`) is one bound term for `*q`
+                        // and `^q` alike: the collapse read `^q == *q` of
+                        // every borrow, and `!(exists<q: &mut i32> ^q != *q)`
+                        // verified (D-126). A written binder the parser gave
+                        // no sort (`exists<q: (&mut i32, i32)>`, `exists<g>`
+                        // over a closure state) is the same binder: the
+                        // collapse verified `!(exists<q: &mut Holder> ^q !=
+                        // *q)` and `exists<g> f.postcondition_mut((), g, ())
+                        // && resolve(g)` of a function RETURNING that state
+                        // (D-127). A logic-fn formal is bound elsewhere and
+                        // keeps the driver-split collapse.
+                        return Err(self.refuse_final_collapse(name, ann.as_ref()));
                     }
                     return Ok(term);
                 }
@@ -384,10 +415,218 @@ impl AYEncoder {
             }
         }
 
+        // Phase 1f: `^` over a field or tuple projection whose field may be a
+        // reference. Phase 3 distributes `^` into the projection's argument,
+        // `^(x.f) = (^x).f`: Creusot's rule for a place REBORROWED out of
+        // `*x`, which is what the driver's image of `^r` for `r = &mut x.f`
+        // spells. A written `^x.m` (auto-deref, `^((*x).m)`) of a field that
+        // IS a borrow is that borrow's final value, which its holder decides
+        // after the call, and the two spell the same term. Read as the rule,
+        // `proof_assert!(^x.m == *x.m)` of an untouched `x: &mut M { m: &mut
+        // i32 }` held. A field that may be a reference is refused (D-127).
+        // An element of a sequence reached through a reference is refused
+        // alike: the sort names no element type, so `^x[0]` of `x: &mut
+        // Vec<&mut i32>` may be the element borrow's final value (D-129).
+        if kind == WrapperKind::Final {
+            match inner {
+                PureExpr::LogicFnCall { name, args } => {
+                    if let [base] = args.as_slice() {
+                        if self.projected_field_may_be_a_reference(name, base) {
+                            return Err(self.refuse_final_of_a_held_borrow(inner));
+                        }
+                    }
+                }
+                PureExpr::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                } if is_element_projection(method, args)
+                    && self.projection_place_through_a_reference(receiver) =>
+                {
+                    return Err(self.refuse_final_of_a_held_borrow(inner));
+                }
+                _ => {}
+            }
+        }
+
         // Phase 3: Structural rewriting — peel nested same-kind wrappers,
         // then push the wrapper into the base expression's args/receiver.
         let (depth, base) = peel_wrapper_depth(inner, kind);
         self.encode_wrapper_rewrite(outer_expr, base, kind, depth, prefix)
+    }
+
+    /// Whether `name(base)` projects, through a reference (`x.f` of `x: &mut
+    /// H`, `(*x).f`, `x.s.f` of `x: &mut N { s: H }`), a field or tuple
+    /// element that may itself be a mutable reference: its declaration says
+    /// `&mut` or a type parameter, a declaration another instantiation of
+    /// which may hold a borrow its field sorts erase says a non-datatype sort
+    /// (`AdtDecl::may_hold_a_borrow`), no declaration is registered, the
+    /// holder is a tuple whose components the sort does not carry, or the
+    /// holder is reached through a reference by a chain whose sort the
+    /// annotations and declarations do not give. A by-value holder's borrow
+    /// is its own, read by the lanes that place a parameter's reads.
+    fn projected_field_may_be_a_reference(&self, name: &str, base: &PureExpr) -> bool {
+        use trust_wp_core::formula::resolve_sort_name;
+        let Some(field) = FieldProjection::of(name) else {
+            return false;
+        };
+        let (sort, mut through_a_reference) = self.projection_place_sort(base);
+        // The holder is reached through a reference and its sort is unknown:
+        // `^x.s.m` of a chain the walk cannot type may be a borrow's final
+        // value, so it is refused (D-128).
+        let Some(mut sort) = sort else {
+            return through_a_reference;
+        };
+        while let ExprSort::Ref(inner) | ExprSort::MutRef(inner) = sort {
+            through_a_reference = true;
+            sort = *inner;
+        }
+        if !through_a_reference {
+            return false;
+        }
+        let id = match sort {
+            ExprSort::Tuple(_) | ExprSort::TypeParam(_) => return true,
+            ExprSort::Datatype(id) => id,
+            _ => return false,
+        };
+        let Some(decl) = self.adt_decl_for_name(&resolve_sort_name(id)) else {
+            return true;
+        };
+        let Some(field) = field.declared_in(decl) else {
+            return true;
+        };
+        // A shared reference has no final value of its own: `^` of a field
+        // that is one is only ever the driver's image of a reborrow of the
+        // field's place, whose rule is `(^x).f` (a `&Cell` field read after
+        // `p.c.set(x)`).
+        match &field.sort {
+            ExprSort::MutRef(_) | ExprSort::TypeParam(_) => true,
+            ExprSort::Ref(_)
+            | ExprSort::Datatype(_)
+            | ExprSort::Seq
+            | ExprSort::FMap
+            | ExprSort::Tuple(_) => false,
+            _ => decl.may_hold_a_borrow,
+        }
+    }
+
+    /// Whether the place `expr` names is reached through a reference, or is
+    /// one: its holder is then not the function's own, and an element of it
+    /// that may be a borrow is that holder's.
+    fn projection_place_through_a_reference(&self, expr: &PureExpr) -> bool {
+        match self.projection_place_sort(expr) {
+            (_, true) | (Some(ExprSort::Ref(_) | ExprSort::MutRef(_)), _) => true,
+            _ => false,
+        }
+    }
+
+    /// The sort of the place `expr` names, and whether the chain reaching it
+    /// goes through a reference, for a chain of variables, dereferences,
+    /// final values and field, tuple or element projections, chosen by an
+    /// `if` or `match` or not. An annotated operand keeps
+    /// `effective_expr_annotation`'s reading. A projection's sort is its
+    /// field's declared sort when that sort can hold further places (a
+    /// datatype, a tuple, a reference); any other field, an erased one, a
+    /// tuple component, a sequence's element or an undeclared holder gives no
+    /// sort, so a projection OF it is typed by nobody (D-128). `^e` is the
+    /// value a borrow ends with, whose borrows the caller keeps: it is
+    /// reached through a reference whatever its sort (D-129). Branches that
+    /// disagree give no sort, and go through a reference when one does.
+    /// Refusing is then the caller's call.
+    fn projection_place_sort(&self, expr: &PureExpr) -> (Option<ExprSort>, bool) {
+        use trust_wp_core::formula::resolve_sort_name;
+        if let Some(sort) = effective_expr_annotation(expr) {
+            return (
+                Some(sort.clone()),
+                matches!(expr, PureExpr::Deref(_) | PureExpr::Final(_)),
+            );
+        }
+        match expr {
+            PureExpr::Final(inner) => match self.projection_place_sort(inner) {
+                (Some(ExprSort::Ref(referent) | ExprSort::MutRef(referent)), _) => {
+                    (Some(*referent), true)
+                }
+                (sort, _) => (sort, true),
+            },
+            PureExpr::Ite(_, then_branch, else_branch) => self.join_projection_place_sorts(
+                [then_branch.as_ref(), else_branch.as_ref()].into_iter(),
+            ),
+            PureExpr::Match { arms, .. } => {
+                self.join_projection_place_sorts(arms.iter().map(|arm| &arm.body))
+            }
+            PureExpr::MethodCall {
+                receiver,
+                method,
+                args,
+            } if is_element_projection(method, args) => {
+                (None, self.projection_place_through_a_reference(receiver))
+            }
+            // A dereference of a reference goes through it. The driver erases
+            // a `Box` layer from a sort, so `*` of an operand whose sort is
+            // known and is no reference is the owned value's own place, and
+            // `*` of one whose sort is unknown proves nothing either way, as
+            // for a variable without an annotation.
+            PureExpr::Deref(inner) => match self.projection_place_sort(inner) {
+                (Some(ExprSort::Ref(referent) | ExprSort::MutRef(referent)), _) => {
+                    (Some(*referent), true)
+                }
+                unchanged => unchanged,
+            },
+            PureExpr::Old(inner) => self.projection_place_sort(inner),
+            PureExpr::LogicFnCall { name, args } => {
+                let (Some(field), [holder]) = (FieldProjection::of(name), args.as_slice()) else {
+                    return (None, false);
+                };
+                let (sort, mut through_a_reference) = self.projection_place_sort(holder);
+                let Some(mut sort) = sort else {
+                    return (None, through_a_reference);
+                };
+                while let ExprSort::Ref(inner) | ExprSort::MutRef(inner) = sort {
+                    through_a_reference = true;
+                    sort = *inner;
+                }
+                let field_sort = match sort {
+                    ExprSort::Datatype(id) => self
+                        .adt_decl_for_name(&resolve_sort_name(id))
+                        .and_then(|decl| field.declared_in(decl))
+                        .map(|field| field.sort.clone())
+                        .filter(|sort| {
+                            matches!(
+                                sort,
+                                ExprSort::Datatype(_)
+                                    | ExprSort::Tuple(_)
+                                    | ExprSort::Ref(_)
+                                    | ExprSort::MutRef(_)
+                            )
+                        }),
+                    _ => None,
+                };
+                (field_sort, through_a_reference)
+            }
+            _ => (None, false),
+        }
+    }
+
+    /// The place an `if` or `match` chooses among `branches` names: their
+    /// common sort, none when they disagree, and through a reference when
+    /// any branch is one or is reached through one.
+    fn join_projection_place_sorts<'e>(
+        &self,
+        branches: impl Iterator<Item = &'e PureExpr>,
+    ) -> (Option<ExprSort>, bool) {
+        let mut joined: Option<Option<ExprSort>> = None;
+        let mut through_a_reference = false;
+        for branch in branches {
+            let (sort, through) = self.projection_place_sort(branch);
+            through_a_reference |=
+                through || matches!(sort, Some(ExprSort::Ref(_) | ExprSort::MutRef(_)));
+            joined = Some(match joined {
+                None => sort,
+                Some(previous) if previous == sort => previous,
+                Some(_) => None,
+            });
+        }
+        (joined.flatten(), through_a_reference)
     }
 
     /// #prophecy-slots (Fix B M2): does this expression mention a variable
@@ -721,6 +960,43 @@ impl AYEncoder {
                 outer_kind.label(),
                 inner_kind.label(),
             ))),
+        }
+    }
+}
+
+/// Whether `method(args)` is the call an index `e[i]` lowers to.
+fn is_element_projection(method: &str, args: &[PureExpr]) -> bool {
+    args.len() == 1 && matches!(method, "index_logic" | "index")
+}
+
+/// A field or tuple-element getter's name, read as the field it selects.
+#[derive(Clone, Copy)]
+enum FieldProjection<'a> {
+    Index(usize),
+    Named(&'a str),
+}
+
+impl<'a> FieldProjection<'a> {
+    fn of(name: &'a str) -> Option<Self> {
+        use trust_wp_core::formula::internal::tuple_lowering::{
+            tuple_field_logic_fn_index, NAMED_FIELD_LOGIC_FN_PREFIX,
+        };
+        if let Some(index) = tuple_field_logic_fn_index(name) {
+            return Some(Self::Index(index));
+        }
+        name.strip_prefix(NAMED_FIELD_LOGIC_FN_PREFIX)
+            .map(Self::Named)
+    }
+
+    /// The field of `decl`'s first constructor this projection selects.
+    fn declared_in(
+        self,
+        decl: &trust_wp_core::logic::AdtDecl,
+    ) -> Option<&trust_wp_core::logic::AdtFieldDecl> {
+        let ctor = decl.constructors.first()?;
+        match self {
+            Self::Index(index) => ctor.fields.get(index),
+            Self::Named(name) => ctor.fields.iter().find(|field| field.name == name),
         }
     }
 }

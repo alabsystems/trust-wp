@@ -9,14 +9,22 @@
 //! - Exist only for verification (erased at runtime)
 //! - Are encoded as uninterpreted SMT functions with defining axioms
 //! - Can be called from contracts and ghost blocks
-//!
-//! Reference: `designs/2026-02-01-logic-functions.md`
 
 #![allow(clippy::doc_markdown)]
 
 mod attrs;
+pub(crate) mod block_scope;
+pub(crate) mod call_resolution;
 pub(crate) mod discovery;
+pub(crate) mod identity;
+/// In-process rustc harness shared by the logic-identity decision tests.
+#[cfg(test)]
+pub(crate) mod identity_test_support;
+pub(crate) mod identity_typed;
+pub(crate) mod method_lookup;
+pub(crate) mod ptr_casts;
 mod recursion;
+pub(crate) mod spec_calls;
 mod type_transforms;
 
 use std::collections::{HashMap, HashSet};
@@ -33,6 +41,7 @@ use self::type_transforms::{
     unit_field_constraints_for_logic_fn,
 };
 pub(crate) use self::{
+    attrs::extract_requires,
     discovery::{
         extract_logic_mode, find_logic_functions, has_law_doc_marker, has_logic_marker,
         to_logic_fn_def,
@@ -76,7 +85,7 @@ fn validate_logic_laws_impl(tcx: TyCtxt<'_>, emit_diagnostics: bool) -> usize {
         }
 
         let has_own_generics = !tcx.generics_of(def_id).own_params.is_empty();
-        let has_own_predicates = !tcx.predicates_of(def_id).predicates.is_empty();
+        let has_own_predicates = !tcx.clauses_of(def_id).clauses.is_empty();
         if has_own_generics || has_own_predicates {
             if emit_diagnostics {
                 tcx.dcx().span_err(
@@ -94,7 +103,7 @@ fn validate_logic_laws_impl(tcx: TyCtxt<'_>, emit_diagnostics: bool) -> usize {
 fn validate_impl_logic_trait_mode_matches_trait(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-    impl_attrs: &[rustc_hir::Attribute],
+    impl_attrs: &[rustc_attr_ir::Attribute],
     impl_is_law: bool,
     emit_diagnostics: bool,
 ) -> usize {
@@ -148,7 +157,7 @@ fn validate_impl_law_mode_matches_trait(
     tcx: TyCtxt<'_>,
     def_id: DefId,
     impl_is_law: bool,
-    trait_attrs: &[rustc_hir::Attribute],
+    trait_attrs: &[rustc_attr_ir::Attribute],
     emit_diagnostics: bool,
 ) -> usize {
     let trait_is_law = has_law_doc_marker(trait_attrs);
@@ -176,8 +185,8 @@ fn validate_impl_logic_mode_matches_trait(
     tcx: TyCtxt<'_>,
     def_id: DefId,
     trait_item_def_id: DefId,
-    impl_attrs: &[rustc_hir::Attribute],
-    trait_attrs: &[rustc_hir::Attribute],
+    impl_attrs: &[rustc_attr_ir::Attribute],
+    trait_attrs: &[rustc_attr_ir::Attribute],
     emit_diagnostics: bool,
 ) -> usize {
     let impl_is_logic = has_logic_marker(impl_attrs);
@@ -222,12 +231,33 @@ fn validate_impl_logic_mode_matches_trait(
         return 1;
     }
 
-    // Lenient mode (Creusot compatibility): most trait/impl logic-marker
-    // mismatches are accepted. Creusot accepts impls that:
-    // (a) inherit logic-ness from the trait without re-marking
-    // (b) add `#[logic(open)]` to mark body visibility on an
-    //     unmarked trait method
-    // (c) strengthen `open` (or any visible mode) to `prophetic` when the
+    // Strict guard (Creusot `ItemType::can_implement`): a logic function
+    // cannot implement a PROGRAM trait method. The code that runs for the
+    // call is the logic function's erased body (`unreachable!()`), and the
+    // contract a caller of the trait method is handed is owed by no program
+    // body (trait_logic_impl_of_program_method_granted.rs). Asked only where
+    // the trait item's kind is certain: a local item, whose markers are all
+    // visible, or a standard-library item, which is never a logic function.
+    if impl_is_logic && !trait_is_logic && trait_item_kind_is_certain(tcx, trait_item_def_id) {
+        if emit_diagnostics {
+            crate::result_protocol_state::record_logic_recursion_error();
+            let full_path = tcx.def_path_str(def_id);
+            tcx.dcx().span_err(
+                tcx.def_span(def_id),
+                format!(
+                    "trust-wp: logic recursion check failed: `{full_path}`: Expected \
+                     `{method_name}` to be a program function as specified by the trait \
+                     declaration",
+                ),
+            );
+        }
+        return 1;
+    }
+
+    // Lenient mode: the remaining trait/impl logic-marker mismatches are
+    // accepted:
+    // (a) a plain impl of a bodyless `#[logic]` trait method (see above)
+    // (b) strengthening `open` (or any visible mode) to `prophetic` when the
     //     body needs `^x`
     //
     // Strict guard (creusot tests/should_fail/logic_prophetic_impl.rs): an
@@ -272,10 +302,23 @@ fn validate_impl_logic_mode_matches_trait(
     0
 }
 
+/// Whether a trait item's logic/program kind is read from markers this crate
+/// can see: every local item's, and a standard-library item's, which carries
+/// none because it is never a logic function. A spec library's items carry
+/// their markers in metadata, but a marker it omits would read as a program
+/// function and refuse a valid impl, so they are not asked.
+fn trait_item_kind_is_certain(tcx: TyCtxt<'_>, trait_item_def_id: DefId) -> bool {
+    trait_item_def_id.is_local()
+        || matches!(
+            tcx.crate_name(trait_item_def_id.krate).as_str(),
+            "core" | "alloc" | "std"
+        )
+}
+
 fn validate_impl_does_not_override_sealed_trait_method(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-    trait_attrs: &[rustc_hir::Attribute],
+    trait_attrs: &[rustc_attr_ir::Attribute],
     emit_diagnostics: bool,
 ) -> usize {
     if !has_doc_marker(trait_attrs, "trust-wp:logic_sealed:") {
@@ -291,11 +334,82 @@ fn validate_impl_does_not_override_sealed_trait_method(
     1
 }
 
-fn has_doc_marker(attrs: &[rustc_hir::Attribute], marker: &str) -> bool {
+fn has_doc_marker(attrs: &[rustc_attr_ir::Attribute], marker: &str) -> bool {
     attrs
         .iter()
         .filter_map(crate::attr_utils::doc_marker_str)
         .any(|value| value.as_str().starts_with(marker))
+}
+
+/// Place every named-field constructor and pattern in one logic function's
+/// body, requires, ensures and variants at its DECLARED indices.
+///
+/// A clause that cannot be placed is left AS WRITTEN and reported. That is not
+/// a source-order fallback: the expression keeps the parser's `{a,b}`
+/// metadata, and `trust_wp_ay::verify::placement_gate` refuses any request
+/// carrying it. The cost is the proofs that logic function could have
+/// supported, never a verdict decided by the order two fields were typed in.
+fn place_named_field_ctors_in_logic_fn(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    parsed: &mut LogicFnDef,
+    full_path: &str,
+) {
+    let place = |expr: &PureExpr| -> Option<PureExpr> {
+        match crate::callbacks::place_named_field_ctors_in_expr(tcx, def_id, expr) {
+            Ok(placed) => Some(placed),
+            Err(why) => {
+                eprintln!(
+                    "trust-wp: logic function `{full_path}`: {why}; the clause is left as \
+                     written and the encoder will refuse it rather than bind the fields in \
+                     the order they appear"
+                );
+                None
+            }
+        }
+    };
+    if let Some(body) = place(parsed.body()) {
+        parsed.set_body(body);
+    }
+    for clause in parsed.requires_mut() {
+        if let Some(placed) = place(clause) {
+            *clause = placed;
+        }
+    }
+    for clause in parsed.ensures_mut() {
+        if let Some(placed) = place(clause) {
+            *clause = placed;
+        }
+    }
+    for clause in parsed.variants_mut() {
+        if let Some(placed) = place(clause) {
+            *clause = placed;
+        }
+    }
+}
+
+/// Report a logic function whose specification text still carries unplaced
+/// named-field metadata, so the encoder's refusal has a name attached to it.
+fn report_unplaced_logic_fn(parsed: &LogicFnDef, full_path: &str, why: &str) {
+    let unplaced = trust_wp_core::formula::first_unplaced_named_ctor(parsed.body())
+        .or_else(|| {
+            parsed
+                .requires()
+                .iter()
+                .find_map(trust_wp_core::formula::first_unplaced_named_ctor)
+        })
+        .or_else(|| {
+            parsed
+                .ensures()
+                .iter()
+                .find_map(trust_wp_core::formula::first_unplaced_named_ctor)
+        });
+    if let Some(name) = unplaced {
+        eprintln!(
+            "trust-wp: logic function `{full_path}`: named-field constructor `{name}` could \
+             not be placed at its declared indices ({why}); the encoder will refuse it"
+        );
+    }
 }
 
 /// Extract all logic function definitions from a crate.
@@ -350,8 +464,24 @@ pub(crate) fn extract_logic_fn_defs(tcx: TyCtxt<'_>) -> Vec<LogicFnDef> {
                 parsed.set_is_recursive(true);
             }
             let Some(def_id) = fn_def_ids_by_path.get(&logic_fn.full_path).copied() else {
+                // No DefId for this path, so no declarations can be resolved
+                // for it. Anything it wrote as `S { b: _, a: aa }` keeps its
+                // field metadata and the encoder's placement gate refuses the
+                // functions that use it. That costs a proof; it cannot cost a
+                // verdict.
+                report_unplaced_logic_fn(&parsed, &logic_fn.full_path, "no DefId resolved");
                 return Some(parsed);
             };
+
+            // PLACEMENT, FIRST. A `#[logic]` body is specification text that
+            // the contract-rewriting path never sees: it is parsed here and
+            // handed to the encoder as a defining axiom, so its named-field
+            // constructors are placed here or nowhere (D-31). Unplaced,
+            // `match s { S { a: aa, b: _bb } => aa }` on `struct S { b, a }`
+            // binds `aa` to `b` and the function reads a field it did not name
+            // (s82_structpat_reorder_logic_body.rs). Runs before every rewrite
+            // below so those see canonical, positional constructor names.
+            place_named_field_ctors_in_logic_fn(tcx, def_id, &mut parsed, &logic_fn.full_path);
 
             // Newtype view simplification
             simplify_newtype_views(
@@ -377,7 +507,28 @@ pub(crate) fn extract_logic_fn_defs(tcx: TyCtxt<'_>) -> Vec<LogicFnDef> {
             Some(parsed)
         })
         .collect();
-    inline_qualified_logic_fn_calls_in_defs(&mut logic_defs);
+    // Unique identity for every short-name collision member, resolved in the
+    // defining item's own scope, BEFORE any path-keyed inlining below.
+    identity::assign_logic_fn_identities(tcx, &mut logic_defs, &fn_def_ids_by_path);
+    // What rustc resolved each body's calls to, read against the bodies as the
+    // identity pass left them: after inlining, a body also holds calls written
+    // in another function's scope (D-136). A call left spelled is named by the
+    // definition rustc resolved it to, and a misread body is hidden, before
+    // the inline map is built from the bodies; the record reads which calls
+    // the inliner replaces through the inliner's own test, on the same map.
+    let typed = call_resolution::typed_bodies(tcx, &logic_defs, &fn_def_ids_by_path);
+    let misread = call_resolution::settle_spelled_calls(tcx, &mut logic_defs, &typed);
+    let inline_map = build_qualified_logic_fn_inline_map(&logic_defs);
+    call_resolution::record_logic_body_calls(
+        tcx,
+        &logic_defs,
+        typed,
+        &misread,
+        &|name, arity, current_full_path| {
+            inline_target(&inline_map, name, arity, current_full_path).is_some()
+        },
+    );
+    inline_qualified_logic_fn_calls_in_defs(&mut logic_defs, &inline_map);
     logic_defs
 }
 
@@ -388,8 +539,10 @@ struct InlineLogicFn {
     body: PureExpr,
 }
 
-fn inline_qualified_logic_fn_calls_in_defs(logic_defs: &mut [LogicFnDef]) {
-    let inline_map = build_qualified_logic_fn_inline_map(logic_defs);
+fn inline_qualified_logic_fn_calls_in_defs(
+    logic_defs: &mut [LogicFnDef],
+    inline_map: &HashMap<String, InlineLogicFn>,
+) {
     if inline_map.is_empty() {
         return;
     }
@@ -398,25 +551,37 @@ fn inline_qualified_logic_fn_calls_in_defs(logic_defs: &mut [LogicFnDef]) {
         let full_path = logic_def.full_path().to_string();
         let body = logic_def.take_body();
         logic_def.set_body(inline_qualified_logic_fn_calls(
-            body,
-            &inline_map,
-            &full_path,
+            body, inline_map, &full_path,
         ));
 
         let requires: Vec<PureExpr> = logic_def
             .take_requires()
             .into_iter()
-            .map(|expr| inline_qualified_logic_fn_calls(expr, &inline_map, &full_path))
+            .map(|expr| inline_qualified_logic_fn_calls(expr, inline_map, &full_path))
             .collect();
         logic_def.set_requires(requires);
 
         let ensures: Vec<PureExpr> = logic_def
             .take_ensures()
             .into_iter()
-            .map(|expr| inline_qualified_logic_fn_calls(expr, &inline_map, &full_path))
+            .map(|expr| inline_qualified_logic_fn_calls(expr, inline_map, &full_path))
             .collect();
         logic_def.set_ensures(ensures);
     }
+}
+
+/// The definition a call named `name` with `arity` arguments, in the body of
+/// the function at `current_full_path`, is replaced by: the inliner's one
+/// test, which `call_resolution` also reads.
+fn inline_target<'m>(
+    inline_map: &'m HashMap<String, InlineLogicFn>,
+    name: &str,
+    arity: usize,
+    current_full_path: &str,
+) -> Option<&'m InlineLogicFn> {
+    inline_map
+        .get(name)
+        .filter(|target| target.full_path != current_full_path && target.params.len() == arity)
 }
 
 fn build_qualified_logic_fn_inline_map(
@@ -438,8 +603,28 @@ fn build_qualified_logic_fn_inline_map(
             body: logic_def.body().clone(),
         };
         map.insert(logic_def.full_path().to_string(), inline.clone());
+        // A call already resolved to this definition's unique id denotes
+        // exactly this definition — but only for an ASSOCIATED definition.
+        // A free function is called by its bare name, and a bare-name call is
+        // deliberately NOT inlined here (the `relative != short name` guard
+        // below): it keeps its call shape so the definition reaches the
+        // encoder with its spec axiom. v2 renames every definition, so the
+        // free case has to be excluded by OWNER kind rather than by spelling.
+        if logic_def
+            .name()
+            .starts_with(trust_wp_core::logic::identity::LOGIC_FN_ID_PREFIX)
+            && trust_wp_core::logic::identity::logic_fn_identity_registry().is_some_and(
+                |registry| {
+                    registry.member(logic_def.name()).is_some_and(|member| {
+                        member.kind != trust_wp_core::logic::identity::LogicFnOwnerKind::Free
+                    })
+                },
+            )
+        {
+            map.insert(logic_def.name().to_string(), inline.clone());
+        }
         if let Some((_, relative)) = logic_def.full_path().split_once("::") {
-            if relative != logic_def.name() {
+            if relative != logic_def.short_name() {
                 map.insert(relative.to_string(), inline.clone());
             }
         }
@@ -484,12 +669,10 @@ fn inline_qualified_logic_fn_calls(
 ) -> PureExpr {
     expr.rewrite_bottom_up(|node| match node {
         PureExpr::LogicFnCall { name, args } => {
-            let Some(target) = inline_map.get(&name) else {
+            let Some(target) = inline_target(inline_map, &name, args.len(), current_full_path)
+            else {
                 return PureExpr::LogicFnCall { name, args };
             };
-            if target.full_path == current_full_path || target.params.len() != args.len() {
-                return PureExpr::LogicFnCall { name, args };
-            }
             let substitutions: HashMap<String, PureExpr> =
                 target.params.iter().cloned().zip(args).collect();
             target.body.substitute_capture_avoiding(
@@ -597,6 +780,7 @@ mod tests {
 
     use super::{
         attrs::append_opaque_guard_if_needed,
+        build_qualified_logic_fn_inline_map,
         discovery::{
             extract_function_name, looks_like_seq_type_name, to_logic_fn_def, LogicFunction,
         },
@@ -657,13 +841,20 @@ mod tests {
         .with_mode(LogicMode::Open);
 
         let mut defs = vec![trait_decl, impl_def, calls_g];
-        inline_qualified_logic_fn_calls_in_defs(&mut defs);
+        let inline_map = build_qualified_logic_fn_inline_map(&defs);
+        inline_qualified_logic_fn_calls_in_defs(&mut defs, &inline_map);
 
         assert_eq!(defs[2].body(), &PureExpr::Int(1));
     }
 
+    /// `<i32 as Bar>::g()` names a trait method through a type, so what it
+    /// denotes is read from rustc's type check of the body
+    /// (`logic::spec_calls`). This probe crate has no type-check closure (no
+    /// macros ran), so the call is refused rather than read by name; the
+    /// inlining of the open impl body it names is
+    /// `test_inline_qualified_logic_fn_calls_uses_open_trait_impl_body`.
     #[test]
-    fn test_extract_logic_fn_defs_inlines_open_trait_impl_ufcs_call() {
+    fn test_extract_logic_fn_defs_refuses_a_ufcs_call_with_no_type_checked_body() {
         let defs = collect_logic_defs_from_source(
             r#"
 pub type Int = i128;
@@ -693,7 +884,16 @@ pub fn calls_g() -> Int {
             .iter()
             .find(|def| def.full_path().ends_with("::calls_g"))
             .expect("calls_g should be extracted");
-        assert_eq!(calls_g.body(), &PureExpr::Int(1));
+        assert!(
+            matches!(
+                calls_g.body(),
+                PureExpr::LogicFnCall { name, args }
+                    if trust_wp_core::logic::identity::is_refused_logic_fn_marker(name)
+                        && args.is_empty()
+            ),
+            "{:?}",
+            calls_g.body()
+        );
     }
 
     fn make_logic_fn(name: &str, full_path: &str, body: &str) -> LogicFunction {
@@ -702,6 +902,7 @@ pub fn calls_g() -> Int {
             full_path: full_path.to_string(),
             params: vec!["self".to_string()],
             requires: Vec::new(),
+            written_requires: 0,
             ensures: Vec::new(),
             variants: Vec::new(),
             is_opaque: false,
@@ -709,10 +910,13 @@ pub fn calls_g() -> Int {
             is_law: false,
             mode: LogicMode::Default,
             is_trait_method: false,
+            is_associated_fn: false,
             param_sort_hints: vec![None],
+            param_int_widths: Vec::new(),
             return_sort_hint: None,
             body_text: Some(body.to_string()),
             deep_model_dispatch_targets: None,
+            param_bindings: Default::default(),
         }
     }
 
@@ -733,10 +937,10 @@ pub fn calls_g() -> Int {
         };
 
         PureExpr::Let {
-            var: "__stmt0".to_string(),
+            var: "$stmt0".to_string(),
             value: Arc::new(call(2)),
             body: Arc::new(PureExpr::Let {
-                var: "__stmt1".to_string(),
+                var: "$stmt1".to_string(),
                 value: Arc::new(call(1)),
                 body: Arc::new(unit_expr()),
             }),
@@ -744,22 +948,29 @@ pub fn calls_g() -> Int {
     }
 
     fn recursive_statement_call_prefix_body() -> PureExpr {
+        recursive_statement_call_prefix_body_calling("lemma_fib_bound")
+    }
+
+    /// The same body with the self-call spelled `callee`: whole-crate
+    /// extraction resolves a recursive call to the definition's own unique
+    /// id, source-level extraction leaves the short name.
+    fn recursive_statement_call_prefix_body_calling(callee: &str) -> PureExpr {
         let var_i = || PureExpr::Var("i".to_string(), None);
         let sub =
             |rhs: i64| PureExpr::BinOp(Arc::new(var_i()), BinOp::Sub, Arc::new(PureExpr::Int(rhs)));
         let call = |rhs: i64| PureExpr::LogicFnCall {
-            name: "lemma_fib_bound".to_string(),
+            name: callee.to_string(),
             args: vec![sub(rhs)],
         };
 
         PureExpr::Let {
-            var: "__stmt0".to_string(),
+            var: "$stmt0".to_string(),
             value: Arc::new(call(2)),
             body: Arc::new(call(1)),
         }
     }
 
-    fn recursive_statement_call_nested_if_body() -> PureExpr {
+    fn recursive_statement_call_nested_if_body_calling(callee: &str) -> PureExpr {
         let var_i = || PureExpr::Var("i".to_string(), None);
         let eq =
             |rhs: i64| PureExpr::BinOp(Arc::new(var_i()), BinOp::Eq, Arc::new(PureExpr::Int(rhs)));
@@ -770,7 +981,7 @@ pub fn calls_g() -> Int {
             Arc::new(PureExpr::Ite(
                 Arc::new(eq(1)),
                 Arc::new(unit_expr()),
-                Arc::new(recursive_statement_call_prefix_body()),
+                Arc::new(recursive_statement_call_prefix_body_calling(callee)),
             )),
         )
     }
@@ -833,6 +1044,7 @@ pub fn calls_g() -> Int {
     }
 
     fn collect_logic_defs_from_source(source: &str) -> Vec<LogicFnDef> {
+        let _registry = super::identity_test_support::registry_guard();
         let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_dir = std::env::temp_dir().join(format!(
             "trust_wp_logic_decl_only_test_{}_{}",
@@ -874,6 +1086,7 @@ pub fn calls_g() -> Int {
     fn collect_type_invariant_defs_from_source(
         source: &str,
     ) -> Vec<trust_wp_core::logic::TypeInvariantDef> {
+        let _registry = super::identity_test_support::registry_guard();
         let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_dir = std::env::temp_dir().join(format!(
             "trust_wp_logic_inv_test_{}_{}",
@@ -979,6 +1192,40 @@ pub fn calls_g() -> Int {
         let def = to_logic_fn_def(&lf).expect("valid clauses should produce logic fn def");
         assert_eq!(def.requires().len(), 1);
         assert_eq!(def.ensures().len(), 1);
+    }
+
+    /// A `#[variant]` logic fn over a machine-integer parameter carries the
+    /// type range in its requires, so the defining axiom is guarded by it
+    /// (review probe r1: `k(x: u8)` must be unconstrained at `k(400)`). A logic
+    /// fn without a variant is untouched.
+    #[test]
+    fn test_to_logic_fn_def_guards_variant_machine_int_params_by_range() {
+        let mut lf = make_logic_fn("k", "crate::specs::k", "0");
+        lf.params = vec!["x".to_string()];
+        lf.param_sort_hints = vec![Some(trust_wp_core::formula::ExprSort::Int)];
+        lf.param_int_widths = vec![Some(super::discovery::MachineIntWidth {
+            signed: false,
+            bits: 8,
+        })];
+        let plain = to_logic_fn_def(&lf).expect("valid logic fn def");
+        assert!(
+            plain.requires().is_empty(),
+            "no variant: no range requires, got {:?}",
+            plain.requires()
+        );
+
+        lf.variants = vec!["x".to_string()];
+        let guarded = to_logic_fn_def(&lf).expect("valid logic fn def");
+        let rendered: Vec<String> = guarded.requires().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            guarded.requires().len(),
+            2,
+            "u8 range must guard the definition, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|r| r.contains("255")),
+            "upper bound 255 expected, got {rendered:?}"
+        );
     }
 
     #[test]
@@ -1128,11 +1375,11 @@ impl Tr for () {
     }
 
     #[test]
-    fn test_validate_logic_laws_lenient_plain_trait_implemented_by_logic_fn() {
-        // Lenient mode (Creusot compatibility): impls may add `#[logic]`
-        // even when the trait declaration does not — this matches the
-        // Creusot pattern where trait declarations are unmarked and impls
-        // opt into logic explicitly.
+    fn test_validate_logic_laws_rejects_logic_fn_implementing_plain_trait_method() {
+        // Creusot's `can_implement`: a logic function cannot implement a
+        // program trait method. The code that runs is the logic function's
+        // erased body, and no program body owes the trait method's contract
+        // (trait_logic_impl_of_program_method_granted.rs).
         let errors = collect_logic_law_validation_errors_from_source(
             r#"
 pub trait Tr {
@@ -1147,8 +1394,8 @@ impl Tr for () {
         );
 
         assert_eq!(
-            errors, 0,
-            "lenient mode: impl may add #[logic] to a plain trait method"
+            errors, 1,
+            "a logic function cannot implement a program trait method"
         );
     }
 
@@ -1184,10 +1431,10 @@ impl Tr for () {
 
     #[test]
     fn test_validate_logic_laws_rejects_impl_added_prophetic_mode() {
-        // Strict guard (Phase 2, creusot tests/should_fail/logic_prophetic_impl.rs):
+        // Strict guard (creusot tests/should_fail/logic_prophetic_impl.rs):
         // an impl MUST NOT upgrade from the trait's default-opaque `#[logic]`
-        // mode directly to `#[logic(prophetic)]`. Creusot rejects this. The
-        // previously-lenient acceptance was a false-accept closed by Phase 2.
+        // mode directly to `#[logic(prophetic)]`. Creusot rejects this;
+        // accepting it would be a false accept.
         let errors = collect_logic_law_validation_errors_from_source(
             r#"
 pub trait Tr {
@@ -1300,7 +1547,7 @@ pub trait Tr {
 
         let f = logic_fns
             .iter()
-            .find(|logic_fn| logic_fn.name() == "f")
+            .find(|logic_fn| logic_fn.short_name() == "f")
             .expect("bodyless trait logic method should be extracted");
 
         assert_eq!(
@@ -1362,17 +1609,15 @@ impl<T> Invariant for Zero<T> {
         );
         // A multi-field tuple struct has no single underlying scalar to view, so
         // it is NOT collapsed like a newtype. The receiver sort follows the
-        // #2683 native-carrier rule (a4440d5, "partially_opaque datatype" fix):
-        // when `ty_to_expr_sort_enriched` produces a native `Datatype` carrier
-        // for the struct — the common case, including `Zero<T>` here — the
-        // call-site final-value carrier is that datatype, and the invariant's
-        // `self` must be registered under the SAME `Datatype` sort so the body
-        // axiom connects to the carrier and `tuple_get_i(self)` resolves to the
-        // native field selector. Overriding to `Tuple<N>` would desync the
-        // axiom's `self` from the carrier (spurious `&mut` postcondition
-        // failures — validated should_fail lane 94/0 false-accepts at a4440d5).
-        // The `Tuple<N>` override only applies when NO native datatype carrier
-        // exists.
+        // native-carrier rule (#2683): when `ty_to_expr_sort_enriched` produces
+        // a native `Datatype` carrier for the struct — the common case,
+        // including `Zero<T>` here — the call-site final-value carrier is that
+        // datatype, and the invariant's `self` must be registered under the
+        // SAME `Datatype` sort so the body axiom connects to the carrier and
+        // `tuple_get_i(self)` resolves to the native field selector. Overriding
+        // to `Tuple<N>` would desync the axiom's `self` from the carrier
+        // (spurious `&mut` postcondition failures). The `Tuple<N>` override
+        // only applies when NO native datatype carrier exists.
         assert_eq!(
             zero.param_sort(),
             Some(&ExprSort::Datatype(
@@ -1461,7 +1706,7 @@ pub fn nat_i3_logic<T: Nat>() -> usize {
 
         let nat_i3_logic = logic_fns
             .iter()
-            .find(|logic_fn| logic_fn.name() == "nat_i3_logic")
+            .find(|logic_fn| logic_fn.short_name() == "nat_i3_logic")
             .expect("generic assoc const logic fn should be extracted");
         let ensures_text: Vec<String> = nat_i3_logic
             .ensures()
@@ -1517,7 +1762,7 @@ mod outer {
 
         let nat_i3_logic = logic_fns
             .iter()
-            .find(|logic_fn| logic_fn.name() == "nat_i3_logic")
+            .find(|logic_fn| logic_fn.short_name() == "nat_i3_logic")
             .expect("super-qualified generic assoc const logic fn should be extracted");
         let ensures_text: Vec<String> = nat_i3_logic
             .ensures()
@@ -1578,7 +1823,8 @@ mod outer {
 #![allow(unused_variables)]
 
 #[doc = "trust-wp:logic:"]
-#[doc = "trust-wp:logic_body:{ fib(n - 1) + fib(n - 2) }"]
+#[doc = "trust-wp:logic_body:{ if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }"]
+#[doc = "trust-wp:variant:n"]
 pub fn fib(n: u64) -> u64 {
     0
 }
@@ -1594,20 +1840,31 @@ pub fn fib(n: u64) -> u64 {
         lemma_fib_bound(i - 1)
     }
 }"]
+#[doc = "trust-wp:variant:i"]
 pub fn lemma_fib_bound(i: u64) {
 }
 "#,
         );
 
+        // The #[variant] markers keep these fixtures inside Creusot's
+        // termination rule (non-structural recursion needs a variant), and
+        // both recursions are guarded so the variants genuinely decrease: an
+        // unguarded `fib(n - 1)` recurses forever (and leaves `u64` at n = 0),
+        // which the decrease proof rightly rejects.
         let lemma = logic_fns
             .iter()
-            .find(|lf| lf.name() == "lemma_fib_bound")
+            .find(|lf| lf.short_name() == "lemma_fib_bound")
             .expect("lemma_fib_bound should be extracted");
 
+        assert_ne!(
+            lemma.name(),
+            "lemma_fib_bound",
+            "every local logic definition carries a unique id",
+        );
         assert_eq!(
             lemma.body(),
-            &recursive_statement_call_nested_if_body(),
-            "source extraction should preserve recursive statement calls inside nested branch blocks",
+            &recursive_statement_call_nested_if_body_calling(lemma.name()),
+            "source extraction should preserve recursive statement calls inside nested branch blocks, resolved to the definition's own id",
         );
         assert_eq!(lemma.return_sort(), Some(ExprSort::Unit));
     }
@@ -1638,11 +1895,11 @@ pub fn is_odd(n: i32) -> bool {
 
         let is_even = logic_fns
             .iter()
-            .find(|logic_fn| logic_fn.name() == "is_even")
+            .find(|logic_fn| logic_fn.short_name() == "is_even")
             .expect("is_even should be extracted");
         let is_odd = logic_fns
             .iter()
-            .find(|logic_fn| logic_fn.name() == "is_odd")
+            .find(|logic_fn| logic_fn.short_name() == "is_odd")
             .expect("is_odd should be extracted");
 
         assert!(

@@ -9,10 +9,7 @@
 //! `QuantifierState`, `SeqState`, `AdtState`, `AssertionPipelineState`).
 //!
 //! The shell keeps `encoder/mod.rs` focused on struct definition, constants,
-//! RAII guards, and actual encoding entrypoints.
-//!
-//! See: `designs/2026-03-20-2588-encoder-shell-submodules.md`
-//! Issue: #2588
+//! RAII guards, and actual encoding entrypoints. (#2588)
 
 mod declarations;
 mod path;

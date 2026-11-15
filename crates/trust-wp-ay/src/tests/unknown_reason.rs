@@ -130,13 +130,11 @@ fn test_loop_context_builder_api_additive_evolution() {
 
     // Build context using builder API — no struct-literal coupling.
     //
-    // BUDGET (#133 mass unit adjudication, 2026-08-27): this test's own solver
-    // budget was raised 5s -> 20s as a LOAD-FLAKE guard. The VC here is trivial
-    // (`0 >= 0` initialization) and solves in 0.02s solo, measured 3/3 at this
-    // pin; in-suite it was returning `Unknown(Timeout)` because a 5s wall-clock
-    // deadline can expire while the solve is starved under full-suite
-    // parallelism. This is an API-shape test, so the deadline was never the
-    // property under test. 20s stays inside the 30s ntest budget above.
+    // BUDGET: the solver budget is a load-flake guard, not the property under
+    // test. The VC here is trivial (`0 >= 0` initialization) and solves
+    // instantly solo, but under full-suite parallelism a starved solve can
+    // outlive a short wall-clock deadline and come back `Unknown(Timeout)`.
+    // 20s is generous for this VC and stays inside the 30s ntest budget above.
     let config = LoopEncoderConfig::default().with_timeout(std::time::Duration::from_secs(20));
     let ctx = LoopVerificationContext::new(
         &[],

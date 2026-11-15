@@ -121,7 +121,8 @@ pub fn test_fn(x: Option<i32>) -> i32 {
     assert!(
         matches!(
             &fallback.expr,
-            PureExpr::Var(name, Some(ExprSort::Datatype(_))) if name == "arg0"
+            PureExpr::Var(name, Some(ExprSort::Datatype(_)))
+                if name.starts_with("$fallback_arg0_")
         ),
         "fallback arg should preserve Option<T>'s MIR datatype sort, got {:?}",
         fallback.expr

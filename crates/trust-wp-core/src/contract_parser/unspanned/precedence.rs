@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use super::super::{ContractParser, ParseError};
+use super::super::{helpers::borrows::dereference, ContractParser, ParseError, WrittenTypeSite};
 use crate::formula::{BinOp, PureExpr, UnOp};
 
 impl ContractParser<'_> {
@@ -124,12 +124,14 @@ impl ContractParser<'_> {
     pub(super) fn parse_shift(&mut self) -> Result<PureExpr, ParseError> {
         let mut left = self.parse_additive()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("<<") {
                 let right = self.parse_additive()?;
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Shl, Arc::new(right));
+                left = self.written_binop(left, BinOp::Shl, right, at)?;
             } else if self.try_consume(">>") {
                 let right = self.parse_additive()?;
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Shr, Arc::new(right));
+                left = self.written_binop(left, BinOp::Shr, right, at)?;
             } else {
                 break;
             }
@@ -141,12 +143,14 @@ impl ContractParser<'_> {
     pub(super) fn parse_additive(&mut self) -> Result<PureExpr, ParseError> {
         let mut left = self.parse_multiplicative()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("+") {
                 let right = self.parse_multiplicative()?;
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Add, Arc::new(right));
+                left = self.written_binop(left, BinOp::Add, right, at)?;
             } else if self.try_consume("-") {
                 let right = self.parse_multiplicative()?;
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Sub, Arc::new(right));
+                left = self.written_binop(left, BinOp::Sub, right, at)?;
             } else {
                 break;
             }
@@ -158,9 +162,11 @@ impl ContractParser<'_> {
     pub(super) fn parse_multiplicative(&mut self) -> Result<PureExpr, ParseError> {
         let mut left = self.parse_cast()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume("*") {
                 let right = self.parse_cast()?;
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Mul, Arc::new(right));
+                left = self.written_binop(left, BinOp::Mul, right, at)?;
             } else if self.try_consume("/") {
                 let right = self.parse_cast()?;
                 // Creusot models the `/` operator on `Int` as
@@ -169,14 +175,14 @@ impl ContractParser<'_> {
                 // to `BinOp::DivTrunc` so contract division matches the signed
                 // machine body (also `DivTrunc`). `div_euclid` stays Euclidean
                 // (`BinOp::Div`). See trust-wp-divmod-semantics.
-                left = PureExpr::BinOp(Arc::new(left), BinOp::DivTrunc, Arc::new(right));
+                left = self.written_binop(left, BinOp::DivTrunc, right, at)?;
             } else if self.try_consume("%") {
                 let right = self.parse_cast()?;
-                // `%` stays Euclidean (`BinOp::Mod`): trust-wp-std's wrapping
-                // arithmetic specs reduce a possibly-negative dividend modulo
-                // `2^n` and rely on the non-negative Euclidean remainder. Only
-                // `/` is reclassified to truncated. See trust-wp-divmod-semantics.
-                left = PureExpr::BinOp(Arc::new(left), BinOp::Mod, Arc::new(right));
+                // Creusot's `%` on `Int` is `int.ComputerDivision.mod`
+                // (truncating, sign of the dividend: `-3 % 2 == -1`). Lower it
+                // to `BinOp::RemTrunc`; the Euclidean remainder is spelled
+                // `a.rem_euclid(b)`. `x % 0` stays unspecified.
+                left = self.written_binop(left, BinOp::RemTrunc, right, at)?;
             } else {
                 break;
             }
@@ -187,22 +193,26 @@ impl ContractParser<'_> {
     /// Parse cast expressions (`expr as Type`) and type ascriptions
     /// (`expr : Type`).
     ///
-    /// Casts are currently treated as logical no-ops so contracts using
-    /// pointer/integer cast syntax can be parsed and encoded. Pearlite type
-    /// ascriptions (`(term : Type)`) are likewise transparent: the ascribed
-    /// type is parsed and discarded, and the inner expression is returned
-    /// unchanged. The `: Type` is only consumed when a single `:` (not `::`)
-    /// follows; quantifier/closure/let binders and struct fields consume their
-    /// `:` before reaching expression parsing, so there is no collision.
+    /// A cast is Rust's `as` between integer types, lowered to exact integer
+    /// arithmetic, or a parse error naming it (`lower_cast`); it is never its
+    /// operand. A Pearlite ascription (`(term : Type)`) keeps the operand's
+    /// value and states its sort (`ascribe`). The `: Type` is only consumed
+    /// when a single `:` (not `::`) follows; quantifier/closure/let binders
+    /// and struct fields consume their `:` before reaching expression
+    /// parsing, so there is no collision.
     pub(super) fn parse_cast(&mut self) -> Result<PureExpr, ParseError> {
-        let expr = self.parse_view()?;
+        let mut expr = self.parse_view()?;
         loop {
+            self.skip_whitespace();
+            let at = self.position;
             if self.try_consume_keyword("as") {
                 self.skip_whitespace();
-                self.consume_type_annotation()?;
+                let (_, text) = self.consume_written_type_text(WrittenTypeSite::Cast)?;
+                expr = self.lower_cast(expr, &text, at)?;
             } else if self.try_consume_single_colon() {
                 self.skip_whitespace();
-                self.consume_type_annotation()?;
+                let (sort, text) = self.consume_written_type_text(WrittenTypeSite::Ascription)?;
+                expr = self.ascribe(expr, sort.as_ref(), &text, "type ascription", at)?;
             } else {
                 break;
             }
@@ -224,12 +234,13 @@ impl ContractParser<'_> {
     /// RustHorn/Creusot-style operators:
     /// - `*v`: Dereference (current value of borrow)
     /// - `^v`: Final/prophecy value (value when borrow ends)
-    /// - `&mut v` / `&v`: Reference operators (transparent in contract logic)
+    /// - `&mut v` / `&v`: Reference operators (the AST keeps the operand)
     pub(super) fn parse_unary(&mut self) -> Result<PureExpr, ParseError> {
         self.skip_whitespace();
+        let at = self.position;
         if self.try_consume("!") {
             let operand = self.parse_unary()?;
-            return Ok(PureExpr::UnOp(UnOp::Not, Arc::new(operand)));
+            return self.written_not(operand, at);
         }
         if self.try_consume("~") {
             let operand = self.parse_unary()?;
@@ -239,27 +250,29 @@ impl ContractParser<'_> {
         if self.peek() == Some('-') && !self.is_negative_literal() {
             self.advance();
             let operand = self.parse_unary()?;
-            return Ok(PureExpr::UnOp(UnOp::Neg, Arc::new(operand)));
+            return self.written_neg(operand, at);
         }
-        // Dereference: *v (current value of mutable borrow)
+        // Dereference: *v (current value of a borrow). `*` of a borrow is the
+        // borrowed value (`helpers/borrows.rs`).
         if self.try_consume("*") {
             let operand = self.parse_unary()?;
-            return Ok(PureExpr::Deref(Arc::new(operand)));
+            return Ok(dereference(operand));
         }
-        // Final/prophecy: ^v (value when borrow ends)
+        // Final/prophecy: ^v (value when borrow ends); never of a borrow.
         if self.try_consume("^") {
             let operand = self.parse_unary()?;
-            return Ok(PureExpr::Final(Arc::new(operand)));
+            return self.final_value(operand, "^");
         }
-        // Reference operators: &mut expr / &expr
-        // In contract logic, references are transparent — the reference operator
-        // is parsed but does not change the logical value. This allows Creusot
-        // contracts like `result == &mut r.0` to parse correctly.
+        // Reference operators: &mut expr / &expr. The finished AST has no
+        // borrow node: `*` reads through the borrow, and otherwise the
+        // operand stands for it (`result == &mut r.0` parses) and the borrow
+        // is recorded (`helpers/borrows.rs`).
+        let borrow_start = self.position;
         if self.try_consume_single_ampersand() {
             self.skip_whitespace();
             self.try_consume_keyword("mut");
             let operand = self.parse_unary()?;
-            return Ok(operand);
+            return Ok(self.borrow(borrow_start, operand));
         }
         self.parse_postfix()
     }

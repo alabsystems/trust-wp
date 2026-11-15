@@ -21,7 +21,7 @@ impl Meas for i32 {
     where
         Self: Sized,
     {
-        5
+        5i32
     }
 }
 

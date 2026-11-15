@@ -27,8 +27,17 @@
 //!
 //! Part of #459 (Creusot compat shim).
 
-// Make `trust_wp_std` available as an extern crate so that proc macro expansions
-// using `::trust_wp_std::...` paths resolve correctly in downstream crates.
+// `trust_wp_std` re-exported as an item, so `creusot_contracts::trust_wp_std::...` names
+// it and a downstream `use creusot_contracts::*;` brings the name into scope.
+//
+// It does NOT put `trust_wp_std` in a downstream crate's EXTERN PRELUDE — a
+// `pub extern crate` re-export never does — so it is not what makes the
+// ABSOLUTE `::trust_wp_std::...` paths that contract macros expand to
+// resolve. That is done by the trust-wp driver, which adds `--extern
+// trust_wp_std` to every crate it compiles with contracts
+// (`trust-wp-driver` `inject_spec_tc_extern`); the claim that this line did
+// it was false, and a crate depending on `creusot-contracts` alone failed every contract
+// with `error[E0433]: cannot find `trust_wp_std` in the crate root`.
 pub extern crate trust_wp_std;
 
 // Re-export all proc macros and modules from trust-wp.

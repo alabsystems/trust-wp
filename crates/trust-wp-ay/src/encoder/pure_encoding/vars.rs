@@ -234,14 +234,12 @@ impl AYEncoder {
             Some(prefixed) => Cow::Owned(prefixed.clone()),
             None => Cow::Borrowed(name),
         };
-        // Sort authority cutover (#1965): pre-declared variables use their
-        // existing sort directly, bypassing the hint cascade entirely.
+        // Sort authority (#1965): pre-declared variables use their existing
+        // sort directly, bypassing the hint cascade entirely.
         // `predeclare_collected_vars` determines sorts from complete evidence
         // across ALL expression sources; the cascade can only disagree, never
         // improve. The cascade remains as fallback for synthesized variables
         // not present in input expressions (_current, _final, _view, etc.).
-        //
-        // See: designs/2026-03-08-1965-sort-authority-cutover.md Step 1.
         let sort = if let Some(existing_sort) = self.var_sort(var_name.as_ref()) {
             // Variable was pre-declared by predeclare_collected_vars,
             // predeclare_datatype_vars, or a prior encoding step.
@@ -249,7 +247,7 @@ impl AYEncoder {
             existing_sort.clone()
         } else {
             // Variable was NOT pre-declared (synthesized name, _current/_final
-            // suffix, or other non-input variable). Fall back to old cascade.
+            // suffix, or other non-input variable). Fall back to the cascade.
             self.resolve_var_sort_or_int_with_annotation(&var_name, sort_ann)
         };
         // Track unit-sorted variables for singleton axiom generation.

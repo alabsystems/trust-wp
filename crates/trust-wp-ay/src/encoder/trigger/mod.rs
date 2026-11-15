@@ -463,7 +463,12 @@ pub(crate) fn synthesize_triggers(vars: &[String], body: &PureExpr) -> Vec<Vec<P
                 .collect();
             for candidate in &mut candidates {
                 if consequent_ptrs.contains(&(candidate.expr as *const PureExpr)) {
-                    candidate.score -= TRUST_WP_IMPLICATION_CONSEQUENT_BONUS;
+                    // Lower score is better, so saturating at i32::MIN keeps the
+                    // ordering these bonuses exist to produce; wrapping would send
+                    // the best candidate to the bottom of the ranking.
+                    candidate.score = candidate
+                        .score
+                        .saturating_sub(TRUST_WP_IMPLICATION_CONSEQUENT_BONUS);
                 }
             }
         }
@@ -485,7 +490,9 @@ pub(crate) fn synthesize_triggers(vars: &[String], body: &PureExpr) -> Vec<Vec<P
             // Apply bonus to candidates whose expr pointer matches an equality operand candidate.
             for candidate in &mut candidates {
                 if equality_operand_ptrs.contains(&(candidate.expr as *const PureExpr)) {
-                    candidate.score -= TRUST_WP_EQUALITY_OPERAND_BONUS;
+                    candidate.score = candidate
+                        .score
+                        .saturating_sub(TRUST_WP_EQUALITY_OPERAND_BONUS);
                 }
             }
         }

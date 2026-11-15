@@ -346,7 +346,7 @@ fn ay_cli_proof_trusted_reason_string_maps_to_proof_trusted() {
 /// it explicitly across an ay pin bump:
 ///
 /// ```sh
-/// AY_BIN=/path/to/ay cargo test -p trust-wp-ay --test strict_proof_trust_gate
+/// AY_BIN=/path/to/ay targo --unverified test -p trust-wp-ay --test strict_proof_trust_gate
 /// ```
 #[test]
 fn ay_binary_strict_proofs_downgrades_trust_bearing_unsat() {

@@ -2,19 +2,13 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Binary/unary operation translation and float-to-int lowering.
-
-use std::sync::Arc;
+//! Binary/unary operation translation.
 
 use rustc_middle::{
     mir::{BinOp as MirBinOp, UnOp as MirUnOp},
-    ty::{IntTy, TyKind, UintTy},
+    ty::{IntTy, UintTy},
 };
-use trust_wp_core::formula::{
-    int_bounds::{signed_bounds_expr, unsigned_max_expr},
-    internal::builtins::REAL_TO_INT_FLOOR_LOGIC_FN,
-    BinOp, ExprSort, FloatBits, PureExpr, UnOp,
-};
+use trust_wp_core::formula::{BinOp, UnOp};
 
 /// Translate MIR BinOp to trust-wp BinOp.
 ///
@@ -62,78 +56,6 @@ pub(crate) fn translate_unop(op: MirUnOp, bool_operand: bool) -> Option<UnOp> {
         MirUnOp::Neg => Some(UnOp::Neg),
         MirUnOp::PtrMetadata => None, // Not supported in pure function translation
     }
-}
-
-/// Build `ite(t < lo, lo, ite(t > hi, hi, t))` clamping `t` to `[lo, hi]`.
-fn clamp_expr(t: PureExpr, lo: PureExpr, hi: PureExpr) -> PureExpr {
-    PureExpr::Ite(
-        Arc::new(PureExpr::BinOp(
-            Arc::new(t.clone()),
-            BinOp::Lt,
-            Arc::new(lo.clone()),
-        )),
-        Arc::new(lo),
-        Arc::new(PureExpr::Ite(
-            Arc::new(PureExpr::BinOp(
-                Arc::new(t.clone()),
-                BinOp::Gt,
-                Arc::new(hi.clone()),
-            )),
-            Arc::new(hi),
-            Arc::new(t),
-        )),
-    )
-}
-
-/// Lower a `FloatToInt` cast to `PureExpr` using truncation toward zero + clamping.
-///
-/// Rust semantics: `x as i32` truncates toward zero and saturates to the
-/// target range. NaN → 0, but trust-wp's Real model excludes NaN so we only
-/// handle the finite path.
-///
-/// Generated shape: `let t = trunc_zero(x) in clamp(t, bounds...)`
-/// where `trunc_zero(x) = ite(x >= 0, floor(x), -floor(-x))`.
-pub(super) fn lower_float_to_int(arg: PureExpr, target_kind: &TyKind<'_>) -> Option<PureExpr> {
-    let zero = PureExpr::Float(FloatBits::from_f64(0.0));
-    let floor = |e| PureExpr::LogicFnCall {
-        name: REAL_TO_INT_FLOOR_LOGIC_FN.to_string(),
-        args: vec![e],
-    };
-
-    // trunc_zero(x) = ite(x >= 0.0, floor(x), -floor(-x))
-    let trunc = PureExpr::Ite(
-        Arc::new(PureExpr::BinOp(
-            Arc::new(arg.clone()),
-            BinOp::Ge,
-            Arc::new(zero),
-        )),
-        Arc::new(floor(arg.clone())),
-        Arc::new(PureExpr::UnOp(
-            UnOp::Neg,
-            Arc::new(floor(PureExpr::UnOp(UnOp::Neg, Arc::new(arg)))),
-        )),
-    );
-
-    let trunc_var = "__trust_wp_float_to_int_trunc".to_string();
-    let trunc_ref = PureExpr::Var(trunc_var.clone(), Some(ExprSort::Int));
-
-    let body = match target_kind {
-        TyKind::Int(int_ty) => {
-            let (min, max) = signed_bounds_expr(int_ty_bits(*int_ty));
-            clamp_expr(trunc_ref, min, max)
-        }
-        TyKind::Uint(uint_ty) => {
-            let max = unsigned_max_expr(uint_ty_bits(*uint_ty));
-            clamp_expr(trunc_ref, PureExpr::Int(0), max)
-        }
-        _ => return None,
-    };
-
-    Some(PureExpr::Let {
-        var: trunc_var,
-        value: Arc::new(trunc),
-        body: Arc::new(body),
-    })
 }
 
 #[allow(clippy::cast_possible_truncation)] // isize size always fits u32

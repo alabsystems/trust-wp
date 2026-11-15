@@ -1435,7 +1435,7 @@ mod sep_logic_encoding_tests {
     fn test_extract_footprint_names_empty_for_pure() {
         let formula = Formula::Pure(PureExpr::Bool(true));
         let footprint = extract_footprint_names(&formula);
-        assert!(footprint.is_empty());
+        assert_eq!(footprint, Vec::<String>::new());
     }
 
     #[test]

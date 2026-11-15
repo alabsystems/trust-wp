@@ -72,9 +72,9 @@ impl AYEncoder {
     /// - Only fires for the `Uninterpreted("TupleN")` carrier. Datatype-sorted
     ///   receivers keep their enum-payload/native-selector routes untouched.
     /// - Returns `None` when the declared constructors disagree on the
-    ///   component sort (ambiguous carrier) — behavior falls back to today's.
-    /// - Returns `None` for an `Int` component (today's default), so the
-    ///   Int-lane getters (e.g. `result.0@`) are byte-identical to before.
+    ///   component sort (ambiguous carrier) — the getter keeps the Int default.
+    /// - Returns `None` for an `Int` component (the default), so the Int-lane
+    ///   getters (e.g. `result.0@`) are never refined.
     pub(in crate::encoder) fn tuple_getter_return_sort_from_ctor_domain(
         &self,
         index: usize,
@@ -124,11 +124,12 @@ impl AYEncoder {
     ///
     /// The driver's substitution pipeline reaches a payload binder through a
     /// positional getter chain (`tuple_get_0(tuple_get_0(call))` for the
-    /// `Option<(&mut T, ..)>` shape). Those getters previously defaulted to
-    /// `Int` — the prophecy slot was erased one step before the binder even
-    /// though the receiver's SORT NAME states the element sorts exactly.
+    /// `Option<(&mut T, ..)>` shape). Without this derivation those getters
+    /// default to `Int` — the prophecy slot is erased one step before the
+    /// binder even though the receiver's SORT NAME states the element sorts
+    /// exactly.
     ///
-    /// This derivation is authoritative rather than inferential: the name was
+    /// This derivation is authoritative rather than inferential: the name is
     /// minted by `mutref_carrier_tuple_sort_name` /
     /// `mutref_instantiated_option_name` from the payload's real type. It is
     /// consulted BEFORE the ctor-domain derivation for that reason.
@@ -354,8 +355,8 @@ impl AYEncoder {
             // derive the component sort from the declared `__trust_wp_tupleN`
             // constructor's domain. The ctor placeholder knows the true
             // component sorts (e.g. [Int, Uninterpreted("List")] -> Tuple2)
-            // while the getters previously defaulted to Int, so passing
-            // `get_1(t)` to a logic fn with a non-Int domain forced an
+            // while an unrefined getter defaults to Int, so passing
+            // `get_1(t)` to a logic fn with a non-Int domain would force an
             // [apply-coerce] fresh unconstrained constant — corrupting the
             // recursive-logic-fn one-step unfolding facts and tripping the
             // SpecAxiomDropped demotion guard on contracts whose VCs already
@@ -480,8 +481,9 @@ impl AYEncoder {
     /// This is the common implementation for `encode_logic_fn_call_impl`.
     /// It handles function declaration lookup/creation and application.
     ///
-    /// `arg_exprs` is used to infer parameter sorts for placeholder declarations
-    /// when the function has not been registered yet. `None` is only valid for
+    /// `arg_exprs` supplies the expression context for inferring parameter sorts
+    /// of placeholder declarations when the function has not been registered
+    /// yet. `None` is only valid for
     /// the Bool→Int coercion fallback used by `Some/Ok/Err`; all other placeholder
     /// paths must provide expression context for sort inference. (#1608)
     pub(crate) fn apply_logic_fn(
@@ -498,8 +500,15 @@ impl AYEncoder {
         // placeholder path. This ensures `Self::f()` uses the same UF symbol as
         // `f()`, preserving axiom congruence and sort information.
         let (resolved_name, resolved_smt_name) = self.resolve_logic_fn_call_name_for_decl(name);
-        let name = resolved_name;
-        let smt_name = resolved_smt_name;
+        // Logic-function identity: a colliding short name denotes ONE
+        // definition, chosen on the encoded receiver, or the call is refused.
+        let family_id = self.resolve_logic_fn_family_call(resolved_name, arg_terms, arg_exprs)?;
+        let name: &str = family_id.as_deref().unwrap_or(resolved_name);
+        let smt_name = if family_id.is_some() {
+            trust_wp_core::logic::logic_fn_smt_name(name)
+        } else {
+            resolved_smt_name
+        };
 
         // Seq-literal builtins must NEVER become placeholder UFs, mirroring
         // the dispatch-level routing (`encode_logic_fn_call_impl`): `seq![v]`
@@ -509,9 +518,9 @@ impl AYEncoder {
         // then infers a context return sort (observed live: `s@ == seq!['Ã']`
         // with `s: String` inferring ret=Datatype("String")) and the
         // declaration `logic_seq__placeholder_i__ret_d537472696e67` panics in
-        // ay-dpll's core-identity gate (function_declarations.rs) — the third
-        // declare-collision route beyond #2706's two. (ce-census 2026-08-20,
-        // cc/string test_string_len encoder panic)
+        // ay-dpll's core-identity gate (function_declarations.rs) — a
+        // declare-collision route of the same class as #2706 (cc/string
+        // test_string_len encoder panic).
         if name == "seq" && arg_terms.len() == 1 {
             return Ok(self.encode_seq_singleton(arg_terms[0]));
         }
@@ -577,8 +586,8 @@ impl AYEncoder {
                         );
 
                         let fresh_name = format!("__apply_coerce_{name}_{i}_{}", self.var_count());
-                        // Fresh const is conservative (unconstrained) — reclassified
-                        // from HIGH to LOW per #2231.
+                        // Fresh const is conservative (unconstrained), so this
+                        // bridge is LOW severity, not HIGH (#2231).
                         unsoundness::increment(
                             unsoundness::UnsoundnessCategory::SortCoercionBridge,
                         );
@@ -603,6 +612,17 @@ impl AYEncoder {
         } else {
             // Function not registered - create a placeholder declaration.
             // Infer parameter sorts from argument expressions when available.
+            crate::encoder::logic_fn::note_logic_fn_placeholder(name);
+            // A unique logic-function id names ONE definition; reaching it
+            // without that definition registered means a producer lost the
+            // definition, and an unconstrained stand-in would hide it.
+            if name.starts_with(trust_wp_core::logic::identity::LOGIC_FN_ID_PREFIX)
+                && !name.starts_with(trust_wp_core::logic::identity::LOGIC_FN_EXTERN_DECL_PREFIX)
+            {
+                return Err(EncodingError::unsupported(format!(
+                    "logic function `{name}` is called but its definition is not registered"
+                )));
+            }
             let param_sorts: Vec<Sort> = if let Some(exprs) = arg_exprs {
                 let mut sorts = Vec::with_capacity(exprs.len());
                 for (i, expr) in exprs.iter().enumerate() {
@@ -612,10 +632,9 @@ impl AYEncoder {
                     // match the actual term sorts, since safe_apply validates
                     // sort compatibility. Expression-level inference can diverge
                     // from post-encoding term sorts in both directions:
-                    // - Inferred Int, actual Datatype (Seq, OptionInt) — original
-                    //   case from #994
-                    // - Inferred Datatype, actual Int — when UF fallback was used
-                    //   or TypeParam→Int mapping from #2551 applies (#2565)
+                    // - Inferred Int, actual Datatype (Seq, OptionInt) (#994)
+                    // - Inferred Datatype, actual Int — when the UF fallback is
+                    //   used or the TypeParam→Int mapping applies (#2551, #2565)
                     // Always prefer the actual term sort as ground truth.
                     if let Some(term) = arg_terms.get(i) {
                         let actual = self.solver.get_sort(*term);
@@ -668,7 +687,7 @@ impl AYEncoder {
             // a single monomorphic symbol for all return sorts lets the first
             // call lock the declaration for the entire query, so a later Bool
             // use of the same name after an Int use can panic in `implies`.
-            // Give nullary placeholders sort-specific SMT names instead. (#2169 audit)
+            // Give nullary placeholders sort-specific SMT names instead. (#2169)
             //
             // Extend the same signature-keying to non-nullary placeholders too.
             // A single raw SMT name lets the first declaration lock in one domain
@@ -678,8 +697,8 @@ impl AYEncoder {
             let decl_key = Self::placeholder_smt_name(&smt_name, &param_sorts, &return_sort);
             // Keep placeholder declarations signature-keyed only. Reintroducing
             // raw-name aliases makes the first declaration win across mixed
-            // sorts, which is exactly the collision pattern fixed by the
-            // placeholder split. Consumer layers that need a canonical Int-model
+            // sorts, which is exactly the collision pattern signature-keying
+            // exists to prevent. Consumer layers that need a canonical Int-model
             // constructor must scan the placeholder family explicitly. (#2274)
             let is_new_decl = !self.has_logic_func_decl(&decl_key);
             let func_decl =
@@ -806,15 +825,15 @@ mod tests {
         );
     }
 
-    // ── CE-census 2026-08-20 pin: seq builtins never become placeholders ──
+    // ── Pin: seq builtins never become placeholders ──
 
     /// `apply_logic_fn("seq", [v])` must route to the axiom-backed
     /// `seq_singleton`, never to a placeholder UF declaration. Reaching the
     /// placeholder path infers a context-dependent return sort (observed
     /// live: ret=Datatype("String") for `s@ == seq!['Ã']` with `s: String`)
     /// whose declaration panics in ay-dpll's core-identity gate — the
-    /// cc/string test_string_len encoder panic (declare-collision route #3
-    /// beyond #2706's two).
+    /// cc/string test_string_len encoder panic (a declare-collision route of
+    /// the same class as #2706).
     #[test]
     #[timeout(30000)]
     fn seq_singleton_builtin_never_becomes_placeholder_uf() {
@@ -1480,7 +1499,7 @@ mod tests {
 
     /// CONSERVATIVE GUARD: conflicting ctor domains for the same carrier
     /// ((Int, List) vs (Int, Int)) make component derivation ambiguous — the
-    /// getter must stay on the Int default (today's behavior).
+    /// getter must stay on the Int default.
     #[test]
     #[timeout(30000)]
     fn tuple_getter_stays_int_on_conflicting_ctor_domains() {
@@ -1510,8 +1529,8 @@ mod tests {
         );
     }
 
-    /// INT-LANE UNCHANGED: an Int component (index 0 of (Int, List)) keeps
-    /// the Int-sorted getter exactly as before the refinement.
+    /// INT-LANE CONTROL: an Int component (index 0 of (Int, List)) keeps the
+    /// Int-sorted getter; ctor-domain refinement never fires for Int components.
     #[test]
     #[timeout(30000)]
     fn tuple_getter_index0_int_component_stays_int() {

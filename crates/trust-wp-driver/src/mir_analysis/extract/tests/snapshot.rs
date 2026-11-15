@@ -141,10 +141,10 @@ impl Callbacks for SnapshotSubstitutionCallbacks {
                     .find_map(|(bb_idx, bb_data)| {
                         bb_data.statements.iter().enumerate().find_map(
                             |(stmt_idx, stmt)| match stmt.kind {
-                                StatementKind::Assign(box (
+                                StatementKind::Assign((
                                     _,
                                     Rvalue::Aggregate(
-                                        box rustc_middle::mir::AggregateKind::Closure(_, _),
+                                        rustc_middle::mir::AggregateKind::Closure(_, _),
                                         _,
                                     ),
                                 )) => Some(Location {
@@ -406,6 +406,8 @@ pub fn caller_with_snapshot(x: i32) -> i32 {
 "#;
 
     let lemma_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: Vec::new(),
         ensures: vec!["x >= 0".to_string()],
         param_names: Some(vec!["x".to_string()]),
@@ -467,6 +469,8 @@ pub fn caller_snapshot_capture(x: i32) -> i32 {
 "#;
 
     let lemma_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: Vec::new(),
         ensures: vec!["x >= 0".to_string()],
         param_names: Some(vec!["x".to_string()]),
@@ -498,10 +502,11 @@ pub fn caller_snapshot_capture(x: i32) -> i32 {
 /// lookup) rather than user_specs (DefId-based lookup), the postconditions
 /// should still be injected as assumptions.
 ///
-/// This uses a custom callback that discovers the actual `def_path_str` for the
-/// lemma at runtime and registers it in `extern_specs`. For local crate items,
-/// `def_path_str` omits the crate prefix (e.g., `my_extern_lemma` not
-/// `crate_name::my_extern_lemma`), matching how `resolve_call` performs lookups.
+/// The lemma is a FOREIGN std function (`core::mem::drop`) registered in
+/// `extern_specs` under its printed paths, as a user `extern_spec!` would
+/// register it. (A local function never receives a path-keyed spec: its printed
+/// path omits the crate, so a local lookalike could otherwise steal a library
+/// contract — see `provenance.rs`.)
 ///
 /// Regression test for #2299: extern_spec path for snapshot lemma calls.
 #[test]
@@ -521,30 +526,20 @@ fn cfg_trust_wp_snapshot_block_extern_spec_lemma_preserves_postconditions() {
             let target_suffix = format!("::{}", self.target_fn_name);
 
             let mut target_def_id = None;
-            let mut lemma_path = None;
             for local_def_id in tcx.hir_body_owners() {
                 let def_path = tcx.def_path_str(local_def_id);
                 if def_path == self.target_fn_name || def_path.ends_with(&target_suffix) {
                     target_def_id = Some(local_def_id);
-                }
-                // Discover the actual extern_spec path by matching the short name
-                if def_path == self.lemma_short_name
-                    || def_path.ends_with(&format!("::{}", self.lemma_short_name))
-                {
-                    lemma_path = Some(def_path);
                 }
             }
 
             let Some(target_def_id) = target_def_id else {
                 panic!("target function `{}` not found", self.target_fn_name);
             };
-            let Some(lemma_path) = lemma_path else {
-                panic!("lemma function `{}` not found", self.lemma_short_name);
-            };
-
-            // Register the lemma via extern_specs using the actual def_path_str
+            // Register the foreign lemma via extern_specs under its printed paths.
             let mut extern_specs = HashMap::new();
-            extern_specs.insert(lemma_path, self.lemma_spec.clone());
+            extern_specs.insert(self.lemma_short_name.clone(), self.lemma_spec.clone());
+            extern_specs.insert("std::mem::drop".to_string(), self.lemma_spec.clone());
 
             let body = tcx.optimized_mir(target_def_id.to_def_id());
             let arg_names = resolve_arg_names_or_warn(tcx, target_def_id.to_def_id(), None);
@@ -575,15 +570,11 @@ pub mod trust_wp_std {
     }
 }
 
-pub fn my_extern_lemma(_x: i32) {
-    // Body is irrelevant — the spec comes from extern_specs
-}
-
 pub fn caller_with_extern_spec_lemma(x: i32) -> i32 {
     let _snap: trust_wp_std::ghost::Snapshot<()> = {
         #[cfg(trust_wp)]
         {
-            my_extern_lemma(x);
+            ::core::mem::drop(x);
         }
         trust_wp_std::ghost::Snapshot::new_phantom()
     };
@@ -617,6 +608,8 @@ pub fn caller_with_extern_spec_lemma(x: i32) -> i32 {
     ];
 
     let lemma_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: Vec::new(),
         ensures: vec!["x >= 0".to_string()],
         param_names: Some(vec!["x".to_string()]),
@@ -624,7 +617,7 @@ pub fn caller_with_extern_spec_lemma(x: i32) -> i32 {
 
     let mut callbacks = SnapshotExternSpecCallbacks {
         target_fn_name: "caller_with_extern_spec_lemma".to_string(),
-        lemma_short_name: "my_extern_lemma".to_string(),
+        lemma_short_name: "core::mem::drop".to_string(),
         lemma_spec,
         assumptions: None,
         ran: false,
@@ -766,6 +759,8 @@ pub fn caller_with_multiple_lemmas(x: i32, y: i32) -> i32 {
             (
                 "lemma_a".to_string(),
                 StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: Vec::new(),
                     ensures: vec!["x >= 0".to_string()],
                     param_names: Some(vec!["x".to_string()]),
@@ -774,6 +769,8 @@ pub fn caller_with_multiple_lemmas(x: i32, y: i32) -> i32 {
             (
                 "lemma_b".to_string(),
                 StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: Vec::new(),
                     ensures: vec!["y < 100".to_string()],
                     param_names: Some(vec!["y".to_string()]),

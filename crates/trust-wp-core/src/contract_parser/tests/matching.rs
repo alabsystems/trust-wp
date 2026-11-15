@@ -182,16 +182,15 @@ fn test_match_wildcard_pattern() {
     }
 }
 
+/// A `match` whose first arm cannot fail is that arm, its binding the value.
 #[test]
 fn test_match_variable_binding() {
-    let expr = parse_ok("match x { y => y + 1 }");
-
-    if let PureExpr::Match { ref arms, .. } = expr {
-        assert_eq!(arms.len(), 1);
-        assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "y"));
-    } else {
-        panic!("expected Match expression, got {expr:?}");
-    }
+    assert_eq!(parse_ok("match x { y => y + 1 }").to_string(), "(x + 1)");
+    let expr = parse_ok("match f(x) { y => y + 1 }");
+    let PureExpr::Let { ref var, .. } = expr else {
+        panic!("expected the binding as a Let, got {expr:?}");
+    };
+    assert_eq!(var, "y");
 }
 
 #[test]
@@ -294,26 +293,19 @@ fn test_match_error_missing_brace() {
 
 #[test]
 fn test_match_underscore_prefixed_binding() {
-    // _unused should be treated as a binding, not wildcard
-    let expr = parse_ok("match x { _unused => 0 }");
-
-    if let PureExpr::Match { ref arms, .. } = expr {
-        assert_eq!(arms.len(), 1);
-        // _unused should be parsed as Binding, not Wildcard
-        assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "_unused"));
-    } else {
+    // `_unused` and `__x` are bindings, not wildcards: each binds the value.
+    let expr = parse_ok("match x { Some(_unused) => _unused, None => 0 }");
+    let PureExpr::Match { ref arms, .. } = expr else {
         panic!("expected Match expression, got {expr:?}");
-    }
-
-    // __x (double underscore) should also be a binding
-    let expr2 = parse_ok("match x { __x => __x + 1 }");
-
-    if let PureExpr::Match { ref arms, .. } = expr2 {
-        assert_eq!(arms.len(), 1);
-        assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "__x"));
-    } else {
-        panic!("expected Match expression, got {expr2:?}");
-    }
+    };
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { inner: Some(inner), .. }
+        if matches!(inner.as_ref(), Pattern::Binding(name) if name == "_unused"))
+    );
+    assert_eq!(
+        parse_ok("match x { __x => __x + 1 }").to_string(),
+        "(x + 1)"
+    );
 }
 
 #[test]
@@ -767,29 +759,33 @@ fn test_positional_constructor_not_encoded() {
     ));
 }
 
-/// Reference patterns `&pat` are transparent in the logical model.
-/// Creusot's bdd.rs uses `Bdd(&If { childt, childf, .. }, _)` to match
-/// through a reference field. The `&` should be consumed and the inner
-/// pattern parsed (mirroring `box`-pattern handling).
+/// A reference pattern `&pat` in an arm that can fail is parsed through
+/// (Creusot's bdd.rs `Bdd(&If { childt, childf, .. }, _)`); in an arm that
+/// cannot fail it binds as a `let` does: `x` is the referent.
 #[test]
 fn test_match_reference_pattern_transparent() {
-    let expr = parse_ok("match v { &x => x, _ => 0 }");
+    let expr = parse_ok("match v { Some(&x) => x, _ => 0 }");
     let PureExpr::Match { ref arms, .. } = expr else {
         unreachable!("expected Match, got {expr:?}");
     };
     assert_eq!(arms.len(), 2);
-    // First arm: `&x` parses as just `x` binding
-    assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "x"));
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { inner: Some(inner), .. }
+        if matches!(inner.as_ref(), Pattern::Binding(name) if name == "x"))
+    );
+    assert_eq!(
+        parse_ok("match v { &x => x, _ => 0 }").to_string(),
+        "let x = *v; x"
+    );
 }
 
 /// `&mut pat` is also transparent.
 #[test]
 fn test_match_reference_mut_pattern_transparent() {
-    let expr = parse_ok("match v { &mut x => x, _ => 0 }");
-    let PureExpr::Match { ref arms, .. } = expr else {
-        unreachable!("expected Match, got {expr:?}");
-    };
-    assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "x"));
+    assert_eq!(
+        parse_ok("match v { &mut x => x, _ => 0 }").to_string(),
+        "let x = *v; x"
+    );
 }
 
 /// Reference pattern inside tuple-struct constructor: `Bdd(&If { v, .. }, _)`.
@@ -818,10 +814,11 @@ fn test_match_tuple_ctor_with_reference_struct_pattern() {
         panic!("expected Tuple inner pattern, got {inner:?}");
     };
     assert_eq!(fields.len(), 2);
-    // First field: struct pattern `If { childt, childf, .. }`
+    // First field: struct pattern `If { childt, childf, .. }`, carrying its
+    // field names and rest marker for the driver's placement pass.
     assert!(matches!(
         &fields[0],
-        Pattern::Constructor { name, .. } if name == "If"
+        Pattern::Constructor { name, .. } if name == "If{childt,childf,..}"
     ));
     // Second field: wildcard
     assert!(matches!(&fields[1], Pattern::Wildcard));
@@ -919,5 +916,22 @@ fn test_match_char_literal_pattern_invalid_escape_errors() {
     assert!(
         err.is_err(),
         "expected parse error for invalid escape '\\q', got Ok: {err:?}"
+    );
+}
+
+/// `(p)` is `p` parenthesized, as in Rust. Read as a one-element tuple, `(a)`
+/// bound `a` to a field the value does not have.
+#[test]
+fn a_parenthesized_pattern_is_its_inner_pattern() {
+    assert_eq!(parse_ok("{ let (a) = x; a + 1 }").to_string(), "(x + 1)");
+    assert_eq!(parse_ok("match x { (a) => a + 1 }").to_string(), "(x + 1)");
+    assert_eq!(
+        parse_ok("match x { ((a), b) => a + b }"),
+        parse_ok("match x { (a, b) => a + b }")
+    );
+    // `(x,)` is `x` (primary.rs), so `(a,)` matches what `a` matches.
+    assert_eq!(
+        parse_ok("match (x,) { (a,) => a + 1 }").to_string(),
+        "(x + 1)"
     );
 }

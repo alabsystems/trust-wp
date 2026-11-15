@@ -120,9 +120,8 @@ fn test_spec_axiom_lemma_invocation_trigger_pattern() {
 ///
 /// `forall i,j. i<=j => id(i)<=id(j)` with `id(x)=x` requires ay to instantiate
 /// the defining axiom for `id` and then reason about the resulting linear arithmetic.
-/// Previously (pre-ay pin 8dad3faf), ay's E-matching couldn't handle this because
-/// the negated quantified goal + quantified axiom required inter-quantifier reasoning
-/// beyond E-matching (#1296). The ay pin bump resolved this limitation.
+/// The negated quantified goal plus the quantified axiom needs inter-quantifier
+/// reasoning, which ay's E-matching must supply on its own (#1296).
 #[test]
 #[timeout(30000)]
 fn test_id_mono_postcondition_verifies_via_ay_ematch() {
@@ -150,8 +149,8 @@ fn test_id_mono_postcondition_verifies_via_ay_ematch() {
         ),
     );
 
-    // ay now handles quantified-postcondition-vs-quantified-axiom reasoning
-    // via improved E-matching (ay pin 8dad3faf, +21 commits over previous pin).
+    // Quantified postcondition against a quantified defining axiom: ay's
+    // E-matching handles the nested-quantifier instantiation directly.
     let ensures = vec![id_mono_post];
     let logic_fns = vec![id_fn];
     let result = verify_function_with_modes(
@@ -203,7 +202,7 @@ fn test_box_deref_postcondition_wrong_body_fails() {
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("box_deref wrong body encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "box_deref: result == *x with body x+1 should fail: {result:?}"
     );
 }
@@ -391,7 +390,7 @@ fn test_borrow_in_box_wrong_body_fails() {
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("borrow_in_box wrong body encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "borrow_in_box: result == *x with body x+1 should fail: {result:?}"
     );
 }
@@ -427,10 +426,10 @@ fn test_verify_option_return_eq_constructor() {
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("option return with Var(None) should not error");
     // sort_fallback_to_int (#994): Option encoding triggers sort demotion.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification. The legacy strict helper stays strict for its other call
-    // sites; the tolerance is opt-in here. See
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification. The strict
+    // `assert_verified_or_*` helpers stay strict for their other call sites;
+    // the tolerance is opt-in here. See
     // `tests::helpers::verified_or_known_proof_trusted`.
     crate::tests::helpers::assert_verified_or_known_proof_trusted(
         &result,
@@ -442,9 +441,9 @@ fn test_verify_option_return_eq_constructor() {
 /// uses `exists<y: i32> result == Some(y) && y@ == x@ + 1`, mirroring the actual
 /// `and_then::{closure#1}` contract from `option.rs` (#1572, #1310, #1277).
 ///
-/// Previously failed because ay-dpll cannot propagate `x = x_view` identity through
-/// ITE branches. The `rebind_var` fix on the datatype result path inlines the body
-/// term when encoding postconditions, bypassing the ITE transitivity limitation.
+/// ay-dpll cannot propagate the `x = x_view` identity through ITE branches, so
+/// the datatype result path (`rebind_var`) inlines the body term when encoding
+/// the postcondition instead of relying on ITE transitivity.
 #[test]
 #[timeout(30000)]
 fn test_verify_option_return_eq_constructor_existential() {
@@ -536,10 +535,10 @@ fn test_verify_option_return_match_deref_binding() {
         VerificationRequest::new(&[req], &[ens]).return_expr(Some(&body)),
     )
     .expect("match deref binding should not error");
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result),
         "match {{ Some(v) => *v == elem, None => len_a == 0 }} should verify after deref-collapse fix (#2124 AC3): {result:?}"
@@ -583,7 +582,7 @@ fn test_verify_option_return_match_deref_binding_wrong_postcondition() {
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("wrong postcondition encoding should not error");
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "wrong postcondition *v == elem + 999 must fail: {result:?}"
     );
 }
@@ -591,8 +590,9 @@ fn test_verify_option_return_match_deref_binding_wrong_postcondition() {
 /// Exact model of `tests/should_succeed/slices/01.rs::slice_first`.
 ///
 /// The body returns `Some(a[0])` when `a@.len() > 0` and `None` otherwise.
-/// The postcondition matches on `result`. This previously reached the native
-/// ADT theory-conflict path and returned `Unknown(QuantifierUnhandled)`.
+/// The postcondition matches on `result`; that match must not be routed to
+/// the native ADT theory-conflict path, which cannot discharge it and answers
+/// `Unknown(QuantifierUnhandled)`.
 #[test]
 #[timeout(30000)]
 fn test_verify_slice_first_match_postcondition() {
@@ -632,10 +632,10 @@ fn test_verify_slice_first_match_postcondition() {
     let result =
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("slice_first encoding should not error");
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result),
         "slice_first match postcondition should verify: {result:?}"
@@ -682,7 +682,7 @@ fn test_verify_slice_first_wrong_none_postcondition_fails() {
         verify_function_with_modes(VerificationRequest::new(&[], &[ens]).return_expr(Some(&body)))
             .expect("wrong slice_first postcondition should not error");
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "wrong None-arm postcondition must fail: {result:?}"
     );
 }

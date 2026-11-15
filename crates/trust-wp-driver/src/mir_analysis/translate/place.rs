@@ -100,6 +100,11 @@ pub(crate) fn translate_place_detailed(
         return result;
     }
 
+    // Value-carrier field reads (mutable borrow analysis, s34).
+    if let Some(result) = locals.resolve_carrier_projection(place) {
+        return Some(result);
+    }
+
     // Deref-aware fast paths: resolve mutable borrow projection patterns
     // via the ExprLookup trait before the general projection walk.
     // These patterns come from MIR lowering of `&mut` parameter accesses.
@@ -220,6 +225,20 @@ fn translate_constant_index_projection(
     })
 }
 
+/// Project field `field_idx` of a whole value exactly as a place read of a
+/// non-deref field would (`translate_place` over a full `ExprLookup`). Used to
+/// build functional updates of locals whose later reads must agree with the
+/// write. (s34)
+pub(crate) fn project_field_for_read(
+    current: PureExpr,
+    field_idx: usize,
+    locals: &impl ExprLookup,
+) -> Option<PureExpr> {
+    let mut downcast_active = false;
+    let projected = translate_field_projection(current, field_idx, &mut downcast_active, locals)?;
+    Some(simplify_tuple_get_from_constructor(&projected).unwrap_or(projected))
+}
+
 fn translate_field_projection(
     mut current: PureExpr,
     field_idx: usize,
@@ -295,7 +314,7 @@ fn typed_field_projection<'tcx>(
             let field = variant
                 .fields
                 .get(rustc_abi::FieldIdx::from_usize(field_idx))?;
-            let field_ty = field.ty(tcx, substs).skip_norm_wip();
+            let field_ty = field.ty(tcx, *substs).skip_norm_wip();
             let field_name = field.name.as_str();
             let accessor = if field_name.bytes().all(|b| b.is_ascii_digit()) {
                 tuple_field_logic_fn_name(field_idx)

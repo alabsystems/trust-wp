@@ -10,7 +10,7 @@
 //! - Version output
 //! - Argument parsing
 //!
-//! Note: Full end-to-end tests with trust-wp-rustc require a nightly toolchain
+//! Note: Full end-to-end tests with trust-wp-rustc require the Trust toolchain
 //! and the trust-wp-driver binary built, so those tests are run separately.
 
 use std::process::Command;

@@ -98,10 +98,10 @@ fn test_ghost_vec_element_access_after_push() {
     );
     let vr = result.unwrap();
     // Vacuity guard (#2414) or sort_fallback_to_int (#2204).
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification. The legacy strict helper stays strict for its other call
-    // sites; the tolerance is opt-in here. See
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification. The strict
+    // `assert_verified_or_*` helpers stay strict for their other call sites;
+    // the tolerance is opt-in here. See
     // `tests::helpers::verified_or_known_proof_trusted`.
     crate::tests::helpers::assert_verified_or_known_proof_trusted(
         &vr,
@@ -439,10 +439,9 @@ fn test_ghost_pop_front_option_comparison_sort_fallback_map() {
 /// This exercises the match encoding path that the driver generates, which
 /// may trigger base `SortFallbackToInt` through the pattern condition or
 /// arm body sort reconciliation. Part of #994.
-// BUDGET (#133 mass unit adjudication, 2026-08-27): raised 60s -> 180s. The
-// solve is not stuck: measured solo twice at this pin it COMPLETES and PASSES
-// in 94.8s, so the 60s ntest budget was killing a healthy run and reporting it
-// as a wall-clock timeout. Nothing about the assertion changed.
+// BUDGET: this solve is slow but not stuck; given the time it completes and
+// passes, and a one-minute ntest budget kills the healthy run and reports it
+// as a wall-clock timeout. The assertion does not depend on the deadline.
 #[test]
 #[timeout(180000)]
 fn test_ghost_pop_match_postcondition_sort_fallback() {

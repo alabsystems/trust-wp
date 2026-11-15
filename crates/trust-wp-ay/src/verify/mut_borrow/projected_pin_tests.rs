@@ -100,7 +100,10 @@ fn guarded_pin_closes_the_prophecy_on_the_matching_variant() {
 
     let emitted = bind_projected_final_value(&mut e, &pin(some_projection("res"), 43))
         .expect("pin should encode");
-    assert!(emitted, "a carrier payload with a declared datatype must pin");
+    assert!(
+        emitted,
+        "a carrier payload with a declared datatype must pin"
+    );
 
     let fin = e
         .mut_ref_component_projection(payload, true)
@@ -140,10 +143,9 @@ fn guarded_pin_is_vacuous_on_the_other_variant() {
         .lookup_datatype_decl(&dt_name)
         .cloned()
         .expect("declared datatype");
-    let none_name = crate::encoder::match_enc::short_constructor_name(
-        &datatype_constructor_name(&dt, "None"),
-    )
-    .to_string();
+    let none_name =
+        crate::encoder::match_enc::short_constructor_name(&datatype_constructor_name(&dt, "None"))
+            .to_string();
     let none_tester = e
         .solver_mut()
         .try_datatype_tester(&none_name, res)

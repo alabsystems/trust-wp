@@ -73,9 +73,9 @@ pub(crate) fn find_proof_asserts_in_mir(
     for (bb_idx, bb_data) in body.basic_blocks.iter_enumerated() {
         for (stmt_idx, stmt) in bb_data.statements.iter().enumerate() {
             let closure_def_id = match stmt.kind {
-                StatementKind::Assign(box (
+                StatementKind::Assign((
                     _,
-                    Rvalue::Aggregate(box mir::AggregateKind::Closure(def_id, _), _),
+                    Rvalue::Aggregate(mir::AggregateKind::Closure(def_id, _), _),
                 )) => Some(def_id),
                 _ => None,
             };

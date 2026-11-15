@@ -16,8 +16,9 @@ use trust_wp_core::formula::{BinOp, PureExpr};
 use trust_wp_driver::StdSpec;
 
 use super::{
-    closure_receiver_base_name, collect_closure_receiver_bindings,
-    substitute::substitute_captures_inline, substitute_closure_params_with_args, ClosureSpec,
+    closure_env_ctor_arity, closure_receiver_base_name, collect_closure_receiver_bindings,
+    collect_sole_env_owners, substitute::substitute_captures_inline,
+    substitute_closure_params_with_args, ClosureSpec,
 };
 use crate::mir_analysis::resolve_arg_names_or_warn;
 
@@ -39,8 +40,9 @@ pub(in crate::callbacks) fn enrich_forall_goals_with_closure_ensures(
     goals: &mut Vec<PureExpr>,
 ) -> usize {
     // Build both requires (precondition) and ensures (postcondition) for each closure
+    let env_owners = collect_sole_env_owners(tcx, parent_local_def_id);
     let mut closure_specs: Vec<ClosureSpec> = Vec::new();
-    for binding in collect_closure_receiver_bindings(parent_local_def_id) {
+    for binding in collect_closure_receiver_bindings(tcx, parent_local_def_id) {
         let spec = match user_specs.get(&binding.def_id) {
             Some(s) if !s.ensures.is_empty() && !s.requires.is_empty() => s,
             _ => continue,
@@ -78,6 +80,7 @@ pub(in crate::callbacks) fn enrich_forall_goals_with_closure_ensures(
                 capture_bindings,
                 requires_exprs,
                 ensures_exprs,
+                env_arity: env_owners.get(&binding.def_id).copied(),
             });
         }
     }
@@ -106,10 +109,14 @@ pub(in crate::callbacks) fn enrich_forall_goals_with_closure_ensures(
     enrichment_count
 }
 
-/// Unwrap nested Forall quantifiers to find the innermost body.
-fn unwrap_foralls(expr: &PureExpr) -> &PureExpr {
+/// Unwrap nested Forall quantifiers to find the innermost body, collecting
+/// the bound names on the way.
+fn unwrap_foralls<'e>(expr: &'e PureExpr, binders: &mut Vec<&'e str>) -> &'e PureExpr {
     match expr {
-        PureExpr::Forall { body, .. } => unwrap_foralls(body),
+        PureExpr::Forall { var, body, .. } => {
+            binders.push(var.as_str());
+            unwrap_foralls(body, binders)
+        }
         other => other,
     }
 }
@@ -143,7 +150,8 @@ pub(in crate::callbacks) fn try_ground_forall_obligation(
     expr: &PureExpr,
     closure_specs: &[ClosureSpec],
 ) -> Option<PureExpr> {
-    let inner = unwrap_foralls(expr);
+    let mut binders = Vec::new();
+    let inner = unwrap_foralls(expr, &mut binders);
 
     // Pattern: postcondition_mut(RECV, ARGS, st, r) ==> CONSEQUENT
     let PureExpr::BinOp(antecedent, BinOp::Implies, _consequent) = inner else {
@@ -151,31 +159,34 @@ pub(in crate::callbacks) fn try_ground_forall_obligation(
     };
 
     let (recv, args_expr, _st_expr, _r_expr) = find_postcondition_mut_in_expr(antecedent)?;
-    let spec = match closure_receiver_base_name(recv) {
-        Some(receiver_name) => {
-            let mut matching = closure_specs
-                .iter()
-                .filter(|spec| spec.receiver_name == receiver_name);
-            match matching.next() {
-                Some(spec) if matching.next().is_none() => spec,
-                _ => {
-                    // No name match or ambiguous; fall back to single-entry match
-                    // for chained postcondition_mut with intermediate state receivers.
-                    if closure_specs.len() == 1 {
-                        &closure_specs[0]
-                    } else {
-                        return None;
-                    }
-                }
-            }
+    // Identity or nothing: the spec is the one bound to the closure the
+    // receiver IS — a source local (`c`, `*c`, `^c`) matched by exactly one
+    // entry and not a name the obligation itself binds, or a
+    // closure-environment constructor (`__trust_wp_tuple<N>(..)`) whose
+    // arity exactly one closure of the body owns (`ClosureSpec::env_arity`).
+    // A bound name, an environment term of a shared arity, and a name
+    // matching no or several entries ground nothing: a single-entry fallback
+    // would hand an uncontracted sibling's call the contracted closure's spec
+    // (`tests/adversarial/cases/s71_closure_ensures_*`).
+    let spec = if let Some(arity) = closure_env_ctor_arity(recv) {
+        let mut owners = closure_specs
+            .iter()
+            .filter(|spec| spec.env_arity == Some(arity));
+        match (owners.next(), owners.next()) {
+            (Some(spec), None) => spec,
+            _ => return None,
         }
-        None => {
-            // Receiver is a tuple constructor; single-entry fallback.
-            if closure_specs.len() == 1 {
-                &closure_specs[0]
-            } else {
-                return None;
-            }
+    } else {
+        let receiver_name = closure_receiver_base_name(recv)?;
+        if binders.contains(&receiver_name) {
+            return None;
+        }
+        let mut matching = closure_specs
+            .iter()
+            .filter(|spec| spec.receiver_name == receiver_name);
+        match (matching.next(), matching.next()) {
+            (Some(spec), None) => spec,
+            _ => return None,
         }
     };
 
@@ -188,8 +199,8 @@ pub(in crate::callbacks) fn try_ground_forall_obligation(
     // variable sorts), not necessarily Int. The ay encoder infers Sort::Int
     // as the default for untyped variables, which matches the SMT encoding
     // where all uninterpreted sorts map to Int.
-    let fresh_post_var = PureExpr::Var("__forall_post_state".to_string(), None);
-    let unused_result = PureExpr::Var("_unused".to_string(), None);
+    let fresh_post_var = PureExpr::Var("$forall_post_state".to_string(), None);
+    let unused_result = PureExpr::Var("$unused".to_string(), None);
 
     // Build ensures(pre=RECV, post=S): constrains S based on RECV.
     // substitute_captures_inline maps:
@@ -250,9 +261,9 @@ pub(in crate::callbacks) fn try_ground_forall_obligation(
 /// - `tuple_get_i(tupleN(f_0, .., f_{N-1}))` on the pre-state (receiver) side —
 ///   reduced to `f_i` (the constructor/projection identity the encoder itself
 ///   asserts as an axiom for every tuple term).
-/// - `tuple_get_i(__forall_post_state)` on the universal post-state side —
+/// - `tuple_get_i($forall_post_state)` on the universal post-state side —
 ///   replaced by a fresh free field variable carrying the receiver field's
-///   inferred scalar sort. `__forall_post_state` has no other uses (only
+///   inferred scalar sort. `$forall_post_state` has no other uses (only
 ///   projections of it occur), so this is an equisatisfiable renaming of the
 ///   implicitly-universal state, NOT a witness instantiation.
 ///
@@ -322,9 +333,9 @@ fn reduce_tuple_projections(
             } if tuple_logic_fn_arity(ctor) == Some(fields.len()) && field_idx < fields.len() => {
                 fields[field_idx].clone()
             }
-            // tuple_get_i(__forall_post_state) → fresh sorted field var
-            PureExpr::Var(state, _) if state == "__forall_post_state" => PureExpr::Var(
-                format!("__forall_post_field_{field_idx}"),
+            // tuple_get_i($forall_post_state) → fresh sorted field var
+            PureExpr::Var(state, _) if state == "$forall_post_state" => PureExpr::Var(
+                format!("$forall_post_field_{field_idx}"),
                 field_sorts.get(field_idx).cloned().flatten(),
             ),
             _ => node,

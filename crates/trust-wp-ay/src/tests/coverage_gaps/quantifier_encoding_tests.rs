@@ -277,3 +277,120 @@ fn resolve_quant_sort_method_usage_seq_receiver_overrides_int_fallback() {
         "s.len() should refine an Int fallback binder to Seq"
     );
 }
+
+#[test]
+#[timeout(30000)]
+fn quantified_exchange_uses_certifiable_carrier() {
+    let mut encoder = AYEncoder::new_pure_with_quantifiers();
+    encoder.use_certifiable_seq_carrier();
+    let exchange = method_call(
+        var("after"),
+        "exchange",
+        vec![var("before"), var("i"), var("j")],
+    );
+    // The exchange itself is sufficient to infer both collection binders;
+    // inference must not depend on an unrelated len/permutation expression.
+    for name in ["after", "before"] {
+        assert_eq!(
+            encoder.resolve_quantifier_var_sort(name, None, &HashSet::new(), &exchange),
+            Sort::Uninterpreted("Seq".to_string())
+        );
+    }
+    let permutation = method_call(var("after"), "permutation_of", vec![var("before")]);
+    let law = forall(
+        "after",
+        forall(
+            "before",
+            forall("i", forall("j", implies(exchange, permutation))),
+        ),
+    );
+    let negated = encoder
+        .encode_pure(&not(law))
+        .expect("exchange law should encode");
+    encoder.assert_term(negated);
+
+    // Encoding the nested theorem must preserve the carrier selected by the
+    // production track. Its checked proof is tested through that public track
+    // below, which performs proof replay and authority validation.
+    let text = encoder.solver_mut().format_term(negated);
+    assert!(!text.contains("(Seq Int)"), "{text}");
+}
+
+#[test]
+#[timeout(30000)]
+fn quantified_exchange_preserves_permutation() {
+    let exchange = method_call(
+        var("after"),
+        "exchange",
+        vec![var("before"), var("i"), var("j")],
+    );
+    let permutation = method_call(var("after"), "permutation_of", vec![var("before")]);
+    let law = forall(
+        "after",
+        forall(
+            "before",
+            forall("i", forall("j", implies(exchange, permutation))),
+        ),
+    );
+    let ensures = [law];
+    let result = crate::verify_function_with_modes(
+        crate::VerificationRequest::new(&[], &ensures)
+            .timeout(Some(std::time::Duration::from_secs(3))),
+    );
+    assert!(
+        matches!(&result, Ok(crate::VerificationResult::Verified(Some(proof))) if proof.is_fully_verified()),
+        "{result:?}"
+    );
+}
+
+#[test]
+#[timeout(30000)]
+fn ground_exchange_preserves_permutation_with_checked_proof() {
+    let after = var_with_sort("after", ExprSort::Seq);
+    let before = var_with_sort("before", ExprSort::Seq);
+    let exchange = method_call(
+        after.clone(),
+        "exchange",
+        vec![before.clone(), int(0), int(1)],
+    );
+    let permutation = method_call(after, "permutation_of", vec![before]);
+    let requires = [exchange];
+    let ensures = [permutation.clone()];
+    let outcome = crate::verify_function_with_modes_outcome(
+        crate::VerificationRequest::new(&requires, &ensures)
+            .timeout(Some(std::time::Duration::from_secs(3))),
+    )
+    .expect("ground exchange should encode");
+    let proved = matches!(&outcome.result, crate::VerificationResult::Verified(Some(proof)) if proof.is_fully_verified())
+        && outcome
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.solve_evidence.as_ref())
+            .is_some_and(|evidence| evidence.accepted_for_consumer);
+    if !proved && std::env::var_os("TWP_BR_DBG").is_some() {
+        if let Some(replay) = outcome
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.native_replay_json.as_deref())
+        {
+            eprintln!("EXCHANGE_NATIVE_REPLAY_BEGIN\n{replay}\nEXCHANGE_NATIVE_REPLAY_END");
+        }
+    }
+    assert!(
+        proved,
+        "ground exchange needs a fully checked proof: {:?}",
+        outcome.result
+    );
+    let false_ensures = [not(permutation)];
+    let rejected = crate::verify_function_with_modes(crate::VerificationRequest::new(
+        &requires,
+        &false_ensures,
+    ));
+    assert!(
+        matches!(
+            rejected,
+            Ok(crate::VerificationResult::Failed(_) | crate::VerificationResult::Unknown(_))
+        ),
+        "false negation was not rejected: {rejected:?}"
+    );
+}

@@ -193,6 +193,15 @@ def _write_results_file(
         telemetry = getattr(result, "telemetry", None)
         if telemetry is not None:
             entry["telemetry"] = telemetry.to_dict()
+        trusted_def_paths = getattr(result, "trusted_def_paths", None)
+        if trusted_def_paths:
+            entry["trusted_def_paths"] = list(trusted_def_paths)
+        driver_report = getattr(result, "driver_report", None)
+        if driver_report is not None:
+            entry["driver_report"] = list(driver_report)
+        goal_coverage = getattr(result, "goal_coverage", None)
+        if goal_coverage is not None:
+            entry["goal_coverage"] = goal_coverage
         result_dicts.append(entry)
 
     output_data = {

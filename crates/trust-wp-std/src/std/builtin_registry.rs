@@ -12,8 +12,6 @@
 //! The driver merges this registry into its `extern_specs` map before local
 //! discovery, so user-defined `extern_spec!` declarations override these
 //! built-in entries.
-//!
-//! See: `designs/2026-03-12-1672-extern-spec-registry-bridge.md`
 
 /// A built-in extern-spec entry from trust-wp-std.
 ///
@@ -45,6 +43,7 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
         target_path: "std::vec::Vec::with_capacity",
         spec: "\
             params: capacity\n\
+            requires: capacity@ * __trust_wp_std_site_size_of_T() <= isize::MAX@\n\
             ensures: result@.len() == 0\n\
             ensures: result.capacity()@ >= capacity@",
     },
@@ -107,6 +106,8 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
         target_path: "std::vec::Vec::reserve",
         spec: "\
             params: self, additional\n\
+            requires: additional@ == 0 || (self@.len() + additional@ <= usize::MAX@ \
+            && 2 * (self@.len() + additional@ - 1) * __trust_wp_std_site_size_of_T() <= isize::MAX@)\n\
             ensures: (^self)@ == self@\n\
             ensures: (^self)@.len() == self@.len()\n\
             ensures: forall<i: Int> 0 <= i && i < self@.len() ==> (^self)@.index_logic(i) == self@.index_logic(i)",
@@ -115,6 +116,8 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
         target_path: "std::vec::Vec::reserve_exact",
         spec: "\
             params: self, additional\n\
+            requires: additional@ == 0 || (self@.len() + additional@ <= usize::MAX@ \
+            && (self@.len() + additional@) * __trust_wp_std_site_size_of_T() <= isize::MAX@)\n\
             ensures: (^self)@ == self@\n\
             ensures: (^self)@.len() == self@.len()\n\
             ensures: forall<i: Int> 0 <= i && i < self@.len() ==> (^self)@.index_logic(i) == self@.index_logic(i)",
@@ -192,6 +195,8 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
         target_path: "std::vec::Vec::resize",
         spec: "\
             params: self, new_len, value\n\
+            requires: new_len@ <= self@.len() \
+            || 2 * (new_len@ - 1) * __trust_wp_std_site_size_of_T() <= isize::MAX@\n\
             ensures: (^self)@.len() == new_len@",
     },
     BuiltinExternSpec {
@@ -768,18 +773,15 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
     },
     BuiltinExternSpec {
         target_path: "std::string::String::insert",
-        spec: "\
-            params: self, idx, ch",
+        spec: super::string::specs::INSERT,
     },
     BuiltinExternSpec {
         target_path: "std::string::String::insert_str",
-        spec: "\
-            params: self, idx, string",
+        spec: super::string::specs::INSERT_STR,
     },
     BuiltinExternSpec {
         target_path: "std::string::String::remove",
-        spec: "\
-            params: self, idx",
+        spec: super::string::specs::REMOVE,
     },
     // ── Ordering ───────────────────────────────────────────────────
     BuiltinExternSpec {
@@ -841,19 +843,21 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
     // ── String additional methods ───────────────────────────────────
     BuiltinExternSpec {
         target_path: "std::string::String::truncate",
-        spec: "\
-            params: self, new_len\n\
-            ensures: (^self).len() <= self.len()",
+        spec: super::string::specs::TRUNCATE,
     },
     BuiltinExternSpec {
         target_path: "std::string::String::reserve",
         spec: "\
             params: self, additional\n\
+            requires: additional@ == 0 || 2 * (4 * self@.len() + additional@ - 1) <= isize::MAX@\n\
             ensures: (^self)@ == self@",
     },
     BuiltinExternSpec {
         target_path: "std::string::String::with_capacity",
-        spec: "ensures: result@.len() == 0",
+        spec: "\
+            params: capacity\n\
+            requires: capacity@ <= isize::MAX@\n\
+            ensures: result@.len() == 0",
     },
     // ── BTreeMap ────────────────────────────────────────────────────
     BuiltinExternSpec {
@@ -938,7 +942,7 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
     },
     BuiltinExternSpec {
         target_path: "std::collections::HashMap::with_capacity",
-        spec: "ensures: result@.len() == 0",
+        spec: super::collections::specs::HASHMAP_WITH_CAPACITY,
     },
     BuiltinExternSpec {
         target_path: "std::collections::HashMap::len",
@@ -1002,7 +1006,7 @@ pub static BUILTIN_EXTERN_SPECS: &[BuiltinExternSpec] = &[
     },
     BuiltinExternSpec {
         target_path: "std::collections::HashSet::with_capacity",
-        spec: "ensures: result@.len() == 0",
+        spec: super::collections::specs::HASHSET_WITH_CAPACITY,
     },
     BuiltinExternSpec {
         target_path: "std::collections::HashSet::len",

@@ -12,7 +12,6 @@
 //!
 //! Coverage targets:
 //! - `expr_contains_result_var` — all PureExpr variant traversal arms
-//! - `detect_body_constructor_name` — qualified path edge cases
 //! - `result_match_datatype_from_postcondition` — multi-clause edge cases
 //!
 //! Part of #1946 (result_inference.rs unit tests).
@@ -23,8 +22,8 @@ use super::*;
 use crate::{
     encoder::match_enc::MatchDatatypeKind,
     verify::{
-        detect_body_constructor_name, expr_contains_result_var, expr_requires_result_bool,
-        result_is_bool_by_postcondition, result_match_datatype_from_postcondition,
+        expr_contains_result_var, expr_requires_result_bool, result_is_bool_by_postcondition,
+        result_match_datatype_from_postcondition,
     },
     AYEncoder,
 };
@@ -705,54 +704,4 @@ fn constructor_eq_conflicting_across_clauses() {
         eq(var("result"), logic_fn_call("Ok", vec![int(1)])),
     ];
     assert_eq!(result_match_datatype_from_postcondition(&ensures), None);
-}
-
-// ── detect_body_constructor_name: additional edge cases ──────────────
-
-/// Qualified None as Var (e.g., MIR sometimes emits "None" as a variable).
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_none_as_logic_fn() {
-    let expr = logic_fn_call("None", vec![]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("None"));
-}
-
-/// Qualified Err path.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_qualified_err() {
-    let expr = logic_fn_call("std::result::Result::Err", vec![int(1)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Err"));
-}
-
-/// Qualified None path as variable.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_qualified_none_var() {
-    let expr = var("core::option::Option::None");
-    assert_eq!(detect_body_constructor_name(&expr), Some("None"));
-}
-
-/// Non-constructor variable returns None.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_regular_var() {
-    let expr = var("my_value");
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-/// Deref wrapper is not inspected (returns None).
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_deref_not_inspected() {
-    let expr = deref(logic_fn_call("Some", vec![int(1)]));
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-/// BinOp is not inspected (returns None).
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_binop_not_inspected() {
-    let expr = add(logic_fn_call("Some", vec![int(1)]), int(0));
-    assert_eq!(detect_body_constructor_name(&expr), None);
 }

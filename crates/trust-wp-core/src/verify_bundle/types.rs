@@ -749,7 +749,7 @@ fn validate_proof_context_indexes(
                     ),
                 ));
             }
-            expected_index += 1;
+            expected_index = expected_index.saturating_add(1);
         }
     }
 }
@@ -1533,11 +1533,17 @@ fn stable_digest(material: &str) -> BundleDigest {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    // Formatting rather than a lookup table. The table indices are provably
+    // 0..=15 and the capacity product provably fits for any real slice, but
+    // both are obligations this function cannot discharge from its own body:
+    // the shift/mask range and the length bound belong to the caller. `{:02x}`
+    // has neither an index nor a product and emits the identical lowercase
+    // two-digit hex.
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        // Writing to a String cannot fail.
+        let _ = write!(encoded, "{byte:02x}");
     }
     encoded
 }

@@ -379,7 +379,7 @@ fn eager_instantiation_collects_resolve_in_ite_branches() {
     let ensures = vec![mk_exists("st", body)];
     let requires = vec![
         ground_postcondition_mut("f", "result"),
-        resolve_call(var("f")),
+        resolve_call(value_state("f")),
     ];
     assert_eq!(
         run_eager_sat_status(&ensures, &requires),
@@ -408,7 +408,7 @@ fn eager_instantiation_normalizes_deref_inside_ite_precondition() {
 fn eager_instantiation_collects_resolve_inside_skolemized_existential() {
     let skolem_body = and(
         postcondition_mut(var("f"), var("result")),
-        resolve_call(var("f")),
+        resolve_call(value_state("f")),
     );
     let requires = vec![PureExpr::Exists {
         var: "f2".to_string(),

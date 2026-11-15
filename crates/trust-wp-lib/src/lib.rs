@@ -52,6 +52,8 @@ pub mod error;
 pub mod result;
 pub mod serial;
 #[cfg(feature = "trust-ir-native")]
+pub mod trust_ir_body;
+#[cfg(feature = "trust-ir-native")]
 pub mod trust_ir_native;
 
 // --- Re-exports: trust-wp-core types ---
@@ -67,8 +69,9 @@ pub use serial::{
 pub use trust_ir_native::{
     trust_ir_native_bundle_to_verify_requests, verify_trust_ir_native_bundle,
     verify_trust_ir_native_bundle_and_record_evidence, verify_trust_ir_native_bundle_with_evidence,
-    TrustIrNativeBundleError, TrustIrNativeVerificationEvidenceOutput, TrustIrTrustWpMode,
-    TrustIrUnsupportedModeReason, TRUST_WP_PURE_EXPR_FORMULA_SCHEMA_VERSION,
+    TrustIrClauseCarrier, TrustIrNativeBundleError, TrustIrNativeVerificationEvidenceOutput,
+    TrustIrTrustWpMode, TrustIrUnsupportedClauseBindingReason, TrustIrUnsupportedModeReason,
+    TrustIrUnsupportedObligationKindReason, TRUST_WP_PURE_EXPR_FORMULA_SCHEMA_VERSION,
 };
 // --- Re-exports: trust-wp-ay types ---
 pub use trust_wp_ay::{
@@ -285,12 +288,12 @@ mod tests {
     #[test]
     fn test_verification_bundle_default_construction() {
         let bundle = VerificationBundle::new(vec![], vec![]);
-        assert!(bundle.requires.is_empty());
-        assert!(bundle.ensures.is_empty());
+        assert_eq!(bundle.requires, []);
+        assert_eq!(bundle.ensures, []);
         assert!(bundle.return_expr.is_none());
-        assert!(bundle.ghost_context.is_empty());
+        assert_eq!(bundle.ghost_context, []);
         assert!(bundle.logic_fns.is_empty());
-        assert!(bundle.mode_overrides.is_empty());
+        assert_eq!(bundle.mode_overrides, []);
         assert!(bundle.type_invariants.is_empty());
         assert!(bundle.adt_decls.is_none());
         assert!(bundle.adt_field_ranges.is_none());
@@ -415,23 +418,7 @@ mod tests {
 
     #[test]
     fn test_verify_bundle_result_json_round_trips() {
-        let evidence = ProofEvidence::checked(
-            "trust-wp",
-            ProofEvidenceFormat::AYProofCertificate,
-            "NativeTrustWpBundleVerifier",
-        )
-        .with_digest(BundleDigest::new("sha256", "proof-digest"))
-        .with_artifact(EvidenceArtifact::new(
-            EvidenceArtifactKind::ReplayLog,
-            BundleDigest::new("sha256", "replay-digest"),
-            "native replay log",
-        ));
-
-        let result = VerifyBundleResult::from_obligation_results(
-            sample_verify_bundle_request(),
-            vec![BundleObligationResult::verified("post-1", evidence)],
-            Vec::new(),
-        );
+        let result = verify_bundle(sample_verify_bundle_request());
         assert_eq!(result.status, VerifyBundleStatus::Verified);
 
         let json = serialize_verify_bundle_result(&result).expect("result serializes");

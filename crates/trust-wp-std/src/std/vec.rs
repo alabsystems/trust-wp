@@ -359,8 +359,18 @@ pub mod specs {
     "#;
 
     /// Contract for `Vec::reserve`
+    ///
+    /// Panics ("capacity overflow") when it must grow and the capacity it
+    /// grows to exceeds `isize::MAX` bytes. It grows only when `additional`
+    /// exceeds the spare capacity, and then to `max(2 * cap, len +
+    /// additional)`. The capacity is not modelled, so the requirement is the
+    /// one that holds for every capacity `cap >= len`: the worst is `cap ==
+    /// len + additional - 1`. `len + additional` must not overflow `usize`
+    /// either, which for a zero-sized `T` is the whole condition.
     pub const RESERVE: &str = r#"
         params: self, additional
+        requires: additional@ == 0 || (self@.len() + additional@ <= usize::MAX@
+            && 2 * (self@.len() + additional@ - 1) * __trust_wp_std_site_size_of_T() <= isize::MAX@)
         ensures: (^self)@ == self@
         ensures: (^self)@.len() == self@.len()
         ensures: forall<i: Int> 0 <= i && i < self@.len() ==>
@@ -369,8 +379,14 @@ pub mod specs {
     "#;
 
     /// Contract for `Vec::reserve_exact`
+    ///
+    /// Panics ("capacity overflow") when it must grow and `len + additional`
+    /// elements exceed `isize::MAX` bytes, or `len + additional` overflows
+    /// `usize`. Stated for every capacity, as for `RESERVE`.
     pub const RESERVE_EXACT: &str = r#"
         params: self, additional
+        requires: additional@ == 0 || (self@.len() + additional@ <= usize::MAX@
+            && (self@.len() + additional@) * __trust_wp_std_site_size_of_T() <= isize::MAX@)
         ensures: (^self)@ == self@
         ensures: (^self)@.len() == self@.len()
         ensures: forall<i: Int> 0 <= i && i < self@.len() ==>
@@ -379,8 +395,12 @@ pub mod specs {
     "#;
 
     /// Contract for `Vec::with_capacity`
+    ///
+    /// Panics ("capacity overflow") before it allocates when `capacity`
+    /// elements exceed `isize::MAX` bytes; a zero-sized `T` never does.
     pub const WITH_CAPACITY: &str = r#"
         params: capacity
+        requires: capacity@ * __trust_wp_std_site_size_of_T() <= isize::MAX@
         ensures: result@.len() == 0
         ensures: result.capacity()@ >= capacity@
     "#;
@@ -472,8 +492,13 @@ pub mod specs {
     "#;
 
     /// Contract for `Vec::resize` (with Clone value)
+    ///
+    /// Growing reserves `new_len - len` more elements, so the requirement is
+    /// `RESERVE`'s with `len + additional == new_len`.
     pub const RESIZE: &str = r#"
         params: self, new_len, value
+        requires: new_len@ <= self@.len()
+            || 2 * (new_len@ - 1) * __trust_wp_std_site_size_of_T() <= isize::MAX@
         ensures: (^self)@.len() == new_len@
         ensures: forall<i: Int> 0 <= i && i < min(new_len@, self@.len()) ==>
             (^self)@.index_logic(i) == self@.index_logic(i)
@@ -715,17 +740,25 @@ pub mod specs {
 
     /// Contract for `Vec::from_elem` (used by `vec![val; count]` macro)
     ///
-    /// Creates a new Vec with `count` copies of `elem`.
+    /// Creates a new Vec with `count` copies of `elem`. It allocates
+    /// `count` elements up front, so it panics exactly as `WITH_CAPACITY`.
     pub const FROM_ELEM: &str = r#"
         params: elem, count
+        requires: count@ * __trust_wp_std_site_size_of_T() <= isize::MAX@
         ensures: result@.len() == count@
         ensures: forall<i> 0 <= i && i < count@ ==> result@.index_logic(i) == elem
     "#;
 
     /// Contract for `Vec::drain` — removes a range of elements, returning
     /// a drain iterator. Prevents opaque-call fallback.
+    ///
+    /// Panics when the range starts after it ends or ends past the length.
+    /// The range is any `RangeBounds<usize>`, which a spec clause cannot
+    /// read, so the call is refused rather than trusted, except where the call
+    /// site instantiates `R` with `RangeFull`, the range that never panics.
     pub const DRAIN: &str = r#"
         params: self, range
+        requires: __trust_wp_std_site_unmodelled_panic_unless_full_range_R()
     "#;
 
     /// Contract for `Vec::retain_mut` — retains only elements for which

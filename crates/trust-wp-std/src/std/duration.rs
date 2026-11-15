@@ -32,10 +32,11 @@ pub mod specs {
 
     /// Contract for `Duration::new(secs, nanos)`
     ///
-    /// Creates a Duration from seconds and nanoseconds.
-    /// View is total nanoseconds: secs * 1_000_000_000 + nanos.
+    /// Whole seconds in `nanos` carry into `secs`, and the call panics
+    /// ("overflow in Duration::new") exactly when that carry overflows `u64`
+    /// seconds. Creusot's contract, with its `nanos_to_secs` spelled out.
     pub const NEW: &str = r#"
-        requires: arg1@ < 1_000_000_000
+        requires: arg0@ + arg1@ / 1_000_000_000 <= u64::MAX@
         ensures: result@ == arg0@ * 1_000_000_000 + arg1@
     "#;
 
@@ -112,10 +113,15 @@ pub mod specs {
     // ── checked arithmetic ───────────────────────────────────────
 
     /// Contract for `Duration::checked_add(rhs)`
+    ///
+    /// `None` exactly when the sum's whole seconds, carry included, overflow
+    /// `u64`: the sum is past `Duration::MAX`, the bound `ADD` owes. Creusot's
+    /// contract, with `nanos_to_secs(s) <= u64::MAX@` spelled as the linear
+    /// `s <= u64::MAX@ * 1_000_000_000 + 999_999_999`.
     pub const CHECKED_ADD: &str = r#"
         ensures: match result {
-            Some(v) => v@ == self@ + rhs@,
-            None => true,
+            Some(v) => v@ == self@ + rhs@ && self@ + rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999,
+            None => self@ + rhs@ > u64::MAX@ * 1_000_000_000 + 999_999_999,
         }
     "#;
 
@@ -128,10 +134,14 @@ pub mod specs {
     "#;
 
     /// Contract for `Duration::checked_mul(rhs)`
+    ///
+    /// The product's whole seconds are `secs * rhs` plus the carry out of
+    /// `nanos * rhs`, so the call is `None` exactly when the product is past
+    /// `Duration::MAX`. Creusot's contract, spelled linearly as `CHECKED_ADD`.
     pub const CHECKED_MUL: &str = r#"
         ensures: match result {
-            Some(v) => v@ == self@ * rhs@,
-            None => true,
+            Some(v) => v@ == self@ * rhs@ && self@ * rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999,
+            None => self@ * rhs@ > u64::MAX@ * 1_000_000_000 + 999_999_999,
         }
     "#;
 
@@ -146,7 +156,11 @@ pub mod specs {
     // ── operator overloads ───────────────────────────────────────
 
     /// Contract for `Duration + Duration` (Add trait)
+    ///
+    /// Panics ("overflow when adding durations") when the sum exceeds
+    /// `Duration::MAX`, `u64::MAX` seconds and 999_999_999 nanoseconds.
     pub const ADD: &str = r#"
+        requires: self@ + rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999
         ensures: result@ == self@ + rhs@
     "#;
 
@@ -201,9 +215,12 @@ mod tests {
     use super::super::test_shim;
 
     #[test]
-    fn test_duration_new_spec_parses() {
+    fn test_duration_new_owes_only_the_carry_overflow() {
         let spec = test_shim::parse_spec_string(super::specs::NEW);
-        assert_eq!(spec.requires.len(), 1);
+        assert_eq!(
+            spec.requires,
+            ["arg0@ + arg1@ / 1_000_000_000 <= u64::MAX@"]
+        );
         assert_eq!(spec.ensures.len(), 1);
     }
 
@@ -229,6 +246,27 @@ mod tests {
     }
 
     #[test]
+    fn test_duration_checked_add_and_mul_are_none_exactly_past_max() {
+        for (name, spec) in [
+            ("CHECKED_ADD", super::specs::CHECKED_ADD),
+            ("CHECKED_MUL", super::specs::CHECKED_MUL),
+        ] {
+            let parsed = test_shim::parse_spec_string(spec);
+            assert!(parsed.requires.is_empty(), "{name}");
+            assert_eq!(parsed.ensures.len(), 1, "{name}");
+            let ensures = &parsed.ensures[0];
+            assert_eq!(
+                ensures
+                    .matches("u64::MAX@ * 1_000_000_000 + 999_999_999")
+                    .count(),
+                2,
+                "{name} should bound both arms by Duration::MAX, got: {ensures}"
+            );
+            assert!(!ensures.contains("None => true"), "{name}: {ensures}");
+        }
+    }
+
+    #[test]
     fn test_duration_checked_sub_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::CHECKED_SUB);
         assert!(spec.requires.is_empty());
@@ -238,7 +276,10 @@ mod tests {
     #[test]
     fn test_duration_add_spec_parses() {
         let spec = test_shim::parse_spec_string(super::specs::ADD);
-        assert!(spec.requires.is_empty());
+        assert_eq!(
+            spec.requires,
+            ["self@ + rhs@ <= u64::MAX@ * 1_000_000_000 + 999_999_999"]
+        );
         assert_eq!(spec.ensures.len(), 1);
     }
 

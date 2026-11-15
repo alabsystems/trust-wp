@@ -65,7 +65,7 @@ fn encode_mutref_inner_sort(sort: &ExprSort) -> String {
                 encode_name_component(&resolve_sort_name(*id))
             )
         }
-        ExprSort::Float => "float".to_string(),
+        ExprSort::Float(width) => format!("float_{}", width.rust_name()),
         #[allow(unreachable_patterns)]
         _ => "int".to_string(),
     }
@@ -78,7 +78,8 @@ fn decode_mutref_inner_sort(encoded: &str) -> Option<ExprSort> {
         "seq" => Some(ExprSort::Seq),
         "unit" => Some(ExprSort::Unit),
         "fmap" => Some(ExprSort::FMap),
-        "float" => Some(ExprSort::Float),
+        "float_f32" => Some(ExprSort::Float(trust_wp_core::formula::FloatWidth::F32)),
+        "float_f64" => Some(ExprSort::Float(trust_wp_core::formula::FloatWidth::F64)),
         other => {
             if let Some(rest) = other.strip_prefix("datatype_") {
                 return decode_name_component(rest)
@@ -503,7 +504,7 @@ pub(crate) fn expr_sort_to_ay_sort_for_carrier(sort: &ExprSort, carrier: SeqCarr
         // (#2551: previously Uninterpreted, causing __apply_coerce disconnections
         // and SortFallbackToInt demotions.)
         ExprSort::TypeParam(_) => Sort::Int,
-        ExprSort::Float => Sort::Real,
+        ExprSort::Float(width) => crate::encoder::pure_encoding::ieee::float_sort(*width),
         ExprSort::Ref(inner) => expr_sort_to_ay_sort_for_carrier(inner, carrier),
         ExprSort::MutRef(inner) => Sort::Uninterpreted(encode_mutref_sort_name(inner)),
         // ExprSort is #[non_exhaustive]; required for cross-crate match.
@@ -591,9 +592,7 @@ fn contains_mut_ref_carrier_inner(
             if !seen.insert(name.clone()) {
                 return false;
             }
-            resolve(name).is_some_and(|dt| {
-                constructors_contain_mut_ref_carrier(&dt, resolve, seen)
-            })
+            resolve(name).is_some_and(|dt| constructors_contain_mut_ref_carrier(&dt, resolve, seen))
         }
         Sort::Datatype(dt) => {
             if name_is_mut_ref_carrier(&dt.name) {
@@ -641,13 +640,15 @@ fn constructors_contain_mut_ref_carrier(
 /// - `Sort::Uninterpreted("Tuple<N>")` → `ExprSort::Tuple(N)`
 /// - `Sort::Uninterpreted("__trust_wp_typaram::<name>")` → `ExprSort::TypeParam(intern(<name>))`
 /// - `Sort::Uninterpreted(<other>)` → `ExprSort::Datatype(intern(<other>))`
-/// - `Sort::Real` → `ExprSort::Float`
+/// - a floating-point sort of `f32`/`f64`'s format → `ExprSort::Float`
 /// - All others (Int, BitVec, Array, etc.) → `None`
 pub(crate) fn ay_sort_to_expr_sort(sort: &Sort) -> Option<ExprSort> {
     match sort {
         Sort::Bool => Some(ExprSort::Bool),
         Sort::Int => None,
-        Sort::Real => Some(ExprSort::Float),
+        sort @ Sort::FloatingPoint(..) => {
+            crate::encoder::pure_encoding::ieee::sort_float_width(sort).map(ExprSort::Float)
+        }
         Sort::Seq(_) => Some(ExprSort::Seq),
         Sort::Uninterpreted(name) => match name.as_str() {
             "FMap" => Some(ExprSort::FMap),

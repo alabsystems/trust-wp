@@ -16,8 +16,8 @@ use rustc_middle::{
     mir::{Local, Operand},
     ty::TyKind,
 };
-use trust_wp_core::formula::{CaptureAvoidingSubstOptions, PureExpr};
-use trust_wp_driver::{lookup_spec_with_extern, StdSpec};
+use trust_wp_core::formula::{elaborate::Signature, CaptureAvoidingSubstOptions, PureExpr};
+use trust_wp_driver::StdSpec;
 
 use super::{
     call_classification::is_fn_trait_call,
@@ -26,7 +26,10 @@ use super::{
 };
 use crate::mir_analysis::{
     call_resolve::{extract_call_def_id, resolve_trait_method_def_id, ufcs_path_for_call},
+    call_signature,
+    spec_apply::clause_read_as_written,
     translate::translate_operand,
+    CallSite,
 };
 
 /// Result of a successful spec-driven state advancement.
@@ -44,26 +47,47 @@ pub(super) fn lookup_call_spec<'tcx>(
     def_id: DefId,
 ) -> Option<StdSpec> {
     // Direct user/trait spec by DefId.
-    if let Some(spec) = ctx
-        .user_specs
-        .get(&def_id)
-        .or_else(|| ctx.trait_specs.get(&def_id))
-    {
-        return Some(spec.clone());
+    if let Some(spec) = crate::trait_credit::lookup_user_or_trait_spec(
+        ctx.user_specs,
+        ctx.trait_specs,
+        def_id,
+        crate::trait_credit::GrantSite {
+            tcx: ctx.tcx,
+            body: ctx.body,
+            func,
+        },
+    ) {
+        return Some(
+            crate::logic::identity_typed::instantiate_generic_markers_for_call(
+                ctx.tcx,
+                ctx.body,
+                func,
+                def_id,
+                spec.clone(),
+            ),
+        );
     }
 
     let extern_opt = (!ctx.extern_specs.is_empty()).then_some(ctx.extern_specs);
+    let admission = crate::provenance::builtin_spec_admission_for_operand(
+        ctx.tcx,
+        func,
+        Some(ctx.body.source.def_id()),
+    );
+    let site = crate::provenance::CallSite::of_operand(func, Some(ctx.body.source.def_id()));
 
     // UFCS-qualified path lookup.
-    let spec =
-        ufcs_path_for_call(ctx.tcx, func).and_then(|p| lookup_spec_with_extern(extern_opt, &p));
+    let spec = ufcs_path_for_call(ctx.tcx, func).and_then(|p| {
+        crate::provenance::lookup_spec_for_def(ctx.tcx, def_id, admission, extern_opt, &p, site)
+    });
     if spec.is_some() {
         return spec;
     }
 
     // Plain def_path_str lookup.
     let path = ctx.tcx.def_path_str(def_id);
-    let spec = lookup_spec_with_extern(extern_opt, &path);
+    let spec =
+        crate::provenance::lookup_spec_for_def(ctx.tcx, def_id, admission, extern_opt, &path, site);
     if spec.is_some() {
         return spec;
     }
@@ -71,7 +95,14 @@ pub(super) fn lookup_call_spec<'tcx>(
     // Trait method fallback.
     let trait_method_id = resolve_trait_method_def_id(ctx.tcx, def_id)?;
     let trait_path = ctx.tcx.def_path_str(trait_method_id);
-    lookup_spec_with_extern(extern_opt, &trait_path)
+    crate::provenance::lookup_spec_for_def(
+        ctx.tcx,
+        trait_method_id,
+        admission,
+        extern_opt,
+        &trait_path,
+        site,
+    )
 }
 
 /// Find which `&mut` argument is the mutation receiver and return its
@@ -107,21 +138,26 @@ pub(super) fn find_mutation_receiver<'tcx>(
 ///
 /// Looks for ensures clauses of the form `(^self)@ == <rhs>` or `^self == <rhs>`.
 /// When found, substitutes call-site argument expressions for the spec's parameter
-/// names in `<rhs>`, producing the new symbolic state for the receiver.
+/// names in `<rhs>`, producing the new symbolic state for the receiver. Only a
+/// clause a call reads as written is matched (`spec_apply::clause_read_as_written`).
 pub(super) fn extract_post_state_from_spec(
     spec: &StdSpec,
+    callee: &Signature,
     receiver_expr: &PureExpr,
     args: &[rustc_span::Spanned<Operand<'_>>],
     lookup: &DerefLookup<'_>,
 ) -> Option<PureExpr> {
     for ensures_str in &spec.ensures {
-        let ensures_expr = trust_wp_core::contract_parser::parse_contract(ensures_str).ok()?;
+        let Some(ensures_expr) = clause_read_as_written(ensures_str, callee) else {
+            continue;
+        };
 
         // Look for `(^self)@ == <rhs>` pattern.
         if let Some(rhs) = extract_final_self_equation(&ensures_expr) {
             // Build substitution: spec param names → call-site expressions.
-            let substituted = substitute_spec_params(rhs, spec, receiver_expr, args, lookup);
-            return Some(substituted);
+            // A clause whose vocabulary cannot be bound refuses the advancement
+            // rather than leaving callee parameter names free.
+            return substitute_spec_params(rhs, spec, receiver_expr, args, lookup);
         }
     }
     None
@@ -169,50 +205,75 @@ fn substitute_spec_params(
     receiver_expr: &PureExpr,
     args: &[rustc_span::Spanned<Operand<'_>>],
     lookup: &DerefLookup<'_>,
-) -> PureExpr {
-    // Build name → expression map for substitution.
-    let mut subs: HashMap<String, PureExpr> = HashMap::new();
+) -> Option<PureExpr> {
+    // "self" (current view) → receiver's current expression. The spec uses
+    // `self@` which parses as View(Var("self")), so the view is applied by the
+    // parsed spec structure itself.
+    substitute_call_site_params(rhs, spec, receiver_expr.clone(), args, lookup)
+}
 
-    // "self" (current view) → receiver's current expression wrapped in View.
-    // The spec uses `self@` which parses as View(Var("self")), so we map
-    // "self" to the receiver expression (the view is applied by the parsed
-    // spec structure itself).
-    subs.insert("self".to_string(), receiver_expr.clone());
-
-    // Map positional/named non-self parameters to call-site args.
-    // args[0] is self; spec params skip self.
-    let non_self_args: Vec<PureExpr> = args
+/// Bind a callee spec's parameter vocabulary to call-site arguments and
+/// substitute it into `rhs`.
+///
+/// The binding follows `spec_apply::insert_std_symbolic_substitutions` and the
+/// user-name override in `apply_postconditions_with_self_inner` EXACTLY, so a
+/// name means the same argument on every path:
+///
+/// - a declared parameter name at position `idx` binds to `args[idx]`
+///   (position 0 is the receiver `self` for methods);
+/// - positional aliases `arg{idx}` bind to `args[idx]` and `value` / `default`
+///   / `arg` / `rhs` to `args[1]` (else `args[0]`), but only where no declared
+///   parameter already owns the name — real names always win;
+/// - `self` binds to `self_expr`.
+///
+/// Returns `None` (no binding — the caller falls back to an opaque value) when
+/// an argument the spec refers to cannot be translated: leaving the callee's
+/// parameter name free would let it alias a caller variable of the same name.
+fn substitute_call_site_params(
+    rhs: &PureExpr,
+    spec: &StdSpec,
+    self_expr: PureExpr,
+    args: &[rustc_span::Spanned<Operand<'_>>],
+    lookup: &DerefLookup<'_>,
+) -> Option<PureExpr> {
+    let translated: Vec<Option<PureExpr>> = args
         .iter()
-        .skip(1) // Skip the `&mut self` receiver
-        .filter_map(|a| translate_operand(&a.node, lookup))
+        .map(|a| translate_operand(&a.node, lookup))
         .collect();
-
-    // Use param_names if available, otherwise use positional aliases.
+    let mut subs: HashMap<String, PureExpr> = HashMap::new();
     if let Some(ref names) = spec.param_names {
         for (idx, name) in names.iter().enumerate() {
-            if name == "self" {
+            if name == "self" || name == "result" {
                 continue;
             }
-            if let Some(arg_expr) = non_self_args.get(idx.saturating_sub(1)) {
+            if let Some(Some(arg_expr)) = translated.get(idx) {
                 subs.insert(name.clone(), arg_expr.clone());
             }
         }
     }
-    // Always add positional fallbacks.
-    for (idx, arg_expr) in non_self_args.iter().enumerate() {
-        subs.insert(format!("arg{idx}"), arg_expr.clone());
-        // Common spec aliases.
-        if idx == 0 {
-            subs.entry("value".to_string())
-                .or_insert_with(|| arg_expr.clone());
-            subs.entry("arg".to_string())
-                .or_insert_with(|| arg_expr.clone());
-            subs.entry("rhs".to_string())
+    for (idx, arg_expr) in translated.iter().enumerate() {
+        if let Some(arg_expr) = arg_expr {
+            subs.entry(format!("arg{idx}"))
                 .or_insert_with(|| arg_expr.clone());
         }
     }
+    if let Some(Some(value_arg)) = translated.get(1).or_else(|| translated.first()) {
+        for alias in ["value", "default", "arg", "rhs"] {
+            subs.entry(alias.to_string())
+                .or_insert_with(|| value_arg.clone());
+        }
+    }
+    subs.insert("self".to_string(), self_expr);
 
-    substitute_in_expr(rhs, &subs)
+    let unresolved = crate::mir_analysis::spec_apply::unresolved_symbolic_names(
+        rhs,
+        &subs,
+        spec.param_names.as_deref(),
+    );
+    if !unresolved.is_empty() {
+        return None;
+    }
+    Some(substitute_in_expr(rhs, &subs))
 }
 
 /// Recursively substitute variable references in an expression.
@@ -250,27 +311,39 @@ pub(super) fn try_spec_result_binding<'tcx>(
         translate_operand(&args[0].node, lookup)
     };
 
-    extract_result_from_spec(&spec, receiver_expr.as_ref(), args, lookup)
+    let callee = call_signature(
+        ctx.tcx,
+        def_id,
+        spec.param_names.as_deref(),
+        Some(CallSite {
+            body: ctx.body,
+            func,
+        }),
+    );
+    extract_result_from_spec(&spec, &callee, receiver_expr.as_ref(), args, lookup)
 }
 
 /// Parse a spec's ensures clauses and extract the result expression.
 ///
 /// Looks for ensures clauses of the form `result == <rhs>` or `result@ == <rhs>`.
 /// When found, substitutes call-site argument expressions for the spec's parameter
-/// names in `<rhs>`, producing the concrete expression for the call result.
+/// names in `<rhs>`, producing the concrete expression for the call result. Only
+/// a clause a call reads as written is matched (`spec_apply::clause_read_as_written`).
 fn extract_result_from_spec(
     spec: &StdSpec,
+    callee: &Signature,
     receiver_expr: Option<&PureExpr>,
     args: &[rustc_span::Spanned<Operand<'_>>],
     lookup: &DerefLookup<'_>,
 ) -> Option<PureExpr> {
     for ensures_str in &spec.ensures {
-        let ensures_expr = trust_wp_core::contract_parser::parse_contract(ensures_str).ok()?;
+        let Some(ensures_expr) = clause_read_as_written(ensures_str, callee) else {
+            continue;
+        };
 
         // Look for `result == <rhs>` or `result@ == <rhs>` pattern.
         if let Some(rhs) = extract_result_equation(&ensures_expr) {
-            let substituted = substitute_result_spec_params(rhs, spec, receiver_expr, args, lookup);
-            return Some(substituted);
+            return substitute_result_spec_params(rhs, spec, receiver_expr, args, lookup);
         }
     }
     None
@@ -313,47 +386,37 @@ fn substitute_result_spec_params(
     receiver_expr: Option<&PureExpr>,
     args: &[rustc_span::Spanned<Operand<'_>>],
     lookup: &DerefLookup<'_>,
-) -> PureExpr {
-    let mut subs: HashMap<String, PureExpr> = HashMap::new();
-
-    // "self" → receiver's expression (the first argument).
-    // For shared refs, the MIR argument is typically `&(*v)`, and
-    // translate_operand resolves through the deref chain to produce the
-    // tracked expression (e.g., Deref(Var("v")) for a &mut param).
-    if let Some(recv) = receiver_expr {
-        subs.insert("self".to_string(), recv.clone());
-    }
-
-    // Map non-self arguments by name or position.
-    let non_self_args: Vec<PureExpr> = args
-        .iter()
-        .skip(1)
-        .filter_map(|a| translate_operand(&a.node, lookup))
-        .collect();
-
-    if let Some(ref names) = spec.param_names {
-        for (idx, name) in names.iter().enumerate() {
-            if name == "self" {
-                continue;
+) -> Option<PureExpr> {
+    // "self" → the first argument. For shared refs, the MIR argument is
+    // typically `&(*v)`, and translate_operand resolves through the deref
+    // chain to the tracked expression. A spec whose first declared parameter
+    // is not `self` (a free function) has no receiver: `self` stays unbound
+    // and any clause mentioning it is refused by the unresolved-name check.
+    let first_is_self = spec
+        .param_names
+        .as_deref()
+        .is_none_or(|names| names.first().is_some_and(|n| n == "self"));
+    let self_expr = if first_is_self {
+        receiver_expr.cloned()
+    } else {
+        None
+    };
+    match self_expr {
+        Some(self_expr) => substitute_call_site_params(rhs, spec, self_expr, args, lookup),
+        None => {
+            if rhs.free_vars().contains("self") {
+                return None;
             }
-            if let Some(arg_expr) = non_self_args.get(idx.saturating_sub(1)) {
-                subs.insert(name.clone(), arg_expr.clone());
-            }
+            // Bind a placeholder that the clause provably does not mention.
+            substitute_call_site_params(
+                rhs,
+                spec,
+                PureExpr::Var("self".to_string(), None),
+                args,
+                lookup,
+            )
         }
     }
-    for (idx, arg_expr) in non_self_args.iter().enumerate() {
-        subs.insert(format!("arg{idx}"), arg_expr.clone());
-        if idx == 0 {
-            subs.entry("value".to_string())
-                .or_insert_with(|| arg_expr.clone());
-            subs.entry("arg".to_string())
-                .or_insert_with(|| arg_expr.clone());
-            subs.entry("rhs".to_string())
-                .or_insert_with(|| arg_expr.clone());
-        }
-    }
-
-    substitute_in_expr(rhs, &subs)
 }
 
 /// Try to advance the receiver's symbolic state using the called function's spec.
@@ -376,6 +439,7 @@ pub(super) fn try_spec_advancement<'tcx>(
     deref_exprs: &HashMap<Local, PureExpr>,
     field_deref_exprs: &HashMap<(Local, u32), PureExpr>,
     reborrow_map: &HashMap<Local, Local>,
+    carrier_read_locals: &std::collections::HashSet<Local>,
 ) -> Option<SpecAdvancement> {
     // Fn-trait calls must bail for identity-final-value synthesis (#537).
     if is_fn_trait_call(ctx.tcx, func) {
@@ -392,14 +456,35 @@ pub(super) fn try_spec_advancement<'tcx>(
     // to a tracked mut_borrow param.
     let (receiver_local, receiver_expr) =
         find_mutation_receiver(ctx, args, deref_exprs, reborrow_map)?;
+    // The spec's `^self` names the FIRST argument. Advancing some later `&mut`
+    // argument with a `^self` equation would bind the wrong place.
+    let first_local = match args.first().map(|a| &a.node) {
+        Some(Operand::Copy(place) | Operand::Move(place)) => Some(place.local),
+        _ => None,
+    };
+    let first_tracked = first_local
+        .and_then(|local| resolve_reborrow_param_local(local, ctx.mut_borrow_params, reborrow_map));
+    if first_tracked != Some(receiver_local) {
+        return None;
+    }
 
     // Step 4: Parse ensures clauses and extract the `^self` post-state.
     let lookup = DerefLookup {
         locals: local_exprs,
         deref_exprs,
         field_deref_exprs,
+        carrier_read_locals: Some(carrier_read_locals),
     };
-    let new_state = extract_post_state_from_spec(&spec, &receiver_expr, args, &lookup)?;
+    let callee = call_signature(
+        ctx.tcx,
+        def_id,
+        spec.param_names.as_deref(),
+        Some(CallSite {
+            body: ctx.body,
+            func,
+        }),
+    );
+    let new_state = extract_post_state_from_spec(&spec, &callee, &receiver_expr, args, &lookup)?;
 
     Some(SpecAdvancement {
         receiver_local,

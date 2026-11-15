@@ -50,6 +50,7 @@ pub(in crate::mir_analysis::extract) fn handle_call_terminator<'tcx>(
     );
     let cell_builtin = resolved
         .def_id
+        .filter(|def_id| crate::provenance::is_spec_library_item(tcx, *def_id))
         .and_then(|def_id| classify_cell_builtin_path(&tcx.def_path_str(def_id)));
 
     if let Some(builtin) = cell_builtin {
@@ -86,6 +87,7 @@ pub(in crate::mir_analysis::extract) fn handle_call_terminator<'tcx>(
     // the normal (opaque) handling, never fabricating a receiver. (#newfrontier)
     if resolved
         .def_id
+        .filter(|def_id| crate::provenance::is_spec_library_item(tcx, *def_id))
         .map(|def_id| tcx.def_path_str(def_id))
         .is_some_and(|path| is_total_mapping_set_path(&path))
         && args.len() == 3
@@ -111,7 +113,7 @@ pub(in crate::mir_analysis::extract) fn handle_call_terminator<'tcx>(
             //    free Mapping constant even though the capture-side value carries
             //    the semantics. (#newfrontier)
             let result_var = PureExpr::Var(
-                format!("call_{}", destination.local.as_u32()),
+                format!("$call_{}", destination.local.as_u32()),
                 ty_to_expr_sort_enriched(tcx, body.local_decls[destination.local].ty),
             );
             effects.assumptions.push(PureExpr::BinOp(
@@ -318,6 +320,9 @@ pub(in crate::mir_analysis::extract) fn handle_call_terminator<'tcx>(
             handle_map_inv_from_closure(call_site, session, effects)
         }
         ResolvedCallKind::Opaque => {
+            if std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some() {
+                eprintln!("[TWP_AUTH] opaque call: no spec resolves `{func:?}`");
+            }
             let call_site = CallSiteContext {
                 tcx,
                 body,

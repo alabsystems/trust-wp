@@ -302,39 +302,13 @@ fn postcondition_mut_plus_resolve_binds_all_vars() {
     // resolve(f) matches resolve(st2), binding st2 -> f
     let requires = vec![
         postcondition_mut(var("f"), vec![var("result")]),
-        resolve_call(var("f")),
+        resolve_call(value_state("f")),
     ];
 
     let result = run_eager_sat(&ensures, &requires);
     assert!(
         result.is_unsat(),
         "postcondition_mut + resolve cooperation should produce Unsat, got: {result:?}"
-    );
-}
-
-/// Resolve with Deref/Final normalization: ground resolve uses Final wrapper,
-/// body resolve uses bare variable. Normalization must bridge the gap.
-#[test]
-#[timeout(30000)]
-fn resolve_with_deref_final_normalization() {
-    // Body: st.postcondition_mut(r) && resolve(st2)
-    let body = and(
-        postcondition_mut(var("st"), vec![var("r")]),
-        resolve_call(var("st2")),
-    );
-    let ensures = vec![nested_exists(&["st", "r", "st2"], body)];
-
-    // Ground resolve uses Final: resolve(Final(f)) normalizes to resolve(f_final)
-    // Body: resolve(st2) → st2 should bind to f_final
-    let requires = vec![
-        postcondition_mut(deref(var("f")), vec![var("result")]),
-        logic_fn_call("resolve", vec![final_expr(var("f"))]),
-    ];
-
-    let result = run_eager_sat(&ensures, &requires);
-    assert!(
-        result.is_unsat(),
-        "resolve with Deref/Final normalization should produce Unsat, got: {result:?}"
     );
 }
 
@@ -350,10 +324,16 @@ fn resolve_under_quantifier_excluded_from_ground() {
     );
     let ensures = vec![nested_exists(&["st", "r", "st2"], body)];
 
-    // Ground postcondition_mut exists, but resolve is under a forall (not ground)
+    // Ground postcondition_mut exists, but resolve is under a forall (not
+    // ground). The binder is a value: an unannotated one may range over
+    // borrows, and its resolve is refused (D-127).
     let requires = vec![
         postcondition_mut(var("f"), vec![var("result")]),
-        forall("x", resolve_call(var("x"))),
+        forall_with_sort(
+            "x",
+            trust_wp_core::formula::ExprSort::Int,
+            resolve_call(var_with_sort("x", trust_wp_core::formula::ExprSort::Int)),
+        ),
     ];
 
     // st and r are bound by postcondition_mut, but st2 has no ground resolve

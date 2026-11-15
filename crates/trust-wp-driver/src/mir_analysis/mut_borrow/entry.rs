@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use rustc_borrowck::consumers::BodyWithBorrowckFacts;
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{BasicBlock, Body, Local},
@@ -21,14 +20,17 @@ use trust_wp_driver::StdSpec;
 
 use super::{
     data::{MutBorrowAccumulators, MutBorrowBlockContext, MutBorrowBody, MutBorrowTraversalState},
-    extract_mut_borrow_from_block,
+    extract_mut_borrow_from_block, field_writes,
     finality::{build_delayed_writeback_assumptions, compute_reborrow_metadata, ReborrowMetadata},
     type_analysis::{
         collect_mut_ref_paths_with_tcx, direct_closure_field_seeds, find_mut_borrow_params,
-        is_newtype_wrapping_mut, struct_field_count_behind_mut,
+        is_newtype_wrapping_mut, struct_field_count_behind_mut, type_contains_mut_ref_with_tcx,
     },
 };
-use crate::mir_analysis::{resolver::compute_resolve_points, translate::ty_to_expr_sort_enriched};
+use crate::{
+    callbacks::thread_locals::RetainedBorrowckBody,
+    mir_analysis::{resolver::compute_resolve_points, translate::ty_to_expr_sort_enriched},
+};
 
 /// Build a typed `Deref(Var(name, sort))` expression using MIR type info.
 ///
@@ -75,7 +77,7 @@ pub(super) fn make_typed_deref_expr<'tcx>(
 pub(crate) fn extract_mut_borrow_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-    body_with_facts: Option<&BodyWithBorrowckFacts<'tcx>>,
+    body_with_facts: Option<&RetainedBorrowckBody<'tcx>>,
     arg_names: &[String],
     user_specs: &HashMap<DefId, StdSpec>,
     trait_specs: &HashMap<DefId, StdSpec>,
@@ -151,7 +153,19 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         pending_index_mut: HashMap::new(),
         nested_transfer_slots: HashSet::new(),
         nested_transfer_poisoned: false,
+        havoc_params: HashSet::new(),
+        carrier_written_fields: HashSet::new(),
+        field_written_params: HashSet::new(),
+        whole_written_params: HashSet::new(),
+        held_pointee_written_params: HashSet::new(),
     };
+
+    // Borrows lent into the return value (see `lent.rs`).
+    let lent_analysis = super::lent::analyze_lent_borrows(tcx, body);
+    let mut borrow_taint: HashMap<Local, HashSet<Local>> = HashMap::new();
+    for arg in body.args_iter() {
+        borrow_taint.insert(arg, HashSet::from([arg]));
+    }
 
     // Extract final values through block traversal
     let ctx = MutBorrowBlockContext {
@@ -162,6 +176,7 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         user_specs,
         trait_specs,
         extern_specs,
+        borrow_carrying: &lent_analysis.carries,
     };
     let state = MutBorrowTraversalState {
         local_exprs,
@@ -171,11 +186,64 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         field_reborrow_map: HashMap::new(),
         slice_reborrow_map: HashMap::new(),
         slot_borrow_map: HashMap::new(),
+        slot_alias_roots: HashMap::new(),
         slot_exprs: HashMap::new(),
+        carrier_field_reborrows: HashMap::new(),
+        carrier_read_locals: mut_borrow_params
+            .iter()
+            .copied()
+            .filter(|local| {
+                field_writes::value_carrier_referent(tcx, body.local_decls[*local].ty).is_some()
+            })
+            .collect(),
         visited: HashSet::new(),
+        borrow_taint,
     };
     let (final_deref_exprs, final_field_deref_exprs, final_slot_exprs) =
         extract_mut_borrow_from_block(&ctx, BasicBlock::from_u32(0), state, &mut accum)?;
+
+    // Params marked lent on some path by the traversal replay must be treated
+    // as lent even if the flow-insensitive pass (an over-approximation that
+    // should already contain them) disagreed.
+    let mut lent_locals: HashSet<Local> = lent_analysis.lent.clone();
+    for (local, expr) in &final_deref_exprs {
+        if expr_contains_lent_marker(expr) {
+            lent_locals.insert(*local);
+        }
+    }
+    let mut lent_path_resolutions: Vec<PureExpr> = Vec::new();
+    if lent_analysis.refinable {
+        let mut locals: Vec<Local> = lent_locals.iter().copied().collect();
+        locals.sort();
+        for local in locals {
+            let Some(param_idx) = local.as_usize().checked_sub(1) else {
+                continue;
+            };
+            let Some(name) = arg_names.get(param_idx) else {
+                continue;
+            };
+            // A param already mutation-continued for another reason has no
+            // trusted exit pointee: its final_values entry would have been
+            // gated off, so no path-restricted copy of it may be asserted.
+            if name == "self"
+                || accum.mutation_continued_params.contains(name)
+                || is_newtype_wrapping_mut(tcx, body.local_decls[local].ty)
+                || accum.nested_transfer_slots.contains(&local)
+                || final_field_deref_exprs.keys().any(|(l, _)| *l == local)
+            {
+                continue;
+            }
+            let Some(tree) = final_deref_exprs.get(&local) else {
+                continue;
+            };
+            let sort = ty_to_expr_sort_enriched(tcx, body.local_decls[local].ty);
+            let prophecy = PureExpr::Final(Arc::new(PureExpr::Var(name.clone(), sort)));
+            let mut out = Vec::new();
+            if collect_unlent_path_resolutions(tree, &prophecy, &mut Vec::new(), &mut out) {
+                lent_path_resolutions.extend(out);
+            }
+        }
+    }
 
     // Build result map from parameter name to final value
     let mut final_values = HashMap::new();
@@ -214,6 +282,181 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         &mut final_values,
     )?;
 
+    // The value a `&mut` parameter is left with must reflect every write to
+    // its referent, or no premise may state it (D-184):
+    // (1) a write THROUGH a borrow the referent holds (`*x.m = 5`) leaves `x`
+    //     holding that borrow with a new current value, which the per-field
+    //     reconstruction cannot state at the field's sort (it would put the
+    //     pointee `5` where the borrow is);
+    // (2) a per-field write the reconstruction above did not reach `^x` with
+    //     leaves the entry identity `*x`, which would make the write
+    //     invisible to every clause reading a field of `^x` (`(^x).m`, or
+    //     `x.m` as the value `x` is left with).
+    // Either way the entry stays as the declaration carrier and loses its
+    // force, as a by-value carrier's does below.
+    let mut forceless: Vec<(Local, String)> = final_field_deref_exprs
+        .keys()
+        .map(|&(local, _)| local)
+        .chain(accum.held_pointee_written_params.iter().copied())
+        .filter_map(|local| {
+            let name = arg_names.get(local.as_usize().checked_sub(1)?)?;
+            let is_mut_ref = matches!(
+                body.local_decls[local].ty.kind(),
+                rustc_middle::ty::TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+            );
+            let unreconstructed = final_values
+                .get(name)
+                .is_some_and(|whole| field_writes::is_identity_deref(name, whole));
+            (is_mut_ref && (accum.held_pointee_written_params.contains(&local) || unreconstructed))
+                .then(|| (local, name.clone()))
+        })
+        .collect();
+    forceless.sort();
+    forceless.dedup();
+    for (local, name) in forceless {
+        if final_values.contains_key(&name) {
+            final_values.insert(name.clone(), make_typed_deref_expr(tcx, body, local, &name));
+        }
+        accum.mutation_continued_params.insert(name);
+    }
+
+    // Value carriers (s34): per-field final entries for written top-level
+    // fields, projected from the whole final value (literal consequences).
+    let mut carrier_fields: HashMap<Local, Vec<u32>> = HashMap::new();
+    for &(local, idx) in &accum.carrier_written_fields {
+        carrier_fields.entry(local).or_default().push(idx);
+    }
+    for (local, mut idxs) in carrier_fields {
+        if accum.havoc_params.contains(&local) {
+            continue;
+        }
+        let Some(name) = local
+            .as_usize()
+            .checked_sub(1)
+            .and_then(|idx| arg_names.get(idx))
+        else {
+            continue;
+        };
+        let Some(whole) = final_values.get(name).cloned() else {
+            continue;
+        };
+        if field_writes::is_identity_deref(name, &whole) {
+            continue;
+        }
+        idxs.sort_unstable();
+        idxs.dedup();
+        final_values.extend(field_writes::carrier_field_final_entries(
+            name, &whole, idxs,
+        ));
+    }
+
+    // A BY-VALUE carrier of `&mut` fields gets no whole-carrier final value.
+    //
+    // The identity `^p == *p` is true of the tuple's own value — a pair of
+    // references nothing reassigns — but the encoder reads a field back out of
+    // that carrier with `tuple_get_N` at the sort of the REFERENT, so the
+    // identity descends as `^p.N == *p.N` for every field. That is asserted
+    // about a function that writes THROUGH those fields, in both directions at
+    // once: the write becomes invisible, and the true post-state is refuted by
+    // the same equality. The per-field entries below the carrier are the ones
+    // that name a place with a prophecy; a clause this leaves unprovable loses
+    // a premise, which is the direction to lose in.
+    //
+    // A newtype carrier keeps its entry: its final value is the referent's
+    // POST-write value wrapped in a constructor, not an identity, so nothing
+    // descends that contradicts the write.
+    let mut byvalue_carriers: Vec<String> = Vec::new();
+    for (idx, name) in arg_names.iter().enumerate() {
+        let local = Local::from_usize(idx + 1);
+        if accum.havoc_params.contains(&local) {
+            continue;
+        }
+        let ty = body.local_decls[local].ty;
+        if matches!(
+            ty.kind(),
+            rustc_middle::ty::TyKind::Ref(_, _, rustc_middle::ty::Mutability::Mut)
+        ) || !type_contains_mut_ref_with_tcx(tcx, ty)
+        {
+            continue;
+        }
+        if final_values
+            .get(name)
+            .is_some_and(|whole| field_writes::is_identity_deref(name, whole))
+        {
+            byvalue_carriers.push(name.clone());
+        }
+    }
+    for name in byvalue_carriers {
+        // The entry stays as the DECLARATION carrier the ay layer expects —
+        // the per-field entries are written in terms of it, and dropping it
+        // outright leaves them projecting out of an unbound symbol at the
+        // wrong sort. What goes is its force: a mutation-continued param has
+        // its `_current_final` alias tied to its own final symbol instead of
+        // to its entry value, and gets no identity resolve either, so nothing
+        // descends to the fields.
+        accum.mutation_continued_params.insert(name);
+    }
+
+    // Havocked params (s34): the referent could not be tracked exactly. Remove
+    // every final-value premise (whole, per-field, indexed writes) and mark the
+    // param mutation-continued so the ay layer asserts neither the final value
+    // nor the identity resolve. The identity entry is kept only as the
+    // declaration carrier the ay layer expects for continued params.
+    let mut havoc_locals: Vec<Local> = accum.havoc_params.iter().copied().collect();
+    havoc_locals.sort();
+    for local in havoc_locals {
+        let Some(name) = local
+            .as_usize()
+            .checked_sub(1)
+            .and_then(|idx| arg_names.get(idx))
+            .cloned()
+        else {
+            continue;
+        };
+        let field_prefix = format!("{name}.");
+        final_values.retain(|key, _| key != &name && !key.starts_with(&field_prefix));
+        let identity = make_typed_deref_expr(tcx, body, local, &name);
+        let identity = if is_newtype_wrapping_mut(tcx, body.local_decls[local].ty) {
+            PureExpr::LogicFnCall {
+                name: tuple_logic_fn_name(1),
+                args: vec![identity],
+            }
+        } else {
+            identity
+        };
+        final_values.insert(name.clone(), identity);
+        accum
+            .indexed_writes
+            .retain(|write| write.param_name != name);
+        accum.mutation_continued_params.insert(name);
+    }
+
+    // Borrows lent into the return value (soundness). A `&mut` parameter
+    // whose borrow — whole, a field reborrow, a deeper reborrow, or inside an
+    // aggregate — may flow into `RETURN_PLACE` on ANY path keeps being written
+    // by the caller through `result`, so every `final_values` entry for it
+    // (identity, branch-merged identity, or field reconstruction) is a FALSE
+    // premise. Remove them all and treat the param as mutation-continued, so
+    // neither `^p == <entry>` nor an identity resolve is asserted. Only
+    // premises are deleted.
+    let lent_param_names: Vec<String> = {
+        let mut names: Vec<String> = lent_locals
+            .iter()
+            .copied()
+            .filter_map(|local| {
+                let idx = local.as_usize().checked_sub(1)?;
+                arg_names.get(idx).cloned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    for name in &lent_param_names {
+        let field_prefix = format!("{name}.");
+        final_values.retain(|key, _| key != name && !key.starts_with(&field_prefix));
+        accum.mutation_continued_params.insert(name.clone());
+    }
+
     // Nested-reborrow transfer resolutions (rusthorn inc_max_3 class).
     //
     // For each parameter slot rebound by a recognized transfer call, emit the
@@ -239,7 +482,7 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
             let name = arg_names
                 .get(param_idx)
                 .cloned()
-                .unwrap_or_else(|| format!("_param_{}", slot.as_u32()));
+                .unwrap_or_else(|| format!("$param_{}", slot.as_u32()));
             let removed_value = final_values.remove(&name);
             accum.mutation_continued_params.insert(name.clone());
             nested_transfer_params.insert(name.clone());
@@ -269,6 +512,15 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         }
         if accum.nested_transfer_poisoned {
             nested_slot_resolutions.clear();
+        }
+    }
+
+    // A lent borrow may be the content of a transfer slot (or the slot
+    // itself): its expiry resolution would pin a prophecy the caller owns.
+    if !lent_param_names.is_empty() {
+        nested_slot_resolutions.clear();
+        if !nested_transfer_params.is_empty() {
+            lent_path_resolutions.clear();
         }
     }
 
@@ -303,7 +555,69 @@ pub(crate) fn extract_mut_borrow_body<'tcx>(
         mutation_continued_params,
         nested_slot_resolutions,
         nested_transfer_params,
+        lent_path_resolutions,
     })
+}
+
+fn expr_contains_lent_marker(expr: &PureExpr) -> bool {
+    expr.any_recursive(|node| {
+        matches!(node, PureExpr::LogicFnCall { name, .. } if name == super::lent::LENT_ON_PATH_MARKER)
+    })
+}
+
+/// Walk a branch-merged final pointee tree of a param lent on SOME path and
+/// emit `guards ==> Final(p) == leaf` for every leaf NOT wrapped in the lent
+/// marker: on that path the borrow is dropped (not returned) at exit with
+/// pointee `leaf`, which is exactly its RustHorn resolution. Marked leaves
+/// (returned on that path) emit nothing. Returns false — emit nothing for this
+/// param at all — if a marker occurs anywhere but as a whole leaf.
+fn collect_unlent_path_resolutions(
+    tree: &PureExpr,
+    prophecy: &PureExpr,
+    guards: &mut Vec<PureExpr>,
+    out: &mut Vec<PureExpr>,
+) -> bool {
+    use trust_wp_core::formula::{BinOp, UnOp};
+
+    const MAX_GUARD_DEPTH: usize = 8;
+    match tree {
+        PureExpr::Ite(cond, then_branch, else_branch) => {
+            if guards.len() >= MAX_GUARD_DEPTH || expr_contains_lent_marker(cond) {
+                return false;
+            }
+            guards.push(cond.as_ref().clone());
+            let then_ok = collect_unlent_path_resolutions(then_branch, prophecy, guards, out);
+            guards.pop();
+            guards.push(PureExpr::UnOp(UnOp::Not, Arc::clone(cond)));
+            let else_ok = collect_unlent_path_resolutions(else_branch, prophecy, guards, out);
+            guards.pop();
+            then_ok && else_ok
+        }
+        PureExpr::LogicFnCall { name, .. } if name == super::lent::LENT_ON_PATH_MARKER => true,
+        leaf => {
+            if expr_contains_lent_marker(leaf) {
+                return false;
+            }
+            let eq = PureExpr::BinOp(
+                Arc::new(prophecy.clone()),
+                BinOp::Eq,
+                Arc::new(leaf.clone()),
+            );
+            let Some(first) = guards.first().cloned() else {
+                out.push(eq);
+                return true;
+            };
+            let antecedent = guards.iter().skip(1).cloned().fold(first, |acc, g| {
+                PureExpr::BinOp(Arc::new(acc), BinOp::And, Arc::new(g))
+            });
+            out.push(PureExpr::BinOp(
+                Arc::new(antecedent),
+                BinOp::Implies,
+                Arc::new(eq),
+            ));
+            true
+        }
+    }
 }
 
 /// Flatten a nested-slot expiry resolution `Final(<content>) == <value>` into
@@ -387,8 +701,9 @@ fn flatten_slot_resolution(
 ///    updates. When `HasMutRef(pub &'a mut T)` has `field_deref[(_1, 0)] = Int(5)`
 ///    but `final_values["x"]` still holds the identity, this reconstructs
 ///    `x_final = tuple1(5)`.
-/// 3. For multi-field structs/tuples with field-level writes, reconstruct
-///    whole-struct final values from per-field finals. (#2683)
+/// 3. For structs/tuples behind `&mut` with field-level writes, reconstruct
+///    whole-struct final values from per-field finals (#2683), one-field
+///    referents included (D-184).
 fn populate_field_and_newtype_final_values<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -428,8 +743,8 @@ fn populate_field_and_newtype_final_values<'tcx>(
         }
     }
 
-    // Phase 3 (#2683): reconstruct whole-struct final values for multi-field
-    // structs/tuples behind &mut.
+    // Phase 3 (#2683): reconstruct whole-struct final values for structs and
+    // tuples behind &mut, a one-field referent included (D-184).
     //
     // When a function writes to individual fields of a &mut struct parameter
     // (e.g., `x.a = 34` on `&mut S { a, b }`), the per-field final values are

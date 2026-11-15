@@ -10,10 +10,9 @@ use trust_wp_core::formula::Pattern;
 
 use super::*;
 
-/// Regression for #1811: when the body returns `Err(42)`, the datatype
-/// wrapping logic must use the `Err` constructor, not the default `Ok`.
-/// Without the fix, `value_constructor_name()` always returns `"Ok"` for
-/// `ResultIntInt`, producing `result = Ok(42)` when the body is `Err(42)`.
+/// Regression for #1811: a body that returns `Err(42)` binds `result` to the
+/// `Err` constructor it names, never to the type's value constructor `Ok`
+/// (`result = Ok(42)` would decide a variant the body does not choose).
 #[test]
 #[timeout(30000)]
 fn test_result_err_body_uses_err_constructor_not_default_ok() {
@@ -86,68 +85,5 @@ fn test_from_arms_no_constructors_returns_none() {
         SwitchTarget::from_arms(&[]),
         None,
         "Empty arms should return None"
-    );
-}
-
-/// `value_constructor_name` returns the first arity>=1 constructor for
-/// `UserDefined`. Verify it works on a valid UserDefined. (#1980)
-#[test]
-#[timeout(30000)]
-fn test_value_constructor_name_user_defined() {
-    use crate::encoder::match_enc::SwitchTarget;
-
-    let target = SwitchTarget::from_arms(&[
-        MatchArm {
-            pattern: Pattern::Constructor {
-                name: "Leaf".to_string(),
-                inner: None,
-            },
-            body: int(0),
-        },
-        MatchArm {
-            pattern: Pattern::Constructor {
-                name: "Node".to_string(),
-                inner: Some(Box::new(Pattern::Binding("val".to_string()))),
-            },
-            body: var("val"),
-        },
-    ])
-    .expect("Should produce UserDefined");
-
-    // Node has arity 1, Leaf has arity 0 → value_constructor_name picks Node.
-    assert_eq!(
-        target.value_constructor_name(),
-        "Node",
-        "Should pick first constructor with arity >= 1"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_value_constructor_name_user_defined_qualified_paths() {
-    use crate::encoder::match_enc::SwitchTarget;
-
-    let target = SwitchTarget::from_arms(&[
-        MatchArm {
-            pattern: Pattern::Constructor {
-                name: "Self::Leaf".to_string(),
-                inner: None,
-            },
-            body: int(0),
-        },
-        MatchArm {
-            pattern: Pattern::Constructor {
-                name: "Self::Node".to_string(),
-                inner: Some(Box::new(Pattern::Binding("val".to_string()))),
-            },
-            body: var("val"),
-        },
-    ])
-    .expect("Should produce UserDefined");
-
-    assert_eq!(
-        target.value_constructor_name(),
-        "Node",
-        "Qualified constructor paths must normalize to ay constructor names"
     );
 }

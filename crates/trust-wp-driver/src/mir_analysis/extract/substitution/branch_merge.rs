@@ -21,7 +21,7 @@ use trust_wp_core::formula::{BinOp, ExprSort, PureExpr};
 
 use super::{
     super::{
-        super::translate::{operand_int_ty, switch_value_to_i64, translate_operand},
+        super::translate::{operand_int_ty, switch_value_to_expr, translate_operand},
         NameSubstitutions,
     },
     extract_substitution_outcome_from_block, extract_substitutions_from_block,
@@ -74,28 +74,41 @@ pub(super) fn merge_switchint_substitutions<'tcx>(
     };
     let discr_int_ty = operand_int_ty(discr, body);
 
-    // Collect (switch_value, BasicBlock) for each non-otherwise target.
-    // Arms whose values exceed i64 range (e.g., i128/u128) are skipped —
-    // they'll be covered by the otherwise (default) branch in the ITE chain.
+    // Collect (arm guard, BasicBlock) for each non-otherwise target. An
+    // arm's guard is `discr == K` with `K` value-exact however wide
+    // (`switch_value_to_expr`: `1u128 << 100`, `i128::MIN`). An arm whose
+    // value has no exact term is still merged, under a guard nothing
+    // constrains: dropping it (as the old i64-only skip did) folded its
+    // writes into the otherwise branch, and `*x = 0; match v { 1 << 100 =>
+    // *x = 5, _ => {} }` then read `*x == 0` on every path (D-186).
     let otherwise_bb = targets.otherwise();
-    let mut valued_arms: Vec<(i64, BasicBlock)> = Vec::new();
+    let mut valued_arms: Vec<(PureExpr, BasicBlock)> = Vec::new();
     for (value, target) in targets.iter() {
         if !reachable.contains(&target) {
             continue;
         }
-        let value_i64 = match discr_int_ty {
-            Some(ty) => switch_value_to_i64(value, ty),
-            None => i64::try_from(value).ok(),
+        let value_expr = match discr_int_ty {
+            Some(ty) => switch_value_to_expr(value, ty),
+            None => i64::try_from(value).ok().map(PureExpr::Int),
         };
-        if let Some(v) = value_i64 {
-            valued_arms.push((v, target));
-        }
+        let guard = match value_expr {
+            Some(value_expr) => PureExpr::BinOp(
+                Arc::new(discr_expr.clone()),
+                BinOp::Eq,
+                Arc::new(value_expr),
+            ),
+            None => PureExpr::Var(
+                format!("$unrepresented_switch_arm_{}", target.as_u32()),
+                Some(ExprSort::Bool),
+            ),
+        };
+        valued_arms.push((guard, target));
     }
 
     // Collect substitutions from all reachable branches.
-    let mut branch_subs: Vec<(Option<i64>, NameSubstitutions)> = Vec::new();
+    let mut branch_subs: Vec<(Option<PureExpr>, NameSubstitutions)> = Vec::new();
     let mut cycle_only_failure = false;
-    for &(value, target) in &valued_arms {
+    for (guard, target) in valued_arms {
         let outcome = extract_substitution_outcome_from_block(
             body,
             target,
@@ -106,7 +119,7 @@ pub(super) fn merge_switchint_substitutions<'tcx>(
         );
         cycle_only_failure |= outcome.failed_only_due_to_cycle;
         if let Some(subs) = outcome.substitutions {
-            branch_subs.push((Some(value), subs));
+            branch_subs.push((Some(guard), subs));
         }
     }
     // Otherwise (default) branch.
@@ -144,7 +157,6 @@ pub(super) fn merge_switchint_substitutions<'tcx>(
 
     // Merge: for each variable name across all branches, build an ITE chain.
     Some(build_ite_merged_substitutions(
-        &discr_expr,
         &branch_subs,
         &fallback_exprs,
     ))
@@ -153,10 +165,11 @@ pub(super) fn merge_switchint_substitutions<'tcx>(
 /// Build ITE-merged substitutions from collected branch data.
 ///
 /// For each variable name that appears in any branch, constructs a nested ITE
-/// expression: `ite(discr == val1, arm1_expr, ite(discr == val2, ..., default))`.
+/// expression: `ite(guard1, arm1_expr, ite(guard2, ..., default))`, each
+/// guard an arm's `discr == K` (or an unconstrained symbol for an arm whose
+/// value has no exact term).
 pub(super) fn build_ite_merged_substitutions(
-    discr_expr: &PureExpr,
-    branch_subs: &[(Option<i64>, NameSubstitutions)],
+    branch_subs: &[(Option<PureExpr>, NameSubstitutions)],
     fallback_exprs: &HashMap<String, PureExpr>,
 ) -> NameSubstitutions {
     // Collect all variable names that appear in any branch.
@@ -167,10 +180,10 @@ pub(super) fn build_ite_merged_substitutions(
 
     // Separate the otherwise branch (default) from valued arms.
     let mut default_subs: Option<&NameSubstitutions> = None;
-    let mut valued_subs: Vec<(i64, &NameSubstitutions)> = Vec::new();
-    for (val, subs) in branch_subs {
-        match val {
-            Some(v) => valued_subs.push((*v, subs)),
+    let mut valued_subs: Vec<(&PureExpr, &NameSubstitutions)> = Vec::new();
+    for (guard, subs) in branch_subs {
+        match guard {
+            Some(guard) => valued_subs.push((guard, subs)),
             None => default_subs = Some(subs),
         }
     }
@@ -185,17 +198,15 @@ pub(super) fn build_ite_merged_substitutions(
 
         // Build nested ITE from the valued arms in order.
         let mut result = default_expr;
-        for &(value, subs) in valued_subs.iter().rev() {
+        for &(guard, subs) in valued_subs.iter().rev() {
             if let Some(arm_expr) = subs.get(name) {
                 // Only add ITE if the arm value differs from the current result.
                 if arm_expr != &result {
-                    let cond = PureExpr::BinOp(
-                        Arc::new(discr_expr.clone()),
-                        BinOp::Eq,
-                        Arc::new(PureExpr::Int(value)),
+                    result = PureExpr::Ite(
+                        Arc::new(guard.clone()),
+                        Arc::new(arm_expr.clone()),
+                        Arc::new(result),
                     );
-                    result =
-                        PureExpr::Ite(Arc::new(cond), Arc::new(arm_expr.clone()), Arc::new(result));
                 }
             }
         }
@@ -277,12 +288,8 @@ fn base_var_sort(expr: &PureExpr) -> Option<ExprSort> {
 }
 
 fn is_simple_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    // A renamed shadowed binding names a source binding too (D-237).
+    crate::mir_analysis::binding_identity::is_binding_ident(name)
 }
 
 /// Branch targets and reachability for a boolean SwitchInt.
@@ -470,7 +477,7 @@ fn first_reachable_substitution<'tcx>(
 }
 
 fn merge_name_sorts(
-    branch_subs: &[(Option<i64>, NameSubstitutions)],
+    branch_subs: &[(Option<PureExpr>, NameSubstitutions)],
 ) -> HashMap<String, Option<ExprSort>> {
     let mut merged = HashMap::new();
     for (_, substitutions) in branch_subs {

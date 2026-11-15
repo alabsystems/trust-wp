@@ -78,12 +78,127 @@ pub(super) fn build_adt_decls(tcx: TyCtxt<'_>, def_id: DefId) -> trust_wp_core::
         return decls;
     };
     let mut seen_adts = std::collections::HashSet::new();
+    let mut borrow_holders = std::collections::HashSet::new();
+    let mut scanned = std::collections::HashSet::new();
 
     for local_decl in &body.local_decls {
         collect_adt_decls_from_ty(tcx, local_decl.ty, &mut seen_adts, &mut decls);
+        record_borrow_holders(tcx, local_decl.ty, &mut scanned, &mut borrow_holders);
+    }
+
+    // One declaration answers for every instantiation and every ADT sharing
+    // its simple name, so it is marked when any of them may hold a `&mut`.
+    for decl in decls.values_mut() {
+        if borrow_holders.contains(&decl.adt_name) {
+            decl.may_hold_a_borrow = true;
+        }
     }
 
     decls
+}
+
+/// Record the simple name of every ADT reachable from `ty` (through
+/// references, pointers, arrays, tuples, type arguments and fields) of which
+/// some value may hold a `&mut` (D-126).
+fn record_borrow_holders<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    scanned: &mut std::collections::HashSet<Ty<'tcx>>,
+    holders: &mut std::collections::HashSet<String>,
+) {
+    use rustc_middle::ty::TyKind;
+
+    if !scanned.insert(ty) {
+        return;
+    }
+    match ty.kind() {
+        TyKind::Ref(_, inner, _)
+        | TyKind::RawPtr(inner, _)
+        | TyKind::Slice(inner)
+        | TyKind::Array(inner, _) => record_borrow_holders(tcx, *inner, scanned, holders),
+        TyKind::Tuple(elements) => {
+            for element in elements.iter() {
+                record_borrow_holders(tcx, element, scanned, holders);
+            }
+        }
+        TyKind::Adt(adt_def, substs) => {
+            if ty_may_hold_a_mut_borrow(tcx, ty, &mut std::collections::HashSet::new()) {
+                holders.insert(tcx.item_name(adt_def.did()).to_string());
+            }
+            for arg in substs.types() {
+                record_borrow_holders(tcx, arg, scanned, holders);
+            }
+            for field in adt_def.all_fields() {
+                record_borrow_holders(
+                    tcx,
+                    field.ty(tcx, *substs).skip_norm_wip(),
+                    scanned,
+                    holders,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a value of `ty` may hold a `&mut`, asked of the Rust type and not
+/// of the declared field sorts, which a builtin value model erases
+/// (`Option<&mut T>` at `Int`, `Vec<&mut T>` at `Seq`). A type argument or a
+/// field holding one is evidence; a trait object, a closure, a coroutine and
+/// a projection that does not normalize may capture one. A type parameter is
+/// not: in a generic function's own declarations it has no prophecy carrier
+/// (`sort_embeds_mut_ref`'s decl-field arm), and `resolve` of a value of a
+/// generic type is refused by its sort (D-126).
+fn ty_may_hold_a_mut_borrow<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    visiting: &mut std::collections::HashSet<Ty<'tcx>>,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+
+    // A revisited type adds no evidence the first visit did not.
+    if !visiting.insert(ty) {
+        return false;
+    }
+    match ty.kind() {
+        TyKind::Ref(_, _, Mutability::Mut) => true,
+        TyKind::Ref(_, inner, Mutability::Not) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
+            ty_may_hold_a_mut_borrow(tcx, *inner, visiting)
+        }
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .any(|element| ty_may_hold_a_mut_borrow(tcx, element, visiting)),
+        TyKind::Adt(adt_def, substs) => {
+            substs
+                .types()
+                .any(|arg| ty_may_hold_a_mut_borrow(tcx, arg, visiting))
+                || adt_def.all_fields().any(|field| {
+                    ty_may_hold_a_mut_borrow(tcx, field.ty(tcx, *substs).skip_norm_wip(), visiting)
+                })
+        }
+        TyKind::Alias(..) => match tcx.try_normalize_erasing_regions(
+            rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::set_aliases_to_non_rigid(tcx, ty),
+        ) {
+            Ok(normalized) if normalized != ty => {
+                ty_may_hold_a_mut_borrow(tcx, normalized, visiting)
+            }
+            _ => true,
+        },
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never
+        | TyKind::Foreign(_)
+        | TyKind::RawPtr(..)
+        | TyKind::FnDef(..)
+        | TyKind::FnPtr(..)
+        | TyKind::Param(_) => false,
+        _ => true,
+    }
 }
 
 /// Recursively inspect a type for enum ADTs and collect field ranges.
@@ -114,7 +229,7 @@ fn collect_adt_field_ranges_from_ty<'tcx>(
             if adt_def.is_union() {
                 for variant in adt_def.variants() {
                     for field in &variant.fields {
-                        let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                        let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                         collect_adt_field_ranges_from_ty(
                             tcx,
                             field_ty,
@@ -141,7 +256,7 @@ fn collect_adt_field_ranges_from_ty<'tcx>(
                 let mut field_ranges = Vec::new();
 
                 for (field_idx, field) in variant.fields.iter().enumerate() {
-                    let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                    let field_ty = field.ty(tcx, *substs).skip_norm_wip();
 
                     // Peel through Box<T> to get inner type
                     let inner_ty = peel_box_ty(tcx, field_ty);
@@ -241,7 +356,7 @@ fn collect_adt_decls_from_ty<'tcx>(
                 return;
             }
 
-            if let Some(inner) = transparent_wrapper_inner_ty(&path, substs) {
+            if let Some(inner) = transparent_wrapper_inner_ty(&path, *substs) {
                 collect_adt_decls_from_ty(tcx, inner, seen_adts, decls);
                 return;
             }
@@ -281,7 +396,7 @@ fn collect_adt_decls_from_ty<'tcx>(
                 return;
             }
 
-            if let Some(decl) = build_single_adt_decl(tcx, *adt_def, substs) {
+            if let Some(decl) = build_single_adt_decl(tcx, *adt_def, *substs) {
                 decls.entry(decl.adt_name.clone()).or_insert(decl);
             }
 
@@ -289,7 +404,7 @@ fn collect_adt_decls_from_ty<'tcx>(
                 for field in &variant.fields {
                     collect_adt_decls_from_ty(
                         tcx,
-                        field.ty(tcx, substs).skip_norm_wip(),
+                        field.ty(tcx, *substs).skip_norm_wip(),
                         seen_adts,
                         decls,
                     );
@@ -303,7 +418,7 @@ fn collect_adt_decls_from_ty<'tcx>(
 fn build_single_adt_decl<'tcx>(
     tcx: TyCtxt<'tcx>,
     adt_def: rustc_middle::ty::AdtDef<'tcx>,
-    substs: &'tcx rustc_middle::ty::List<rustc_middle::ty::GenericArg<'tcx>>,
+    substs: rustc_middle::ty::GenericArgs<'tcx>,
 ) -> Option<trust_wp_core::logic::AdtDecl> {
     use trust_wp_core::logic::{AdtConstructorDecl, AdtDecl, AdtFieldDecl, AdtKind};
 
@@ -386,6 +501,9 @@ fn sign_extend_discriminant_bits(raw: u128, bits: u32) -> i128 {
     (raw << shift).cast_signed() >> shift
 }
 
+/// Uninterpreted carrier name for raw-pointer ADT fields (see `ty_to_adt_decl_sort`).
+const RAW_PTR_OPAQUE_SORT: &str = "__RawPtr";
+
 #[allow(clippy::cast_possible_truncation)] // tuple arity always fits u8
 fn ty_to_adt_decl_sort<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<ExprSort> {
     use rustc_middle::ty::TyKind;
@@ -408,10 +526,17 @@ fn ty_to_adt_decl_sort<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<ExprSort
             })
         }
         TyKind::Param(param) => Some(ExprSort::TypeParam(intern_sort_name(param.name.as_str()))),
-        TyKind::Float(_) => Some(ExprSort::Float),
+        TyKind::Float(float_ty) => Some(crate::mir_analysis::translate::float_ty_sort(*float_ty)),
+        // Raw pointers are opaque values in the logic (Creusot: `Opaque.ptr`,
+        // type_invariants/partial_instance.coma). An uninterpreted carrier
+        // states nothing about the pointer, so declaring the field at it adds
+        // no premise; without it the WHOLE struct lost its decl (`S<T>(i32,
+        // *const T)`) and its `result.0` projection collided with a `Tuple2`
+        // carrier (`sort conflict: result: declared as S, requested as Tuple2`).
+        TyKind::RawPtr(..) => Some(ExprSort::TypeParam(intern_sort_name(RAW_PTR_OPAQUE_SORT))),
         TyKind::Adt(adt_def, substs) => {
             let path = tcx.def_path_str(adt_def.did());
-            if let Some(inner) = transparent_wrapper_inner_ty(&path, substs) {
+            if let Some(inner) = transparent_wrapper_inner_ty(&path, *substs) {
                 return ty_to_adt_decl_sort(tcx, inner);
             }
             if is_box_path(&path) {
@@ -582,6 +707,54 @@ pub fn touch(x: Huge) {
 
         assert_eq!(variant_a.discriminant_value.as_ref(), Some(&expected_a));
         assert_eq!(variant_b.discriminant_value.as_ref(), Some(&expected_b));
+    }
+
+    /// A declaration is marked when a value of some instantiation met under
+    /// its name may hold a `&mut`. Its field sorts cannot show it: the
+    /// Option model declares `W`'s `Option<&mut i32>` field at `Int`, and
+    /// `S<i32>`'s declaration answers for the `S<&mut i32>` in a tuple
+    /// (D-126).
+    #[test]
+    fn test_build_adt_decls_marks_a_declaration_that_may_hold_a_borrow() {
+        let source = r#"
+pub struct W<'a> {
+    pub o: Option<&'a mut i32>,
+}
+pub struct V {
+    pub o: Option<i32>,
+}
+pub struct S<A> {
+    pub a: A,
+}
+pub struct G<A> {
+    pub a: A,
+}
+pub struct Outer<'a> {
+    pub w: W<'a>,
+}
+
+pub fn touch(w: W<'_>, v: V, s: S<i32>, t: (S<&mut i32>, u8), g: G<i32>, o: Outer<'_>) {
+    let _ = (w, v, s, t, g, o);
+}
+"#;
+
+        let decls = collect_adt_decls(source, "touch");
+        let marked = |name: &str| {
+            decls
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} declaration"))
+                .may_hold_a_borrow
+        };
+        assert_eq!(
+            decls["W"].constructors[0].fields[0].sort,
+            trust_wp_core::formula::ExprSort::Int,
+            "the Option model erases the borrow from W's field sort"
+        );
+        assert!(marked("W"), "W holds an Option<&mut i32>");
+        assert!(marked("S"), "an S<&mut i32> is met under S's name");
+        assert!(marked("Outer"), "Outer holds a W");
+        assert!(!marked("V"), "V holds no borrow");
+        assert!(!marked("G"), "only G<i32> is met");
     }
 
     #[test]
@@ -878,7 +1051,7 @@ fn is_builtin_adt_model_name(name: &str) -> bool {
 
 fn transparent_wrapper_inner_ty<'tcx>(
     path: &str,
-    substs: &'tcx rustc_middle::ty::List<rustc_middle::ty::GenericArg<'tcx>>,
+    substs: rustc_middle::ty::GenericArgs<'tcx>,
 ) -> Option<Ty<'tcx>> {
     let is_wrapper = matches!(
         path,

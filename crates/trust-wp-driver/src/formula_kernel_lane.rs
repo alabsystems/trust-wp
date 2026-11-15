@@ -28,17 +28,21 @@
 //!
 //! Boolean clauses over:
 //!
-//! - non-negative integer literals, rendered as kernel `Nat` literals
-//!   (the driver's `Int` model restricted to ℕ — negative literals decline);
-//! - contract variables of UNSIGNED integer MIR type (`u8`..`u64`, `usize` at
+//! - integer literals: in a Nat goal, non-negative ones as kernel `Nat`
+//!   literals (the driver's `Int` model restricted to ℕ — negative literals
+//!   decline there); in an Int goal, any `i64` as `Int.ofNat`/`Int.negSucc`;
+//! - contract variables of integer MIR type up to 64 bits (`usize`/`isize` at
 //!   the target pointer width; see [`kernel_vars_for_contract`]) — parameters
-//!   and `result` — rendered as de-Bruijn-bound kernel `Nat` variables under a
-//!   `∀ (v : Nat)` prefix. The rendering is faithful because every Int-model
-//!   valuation of an unsigned variable lies in `[0, 2^width−1] ⊆ ℕ` and the
-//!   admitted operators agree with the kernel's Nat semantics pointwise there;
-//!   proving the universal Nat closure is therefore ≥ the driver obligation.
-//!   SIGNED variables (and everything else) still decline: a Nat rendering of a
-//!   possibly-negative value is unfaithful — a later brick;
+//!   and `result` — rendered as de-Bruijn-bound kernel variables. UNSIGNED
+//!   variables bind as `Nat` under a `∀ (v : Nat)` prefix: every Int-model
+//!   valuation lies in `[0, 2^width−1] ⊆ ℕ` and the admitted operators agree
+//!   with the kernel's Nat semantics pointwise there, so proving the universal
+//!   Nat closure is ≥ the driver obligation. SIGNED variables bind as `Int`
+//!   under two-sided range hypotheses (`-2^(bits-1) ≤ v ≤ 2^(bits-1)-1`) and
+//!   render through the `Int.*` vocabulary (`int_term`: `+ - *` and the
+//!   comparisons; signed `/` `%` decline). A goal is homogeneous — mixed
+//!   signed/unsigned bindings decline in `build_goal` rather than model one
+//!   variable's range in the wrong type;
 //! - the view operator `v@` on such a variable (`View` is the identity on the
 //!   integer model — anything else under `View` declines);
 //! - `+` and `*` (`Nat.add` / `Nat.mul`: faithful on the non-negative fragment,
@@ -53,9 +57,10 @@
 //!   `&&  ||  !  ==>` (`Bool.and` / `Bool.or` / `Bool.not`; `p ==> q` as
 //!   `!p || q`) — the kernel side of each connective exists and computes.
 //!
-//! Deliberately OUTSIDE the fragment (fail closed, with the reason): signed /
-//! `u128` / non-integer variables (no faithful Nat rendering), `-` (kernel
-//! `Nat.sub` is monus, not integer subtraction), negation, floats,
+//! Deliberately OUTSIDE the fragment (fail closed, with the reason): 128-bit /
+//! non-integer variables and mixed-signedness goals (no faithful rendering),
+//! unsigned `-` (kernel `Nat.sub` is monus, not integer subtraction), signed
+//! `/` `%` (kernel `Int.div`/`Int.mod` semantics differ), negation, floats,
 //! bitwise/shift operators, quantifiers, `old`/`^`/`*`-operators, `@` on
 //! non-variables, method calls, matches, `if`.
 //!
@@ -226,11 +231,11 @@ fn bool_term(e: &PureExpr, scope: &Scope<'_>) -> Option<Expr> {
     }
 }
 
-/// Sort-dispatched equality: `Nat.beq` when both sides render as Nat values,
-/// `Bool.beq` when both render as Bool values. The two renderers cover disjoint
-/// constructors (variables are Nat-only: the env admits only unsigned integer
-/// vars), so a term's sort is unambiguous; mixed or unrenderable operands
-/// decline.
+/// Sort-dispatched equality: `Int.beq`/`Nat.beq` (by the scope's signedness)
+/// when both sides render as integer values, `Bool.beq` when both render as
+/// Bool values. The integer and Bool renderers cover disjoint constructors (a
+/// variable is always an integer, never a Bool), so a term's sort is
+/// unambiguous; mixed or unrenderable operands decline.
 fn eq_term(l: &PureExpr, r: &PureExpr, scope: &Scope<'_>) -> Option<Expr> {
     if scope.signed {
         if let (Some(li), Some(ri)) = (int_term(l, scope), int_term(r, scope)) {
@@ -810,32 +815,27 @@ pub(crate) fn observe_contract_obligations(
     );
 }
 
-/// Feasibility record for the SIGNED-integer contract-variable flagship
-/// (paragon completeness). Executable evidence, captured 2026-07-07, that the
-/// signed lane is BLOCKED on `clean-auto`, not on this driver:
+/// Boundary record for the SIGNED-integer contract-variable lane: executable
+/// evidence of exactly which `Int` goals `clean-auto` (built here
+/// `default-features = false`, NO ay/SMT — the induction/superposition lanes
+/// only) discharges, so the signed rendering path claims no more than the
+/// meter can certify.
 ///
-/// * the Int VOCABULARY needed to render signed contracts IS present in
+/// * the Int VOCABULARY the signed rendering emits IS present in
 ///   `Environment::with_prelude()` — `Int` (`Int.ofNat`/`Int.negSucc`),
 ///   `Int.add`/`Int.sub`/`Int.mul`, `Int.beq`/`Int.ble`, `Int.le`/`Int.neg`
-///   (only `Int.blt` is missing — a rendering would swap `ble` args like the
-///   Nat path already does for `>`/`>=`);
-/// * BUT `clean-auto` (built here `default-features = false`, NO ay/SMT — the
-///   induction/superposition lanes only) discharges NONE of the signed goals,
-///   not even the simplest tautology `∀ (x : Int), x == x`, while it closes the
-///   *Nat* analog in the very same harness (see `nat_tautology_certifies_control`).
-///   The gap is Int-specific, not a harness artifact.
-/// * Even GROUND signed arithmetic fails: the refl route (`Eq.refl Bool ⟦c⟧`
-///   graded against `Eq Bool ⟦c⟧ Bool.true`) is `Rejected{TypeMismatch}` because
-///   `Int.beq (Int.add (ofNat 1) (ofNat 2)) (ofNat 3)` does NOT reduce to
-///   `Bool.true` under the kernel's defeq — Int.add/beq are registered but not
-///   definitionally computable the way Nat's are.
+///   (only `Int.blt` is missing — `lt_term` renders `<` as `¬(r ≤ l)`);
+/// * the SAME harness closes the *Nat* analogs (`nat_tautology_certifies_control`),
+///   so a Pending on an Int goal is Int-specific, not a harness artifact;
+/// * `∀ (x : Int), Int.beq x x = true` — the shape the signed lane emits for
+///   `ensures x == x` — certifies, while `Int.ble` and open `Int.add` under a
+///   binder stay Pending
+///   (`signed_reflexive_equality_certifies_ble_and_open_add_pending`).
 ///
-/// Conclusion: a signed *variable* ensures cannot reach `Certified{auto:true}`
-/// today; the flagship needs a `clean-auto` Int induction/decision path first
-/// (a separate, larger scope). These tests are the tripwire: if `clean-auto`
-/// later closes the signed tautologies, `signed_goals_not_yet_dischargeable`
-/// FAILS — the signal to wire the signed rendering path (mirror
-/// `nat_term`/`kernel_vars_for_contract` with two-sided Int bounds).
+/// These tests are the tripwire in both directions: if `clean-auto` closes the
+/// pending goals the negative assertions fail — the signal to widen the signed
+/// fragment; if it stops closing the flagship, the lane's signed coverage is
+/// gone and the positive assertion fails.
 #[cfg(test)]
 mod signed_feasibility {
     use std::time::Duration;
@@ -937,18 +937,16 @@ mod signed_feasibility {
         ));
     }
 
-    /// SIGNED FLAGSHIP ACHIEVED (was the `signed_goals_not_yet_dischargeable`
-    /// tripwire). clean-auto now discharges the reflexive-equality flagship
+    /// The signed flagship: clean-auto discharges the reflexive-equality goal
     /// `∀x:Int, Int.beq x x = true` — the shape the signed contract lane emits
-    /// for `ensures x == x` — via the Step A `Int.beq` symbolic `Int.rec`
-    /// reduction plus the Step B non-recursive-eliminator field-induction
-    /// fallback (clean `ed98e747` / `588f335c`).
+    /// for `ensures x == x` — via the `Int.beq` symbolic `Int.rec` reduction
+    /// plus the non-recursive-eliminator field-induction fallback.
     ///
-    /// The honest boundary the meter still reports as Pending: `Int.ble` under a
-    /// binder (`∀x, x ≤ x`) and open `Int.add` under a binder (`∀x, x + 0 == x`)
-    /// both route through the `subNatNat` iterated-decrement recursion, which is
-    /// stuck on a symbolic `Nat` — the next milestone (would need `Int.ble` as a
-    /// reducible `Int.rec` definition and/or `subNatNat` reduction lemmas).
+    /// The boundary the meter reports as Pending: `Int.ble` under a binder
+    /// (`∀x, x ≤ x`) and open `Int.add` under a binder (`∀x, x + 0 == x`) both
+    /// route through the `subNatNat` iterated-decrement recursion, which is
+    /// stuck on a symbolic `Nat` (closing them needs `Int.ble` as a reducible
+    /// `Int.rec` definition and/or `subNatNat` reduction lemmas).
     #[test]
     fn signed_reflexive_equality_certifies_ble_and_open_add_pending() {
         let env = Environment::with_prelude();
@@ -958,7 +956,7 @@ mod signed_feasibility {
         let certifies =
             |g: Expr| matches!(auto_grade(&env, &engine, g), LogicTier::Certified { .. });
 
-        // NOW CERTIFIED — the reflexive-equality flagship.
+        // CERTIFIED — the reflexive-equality flagship.
         assert!(
             certifies(forall_int(eq_bool_goal(Expr::apps(
                 c("Int.beq"),
@@ -967,7 +965,7 @@ mod signed_feasibility {
             "the signed flagship ∀x:Int, Int.beq x x = true must certify"
         );
 
-        // STILL PENDING — the next boundary (subNatNat stuck under a binder).
+        // PENDING — the boundary (subNatNat stuck under a binder).
         // ∀ x, Int.ble x x = true
         assert!(
             !certifies(forall_int(eq_bool_goal(Expr::apps(
@@ -1214,7 +1212,7 @@ mod tests {
         assert!(kernel_grade_obligation(&env, &engine, &ctx, &mixed).is_none());
     }
 
-    /// Predictability roundtrip (audit 2026-07-07): every constant this lane can emit
+    /// Predictability roundtrip: every constant this lane can emit
     /// must classify Auto under the interface's author-time checker — the lane and the
     /// whitelist may never disagree. (The quantified GOALS route Deep — binders — by
     /// design; this pins the emitted CONSTANT vocabulary only.)
@@ -1368,10 +1366,8 @@ mod tests {
     /// THE SIGNED FLAGSHIP: `ensures x == x` on an `i32` parameter. The lane
     /// renders `∀ (x : Int), -2^31 ≤ x → x ≤ 2^31-1 → Int.beq x x = true`
     /// (two-sided `Int.ble` bounds as antecedents, `Int.beq` conclusion) and
-    /// clean-auto discharges it — the Step A `Int.beq` symbolic reduction plus
-    /// the Step B non-recursive-`Int.rec`-minor field-induction fallback. This
-    /// is the first SIGNED contract-syntax obligation graded Certified{auto} by
-    /// the kernel lane.
+    /// clean-auto discharges it — the `Int.beq` symbolic reduction plus the
+    /// non-recursive-`Int.rec`-minor field-induction fallback.
     #[test]
     fn formula_kernel_lane_signed_var_reflexive_equality_certifies_via_clean_auto() {
         let env = Environment::with_prelude();

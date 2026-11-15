@@ -40,13 +40,64 @@ pub(super) enum SkipDecision {
     LogicFnEnsures,
     /// Bodyless trait method declaration: spec only, not verifiable (#1178).
     BodylessTraitMethod,
+    /// A body that runs as a coroutine or only builds one: refused, never
+    /// verified (see [`is_coroutine_body`]).
+    CoroutineBody,
+}
+
+/// The refusal both assertion passes and the contract loop print for a body
+/// [`is_coroutine_body`] reports.
+pub(in crate::callbacks) const COROUTINE_REFUSAL: &str =
+    "the body is a coroutine or builds one (`async fn`, `async`/`gen` block, async closure), \
+     which trust-wp does not verify; refused instead of credited";
+
+/// Count and name the contract loop's refusal of a coroutine body.
+pub(super) fn refuse_coroutine_body(
+    def_path: &str,
+    counters: &mut super::super::reporting::VerificationCounters,
+) {
+    counters.errors += 1;
+    eprintln!("trust-wp: {def_path} error: {COROUTINE_REFUSAL}");
+}
+
+/// Whether a body is a coroutine (an `async`/`gen` block, an `async fn`'s
+/// lowered body) or only builds one (an `async fn` item, an async closure).
+///
+/// Neither is verified. The item's own MIR constructs the coroutine and does
+/// nothing else, so its VC holds nothing of the body the user wrote; the
+/// coroutine body carries `Yield`/resume semantics no lane models, and Creusot
+/// does not verify coroutines either (its MIR translation treats `Yield` as
+/// unreachable). A credit on either would be a verdict on code no pass
+/// examined (async_fn_body_assertion_never_examined.rs), so both are REFUSED.
+/// The refusal reaches every such body that owes anything because
+/// `discover_coroutine_obligation_bodies` chooses its candidates with this
+/// predicate; a body no pass admits is examined by nothing, not refused.
+pub(in crate::callbacks) fn is_coroutine_body(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_hir::def_id::DefId,
+) -> bool {
+    use rustc_hir::def::DefKind;
+    if tcx.is_coroutine(def_id) {
+        return true;
+    }
+    match tcx.def_kind(def_id) {
+        DefKind::Fn | DefKind::AssocFn => tcx.asyncness(def_id).is_async(),
+        DefKind::Closure => matches!(
+            tcx.type_of(def_id)
+                .instantiate_identity()
+                .skip_norm_wip()
+                .kind(),
+            rustc_middle::ty::TyKind::CoroutineClosure(..)
+        ),
+        _ => false,
+    }
 }
 
 /// Decide whether a contract should be skipped from the main verification loop.
 ///
-/// Consolidates three independent skip guards (trusted, logic-fn, bodyless-trait)
-/// into a single decision point. The caller updates counters and emits diagnostics
-/// based on the returned variant.
+/// Consolidates the independent skip guards (trusted, logic-fn, coroutine,
+/// bodyless-trait) into a single decision point. The caller updates counters
+/// and emits diagnostics based on the returned variant.
 pub(super) fn check_contract_skip(
     tcx: TyCtxt<'_>,
     contract: &FunctionContract,
@@ -74,7 +125,12 @@ pub(super) fn check_contract_skip(
         };
     }
 
-    // Guard 3: Bodyless trait method declarations (#1178).
+    // Guard 3: coroutine bodies and the items that only build one.
+    if is_coroutine_body(tcx, contract.def_id) {
+        return SkipDecision::CoroutineBody;
+    }
+
+    // Guard 4: Bodyless trait method declarations (#1178).
     // Trait methods without a default body have contracts that serve as specs for
     // implementations. Verifying them produces false counterexamples.
     if let Some(assoc_item) = tcx.opt_associated_item(contract.def_id) {

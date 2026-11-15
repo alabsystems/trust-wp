@@ -11,17 +11,13 @@
 //!   must propagate to prevent unsound Verified result.
 
 use ntest::timeout;
-use trust_wp_core::formula::FloatBits;
 
 use super::{super::*, helpers::*};
 
-/// Returns a `PureExpr` that is guaranteed to fail encoding.
-///
-/// Uses `Float(NaN)` because `try_real_const` rejects NaN/Inf values.
-/// Previously used `PureExpr::Closure` with params, but closures now
-/// encode conservatively as fresh unconstrained constants (#985).
+/// Returns a `PureExpr` that is guaranteed to fail encoding (closures no
+/// longer do: they encode conservatively as fresh constants, #985).
 fn unencodable_expr() -> PureExpr {
-    PureExpr::Float(FloatBits::from_f64(f64::NAN))
+    unencodable_float_order()
 }
 
 /// LetAssume propagates unencodable assumptions after recording LetAssumeDropped.

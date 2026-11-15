@@ -6,7 +6,7 @@ name = "trust-wp"
 description = "Deductive verification for Rust"
 version.workspace = true
 edition.workspace = true
-# rust-version omitted: requires nightly
+# rust-version omitted: requires the Trust toolchain (rust-toolchain.toml)
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

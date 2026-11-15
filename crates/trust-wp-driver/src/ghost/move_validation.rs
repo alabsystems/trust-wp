@@ -227,6 +227,9 @@ impl<'tcx> MoveValidator<'_, 'tcx> {
         }
 
         // Ask rustc whether the type implements Copy (covers user-defined Copy types)
+        // Query keys must be region-free (`'?N` cannot be hashed); `Copy` is
+        // decided modulo regions anyway, so erasing them changes no answer.
+        let ty = self.tcx.erase_and_anonymize_regions(ty);
         if self.tcx.type_is_copy_modulo_regions(self.typing_env, ty) {
             return;
         }

@@ -36,3 +36,34 @@ pub fn get_known_value() -> i32 {
     let opt = Some(42);
     opt.unwrap()
 }
+
+/// Trait whose impl is specified by an `extern_spec!` WITH a body: Creusot
+/// proves that body against the extern spec's own ensures
+/// (`vc_extern_spec_<..>_body`), and so must trust-wp.
+pub trait UseSelf {
+    fn is_one(&self, rhs: &Self) -> bool;
+    fn is_one_wrong(&self, rhs: &Self) -> bool;
+}
+
+impl UseSelf for i32 {
+    fn is_one(&self, _: &i32) -> bool {
+        *self == 1
+    }
+    fn is_one_wrong(&self, _: &i32) -> bool {
+        *self == 1
+    }
+}
+
+extern_spec! {
+    impl UseSelf for i32 {
+        #[ensures(result == (*self == 1i32))]
+        fn is_one(&self, s: &Self) -> bool {
+            *self == 1
+        }
+
+        #[ensures(result == (*self == 1i32))]
+        fn is_one_wrong(&self, s: &Self) -> bool {
+            *self == 2
+        }
+    }
+}

@@ -425,7 +425,7 @@ fn test_compositional_multi_variable_with_post_loop_computation() {
             .return_expr(Some(&return_expr)),
     );
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
+    // KNOWN-CLASS PIN (upstream proof-trusted certification gap): the verdict
     // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
@@ -518,8 +518,8 @@ fn test_compositional_tautological_postcondition_verifies() {
 /// Function-level path with NO loop-exit assumptions (#2085).
 ///
 /// When the loop invariant proof times out (Unknown) but the function has
-/// postconditions, the driver now returns `ContinueWithAssumptions(vec![])`
-/// instead of `Handled`. This means the function-level path runs with only
+/// postconditions, the driver returns `ContinueWithAssumptions(vec![])`
+/// rather than `Handled`. This means the function-level path runs with only
 /// the original preconditions (no loop-exit state injected).
 ///
 /// This test verifies that a tautological postcondition (result == return_expr)

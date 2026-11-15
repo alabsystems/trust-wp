@@ -23,6 +23,7 @@ mod discriminant;
 mod float;
 mod operand;
 mod place;
+pub(crate) mod ptr_cast;
 mod rvalue;
 mod ty_sort;
 
@@ -34,12 +35,13 @@ pub(crate) use constant::{resolve_const_item_value, translate_constant_with_tcx}
 pub(crate) use discriminant::{
     operand_int_ty, switch_value_to_expr, switch_value_to_i64, DiscrIntTy,
 };
+pub(crate) use float::float_ty_sort;
 pub(crate) use operand::{
     operand_is_bool, translate_operand, translate_operand_detailed, translate_operand_with_tcx,
 };
 #[cfg(test)]
 pub(crate) use place::allows_field0_identity_fallback;
-pub(crate) use place::{translate_place, translate_typed_field_place};
+pub(crate) use place::{project_field_for_read, translate_place, translate_typed_field_place};
 #[cfg(test)]
 use rvalue::translate_generic_reborrow;
 pub(crate) use rvalue::{translate_rvalue, translate_rvalue_detailed, translate_rvalue_typed};
@@ -106,6 +108,15 @@ pub(crate) trait ExprLookup {
     fn rich_field_projections(&self) -> bool {
         true
     }
+
+    /// Resolve a field-path read through a tracked value-carrier referent
+    /// (mutable borrow analysis only). `None` = not applicable.
+    fn resolve_carrier_projection(
+        &self,
+        _place: &rustc_middle::mir::Place<'_>,
+    ) -> Option<PureExpr> {
+        None
+    }
 }
 
 impl ExprLookup for HashMap<Local, PureExpr> {
@@ -135,7 +146,6 @@ mod test_reexports {
 
     pub(super) use super::{
         binop::{int_ty_bits, uint_ty_bits},
-        float::concrete_float_expr_f64,
         place::{
             project_closure_capture_field, project_const_index, project_nested_tuple_get_field,
             project_tuple_field, simplify_tuple_get_from_constructor,

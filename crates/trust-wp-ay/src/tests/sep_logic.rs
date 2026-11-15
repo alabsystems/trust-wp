@@ -204,11 +204,9 @@ fn test_encode_exists() {
 ///
 /// The SAT-only `test_encode_exists` proves that ∃x. x > 0 is satisfiable,
 /// but any unconstrained existential over a non-empty domain is trivially SAT.
-/// Ideally, ∃x. x > 0 ∧ x < 0 should be UNSAT, but ay returns Unknown for
-/// trigger-less quantifiers (same as forall — see #627, #718).
-///
-/// This test documents the encoding path succeeds. A triggered companion
-/// would be needed to verify UNSAT, analogous to the forall triggered tests.
+/// A contradictory body separates a real decision from that: ∃x. x > 0 ∧ x < 0
+/// must be UNSAT, and ay decides trigger-less existentials, so the test
+/// demands UNSAT rather than tolerating Unknown.
 #[test]
 #[timeout(30000)]
 fn test_encode_exists_contradictory_body_encodes_successfully() {
@@ -221,8 +219,7 @@ fn test_encode_exists_contradictory_body_encodes_successfully() {
 
     encoder.assert_term(term);
     let result = encoder.check_sat();
-    // Strengthened: ay now handles trigger-less existentials correctly.
-    // Previously accepted Unknown (#627, #718); now assert UNSAT (#1377).
+    // ay decides trigger-less existentials, so Unknown is not acceptable here.
     assert!(
         matches!(result, SolveResult::Unsat(_)),
         "∃x. x > 0 ∧ x < 0 must be UNSAT (contradictory body); got: {result:?}"
@@ -231,8 +228,8 @@ fn test_encode_exists_contradictory_body_encodes_successfully() {
 
 /// Encoding check: ∃x. false (trivially empty). (#901)
 ///
-/// The trivial case: existential over false body has no witness.
-/// ay returns Unknown for trigger-less quantifiers (#627).
+/// The trivial case: existential over false body has no witness, so the
+/// only sound answer is UNSAT.
 #[test]
 #[timeout(30000)]
 fn test_encode_exists_false_body_is_not_sat() {
@@ -244,8 +241,7 @@ fn test_encode_exists_false_body_is_not_sat() {
 
     encoder.assert_term(term);
     let result = encoder.check_sat();
-    // Strengthened: ay now handles trigger-less existentials correctly.
-    // Previously accepted Unknown (#627); now assert UNSAT (#1377).
+    // ay decides trigger-less existentials, so Unknown is not acceptable here.
     assert!(
         matches!(result, SolveResult::Unsat(_)),
         "∃x. false must be UNSAT (no witness exists); got: {result:?}"
@@ -416,9 +412,9 @@ fn test_encode_nested_quantifiers_triggered_sat() {
 
 /// Regression: Formula-level ∀ with Bool-sorted bound variable (#544).
 ///
-/// Before the fix, `encode_forall` hardcoded `Sort::Int` for the bound variable.
-/// With a body that uses `Not(Var("b"))`, ay would panic with "BUG: `mk_not` expects Bool".
-/// The fix uses `resolve_decl_sort` to check sort hints from `register_sort_hints`.
+/// `encode_forall` must take the bound variable's sort from `resolve_decl_sort`
+/// (fed by `register_sort_hints`) rather than assuming `Sort::Int`: with a body
+/// `Not(Var("b"))` an Int-sorted binder makes ay panic with "BUG: `mk_not` expects Bool".
 #[test]
 #[timeout(30000)]
 fn test_encode_forall_bool_bound_variable() {
@@ -444,8 +440,8 @@ fn test_encode_forall_bool_bound_variable() {
     // 2) Assert the term and verify UNSAT (b=true is a counterexample to ∀b.¬b)
     encoder.assert_term(term);
     let sat_result = encoder.check_sat();
-    // Strengthened: ay now handles Bool-sorted quantifiers correctly.
-    // Previously accepted Unknown; now assert UNSAT (#1377).
+    // Bool expansion makes a Bool-sorted quantifier decidable, so Unknown is
+    // not acceptable here.
     assert!(
         matches!(sat_result, SolveResult::Unsat(_)),
         "∀b. ¬b must be UNSAT (b=true is a counterexample); got: {sat_result:?}"
@@ -1038,11 +1034,11 @@ fn test_encode_points_to_dangling_pointer_unsat() {
 // =============================================================================
 // SepConj chain scalability tests (#446, #453)
 //
-// Phase 1 (#446): Footprint caching eliminated O(N^3+) traversal overhead.
-// Phase 2 (#453): Quantified domain-based disjointness encoding replaces
-// O(L*R) cross-pair constraints with uninterpreted domain predicates and a
-// single `forall x. D_left(x) => !D_right(x)` assertion when footprints
-// exceed the threshold. Tests verify full encode+solve at 16 and 64 elements.
+// Footprint caching keeps chain encoding from re-traversing sub-footprints
+// (O(N^3+) otherwise). Once footprints exceed the threshold, disjointness is
+// encoded with uninterpreted domain predicates and a single
+// `forall x. D_left(x) => !D_right(x)` assertion instead of O(L*R) cross-pair
+// constraints. Tests verify full encode+solve at 16 and 64 elements.
 // =============================================================================
 
 // build_sep_conj_chain is imported from helpers::*
@@ -1147,10 +1143,11 @@ fn test_encode_sep_conj_quantified_overlap_unsat() {
 /// For semantic overlaps (different names, equal values), `check_sat()` performs
 /// a model-guided recheck and materializes `l != r` only for overlapping pairs.
 ///
-/// Previously (#618), this test asserted SAT (a soundness gap) because ay's
-/// E-matching didn't propagate external equalities through UF applications.
-/// The fix keeps quantified encoding lightweight and adds lazy `l != r`
-/// materialization when a SAT model shows semantic overlap.
+/// The lazy recheck exists because ay's E-matching does not propagate external
+/// equalities through UF applications: without it a semantic overlap comes back
+/// SAT (a soundness gap). Keeping the quantified encoding lightweight and
+/// materializing `l != r` only when a SAT model shows overlap closes that gap
+/// without paying the eager pairwise cost. (#618)
 #[test]
 #[timeout(30000)]
 fn test_quantified_disjointness_semantic_overlap_is_sound() {
@@ -1957,9 +1954,10 @@ fn ay_solver_timeout_secs_2() -> std::time::Duration {
     std::time::Duration::from_secs(2)
 }
 
-/// Assert that a semantically UNSAT formula is correctly solved as Unsat.
-/// These formulas previously triggered ay#2829 (quantifier/arithmetic soundness bug),
-/// but the bug is now fixed in the pinned ay revision (f3b656dd).
+/// Assert that a semantically UNSAT formula is solved as Unsat.
+/// The formulas routed here are the ay#2829 shapes (ground arithmetic under a
+/// forall axiom); Unknown or Sat on any of them means the quantifier/arithmetic
+/// interaction has regressed.
 fn assert_ay_2829_fixed(result: SolveResult, context: &str) {
     assert_eq!(
         result,
@@ -1994,8 +1992,8 @@ fn check_sat_catching_ay_2829(
 
 /// Raw ay UFLIA test: ground arithmetic with a forall axiom present.
 ///
-/// The formula is semantically UNSAT. Previously triggered ay#2829
-/// (quantifier/arithmetic soundness bug), now fixed in ay rev f3b656dd.
+/// The formula is semantically UNSAT; this is the ay#2829 shape (a forall
+/// axiom in scope must not disturb ground arithmetic reasoning).
 #[test]
 #[timeout(5000)]
 fn test_uflia_ground_arithmetic_with_forall_present() {
@@ -2081,7 +2079,7 @@ fn test_qflia_ground_arithmetic_control() {
 
 /// Raw ay UFLIA test: same formula but forall WITHOUT triggers.
 ///
-/// Previously triggered ay#2829 (no-trigger variant), now fixed in ay rev f3b656dd.
+/// The ay#2829 shape without triggers: ground arithmetic must still decide UNSAT.
 #[test]
 #[timeout(5000)]
 fn test_uflia_ground_arithmetic_with_forall_no_triggers() {
@@ -2120,7 +2118,7 @@ fn test_uflia_ground_arithmetic_with_forall_no_triggers() {
 
 /// Raw ay AUFLIA test: same ground arithmetic + forall, using AUFLIA logic.
 ///
-/// Previously triggered ay#2829 in AUFLIA, now fixed in ay rev f3b656dd.
+/// The ay#2829 shape under AUFLIA: the array theory must not change the verdict.
 #[test]
 #[timeout(5000)]
 fn test_auflia_ground_arithmetic_with_forall_present() {
@@ -2221,9 +2219,8 @@ fn test_auflia_ground_arithmetic_with_applied_forall() {
 ///   acc_prime == acc + 2          (body effect)
 ///   NOT(acc_prime == double(i_prime))  (negated primed invariant — ground app double(i_prime))
 ///
-/// This is semantically UNSAT. ay#2829 is partially fixed in ay rev f3b656dd
-/// (simple ground arithmetic cases pass), but this complex preservation VC still
-/// triggers the remaining bug. Behavior-locked to Sat until fully resolved.
+/// This is semantically UNSAT: E-matching must instantiate the axiom at the
+/// primed ground application `double(i_prime)`, not only at `double(i)`.
 #[test]
 #[timeout(5000)]
 fn test_uflia_preservation_vc_with_logic_fn() {
@@ -2279,10 +2276,8 @@ fn test_uflia_preservation_vc_with_logic_fn() {
 
     let result = check_sat_catching_ay_2829(&mut s);
 
-    // ay#2829 is now FIXED: the UFLIA preservation formula correctly returns Unsat.
-    // Historically this returned Sat (pre-bump) or Unknown (post-bump ay rev e8923d41).
-    // Current ay rev fully resolves E-matching for primed variables in UFLIA logic.
-    // (#1316, ay#2829)
+    // Unsat is the only acceptable verdict: Sat would be a soundness bug and
+    // Unknown means E-matching missed the primed instance. (#1316, ay#2829)
     assert_eq!(
         result.as_ref().unwrap(),
         &SolveResult::unsat(),
@@ -2290,19 +2285,17 @@ fn test_uflia_preservation_vc_with_logic_fn() {
     );
 }
 
-/// Minimal formula to find the ay bug boundary.
-/// Starts from the passing simple test and incrementally adds constraints
-/// from the failing preservation VC.
+/// Preservation core only: forall x. double(x) = x+x, acc == double(i),
+/// acc_prime == acc+2, i_prime == i+1, NOT(acc_prime == double(i_prime)),
+/// with the `i >= 0` / `i < n` constraints of
+/// `test_uflia_preservation_vc_with_logic_fn` left out.
 ///
-/// Step 1: forall x. double(x) = x+x, acc == double(i), acc_prime == acc+2,
-///         i_prime == i+1, NOT(acc_prime == double(i_prime))
-/// (No i >= 0 or i < n constraints — just the preservation core)
-///
-/// This is semantically UNSAT. ay#2829 is partially fixed in ay rev f3b656dd
-/// but this preservation formula still triggers the remaining bug.
-/// Behavioral transition at ay rev e8923d41: was Err(Model validation failed),
-/// now Ok(Unknown) — ay no longer attempts invalid model reconstruction.
-/// Behavior-locked to Unknown until fully resolved (Unsat = fixed).
+/// This is semantically UNSAT. The full VC, which asserts the same two ground
+/// applications `double(i)` and `double(i_prime)` plus `i >= 0`, `i < n`, is
+/// decided UNSAT; this shape may come back Unknown. The difference is an ay
+/// E-matching incompleteness this test tolerates but does not explain. Sat
+/// (or a panic from validating an invalid model) is the soundness failure
+/// this test exists to catch.
 #[test]
 #[timeout(5000)]
 fn test_uflia_minimal_preservation_no_extra_constraints() {
@@ -2349,10 +2342,10 @@ fn test_uflia_minimal_preservation_no_extra_constraints() {
 
     let result = check_sat_catching_ay_2829(&mut s);
 
-    // ay#2829 was FIXED but ay v0.2.0 regressed E-matching for primed variables.
-    // Behavioral history: Err(ModelValidationFailed) → Ok(Unknown) → Ok(Unsat) → Ok(Unknown).
-    // ay v0.2.0 zone merges changed E-matching internals; this formula no longer
-    // triggers instantiation without ground double(i_prime) hints. (#1316, #1412, ay#2829, ay#7882)
+    // Unsat or Unknown: the full VC with the same ground double applications is
+    // decided UNSAT, so an Unknown here is an ay E-matching incompleteness this
+    // test tolerates. Sat would be unsound; a panic means ay validated an
+    // invalid model. (#1316, #1412, ay#2829, ay#7882)
     assert!(
         matches!(
             result.as_ref().unwrap(),
@@ -2366,7 +2359,8 @@ fn test_uflia_minimal_preservation_no_extra_constraints() {
 /// QF_LIA control: simplified preservation formula without extra variables.
 /// acc = i+i ∧ i' = i+1 ∧ acc' = acc+2 ∧ ¬(acc' = i'+i')
 ///
-/// Previously triggered ay#2832 (QF_LIA equality-chain timeout), now fixed in ay rev f3b656dd.
+/// Pure linear arithmetic, no quantifier: the equality chain must be decided
+/// UNSAT promptly (ay#2832 is the timeout shape).
 #[test]
 #[timeout(30000)]
 fn test_qflia_preservation_simplified() {
@@ -2410,8 +2404,8 @@ fn test_qflia_preservation_simplified() {
     );
 }
 
-/// Same as simplified test but using 2*i instead of i+i.
-/// Previously triggered ay#2832 (QF_LIA mul variant), now fixed in ay rev f3b656dd.
+/// Same as simplified test but using 2*i instead of i+i: the constant
+/// multiplication must normalize to the same linear term (ay#2832 mul variant).
 #[test]
 #[timeout(30000)]
 fn test_qflia_preservation_with_mul_instead_of_add() {

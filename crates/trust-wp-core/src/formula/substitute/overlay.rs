@@ -174,6 +174,9 @@ pub(super) struct ScopedSubstitutions<'a> {
     /// (non-shadowed) substitution values. A name with count > 0 appears
     /// free in at least one visible value.
     visible_free_var_counts: HashMap<String, usize>,
+    /// Whether `summaries` and `visible_free_var_counts` are computed. The
+    /// plain path computes them at the first binder it reaches.
+    summarized: bool,
 }
 
 impl<'a> ScopedSubstitutions<'a> {
@@ -196,20 +199,42 @@ impl<'a> ScopedSubstitutions<'a> {
             shadowed: HashMap::new(),
             summaries,
             visible_free_var_counts,
+            summarized: true,
         }
     }
 
-    /// Create a lightweight scoped view without free-variable summaries.
-    ///
-    /// Used by the plain substitution path (`substitute()` / `substitute_filtered()`)
-    /// where only shadow/unshadow tracking is needed, not capture avoidance.
+    /// Create a scoped view whose free-variable summaries are computed at the
+    /// first binder the substitution reaches
+    /// ([`Self::visible_value_mentions_summarizing`]): the plain path
+    /// (`substitute()` / `substitute_filtered()`) needs them only there, to
+    /// rename a binder apart from the values substituted beneath it.
     pub(super) fn new_plain(base: &'a HashMap<String, PureExpr>) -> Self {
         Self {
             base,
             shadowed: HashMap::new(),
             summaries: HashMap::new(),
             visible_free_var_counts: HashMap::new(),
+            summarized: false,
         }
+    }
+
+    /// [`Self::visible_value_mentions`], computing the free-variable summaries
+    /// first if they are not yet.
+    pub(super) fn visible_value_mentions_summarizing(&mut self, name: &str) -> bool {
+        if !self.summarized {
+            self.summarized = true;
+            let base = self.base;
+            for (key, value) in base {
+                let summary = collect_free_vars_with_limit(value, None);
+                if !self.is_shadowed(key) {
+                    for var in &summary.names {
+                        *self.visible_free_var_counts.entry(var.clone()).or_default() += 1;
+                    }
+                }
+                self.summaries.insert(key.clone(), summary);
+            }
+        }
+        self.visible_value_mentions(name, None)
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&PureExpr> {

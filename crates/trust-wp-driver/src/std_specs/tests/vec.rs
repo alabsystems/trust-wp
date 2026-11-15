@@ -169,7 +169,11 @@ fn test_lookup_vec_capacity() {
 #[test]
 fn test_lookup_vec_reserve() {
     let spec = lookup_std_spec("alloc::vec::Vec::reserve").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "2 * (self@.len() + additional@ - 1) * __trust_wp_std_site_size_of_T() <= isize::MAX@",
+        "Vec::reserve",
+    );
     assert_ensures_contains(&spec, "(^self)@ == self@", "Vec::reserve");
     assert_ensures_contains(&spec, "(^self)@.len() == self@.len()", "Vec::reserve");
     assert_ensures_contains(
@@ -187,7 +191,11 @@ fn test_lookup_vec_reserve() {
 #[test]
 fn test_lookup_vec_reserve_exact() {
     let spec = lookup_std_spec("alloc::vec::Vec::reserve_exact").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "(self@.len() + additional@) * __trust_wp_std_site_size_of_T() <= isize::MAX@",
+        "Vec::reserve_exact",
+    );
     assert_ensures_contains(&spec, "(^self)@ == self@", "Vec::reserve_exact");
     assert_ensures_contains(&spec, "(^self)@.len() == self@.len()", "Vec::reserve_exact");
     assert_ensures_contains(
@@ -205,7 +213,11 @@ fn test_lookup_vec_reserve_exact() {
 #[test]
 fn test_lookup_vec_with_capacity() {
     let spec = lookup_std_spec("std::vec::Vec::with_capacity").unwrap();
-    assert!(spec.requires.is_empty());
+    assert_requires_contains(
+        &spec,
+        "capacity@ * __trust_wp_std_site_size_of_T() <= isize::MAX@",
+        "Vec::with_capacity",
+    );
     assert_ensures_contains(&spec, "result@.len() == 0", "Vec::with_capacity");
     assert_ensures_contains(
         &spec,
@@ -259,3 +271,20 @@ fn test_lookup_vec_shrink_to() {
 }
 
 // String tests
+
+/// A drain panics on a range out of order or past the length, which no clause
+/// reads off a `RangeBounds`; the call site discharges the refusal for `..`.
+#[test]
+fn test_lookup_drain_is_refused_but_for_the_full_range() {
+    for path in [
+        "alloc::vec::Vec::drain",
+        "std::collections::VecDeque::drain",
+    ] {
+        let spec = lookup_std_spec(path).unwrap_or_else(|| panic!("{path} should have a spec"));
+        assert_eq!(
+            spec.requires,
+            ["__trust_wp_std_site_unmodelled_panic_unless_full_range_R()"],
+            "{path} refuses every range but `..`"
+        );
+    }
+}

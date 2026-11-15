@@ -188,7 +188,7 @@ pub(super) fn seq_push_back_index_matches_requirements(
         int_expr_value(expected_value),
     ) {
         (Some(appended), Some(expected)) if appended != expected => {
-            Some(VerificationResult::Failed(Counterexample::empty()))
+            Some(crate::verify::structural_failed_traced())
         }
         _ => None,
     }
@@ -1278,16 +1278,34 @@ fn direct_final_value_side_matches(
     let PureExpr::Final(inner) = final_side else {
         return false;
     };
-    let Some(base_name) = peel_deref_var_name(inner) else {
-        return false;
+    // `^v` and its deref form `^(*v)` (this encoding's spelling of the same
+    // prophecy for a single-level borrow) are `final_values[v]`. A deeper
+    // chain, or `^*v` for a nested reference, is the prophecy of the borrow
+    // STORED in `*v`, a different value (s32 gate hardening).
+    let base_name = match inner.as_ref() {
+        PureExpr::Var(name, _) => name,
+        PureExpr::Deref(deref_inner) => match deref_inner.as_ref() {
+            PureExpr::Var(name, sort) if !sort_is_nested_reference(sort.as_ref()) => name,
+            _ => return false,
+        },
+        _ => return false,
     };
-    let Some(final_value) = final_values.get(base_name) else {
+    let Some(final_value) = final_values.get(base_name.as_str()) else {
         return false;
     };
 
     let expected = normalize_identity_finals(expected, final_values);
     let final_value = normalize_identity_finals(final_value, final_values);
     crate::encoder::quantifier::pure_quantifier::is_sort_agnostic_equal(&final_value, &expected)
+}
+
+fn sort_is_nested_reference(sort: Option<&trust_wp_core::formula::ExprSort>) -> bool {
+    use trust_wp_core::formula::ExprSort;
+    matches!(
+        sort,
+        Some(ExprSort::MutRef(inner) | ExprSort::Ref(inner))
+            if matches!(inner.as_ref(), ExprSort::MutRef(_) | ExprSort::Ref(_))
+    )
 }
 
 fn substitute_result_projections(expr: &PureExpr, return_expr: &PureExpr) -> PureExpr {
@@ -1456,10 +1474,10 @@ fn result_projection_other_side<'a>(
     candidate: &PureExpr,
     other: &'a PureExpr,
 ) -> Option<&'a PureExpr> {
+    // `^result` is the caller's prophecy for a returned field borrow; the
+    // reconstructed final of the base says nothing about it (s32 ROOT B).
     match candidate {
-        PureExpr::Deref(inner) | PureExpr::Final(inner) if is_result_var(inner.as_ref()) => {
-            Some(other)
-        }
+        PureExpr::Deref(inner) if is_result_var(inner.as_ref()) => Some(other),
         _ => None,
     }
 }
@@ -1758,17 +1776,15 @@ fn direct_result_exprs_match(
         return true;
     }
 
+    // Different deref depths (`**x` vs `***x`) or a deref chain against the
+    // bare carrier (`*x` vs `x`) denote different values; only an equal-depth
+    // chain over the same param is the same expression modulo sort annotations
+    // (s32 gate hardening).
     if let Some((return_base, return_depth)) = peel_deref_var_chain(return_expr) {
-        if let PureExpr::Var(expected_base, _) = expected {
-            if return_base == expected_base && param_names.contains(expected_base.as_str()) {
-                return true;
-            }
-        }
         if let Some((expected_base, expected_depth)) = peel_deref_var_chain(expected) {
             return return_base == expected_base
                 && param_names.contains(return_base)
-                && return_depth >= 2
-                && expected_depth >= 2;
+                && return_depth == expected_depth;
         }
     }
 
@@ -1776,10 +1792,10 @@ fn direct_result_exprs_match(
 }
 
 fn peel_deref_var_chain(expr: &PureExpr) -> Option<(&str, usize)> {
-    let mut depth = 0;
+    let mut depth = 0usize;
     let mut current = expr;
     while let PureExpr::Deref(inner) = current {
-        depth += 1;
+        depth = depth.saturating_add(1);
         current = inner.as_ref();
     }
     match current {
@@ -1890,6 +1906,21 @@ fn tag_mut_borrow_continuation_with_violated_postcondition(
     }
 }
 
+fn final_values_excluding_mutation_continued(
+    final_values: Option<&HashMap<String, PureExpr>>,
+    mutation_continued_params: Option<&HashSet<String>>,
+) -> Option<HashMap<String, PureExpr>> {
+    let final_values = final_values?;
+    let continued = mutation_continued_params.filter(|params| !params.is_empty())?;
+    Some(
+        final_values
+            .iter()
+            .filter(|(name, _)| !continued.contains(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
+}
+
 fn verify_mut_borrow_single_obligation_slice_indexed_inner(
     encoder: &mut AYEncoder,
     obligation_index: usize,
@@ -1908,10 +1939,26 @@ fn verify_mut_borrow_single_obligation_slice_indexed_inner(
         )));
     }
 
+    // Structural shortcut gates below read `final_values` as FACTS (an
+    // identity entry `v -> *v` licenses rewriting `^v` to `*v`). For a
+    // mutation-continued parameter the ay layer deliberately does NOT assert
+    // its identity entry — the callee postcondition alone constrains `^v` — so
+    // letting a gate read that entry turned `(^v)@ == (*v)@` after
+    // `v.extend(w)` into a syntactic match routed to the circular
+    // materialized-consequence proof. Hide those entries from the gates.
+    // (s25 vacuous whole-value equality soundness)
+    let gate_final_values_owned = final_values_excluding_mutation_continued(
+        ctx.mut_borrow_final_values,
+        ctx.mutation_continued_params,
+    );
+    let gate_final_values = gate_final_values_owned
+        .as_ref()
+        .or(ctx.mut_borrow_final_values);
+
     if required_disequality_contradicts_postcondition(ctx.requires, ensure) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
+        return Ok(ResolveContinuation::Continue(
+            crate::verify::structural_failed_traced(),
+        ));
     }
 
     if let Some(result) = type_invariant_negative_precheck(ensure, ctx) {
@@ -1928,32 +1975,28 @@ fn verify_mut_borrow_single_obligation_slice_indexed_inner(
     if result_projection_matches_reconstructed_return_field(
         ensure,
         ctx.return_expr,
-        ctx.mut_borrow_final_values,
+        gate_final_values,
     ) {
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
-    if reconstructed_tuple_field_finality_matches(ensure, ctx.mut_borrow_final_values) {
+    if reconstructed_tuple_field_finality_matches(ensure, gate_final_values) {
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
-    if direct_result_equality_matches_return_expr(
-        ensure,
-        ctx.return_expr,
-        ctx.mut_borrow_final_values,
-    ) {
+    if direct_result_equality_matches_return_expr(ensure, ctx.return_expr, gate_final_values) {
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
     if structural_return_or_identity_final_postcondition_matches(
         ensure,
         ctx.return_expr,
-        ctx.mut_borrow_final_values,
+        gate_final_values,
     ) {
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
-    if direct_final_value_postcondition_matches(ensure, ctx.mut_borrow_final_values) {
+    if direct_final_value_postcondition_matches(ensure, gate_final_values) {
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
@@ -1996,9 +2039,7 @@ fn verify_mut_borrow_single_obligation_slice_indexed_inner(
         return prove_materialized_verified_consequence(encoder, obligation_index, ensure, ctx);
     }
 
-    if let Some(result) =
-        resolve_postcondition_matches_final_values(ensure, ctx.mut_borrow_final_values)
-    {
+    if let Some(result) = resolve_postcondition_matches_final_values(ensure, gate_final_values) {
         if !verified_structural_result_enabled(&result) {
             debug!(
                 "  slice[{obligation_index}]: resolve/final structural verified shortcut disabled"
@@ -2177,7 +2218,7 @@ fn mut_ref_carrier_goal_certificate(
     let base_smt = encoder.solver().to_smtlib2();
 
     encoder.push_scope().ok()?;
-    encoder.assert_term(negated_carrier);
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(negated_carrier));
     let summary = encoder.batch_resolve_current_stack_unsat();
     let popped = encoder.pop_scope();
     // A failed pop leaves the stack in an unknown shape; refuse rather than
@@ -2207,25 +2248,40 @@ fn type_invariant_negative_precheck(
     });
 
     let Some(invariant) = invariant else {
-        let current_receiver = PureExpr::Deref(Arc::new(PureExpr::Var(var_name.to_string(), None)));
-        if super::resolve::is_identity_final_value(var_name, final_expr)
-            && requires_include_invariant_receiver(ctx.requires, method, &current_receiver)
-        {
-            return None;
-        }
-        return Some(VerificationResult::Failed(Counterexample::empty()));
+        // No registered invariant body. The solver sees `invariant(..)` as an
+        // UNINTERPRETED predicate, so its SAT model (invariant = false at the
+        // final value) refutes nothing about the program: a trait default
+        // `invariant(self) { true }` is a valid impl — Creusot
+        // should_fail/bug/222 `uses_invariant`, which Creusot PROVES — and the
+        // structural `Failed` this branch used to return was that same false
+        // refutation. Neither direction is known here; say so, fail closed.
+        return Some(VerificationResult::Unknown(UnknownReason::SolverMessage(
+            format!(
+                "{}: type invariant `{method}` has no registered body for the final value of \
+                 `{var_name}` (an uninterpreted invariant proves nothing either way)",
+                crate::verify::types::REFUTATION_AUTHORITY_MESSAGE
+            ),
+        )));
     };
 
     let mut substitutions = HashMap::new();
     substitutions.insert(invariant.self_param().to_string(), final_expr.clone());
     let body = invariant.body().substitute(&substitutions);
-    super::super::function::type_invariant_body_has_simple_counterexample(
+    if super::super::function::type_invariant_body_has_simple_counterexample(
         ctx.requires,
         &body,
         ctx.type_invariants,
         ctx.logic_fns,
-    )
-    .then_some(VerificationResult::Failed(Counterexample::empty()))
+    ) {
+        // The invariant body has a syntactic counterexample; the solver
+        // produces the VALIDATED one the verdict needs.
+        crate::verify::authority_trace(|| {
+            "type-invariant negative precheck: simple counterexample shape; \
+             deferring to the solver"
+                .to_string()
+        });
+    }
+    None
 }
 
 fn type_invariant_ensure_parts(ensure: &PureExpr) -> Option<(&str, &PureExpr)> {
@@ -2301,7 +2357,7 @@ pub(super) fn verify_mut_borrow_single_obligation_slice(
     {
         let negated_ensure =
             encode_negated_postcondition(encoder, ensure, ctx.logic_fns, ctx.return_expr)?;
-        encoder.assert_term(negated_ensure);
+        encoder.with_goal_assertions(|encoder| encoder.assert_term(negated_ensure));
         return Ok(ResolveContinuation::Continue(VerificationResult::Unknown(
             UnknownReason::Incomplete,
         )));
@@ -2323,7 +2379,7 @@ fn resolve_postcondition_matches_final_values(
         return Some(VerificationResult::Verified(None));
     }
     if final_value_is_visible_increment(var_name, final_expr) {
-        return Some(VerificationResult::Failed(Counterexample::empty()));
+        return Some(crate::verify::structural_failed_traced());
     }
     None
 }
@@ -2335,7 +2391,12 @@ fn resolve_postcondition_base_name(ensure: &PureExpr) -> Option<&str> {
     if name != "resolve" || args.len() != 1 {
         return None;
     }
-    peel_deref_var_name(&args[0])
+    // `resolve(v)` is `^v == *v`; `resolve(*v)` resolves the inner borrow,
+    // which `final_values[v]` says nothing about (s32 gate hardening).
+    match &args[0] {
+        PureExpr::Var(name, _) => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 fn peel_deref_var_name(expr: &PureExpr) -> Option<&str> {
@@ -2397,6 +2458,7 @@ mod tests {
             mutation_continued_params: None,
             body_div_obligations: &[],
             fresh_base_recheck: None,
+            literal_false_base_recheck: None,
             slice_length_stable_vars: None,
             base_recheck_pathology: std::cell::Cell::new(false),
         }

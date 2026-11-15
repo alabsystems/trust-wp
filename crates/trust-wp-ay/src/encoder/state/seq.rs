@@ -16,8 +16,6 @@ use crate::encoder::sort_context::sort_mapping::SeqCarrier;
 /// the encoder tracks concrete `(arr, len, offset)` components for each
 /// known Seq term. Operations like `seq_len` and `seq_index` consult this
 /// registry first, falling back to UF projectors only for unknown terms.
-///
-/// See `designs/2026-02-14-seq-array-encoding-alternative.md` (EXECUTE).
 #[derive(Clone, Debug)]
 pub(crate) struct SeqValue {
     /// Backing array: `Array<Int, Int>`.
@@ -76,13 +74,12 @@ pub(crate) struct SeqState {
     /// Whether this encoder is a mixed native-collection lane, where ay-dpll
     /// rejects a Seq carrier quantified together with the array theory.
     ///
-    /// Deliberately separate from the carrier. These were one flag until the
-    /// carrier became a proof-surface decision: `ensure_seq_theory` decided
-    /// whether to assert the `index_logic(s, i) = select(seq_array(s),
-    /// seq_offset(s) + i)` bridge by *looking at the sort spelling*, so any
-    /// lane that moved to the uninterpreted carrier for certifiability
-    /// silently lost that axiom too. Which sort carries a sequence and which
-    /// axioms are sound to assert about it are independent questions.
+    /// Deliberately separate from the carrier: which sort carries a sequence
+    /// and which axioms are sound to assert about it are independent
+    /// questions. Were `ensure_seq_theory` to decide whether to assert the
+    /// `index_logic(s, i) = select(seq_array(s), seq_offset(s) + i)` bridge
+    /// by *looking at the sort spelling*, a lane on the uninterpreted carrier
+    /// (chosen for certifiability) would silently lose that axiom too.
     mixed_collection_lane: bool,
     /// Seq uninterpreted functions (lazy initialized via `ensure_seq_theory`).
     funcs: Option<SeqFunctions>,

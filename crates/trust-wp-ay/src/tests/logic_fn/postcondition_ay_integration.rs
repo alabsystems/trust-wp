@@ -7,8 +7,6 @@
 //! Covers ay ITE/UF primitives, Seq-parameter sort panics (#1572),
 //! structural induction with spec axioms (#2097), and Bool-result
 //! sort pollution regressions (#994).
-//!
-//! Split from postcondition_verification.rs per #2251.
 
 use std::sync::Arc;
 
@@ -151,9 +149,9 @@ fn test_verify_lemma_postcondition_with_seq_param_no_sort_panic() {
 
     // Use a 2s solver timeout so ay terminates gracefully. This test
     // only checks for sort-mismatch panics, not solver completeness.
-    // With the logic function body prescan (#1965), sorts are now
-    // correct (Seq for t), making ay explore a larger Array-theory
-    // search space. A short timeout is sufficient for the panic check.
+    // The logic function body prescan (#1965) gives `t` its Seq sort, so
+    // ay explores a larger Array-theory search space; a short timeout is
+    // sufficient for the panic check.
     let result = verify_function_with_modes(
         crate::verify::VerificationRequest::new(&requires, &ensures)
             .logic_fns(Some(&logic_fns))
@@ -179,11 +177,11 @@ fn test_verify_lemma_postcondition_with_seq_param_no_sort_panic() {
 ///   sum_nat(n) = if n <= 0 { 0 } else { n + sum_nat(n - 1) }
 ///   requires(n >= 0), ensures(result >= 0)
 ///
-/// Without the spec axiom (old behavior): the function's own postcondition
+/// Without the spec axiom: the function's own postcondition
 /// is excluded to prevent circular reasoning, so the solver cannot derive
 /// `sum_nat(n-1) >= 0` in the inductive step. Verification fails or is Unknown.
 ///
-/// With the spec axiom in Default mode (new behavior): the spec axiom
+/// With the spec axiom in Default mode: the spec axiom
 /// `forall n [sum_nat(n)]. n >= 0 => sum_nat(n) >= 0` is available. The
 /// recursive call `sum_nat(n-1)` in the body creates a ground instance that
 /// triggers E-matching, producing `sum_nat(n-1) >= 0` (the IH). Combined
@@ -214,7 +212,7 @@ fn test_recursive_logic_fn_structural_induction_with_spec_axiom() {
     .detect_recursion();
     sum_fn.set_ensures(vec![ge(var("result"), int(0))]);
 
-    // --- Case 1: WITHOUT spec axiom (old behavior) ---
+    // --- Case 1: WITHOUT spec axiom ---
     // Exclude sum_nat from available logic fns entirely. The postcondition
     // cannot be proved because the IH `sum_nat(n-1) >= 0` is unavailable.
     let result_without = verify_function_with_modes(
@@ -226,7 +224,7 @@ fn test_recursive_logic_fn_structural_induction_with_spec_axiom() {
         "Without spec axiom, recursive postcondition should fail: {result_without:?}"
     );
 
-    // --- Case 2: WITH spec axiom in Default mode (new behavior) ---
+    // --- Case 2: WITH spec axiom in Default mode ---
     // Include sum_nat but with Default mode override. This emits only the
     // spec axiom (postcondition), not the defining axiom (body).
     let mode_overrides = vec![LogicMode::Default];
@@ -285,173 +283,16 @@ fn test_recursive_logic_fn_structural_induction_wrong_postcondition_fails() {
     );
     // n=1 gives sum_nat(1) = 1 + sum_nat(0) = 1 + 0 = 1 > 0, contradicting result <= 0
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "Wrong postcondition (result <= 0) must fail. Got: {result:?}"
     );
 }
 
-/// Structural-induction precheck for ADT lemmas of the rusthorn
-/// `lemma_sum_nonneg` shape. (trust-wp Phase 3 B4)
-///
-/// Models the lemma over a `List` ADT:
-///
-/// ```text
-/// #[logic(open)]
-/// fn sum(self) -> Int {
-///     match self {
-///         Cons(a, l) => a@ + l.sum(),
-///         Nil => 0,
-///     }
-/// }
-///
-/// #[logic]
-/// #[ensures(self.sum() >= 0)]
-/// fn lemma_sum_nonneg(&self) {
-///     match self {
-///         Cons(_, l) => l.lemma_sum_nonneg(),
-///         Nil => (),
-///     }
-/// }
-/// ```
-///
-/// Without the precheck, the quantified obligation
-/// `forall self. body ==> sum(self) >= 0` cannot be closed by E-matching on
-/// an ADT receiver and the solver returns
-/// `quantifier-ematching-exists-incomplete`. The structural-induction
-/// precheck recognises the shape (recursive helper with non-negative-sum
-/// arms + a body that mirrors the helper's match structure) and discharges
-/// the obligation directly.
-#[test]
-#[timeout(15000)]
-fn test_recursive_adt_lemma_structural_induction_precheck_verifies() {
-    use trust_wp_core::formula::{
-        internal::tuple_lowering::tuple_logic_fn_name, MatchArm, Pattern,
-    };
-
-    use crate::{verify_function_with_modes, VerificationRequest};
-
-    let unit = PureExpr::LogicFnCall {
-        name: tuple_logic_fn_name(0),
-        args: vec![],
-    };
-
-    // sum(self) = match self { Cons(a, l) => a@ + l.sum(), Nil => 0 }
-    let sum_body = PureExpr::Match {
-        scrutinee: Arc::new(var("self")),
-        arms: vec![
-            MatchArm {
-                pattern: Pattern::Constructor {
-                    name: "Cons".to_string(),
-                    inner: Some(Box::new(Pattern::Tuple(vec![
-                        Pattern::Binding("a".to_string()),
-                        Pattern::Binding("l".to_string()),
-                    ]))),
-                },
-                body: add(
-                    view(var("a")),
-                    PureExpr::MethodCall {
-                        receiver: Arc::new(var("l")),
-                        method: "sum".to_string(),
-                        args: vec![],
-                    },
-                ),
-            },
-            MatchArm {
-                pattern: Pattern::Constructor {
-                    name: "Nil".to_string(),
-                    inner: None,
-                },
-                body: int(0),
-            },
-        ],
-    };
-
-    // Rewrite the sum body so the recursive call uses the LogicFnCall form
-    // that the precheck matches against (precheck accepts both, but the
-    // unfold layer is more reliably exercised this way).
-    let sum_body = sum_body.rewrite_bottom_up(|node| match node {
-        PureExpr::MethodCall {
-            receiver,
-            method,
-            args,
-        } if method == "sum" && args.is_empty() => PureExpr::LogicFnCall {
-            name: "sum".to_string(),
-            args: vec![(*receiver).clone()],
-        },
-        other => other,
-    });
-
-    let sum_fn = LogicFnDef::new(
-        "sum".to_string(),
-        "test::List::sum".to_string(),
-        vec!["self".to_string()],
-        sum_body,
-    )
-    .with_mode(LogicMode::Open)
-    .detect_recursion();
-
-    // lemma_sum_nonneg(self) = match self { Cons(_, l) => l.lemma_sum_nonneg(), Nil => () }
-    let lemma_body = PureExpr::Match {
-        scrutinee: Arc::new(var("self")),
-        arms: vec![
-            MatchArm {
-                pattern: Pattern::Constructor {
-                    name: "Cons".to_string(),
-                    inner: Some(Box::new(Pattern::Tuple(vec![
-                        Pattern::Wildcard,
-                        Pattern::Binding("l".to_string()),
-                    ]))),
-                },
-                body: PureExpr::MethodCall {
-                    receiver: Arc::new(var("l")),
-                    method: "lemma_sum_nonneg".to_string(),
-                    args: vec![],
-                },
-            },
-            MatchArm {
-                pattern: Pattern::Constructor {
-                    name: "Nil".to_string(),
-                    inner: None,
-                },
-                body: unit.clone(),
-            },
-        ],
-    };
-    let mut lemma_fn = LogicFnDef::new(
-        "lemma_sum_nonneg".to_string(),
-        "test::List::lemma_sum_nonneg".to_string(),
-        vec!["self".to_string()],
-        lemma_body,
-    )
-    .with_mode(LogicMode::Default)
-    .detect_recursion();
-    // ensures(sum(self) >= 0)
-    lemma_fn.set_ensures(vec![ge(logic_fn_call("sum", vec![var("self")]), int(0))]);
-
-    let logic_fns = vec![sum_fn, lemma_fn.clone()];
-    let mode_overrides = vec![LogicMode::Open, LogicMode::Default];
-    let result = verify_function_with_modes(
-        VerificationRequest::new(lemma_fn.requires(), lemma_fn.ensures())
-            .return_expr(Some(lemma_fn.body()))
-            .logic_fns(Some(&logic_fns))
-            .mode_overrides(Some(&mode_overrides)),
-    );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
-    assert!(
-        result
-            .as_ref()
-            .is_ok_and(crate::tests::helpers::verified_or_known_proof_trusted),
-        "Structural-induction precheck should discharge the lemma. Got: {result:?}"
-    );
-}
-
-/// Negative control: the precheck must NOT fire when the helper's arm body
-/// is not a non-negative sum (e.g., the helper subtracts a value), even if
-/// the lemma's match shape looks superficially correct. This guards against
-/// the precheck blindly returning `Verified` for any ADT-shaped lemma.
+/// Negative control: a lemma whose helper's arm body is not a non-negative
+/// sum (e.g., the helper subtracts a value) must never verify, even though
+/// the lemma's match shape looks superficially like the rusthorn
+/// `lemma_sum_nonneg` shape. No path may accept it: neither a syntactic
+/// ADT-lemma shortcut nor the regular solver pipeline.
 #[test]
 #[timeout(15000)]
 fn test_recursive_adt_lemma_structural_induction_precheck_rejects_subtraction() {
@@ -660,10 +501,10 @@ fn test_recursive_logic_fn_proof_calls_keep_branch_guards() {
             .mode_overrides(Some(&mode_overrides))
             .timeout(Some(std::time::Duration::from_secs(45))),
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()
@@ -741,14 +582,14 @@ fn test_logic_fn_bool_result_does_not_pollute_option_result() {
         .logic_fns(Some(&logic_fns)),
     );
     assert!(
-        matches!(result, Ok(VerificationResult::Failed(_))),
+        crate::tests::rejected_ok(&result),
         "find_ptr postcondition is false at i == 10 and should fail without a \
          sibling Bool-result sort conflict. Got: {result:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// MBQI evaluation matrix — Slice 2 of #1925
+// MBQI evaluation matrix (#1925)
 //
 // Three paired tests measuring whether ay-dpll's MBQI can replace trust-wp's
 // manual logic ground-pool flushing in the "spec-axiom" lane.
@@ -803,8 +644,8 @@ fn test_mbqi_matrix_spec_axiom_ground_pool_enabled() {
     );
 }
 
-/// Spec-axiom structural induction with ground-pool **disabled**. MBQI should
-/// now close the `sum_nat >= 0` proof without the manual ground pool.
+/// Spec-axiom structural induction with ground-pool **disabled**. MBQI must
+/// close the `sum_nat >= 0` proof without the manual ground pool.
 #[test]
 #[timeout(60000)]
 fn test_mbqi_matrix_spec_axiom_ground_pool_disabled() {
@@ -851,8 +692,8 @@ fn test_mbqi_matrix_spec_axiom_ground_pool_disabled() {
     );
 }
 
-/// Defining-axiom ("proof calls") lane with ground-pool disabled. MBQI should
-/// now verify this lane without the manual ground pool.
+/// Defining-axiom ("proof calls") lane with ground-pool disabled. MBQI must
+/// verify this lane without the manual ground pool.
 #[test]
 #[timeout(60000)]
 fn test_mbqi_matrix_proof_calls_regresses_without_ground_pool() {
@@ -953,10 +794,10 @@ fn test_mbqi_matrix_proof_calls_regresses_without_ground_pool() {
             .logic_ground_mode(LogicGroundInstantiationMode::Disabled)
             .timeout(Some(std::time::Duration::from_secs(45))),
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()

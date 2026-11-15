@@ -9,16 +9,13 @@
 //!
 //! Verify it with:  `trust-wp examples/mut_borrow.rs`
 //!
-//! STATUS: all three functions — `increment_ref`, `swap`, and `abs_mut` —
-//! verify, and the file exits 0. An earlier revision of this header recorded
-//! `abs_mut` as `unknown (proof-trusted)` with the file exiting 2; that was
-//! accurate when written and is no longer (see the 2026-08-23 retirement of the
-//! `&mut` proof-trusted rule in README.md and demo/README.md).
+//! All three functions — `increment_ref`, `swap`, and `abs_mut` — verify, and
+//! the file exits 0.
 //!
 //! This lane is the one most sensitive to the `ay` revision in the sibling
 //! checkout the manifest path-depends on — an older solver demotes all three
-//! back to `unknown (proof-trusted)`, which is a stale dependency, not a
-//! broken contract.
+//! to `unknown (proof-trusted)`, which is a stale dependency, not a broken
+//! contract.
 //!
 //! The implementation supports:
 //! - `*v` (deref current) maps to `v_current` in SMT
@@ -27,9 +24,8 @@
 //! - MIR body extraction for mutable borrow functions
 //! - Conditional body extraction (for if/else patterns like abs_mut)
 //!
-//! References: an internal design note, "RustHorn vs Separation Logic"
-//! (2026-02-01), and Creusot's own `ARCHITECTURE.md`. Neither is tracked in
-//! this repository.
+//! The prophecy encoding follows Creusot's; see
+//! `reference/creusot/ARCHITECTURE.md`.
 
 use trust_wp::{ensures, requires};
 

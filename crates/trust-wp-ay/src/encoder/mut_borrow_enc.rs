@@ -10,9 +10,9 @@
 //! this purely first-order — no heap arrays or separation logic primitives are
 //! needed.
 //!
-//! Extracted from `sep_logic.rs` to separate production code from the
-//! experimental separation-logic primitives (PointsTo, SepConj, MagicWand)
-//! that are reserved for future unsafe Rust support. See #2214.
+//! The experimental separation-logic primitives (PointsTo, SepConj, MagicWand)
+//! are reserved for future unsafe Rust support and live outside this module,
+//! so the production encoding never depends on them (#2214).
 
 use ay_dpll::api::Term;
 use trust_wp_core::formula::PureExpr;
@@ -38,8 +38,6 @@ impl AYEncoder {
     /// - No quantifiers required
     /// - Better SMT solver performance
     /// - Matches Creusot's approach
-    ///
-    /// See: designs/2026-02-01-rusthorn-vs-sl.md
     #[allow(clippy::similar_names)] // final_var/final_expr are meaningfully different
     pub(super) fn encode_mut_borrow(
         &mut self,
@@ -85,7 +83,7 @@ impl AYEncoder {
         // Keep the user-facing mut-borrow current/final equalities on the
         // compatibility wrapper: complex Bool bodies like `x > 0` still prove
         // more reliably through `iff` here even though lower-level equality
-        // sites now use native Bool equality. (#1179, #2141)
+        // sites use native Bool equality. (#1179, #2141)
         let c1 = self.eq_or_iff(current_var, current_term, &current_sort);
         let c2 = self.eq_or_iff(final_var, final_term, &final_sort);
         let c3 = self.eq_term(id_var, id_term);

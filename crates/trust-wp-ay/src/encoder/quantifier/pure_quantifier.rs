@@ -158,7 +158,7 @@ impl AYEncoder {
         // postcondition_mut call, inherit the closure environment sort from
         // the receiver. This prevents sort mismatches when the UF was declared
         // with a closure-env sort from axiom paths.
-        if usage_sort == Sort::Int {
+        let resolved = if usage_sort == Sort::Int {
             if let Some(precomputed) = precomputed_pcm_sort {
                 precomputed.clone()
             } else {
@@ -167,7 +167,10 @@ impl AYEncoder {
             }
         } else {
             usage_sort
-        }
+        };
+        // Usage inference is stateless and spells a sequence as native Seq.
+        // The binder must use the same carrier as this encoder's projectors.
+        super::super::sort_context::sort_mapping::retarget_seq_carrier(resolved, self.seq_carrier())
     }
 
     /// Encode a pure expression quantifier (forall or exists) with optional prefix.
@@ -568,6 +571,8 @@ impl AYEncoder {
             // Uses depth counter so nested quantifiers with the same name don't
             // prematurely remove the outer binding. (#579 audit)
             self.bind_quantifier_var(v.clone());
+            self.quantifier_state
+                .bind_written_binder(v.clone(), v_sort.clone());
         }
 
         // Increment quantifier_depth so that inner LogicFnCall applications
@@ -604,6 +609,7 @@ impl AYEncoder {
             .rev()
         {
             self.unbind_quantifier_var(v.as_str());
+            self.quantifier_state.unbind_written_binder(v.as_str());
             for (name, old) in old_bindings {
                 self.restore_var(&name, old);
             }

@@ -1,0 +1,116 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "trait-refinement-fail-open-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+creusot-contracts = { path = "../../../crates/creusot-contracts" }
+creusot-std = { path = "../../../crates/creusot-std" }
+trust-wp = { path = "../../../crates/trust-wp" }
+trust-wp-std = { package = "trust-wp-std", path = "../../../crates/trust-wp-std" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "should_fail_contractless_trait_requires"
+path = "src/should_fail_contractless_trait_requires.rs"
+
+[[bin]]
+name = "should_fail_weaker_ensures"
+path = "src/should_fail_weaker_ensures.rs"
+
+[[bin]]
+name = "should_fail_external_trait_requires"
+path = "src/should_fail_external_trait_requires.rs"
+
+[[bin]]
+name = "should_pass_refinements"
+path = "src/should_pass_refinements.rs"
+
+[[bin]]
+name = "should_fail_binder_capture_contractless"
+path = "src/should_fail_binder_capture_contractless.rs"
+
+[[bin]]
+name = "should_fail_binder_capture_declared"
+path = "src/should_fail_binder_capture_declared.rs"
+
+[[bin]]
+name = "should_fail_logic_fn_scope"
+path = "src/should_fail_logic_fn_scope.rs"
+
+[[bin]]
+name = "should_pass_renamed_refinements"
+path = "src/should_pass_renamed_refinements.rs"
+
+[[bin]]
+name = "should_fail_const_scope"
+path = "src/should_fail_const_scope.rs"
+
+[[bin]]
+name = "should_fail_const_scope_caller"
+path = "src/should_fail_const_scope_caller.rs"
+
+[[bin]]
+name = "should_fail_logic_fn_import_alias"
+path = "src/should_fail_logic_fn_import_alias.rs"
+
+[[bin]]
+name = "should_fail_logic_fn_alias_both"
+path = "src/should_fail_logic_fn_alias_both.rs"
+
+[[bin]]
+name = "should_fail_alias_binder"
+path = "src/should_fail_alias_binder.rs"
+
+[[bin]]
+name = "should_fail_tuple_binder"
+path = "src/should_fail_tuple_binder.rs"
+
+[[bin]]
+name = "should_fail_cast_erased"
+path = "src/should_fail_cast_erased.rs"
+
+[[bin]]
+name = "should_fail_literal_suffix"
+path = "src/should_fail_literal_suffix.rs"
+
+[[bin]]
+name = "should_fail_alias_cast"
+path = "src/should_fail_alias_cast.rs"
+
+[[bin]]
+name = "should_fail_shadowed_int_binder"
+path = "src/should_fail_shadowed_int_binder.rs"
+
+[[bin]]
+name = "should_fail_underscore_arg_collision_declared"
+path = "src/should_fail_underscore_arg_collision_declared.rs"
+
+[[bin]]
+name = "should_fail_underscore_arg_collision"
+path = "src/should_fail_underscore_arg_collision.rs"
+
+[[bin]]
+name = "should_fail_trait_param_named_result"
+path = "src/should_fail_trait_param_named_result.rs"
+
+[[bin]]
+name = "should_fail_impl_param_named_result"
+path = "src/should_fail_impl_param_named_result.rs"
+
+[[bin]]
+name = "should_fail_call_site_arg_collision"
+path = "src/should_fail_call_site_arg_collision.rs"
+
+[[bin]]
+name = "should_pass_positional_refinements"
+path = "src/should_pass_positional_refinements.rs"

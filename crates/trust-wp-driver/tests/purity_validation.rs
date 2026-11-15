@@ -4,39 +4,21 @@
 
 //! Integration tests for Creusot-compatible purity/admissibility validation.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::Path;
 
 use ntest::timeout;
-use trust_wp_test_utils::{fixture_dir, trust_wp_rustc_path};
+use trust_wp_test_utils::{fixture_dir, nested_cargo, trust_wp_rustc_path};
 
 fn run_fixture(bin: &str) -> std::process::Output {
     let target_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/purity_validation_tests");
-    Command::new(cargo_path())
+    nested_cargo("check")
         .current_dir(fixture_dir("purity_validation"))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("RUSTC_WRAPPER", trust_wp_rustc_path())
-        .args(["check", "--quiet", "--bin", bin])
+        .args(["--quiet", "--bin", bin])
         .output()
-        .expect("failed to run cargo check for purity validation fixture")
-}
-
-fn cargo_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO") {
-        return PathBuf::from(path);
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = Path::new(&home).join(".cargo/bin/cargo");
-        if path.exists() {
-            return path;
-        }
-    }
-
-    PathBuf::from("cargo")
+        .expect("failed to run targo check for purity validation fixture")
 }
 
 #[test]
@@ -69,10 +51,7 @@ fn purity_validation_rejects_logic_surface_gaps() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     for expected in [
         "The `dead` term can only be used",
-        "Cannot divide primitive integers in logic",
-        "cannot calculate the remainder of primitive integers in logic",
         "Pattern matching literals on Int are unsupported",
-        "no IndexLogic implementation found",
         "Forbidden constructor or field access of opaque type",
         "Cannot make a less-visible logic function transparent",
     ] {
@@ -81,6 +60,44 @@ fn purity_validation_rejects_logic_surface_gaps() {
             "missing `{expected}` diagnostic; stderr: {stderr}",
         );
     }
+}
+
+/// The logic-surface gaps that are TYPE errors of the specification are
+/// reported by rustc through the contract type-check vehicle, before the
+/// driver runs, in Creusot's wording: Creusot's `DivLogic`/`RemLogic` exist
+/// for `Int` only, and `a[i]` in logic is an `IndexLogic` method call whose
+/// absence is an E0599 naming the trait (Creusot lowers it to
+/// `__creusot_index_logic_stub`, the same shape).
+#[test]
+#[timeout(120_000)]
+fn purity_validation_rejects_logic_surface_type_errors() {
+    let output = run_fixture("should_fail_logic_surface_types");
+    assert!(
+        !output.status.success(),
+        "expected logic surface type-error fixture to fail; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "Cannot divide primitive integers in logic",
+        "cannot calculate the remainder of primitive integers in logic",
+        "error[E0599]",
+        "`Bag: trust_wp::logic::ops::IndexLogic<_>`",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing `{expected}` diagnostic; stderr: {stderr}",
+        );
+    }
+    // trust-wp's own verdict lines only: targo's lane banner says
+    // "UNVERIFIED" and "explicit-unverified" of the nested command.
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("trust-wp:")
+            && line.contains("verified")
+            && !line.contains(" 0 verified")),
+        "a fixture that fails to type-check must verify nothing; stderr: {stderr}"
+    );
 }
 
 #[test]

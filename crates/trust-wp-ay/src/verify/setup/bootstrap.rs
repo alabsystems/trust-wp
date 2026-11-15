@@ -550,7 +550,7 @@ fn synthetic_call_alias_value_exprs<'a>(
 }
 
 fn is_synthetic_call_alias(name: &str) -> bool {
-    name.starts_with("call_") || name.starts_with("_call_")
+    name.starts_with("$call_") || name.starts_with("$_call_")
 }
 
 fn build_bootstrap_hint_plan(

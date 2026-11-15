@@ -50,6 +50,12 @@ except ModuleNotFoundError:
 
 
 NO_REPLAY_PASS_PREFIX = "Parse-only (NO_REPLAY):"
+# A NO_REPLAY test that trust-wp actually VERIFIED (clean telemetry, zero exit,
+# and at least one positively verified obligation) is a real proof — strictly
+# more than Creusot's translate-only check — and is stored with this prefix so
+# the tier classifier and the final gate grade it as tier2 rather than as a
+# parse-only pass (D-3).
+NO_REPLAY_VERIFIED_PREFIX = "Verified (NO_REPLAY):"
 NO_REPLAY_STRICT_ERROR_MESSAGE = (
     "NO_REPLAY marker is not accepted by the strict compatibility gate"
 )
@@ -62,44 +68,40 @@ def _is_no_replay_source(source: str) -> bool:
     return bool(re.search(r"//\s*NO_REPLAY", source))
 
 
-# Creusot NO_REPLAY tests whose contract is GENUINELY UNPROVABLE (Creusot itself
-# only translates them — its NO_REPLAY mode never runs the prover — and no sound
-# verifier can prove them). For these, and ONLY these, a "creusot replacement"
-# matches Creusot's translate-only pass. Everything else marked NO_REPLAY must be
-# VERIFIED WITH PROOF by trust-wp (strictly superior to Creusot, which skips it).
-#   - bug/653: ensures(result@ == n@*(n@+1)/2) on `fn omg(n)->usize { n }` is FALSE
-#     for n>=2 (a translation-regression test for Creusot issue #653).
-#   - traits/04: ensures(result == false) on `user<T: A>(a,b) -> bool` whose body is
-#     `a.func1(b) && b.func2(a) && a.func3(b)`. Trait `A`'s methods have NO contracts
-#     (return unconstrained bool), so `result` can be true => `result == false` is FALSE.
-#     ay correctly returns a validated SAT counterexample; no sound verifier can prove it.
-#   - spec_tests: ensures(T::A == T::B) [distinct enum variants] and
-#     ensures(S(0u32,true) == S(1u32,false)) [0u32 != 1u32] are both FALSE by inspection.
-#   - closures/01_basic: a `// NO_REPLAY` test with NO user contracts at all (just
-#     `(|| y)()`, `|a,b| a+b`, `move || *a += 1`, `move || x = new_ref()`). There is
-#     nothing to prove, so a translate-only pass cannot false-accept anything (zero
-#     obligations); trust-wp translates it with a fully clean frontend (0 errors/
-#     panics/parse/erasure/termination/logic-recursion) and emits base_exit_code=2
-#     only because it has zero verifiable obligations — exactly the NO_REPLAY parse-
-#     only shape Creusot accepts. The _no_replay_translation_clean guard still
-#     requires the clean frontend, so a real closure-translation bug would NOT pass.
-# All are `// NO_REPLAY` in the Creusot reference (the why3 prover never runs on them
-# — why3tests/tests/why3.rs:220 is parse/translate-only), so translate-only is the
-# faithful Creusot match and a sound disposition (false-contract or no-contract).
-_NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST: tuple[str, ...] = (
-    "bug/653",
-    "traits/04",
-    "spec_tests",
-    "closures/01_basic",
-)
+# NO_REPLAY CREDIT POLICY (D-21, D-133). Creusot only translates these
+# tests. The shared policy grants translate-only credit exactly when every
+# goal is refutable or contentless; any provable goal excludes the whole row.
+# Countermodels and per-item classes live in allowlist.toml, loaded through
+# the same module used by the final gate. Never maintain a classifier copy.
+def _shared_translate_only_allowlist() -> tuple[str, ...]:
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from creusot_goal_coverage import NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+
+    return NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+
+
+_NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST = _shared_translate_only_allowlist()
 
 
 def _is_translate_only_allowed(test_name: str | None) -> bool:
-    """True iff this NO_REPLAY test is on the documented genuinely-unprovable
-    allowlist, for which translate-only is the faithful Creusot match."""
-    if not test_name:
+    """True iff ``test_name`` is EXACTLY an allowlisted should_succeed test path.
+
+    Exact match on the harness test name (``tests/should_succeed/<t>.rs``), the
+    same rule as creusot_goal_coverage.is_no_replay_translate_only_exempt: no
+    suffix, prefix or other-lane lookalike (``bug/6530``, ``x/bug/653``,
+    ``tests/should_fail/bug/653``) qualifies. The ``// NO_REPLAY`` marker is
+    checked by the caller (this classifier is reached only for NO_REPLAY
+    sources) and again by the gate."""
+    if not isinstance(test_name, str) or not test_name:
         return False
-    return any(marker in test_name for marker in _NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST)
+    return test_name in {
+        f"tests/should_succeed/{marker}.rs" for marker in _NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST
+    }
 
 
 # Should-succeed tests whose proof_assert "counterexample" is SPURIOUS BY
@@ -114,10 +116,10 @@ def _is_translate_only_allowed(test_name: str | None) -> bool:
 #
 # This mirrors the LRA spurious-SAT guard (#2674), which also demotes
 # counterexamples the solver could not have validated against real semantics
-# to "unknown". It deliberately does NOT restore the pre-hardening #2700
-# "pass" credit: baselines 2026-04-18/19 passed these files while the driver
-# emitted 4 proof_assert counterexamples (verified=1, proof_assert_failed=4)
-# — a false parity credit the wire-line hardening was built to remove.
+# to "unknown". It deliberately does NOT grant a "pass": a run that emits
+# proof_assert counterexamples (verified=1, proof_assert_failed=4) must not
+# earn parity credit — that is exactly the false credit the wire-line
+# hardening (#2700) exists to remove.
 # Creusot itself proves these proof_asserts via why3 replay, so an
 # unconditional "pass" would overstate parity; a "fail" would misreport a
 # spurious refutation as a genuine one.
@@ -133,11 +135,9 @@ def _is_translate_only_allowed(test_name: str | None) -> bool:
 #     untethered atoms (`old_x_final_current_final`), and (c) carries
 #     `let mut x = 1` only as `call_4_current == 1` with no tie to `bx` —
 #     so ay finds a model of the (incomplete) VC with x=0,y=0 and reports a
-#     "validated" counterexample that corresponds to no execution. Tracked
-#     as the "closure resolve counterexample" cluster
-#     (internal campaign-session log, 2026-07-04); the driver-side fix needs
-#     pre-/post-call state staging plus capture-loan prophecy linkage
-#     (#2318) and is false-accept-sensitive.
+#     "validated" counterexample that corresponds to no execution. The
+#     driver-side fix needs pre-/post-call state staging plus capture-loan
+#     prophecy linkage (#2318) and is false-accept-sensitive.
 #
 # EXIT CRITERION: remove an entry when the caller-side call staging fix
 # lands and the file's proof_asserts verify (the wire line then shows
@@ -175,7 +175,8 @@ def classify_no_replay_result(
     runs the prover. A trust-wp that merely matched that would throw away its real
     advantage. So the primary gate REQUIRES trust-wp to actually VERIFY the test
     (clean verification telemetry) — asserting more than Creusot. Only a small,
-    documented allowlist of GENUINELY-UNPROVABLE Creusot contracts (bug/653) is
+    documented allowlist of tests whose every Creusot goal is unprovable or
+    contentless (see the NO_REPLAY CREDIT POLICY table) is
     allowed to pass translate-only, which is the faithful Creusot match for those
     (and only those) since Creusot does not prove them either. Anything else marked
     NO_REPLAY that trust-wp fails to verify is a real gap (or regression) and is an
@@ -183,9 +184,9 @@ def classify_no_replay_result(
     """
     if _has_rustc_panic(output):
         return "error", None
-    # Faithful-minimum path: the documented genuinely-unprovable allowlist
-    # (bug/653, traits/04, spec_tests) is checked BEFORE the _has_panic_exit_status
-    # heuristic. These tests EXPECT a non-zero exit: Creusot's NO_REPLAY mode skips
+    # Faithful-minimum path: the documented translate-only allowlist (bug/653,
+    # spec_tests, bug/511, syntax/05_pearlite) is checked BEFORE the
+    # _has_panic_exit_status heuristic. These tests EXPECT a non-zero exit: Creusot's NO_REPLAY mode skips
     # the prover, but trust-wp runs it, (correctly) refutes the false contract, and
     # cargo wraps that failed step as exit 101 with no compile diagnostic — which
     # _has_panic_exit_status would otherwise misread as a suppressed panic and error.
@@ -193,18 +194,128 @@ def classify_no_replay_result(
     # TRUST_WP_RESULT wire line with panics==0 (and zero parse/termination/
     # logic-recursion/erasure errors), so a genuine suppressed panic — which either
     # bumps the panics counter or omits the wire line entirely — still falls through
-    # to the error paths below. (Without this ordering the allowlist never fired in
-    # the direct harness; bug/653 only passed under the heavier review gate.)
-    if _is_translate_only_allowed(test_name) and _no_replay_translation_clean(output):
-        return "pass", None
+    # to the error paths below. (Without this ordering the allowlist can never
+    # fire: the exit-101 heuristic errors first.)
+    if _is_translate_only_allowed(test_name):
+        # For an allowlisted test the ONLY possible credit is translate-only
+        # (tier3); it is never graded "verified" (D-21). The credit is
+        # refused when the driver reports a positive verdict on any refutable
+        # (B) goal item, or on an item outside the shared goal table: that
+        # is a driver false accept a parse-only pass must never hide.
+        refusals = _no_replay_translate_only_refusals(output, test_name)
+        if refusals:
+            return "error", "; ".join(refusals)
+        if _no_replay_translation_clean(output):
+            return "pass", None
+        if _has_panic_exit_status(output, exit_code):
+            return "error", None
+        if (infra := _detect_infrastructure_failure(output)) is not None:
+            return "error", infra
+        return "error", None
     if _has_panic_exit_status(output, exit_code):
         return "error", None
     if (infra := _detect_infrastructure_failure(output)) is not None:
         return "error", infra
     # Strictly-superior path: trust-wp VERIFIED it (more than Creusot's parse-only).
-    if _no_replay_verified_clean(output, exit_code):
+    # Off the allowlist a NO_REPLAY test is credited ONLY as a real proof: a
+    # clean run must also positively verify something and carry zero trust
+    # counters. A clean exit that verified nothing (or rests on trusted/assumed/
+    # vacuous facts) is never a translate-only credit for a test with an (A)
+    # goal (D-21).
+    if (
+        _no_replay_verified_clean(output, exit_code)
+        and _wire_verified_count(output) > 0
+        and _wire_trust_counters_zero(output)
+    ):
         return "pass", None
     return "error", None
+
+
+def classify_no_replay_result_with_mode(
+    output: str,
+    exit_code: int | None = None,
+    test_name: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """``classify_no_replay_result`` plus the pass MODE.
+
+    Returns ``(status, skip_reason, mode)`` where ``mode`` is non-None exactly
+    when ``status == "pass"``:
+
+    * ``"verified"`` — ``_no_replay_verified_clean`` holds AND the wire line
+      shows at least one positively verified obligation (``verified`` or
+      ``proof_assert_verified`` > 0). A clean exit with zero verified
+      obligations proves nothing and is NOT a verified pass.
+    * ``"translate_only"`` — every other pass, which can only be an
+      allowlisted test (every Creusot goal unprovable or contentless, so
+      translate-only is the faithful Creusot match there). An allowlisted test
+      is ALWAYS ``"translate_only"``, never ``"verified"``: its goals are false
+      or contentless, so a report verifying all of them is a refusal, not a
+      proof (D-21).
+    """
+    status, skip_reason = classify_no_replay_result(
+        output, exit_code=exit_code, test_name=test_name
+    )
+    if status != "pass":
+        return status, skip_reason, None
+    if _is_translate_only_allowed(test_name):
+        return status, skip_reason, "translate_only"
+    if (
+        _no_replay_verified_clean(output, exit_code)
+        and _wire_verified_count(output) > 0
+        and _wire_trust_counters_zero(output)
+    ):
+        return status, skip_reason, "verified"
+    return status, skip_reason, "translate_only"
+
+
+def _no_replay_translate_only_refusals(output: str, test_name: str | None) -> list[str]:
+    """Refusal reasons from the ONE shared per-goal table
+    (creusot_goal_coverage.no_replay_translate_only_refusals), applied to the
+    driver report lines and the last wire line of ``output``. Fail-closed: an
+    unavailable table is itself a refusal."""
+    try:
+        import sys
+        from pathlib import Path
+
+        scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from creusot_goal_coverage import driver_report_lines, no_replay_translate_only_refusals
+
+        return no_replay_translate_only_refusals(
+            test_name, driver_report_lines(output), _extract_wire_line_pairs(output)
+        )
+    except Exception as exc:  # pragma: no cover - never a credit
+        return [f"NO_REPLAY translate-only credit refused: goal table unavailable ({exc})"]
+
+
+# Counters that mean some accepted fact was NOT proved. A NO_REPLAY run is a
+# "verified" (tier2) pass only when all are zero.
+_NO_REPLAY_VERIFIED_ZERO_COUNTERS = (
+    "trusted",
+    "skipped",
+    "assumed",
+    "vacuous",
+    "unverified_axioms",
+    "verified_with_axiom_deps",
+    "evidence_gaps",
+)
+
+
+def _wire_trust_counters_zero(output: str) -> bool:
+    """True when the last wire line exists and every trust counter is zero."""
+    pairs = _extract_wire_line_pairs(output)
+    if pairs is None:
+        return False
+    return all(int(pairs.get(key, 0)) == 0 for key in _NO_REPLAY_VERIFIED_ZERO_COUNTERS)
+
+
+def _wire_verified_count(output: str) -> int:
+    """verified + proof_assert_verified from the last wire line (0 if absent)."""
+    pairs = _extract_wire_line_pairs(output)
+    if pairs is None:
+        return 0
+    return int(pairs.get("verified", 0)) + int(pairs.get("proof_assert_verified", 0))
 
 
 def _no_replay_verified_clean(output: str, exit_code: int | None) -> bool:
@@ -283,6 +394,16 @@ def _classify_failure_marker_status(
         for line in output.split("\n")
         if "failed" in line.lower() and "trust-wp:" in line.lower()
     )
+    # A logic postcondition the driver reports FAILED is a refuted or unproved
+    # Creusot goal. The driver counts it as a warning plus an unverified axiom
+    # (#2700), not as ``failed``, so without this it reached a compat pass via
+    # the soundness-gap-only exit. It is never a pass: ``unknown`` (no
+    # documented spurious list exists for logic postconditions).
+    has_logic_postcondition_failed = any(
+        "(logic postcondition)" in line.lower()
+        for line in output.split("\n")
+        if "failed" in line.lower() and "trust-wp:" in line.lower()
+    )
     has_proof_assert_failed = any(
         "proof_assert" in line.lower() and "failed" in line.lower()
         for line in output.split("\n")
@@ -305,6 +426,8 @@ def _classify_failure_marker_status(
         if _has_lra_unsupported_failures(output):
             return "unknown", None
         return "fail", None
+    if has_logic_postcondition_failed:
+        return "unknown", None
     if has_unknown_marker:
         # Timeout-caused unknowns (#2690): when ALL per-function unknown
         # reasons are timeout-related, reclassify as "error" so the error
@@ -602,6 +725,9 @@ def _is_soundness_gap_only_exit(output: str, exit_code: int | None) -> bool:
         "panics",
         "proof_assert_failed",
         "proof_assert_errors",
+        # An inconclusive proof_assert is an unproved assertion goal, not a
+        # soundness-gap disposition (closures/11_proof_assert_in_closure).
+        "proof_assert_inconclusive",
         "parse_errors",
         "termination_errors",
         "logic_recursion_errors",
@@ -632,6 +758,69 @@ def _extract_wire_line_pairs(output: str) -> dict[str, int] | None:
             return None
         return telemetry.to_dict()
     return None
+
+
+def _zero_goal_zero_examined_exit(
+    output: str, exit_code: int | None, test_name: str | None, source: str | None = None
+) -> bool:
+    """True when a should_succeed run examined NO obligation and exited 2 for
+    that reason alone, AND Creusot's own translation of the test carries no
+    goal at all.
+
+    CLAUDE.md "The command line": a verify run that examined no obligation
+    exits 2, never 0 (the driver sets ``base_exit_code=2`` from
+    ``examined_nothing()``). For a test whose reference ``.coma`` exists and
+    has ZERO goal-bearing items (``creusot_goal_coverage.goal_inventory`` returns
+    an empty list, e.g. lang/empty, bug/511) there is nothing any verifier could
+    discharge, so the zero-examined run is the faithful result and cannot
+    false-accept anything. Every other zero-examined run — a test with any
+    Creusot goal, or with no ``.coma`` to prove it has none — stays a hard error.
+
+    Fail-closed: requires exit 2, a parseable wire line claiming
+    ``base_exit_code=2``, EVERY other wire counter zero (so no failure,
+    panic, trust, frontend error or warning was hidden), build output showing
+    the crate compiled to completion (a driver refusal that stops compilation
+    reports the same all-zero exit-2 wire line), and an oracle that shows no
+    goal: an inventory that exists and is empty, over a ``.coma`` that parses
+    whole and holds no goal the inventory does not count. The gate's zero-goal
+    parity (D-88, D-89) applies the same ``compile_completion_refusals`` and
+    ``zero_goal_oracle_refusals``.
+
+    The one counter that may be nonzero is ``trusted``, and only when every
+    trusted item the run names resolves one-for-one to a ``#[trusted]`` item
+    ``source`` declares -- D-49's ``unresolved_trusted_def_paths``, which the
+    gate's parity credit applies to the same items (D-158).
+    """
+    if exit_code != 2 or not test_name:
+        return False
+    if _has_rustc_panic(output) or _has_caught_panic_marker(output):
+        return False
+    wire = _extract_wire_line_pairs(output)
+    if wire is None or wire.get("base_exit_code", -1) != 2:
+        return False
+    if any(int(v) != 0 for k, v in wire.items() if k not in ("base_exit_code", "trusted")):
+        return False
+    trusted = int(wire.get("trusted", 0))
+    try:
+        import sys
+        from pathlib import Path
+
+        scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from creusot_goal_coverage import compile_completion_refusals, zero_goal_oracle_refusals
+        from trusted_source_scan import extract_trusted_def_paths, unresolved_trusted_def_paths
+
+        if trusted and (
+            source is None
+            or unresolved_trusted_def_paths(extract_trusted_def_paths(output), source, trusted)
+        ):
+            return False
+        if compile_completion_refusals(output):
+            return False
+        return not zero_goal_oracle_refusals(test_name)
+    except Exception:  # pragma: no cover - an inventory crash is never a pass
+        return False
 
 
 def _failed_or_error_count(counts: tuple[int, int, int] | None) -> int:
@@ -715,6 +904,10 @@ def classify_failure(
     # through to the content classifiers so ``#[trusted]``-bearing corpus
     # sources keep their compat-lenient (never strict) classification.
     gap_only_exit = _is_soundness_gap_only_exit(output, exit_code)
+    if _zero_goal_zero_examined_exit(output, exit_code, test_name, source):
+        # Nothing examined AND Creusot's .coma has no goal: the fail-closed
+        # exit 2 is the faithful result (see helper). Never proof-grade.
+        return "pass", None
     if exit_code not in (None, 0) and not gap_only_exit:
         return "error", None
 
@@ -769,6 +962,13 @@ def classify_failure(
     # matching the LRA spurious-SAT precedent (#2674). They never classify
     # as a plain pass while the PA-only-failure signature persists.
     if _wire_line_shows_pa_only_failure(output):
+        wire_pa = _extract_wire_line_pairs(output) or {}
+        if (
+            wire_pa.get("proof_assert_failed", 0) == 0
+            and wire_pa.get("proof_assert_errors", 0) == 0
+        ):
+            # Only inconclusive proof_asserts: unproved, not refuted.
+            return "unknown", None
         if (
             spurious_reason := _check_spurious_pa_counterexample(test_name)
         ) is not None:
@@ -828,6 +1028,8 @@ def classify_failure(
 __all__ = [
     "NO_REPLAY_PASS_PREFIX",
     "NO_REPLAY_STRICT_ERROR_MESSAGE",
+    "NO_REPLAY_VERIFIED_PREFIX",
+    "_NO_REPLAY_TRANSLATE_ONLY_ALLOWLIST",
     "_KNOWN_SPURIOUS_PA_COUNTEREXAMPLE_TESTS",
     "_all_contracts_axiomatized",
     "_all_contracts_non_verifiable",
@@ -835,4 +1037,5 @@ __all__ = [
     "_is_no_replay_source",
     "classify_failure",
     "classify_no_replay_result",
+    "classify_no_replay_result_with_mode",
 ]

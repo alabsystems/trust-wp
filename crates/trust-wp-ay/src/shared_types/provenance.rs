@@ -105,6 +105,20 @@ pub struct VerificationProvenance {
     /// blocked obligation is what manufactured a phantom "certified but blocked"
     /// class. Diagnostics only.
     pub strict_proof_replay_unbound: u32,
+
+    /// The structural refutation shape that ALSO refuted the obligation this
+    /// outcome's `Failed` reports, when one fired.
+    ///
+    /// A shape reads the clause, the return expression and the
+    /// preconditions and finds them contradictory — a determination made from
+    /// the PROGRAM TEXT, so it does not rest on any value trust-wp
+    /// manufactured to stand in for a construct it could not model. That is
+    /// what lets the injected-goal refutation gate publish a refutation inside
+    /// a function whose goal set carries a fail-closed marker: the solver
+    /// found a model AND the text forces the violation. `None` is the
+    /// fail-closed reading — "nothing but the model says so" — and is what
+    /// every lane that publishes no shape reports. (D-27, D-28)
+    pub refutation_structural_shape: Option<String>,
 }
 
 impl VerificationProvenance {
@@ -129,6 +143,7 @@ impl VerificationProvenance {
             proof_assert_slice_certificates: Vec::new(),
             strict_proof_replay: None,
             strict_proof_replay_unbound: 0,
+            refutation_structural_shape: None,
         }
     }
 
@@ -253,6 +268,7 @@ impl Default for VerificationProvenance {
             proof_assert_slice_certificates: Vec::new(),
             strict_proof_replay: None,
             strict_proof_replay_unbound: 0,
+            refutation_structural_shape: None,
         }
     }
 }

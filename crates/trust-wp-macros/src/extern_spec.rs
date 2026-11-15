@@ -28,10 +28,17 @@
 //!
 //! # Design
 //!
-//! See `designs/2026-02-01-extern-spec.md` for the full design document.
+//! Each method expands to a stub function carrying `trust-wp:extern_spec:*`
+//! doc markers (target path, parameter names, requires, ensures) that the
+//! driver reads to attach the contract to the named external item. The stubs
+//! live inside a `const _: () = { .. }` block so they never enter the user's
+//! namespace; a method body, when given, becomes a module-level `_body`
+//! function verified against the method's own contract, as Creusot does.
+
+use std::fmt::Write;
 
 use proc_macro2::TokenStream;
-use quote::{quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::{
     braced,
     parse::{Parse, ParseStream},
@@ -61,6 +68,10 @@ struct ExternImplBlock {
 struct ExternMethod {
     attrs: Vec<Attribute>,
     sig: Signature,
+    /// Optional body. Creusot proves an `extern_spec!` body against the
+    /// method's own contract (goal `vc_extern_spec_<..>_body`), so a body is
+    /// kept and expanded into a separate, verified `_body` function.
+    body: Option<syn::Block>,
 }
 
 impl Parse for ExternSpecInput {
@@ -129,20 +140,21 @@ impl Parse for ExternMethod {
     fn parse(input: ParseStream) -> Result<Self> {
         let attrs = input.call(Attribute::parse_outer)?;
         let sig: Signature = input.parse()?;
-        // Accept either `;` (declaration only) or `{ ... }` (body — discarded).
-        // Creusot allows bodies in extern_spec methods for default/logic implementations.
-        // trust-wp only uses the contract attributes; the body is ignored.
-        if input.peek(Token![;]) {
+        // Accept either `;` (declaration only) or `{ ... }` (a body). Creusot
+        // checks an extern_spec body against the method's contract, so the
+        // body is kept and expanded into a verified `_body` function.
+        let body = if input.peek(Token![;]) {
             let _semi: Token![;] = input.parse()?;
+            None
         } else {
-            let _body: syn::Block = input.parse()?;
-        }
-        Ok(ExternMethod { attrs, sig })
+            Some(input.parse::<syn::Block>()?)
+        };
+        Ok(ExternMethod { attrs, sig, body })
     }
 }
 
 /// Generate the expansion for one impl block.
-fn expand_impl_block(impl_block: ExternImplBlock) -> Result<TokenStream> {
+fn expand_impl_block(impl_block: ExternImplBlock) -> Result<(TokenStream, TokenStream)> {
     let target_owner = if let Some(trait_path) = &impl_block.trait_path {
         let self_name = type_to_target_string(&impl_block.self_ty);
         let trait_name = path_to_string(trait_path);
@@ -154,28 +166,32 @@ fn expand_impl_block(impl_block: ExternImplBlock) -> Result<TokenStream> {
     };
 
     let mut output = TokenStream::new();
+    let mut body_fns = TokenStream::new();
 
     for method in impl_block.methods {
-        output.extend(expand_method(
+        let (stub, body_fn) = expand_method(
             &method,
             &impl_block.generics,
             &impl_block.self_ty,
             impl_block.trait_path.as_ref(),
             &target_owner,
-        )?);
+        )?;
+        output.extend(stub);
+        body_fns.extend(body_fn);
     }
 
-    Ok(output)
+    Ok((output, body_fns))
 }
 
-/// Generate the expansion for one method within an impl block.
+/// Generate the expansion for one method within an impl block: the extern
+/// spec stub, and (when the method has a body) the body function to prove.
 fn expand_method(
     method: &ExternMethod,
     impl_generics: &Generics,
     self_ty: &Type,
     trait_path: Option<&Path>,
     target_owner: &str,
-) -> Result<TokenStream> {
+) -> Result<(TokenStream, Option<TokenStream>)> {
     let span = method.sig.span();
     let method_name = method.sig.ident.to_string();
     let target_path = format!("{target_owner}::{method_name}");
@@ -234,7 +250,17 @@ fn expand_method(
         })
         .collect();
 
-    Ok(quote_spanned! {span=>
+    let body_fn = method.body.as_ref().map(|body| {
+        expand_body_fn(
+            &method.attrs,
+            &stub_sig,
+            &body_fn_ident(impl_generics, trait_path, self_ty, &method.sig.ident),
+            body,
+            self_ty,
+        )
+    });
+
+    let stub = quote_spanned! {span=>
         #[doc(hidden)]
         #[doc = #target_doc]
         #[doc = #params_doc]
@@ -245,22 +271,270 @@ fn expand_method(
         #stub_sig {
             #call_expr
         }
-    })
+    };
+    Ok((stub, body_fn))
+}
+
+/// Creusot's generated name for an extern spec body,
+/// `extern_spec<impl generics><trait path><self type>_<method>_body`
+/// (`creusot-std-proc/src/creusot/extern_spec.rs::flatten` with
+/// `doc.rs::DocItemName`). Using the same name places the obligation at the
+/// same item path as Creusot's goal (`M_extern_spec_UseSelf_i32_func_body`).
+fn body_fn_ident(
+    impl_generics: &Generics,
+    trait_path: Option<&Path>,
+    self_ty: &Type,
+    method: &syn::Ident,
+) -> syn::Ident {
+    let mut name = DocItemName(String::from("extern_spec"));
+    name.add_generics(impl_generics);
+    if let Some(tp) = trait_path {
+        name.add_path(tp);
+    }
+    name.add_type(self_ty);
+    name.add_ident(method);
+    format_ident!("{}_body", name.0, span = method.span())
+}
+
+/// Port of Creusot's `DocItemName` (`creusot-std-proc/src/creusot/doc.rs`).
+struct DocItemName(String);
+
+impl DocItemName {
+    fn add_ident(&mut self, i: &syn::Ident) {
+        self.0.push('_');
+        self.0.push_str(&i.to_string());
+    }
+
+    fn add_type(&mut self, ty: &Type) {
+        match ty {
+            Type::Array(t) => {
+                self.0.push_str("__array");
+                self.add_type(&t.elem);
+            }
+            Type::BareFn(t) => {
+                self.0.push_str("__fn");
+                for input in &t.inputs {
+                    self.add_type(&input.ty);
+                }
+                self.add_return_type(&t.output);
+            }
+            Type::Group(t) => self.add_type(&t.elem),
+            Type::ImplTrait(t) => {
+                self.0.push_str("__impl");
+                for bound in &t.bounds {
+                    self.add_type_param_bound(bound);
+                }
+            }
+            Type::Macro(_) => self.0.push_str("__macro"),
+            Type::Never(_) => self.0.push_str("__never"),
+            Type::Paren(t) => self.add_type(&t.elem),
+            Type::Path(t) => {
+                self.add_path(&t.path);
+                if let Some(qself) = &t.qself {
+                    self.add_type(&qself.ty);
+                }
+            }
+            Type::Ptr(t) => {
+                if t.mutability.is_some() {
+                    self.0.push_str("__ptrmut");
+                } else {
+                    self.0.push_str("__ptrconst");
+                }
+                self.add_type(&t.elem);
+            }
+            Type::Reference(t) => {
+                if t.mutability.is_some() {
+                    self.0.push_str("__refmut");
+                } else {
+                    self.0.push_str("__ref");
+                }
+                self.add_type(&t.elem);
+            }
+            Type::Slice(t) => {
+                self.0.push_str("__slice");
+                self.add_type(&t.elem);
+            }
+            Type::TraitObject(t) => {
+                self.0.push_str("__dyn");
+                for b in &t.bounds {
+                    self.add_type_param_bound(b);
+                }
+            }
+            Type::Tuple(t) => {
+                let _ = write!(self.0, "__tuple{}", t.elems.len());
+                for ty in &t.elems {
+                    self.add_type(ty);
+                }
+            }
+            Type::Verbatim(tokens) => {
+                let _ = write!(self.0, "__verbatim{tokens}");
+            }
+            _ => {}
+        }
+    }
+
+    fn add_generics(&mut self, generics: &Generics) {
+        for param in &generics.params {
+            match param {
+                syn::GenericParam::Lifetime(lt) => {
+                    if !lt.bounds.is_empty() {
+                        self.0.push_str("__outlives");
+                    }
+                }
+                syn::GenericParam::Type(tp) => self.add_ident(&tp.ident),
+                syn::GenericParam::Const(cp) => {
+                    self.0.push_str("__const");
+                    self.0.push_str(&cp.ident.to_string());
+                }
+            }
+        }
+    }
+
+    fn add_type_param_bound(&mut self, bound: &syn::TypeParamBound) {
+        match bound {
+            syn::TypeParamBound::Trait(tb) => self.add_path(&tb.path),
+            syn::TypeParamBound::Verbatim(tokens) => {
+                let _ = write!(self.0, "__verbatim{tokens}");
+            }
+            _ => {}
+        }
+    }
+
+    fn add_return_type(&mut self, ret: &syn::ReturnType) {
+        self.0.push_str("__output");
+        match ret {
+            syn::ReturnType::Default => self.0.push_str("__unit"),
+            syn::ReturnType::Type(_, ty) => self.add_type(ty),
+        }
+    }
+
+    fn add_path(&mut self, path: &Path) {
+        for segment in &path.segments {
+            self.add_ident(&segment.ident);
+            match &segment.arguments {
+                syn::PathArguments::None => {}
+                syn::PathArguments::AngleBracketed(args) => {
+                    for arg in &args.args {
+                        match arg {
+                            syn::GenericArgument::Type(ty) => self.add_type(ty),
+                            syn::GenericArgument::Const(syn::Expr::Path(ep)) => {
+                                if let Some(qself) = &ep.qself {
+                                    self.add_type(&qself.ty);
+                                }
+                                self.add_path(&ep.path);
+                            }
+                            syn::GenericArgument::AssocType(at) => {
+                                self.add_ident(&at.ident);
+                                self.add_type(&at.ty);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                syn::PathArguments::Parenthesized(args) => {
+                    self.0.push_str("__lpar");
+                    for arg in &args.inputs {
+                        self.add_type(arg);
+                    }
+                    self.0.push_str("__rpar");
+                    self.add_return_type(&args.output);
+                }
+            }
+        }
+    }
+}
+
+/// Expand an `extern_spec!` method body into a standalone function that is
+/// verified against the method's own contract.
+///
+/// This mirrors Creusot (`creusot-std-proc/src/creusot/extern_spec.rs`,
+/// `f_with_body`): when a method is given a body, Creusot emits a separate
+/// `<name>_body` function carrying the SAME attributes as the extern spec
+/// (contracts, and `#[trusted]` if present, which then suppresses the goal)
+/// and the user's body with `self` escaped, and translates it like any other
+/// program function — producing the `vc_extern_spec_<..>_body` goal. The
+/// extern spec itself (the doc-marker stub) is unaffected: the target's
+/// contract is still an assumption at call sites, exactly as before; this
+/// only ADDS an obligation.
+///
+/// The body function has no `trust-wp:extern_spec:*` doc markers, so it is
+/// never registered as an extern spec entry.
+fn expand_body_fn(
+    attrs: &[Attribute],
+    stub_sig: &Signature,
+    body_ident: &syn::Ident,
+    body: &syn::Block,
+    self_ty: &Type,
+) -> TokenStream {
+    let mut sig = stub_sig.clone();
+    sig.ident = body_ident.clone();
+    let self_ty_tokens = self_ty.to_token_stream();
+    let attrs: Vec<TokenStream> = attrs
+        .iter()
+        .map(|attr| escape_self_tokens(attr.to_token_stream(), &self_ty_tokens))
+        .collect();
+    let body = escape_self_tokens(body.to_token_stream(), &self_ty_tokens);
+    quote! {
+        #[allow(dead_code, non_snake_case, unused_variables)]
+        #(#attrs)*
+        #sig #body
+    }
+}
+
+/// Rewrite the `self` receiver to the stub parameter `self_` and `Self` to the
+/// concrete self type, recursively through every token group.
+///
+/// The stub signature already renames the receiver to `self_: <Self type>`
+/// (`transform_sig_for_stub`); contract expressions and the body must use the
+/// same name.
+fn escape_self_tokens(tokens: TokenStream, self_ty: &TokenStream) -> TokenStream {
+    use proc_macro2::{Group, TokenTree};
+    let mut out = TokenStream::new();
+    for tt in tokens {
+        match tt {
+            TokenTree::Ident(ref ident) if ident == "self" => {
+                out.extend(std::iter::once(TokenTree::Ident(proc_macro2::Ident::new(
+                    "self_",
+                    ident.span(),
+                ))));
+            }
+            TokenTree::Ident(ref ident) if ident == "Self" => {
+                out.extend(self_ty.clone());
+            }
+            TokenTree::Group(group) => {
+                let mut new_group = Group::new(
+                    group.delimiter(),
+                    escape_self_tokens(group.stream(), self_ty),
+                );
+                new_group.set_span(group.span());
+                out.extend(std::iter::once(TokenTree::Group(new_group)));
+            }
+            other => out.extend(std::iter::once(other)),
+        }
+    }
+    out
 }
 
 /// Main entry point for `extern_spec`! macro expansion.
 pub(crate) fn expand_extern_spec(input: ExternSpecInput) -> Result<TokenStream> {
     let mut output = TokenStream::new();
+    let mut body_fns = TokenStream::new();
 
     for impl_block in input.items {
-        output.extend(expand_impl_block(impl_block)?);
+        let (stubs, bodies) = expand_impl_block(impl_block)?;
+        output.extend(stubs);
+        body_fns.extend(bodies);
     }
 
-    // Wrap in a const block to avoid polluting the namespace
+    // Wrap the stubs in a const block to avoid polluting the namespace. Body
+    // functions stay at module scope under Creusot's generated name, exactly
+    // where Creusot places them (`extern_spec_<..>_body`).
     Ok(quote! {
         const _: () = {
             #output
         };
+
+        #body_fns
     })
 }
 
@@ -380,6 +654,99 @@ mod tests {
         assert!(
             expanded.contains("trust-wp:extern_spec:target=<i32 as Foo>::func"),
             "missing expected target doc marker in expansion: {expanded}"
+        );
+    }
+
+    #[test]
+    fn method_body_expands_to_separate_verified_body_fn() {
+        // Creusot proves an extern_spec body against its own contract
+        // (vc_extern_spec_<..>_body); trust-wp must emit that function.
+        let input: ExternSpecInput = syn::parse_str(
+            "impl UseSelf for i32 {
+                #[trusted]
+                fn func(&self, s: &Self) -> bool {
+                    *self == 1 && Self::default() == 0
+                }
+            }",
+        )
+        .expect("should parse extern_spec with method body");
+        let expanded = expand_extern_spec(input)
+            .expect("extern_spec with body should expand")
+            .to_string();
+        let body_fn = expanded
+            .split("fn ")
+            .find(|chunk| chunk.contains("_body"))
+            .unwrap_or_else(|| panic!("no _body fn in expansion: {expanded}"));
+        assert!(
+            body_fn.contains("self_ : & i32") && body_fn.contains("* self_ == 1"),
+            "body fn must use the stub receiver name: {body_fn}"
+        );
+        assert!(
+            body_fn.contains("i32 :: default ()"),
+            "Self in body must be the concrete type: {body_fn}"
+        );
+        assert!(
+            !body_fn.contains(" self ") && !body_fn.contains(" Self "),
+            "unescaped self in body fn: {body_fn}"
+        );
+        // #[trusted] is copied, exactly as Creusot copies the attributes, so a
+        // trusted extern_spec body is not proved.
+        assert!(
+            expanded.matches("# [trusted]").count() == 2,
+            "trusted attr must be on both stub and body fn: {expanded}"
+        );
+        // The body fn carries no extern_spec marker (not a second registration).
+        assert_eq!(expanded.matches("trust-wp:extern_spec:target=").count(), 1);
+        // Creusot's name (goal module M_extern_spec_UseSelf_i32_func_body),
+        // at module scope rather than inside the stubs' `const _` block.
+        assert!(
+            expanded.contains("fn extern_spec_UseSelf_i32_func_body"),
+            "body fn must use Creusot's generated name: {expanded}"
+        );
+        let const_block_end = expanded.rfind("} ;").expect("const block");
+        assert!(
+            expanded
+                .find("fn extern_spec_UseSelf_i32_func_body")
+                .unwrap()
+                > const_block_end,
+            "body fn must be outside the const block: {expanded}"
+        );
+    }
+
+    #[test]
+    fn body_fn_name_follows_creusot_doc_item_name() {
+        let input: ExternSpecInput = syn::parse_str(
+            "impl<T> Clone for Vec<T> {
+                fn clone(&self) -> Vec<T> { loop {} }
+            }
+            impl<'a, U> Foo for &'a mut [U] {
+                fn f(&self) -> bool { true }
+            }",
+        )
+        .expect("should parse");
+        let expanded = expand_extern_spec(input).expect("expand").to_string();
+        assert!(
+            expanded.contains("fn extern_spec_T_Clone_Vec_T_clone_body"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("fn extern_spec_U_Foo__refmut__slice_U_f_body"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn declaration_without_body_emits_no_body_fn() {
+        let input: ExternSpecInput = syn::parse_str(
+            "impl UseSelf for () {
+                fn func(&self, s: &Self) -> bool;
+            }",
+        )
+        .expect("should parse");
+        let expanded = expand_extern_spec(input).expect("expand").to_string();
+        assert!(
+            !expanded.contains("_body"),
+            "unexpected body fn: {expanded}"
         );
     }
 

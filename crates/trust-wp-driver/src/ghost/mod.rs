@@ -4,16 +4,11 @@
 
 //! Ghost block detection and validation for the trust-wp driver.
 //!
-//! This module implements Phase 2 of ghost code support:
+//! This module:
 //! - Detects ghost blocks via `#[doc = "__trust_wp_ghost"]` marker
 //! - Records ghost blocks for validation and SMT encoding
 //! - Validates ghost blocks don't write to non-ghost variables
 //! - Validates ghost blocks don't move non-ghost values
-//!
-//! # Design Reference
-//!
-//! See `designs/2026-02-01-ghost-code.md` section "D3: ghost! Macro Design"
-//! for the full specification.
 //!
 //! # Ghost Block Detection
 //!
@@ -44,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 pub(crate) mod erasure;
 mod move_validation;
+pub(crate) mod program_context;
 mod snapshot_self_reference;
 pub(crate) mod source_assignments;
 #[cfg(test)]
@@ -56,11 +52,14 @@ use rustc_hir::{
     def::Res,
     def_id::{DefId, LocalDefId},
     intravisit::{self, walk_expr, walk_stmt, Visitor},
-    Block, Expr, ExprKind, HirId, Pat, PatKind, QPath, Stmt, StmtKind, TyKind as HirTyKind, UnOp,
+    Expr, ExprKind, HirId, Pat, PatKind, QPath, Stmt, StmtKind, TyKind as HirTyKind, UnOp,
 };
 use rustc_middle::{
     hir::nested_filter,
-    ty::{TyCtxt, TyKind, TypeckResults},
+    ty::{
+        adjustment::{Adjust, DerefAdjustKind},
+        TyCtxt, TyKind, TypeckResults,
+    },
 };
 use rustc_span::Span;
 
@@ -103,6 +102,11 @@ pub(crate) fn find_ghost_blocks(tcx: TyCtxt<'_>) -> Vec<GhostBlock> {
 
     // Iterate over all body owners (functions, closures, etc.)
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         finder.current_fn = Some(local_def_id);
         let body = tcx.hir_body_owned_by(local_def_id);
         finder.visit_body(body);
@@ -178,28 +182,34 @@ impl<'tcx> Visitor<'tcx> for GhostBlockFinder<'tcx> {
     }
 }
 
-/// Check if a HIR node has the `#[doc = "__trust_wp_ghost"]` marker.
+/// Check if a HIR node has the `#[doc = "__trust_wp_ghost"]` marker, every
+/// copy of it written by the `ghost!`/`ghost_let!` expansion.
+///
+/// The expansion keeps the marked block under `cfg(trust_wp)` and behind
+/// `if false` otherwise, so it never runs. The same marker written in user
+/// source, or pasted through a user macro, marks an ordinary `let` whose
+/// initializer runs in every build (ghost_marker_written_by_hand_runs_ghost_deref),
+/// so one such copy disqualifies the block.
 fn has_ghost_marker(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
-    let attrs = tcx.hir_attrs(hir_id);
-    for attr in attrs {
-        // Read the `#[doc = "__trust_wp_ghost"]` marker. Must use
-        // doc_marker_str (doc_str + value_str fallback): the Trust toolchain
-        // parses `#[doc=…]` into Attribute::Parsed(DocComment) for which
-        // value_str() returns None, so a bare value_str() silently misses the
-        // marker → ghost blocks undetected → every ghost API call false-flags
-        // as "ghost in program context".
-        if let Some(value) = crate::attr_utils::doc_marker_str(attr) {
-            if value.as_str() == "__trust_wp_ghost" {
-                return true;
-            }
-        }
-    }
-    false
+    // `doc_marker_str` (doc_str + value_str fallback): the Trust toolchain
+    // parses `#[doc=…]` into Attribute::Parsed(DocComment), for which
+    // value_str() returns None.
+    let mut markers = tcx
+        .hir_attrs(hir_id)
+        .iter()
+        .filter(|attr| {
+            crate::attr_utils::doc_marker_str(attr)
+                .is_some_and(|value| value.as_str() == "__trust_wp_ghost")
+        })
+        .peekable();
+    markers.peek().is_some()
+        && markers
+            .all(|attr| crate::callbacks::spec_typecheck::marker_is_from_trust_wp_macros(tcx, attr))
 }
 
 /// Validate ghost blocks according to the design rules.
 ///
-/// # Validation Rules (from `designs/2026-02-01-ghost-code.md`)
+/// # Validation Rules
 ///
 /// 1. **No Control Flow Escape:**
 ///    - `return` in ghost block -> Error
@@ -286,6 +296,9 @@ impl<'tcx> Visitor<'tcx> for GhostBlockCallValidator<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         let def_id = match expr.kind {
             ExprKind::Call(callee, _) => self.call_def_id(callee),
             ExprKind::MethodCall(..) => self.typeck_results.type_dependent_def_id(expr.hir_id),
@@ -359,6 +372,11 @@ pub(crate) fn validate_program_context_ghost_apis(
     let mut all_errors = Vec::new();
 
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         let hir_id = tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = tcx.hir_attrs(hir_id);
         let body = tcx.hir_body_owned_by(local_def_id);
@@ -366,6 +384,10 @@ pub(crate) fn validate_program_context_ghost_apis(
         let is_logic = crate::logic::has_logic_marker(attrs);
         let validate_program_context_apis =
             !is_logic && !crate::attr_utils::has_check_mode(attrs, "ghost");
+        // A `#[check(ghost)]` body runs as program code when a program calls
+        // it, so a ghost it dereferences, extracts or compares outside
+        // `ghost!` is refused there too; only creating one is left to it.
+        let validate_ghost_value_uses = !is_logic;
         // `#[erasure(target)]` functions are the ghost-bearing implementation
         // side of an erasure pair. They legitimately take a resource and a
         // permission as function inputs and pass them straight to the
@@ -398,8 +420,14 @@ pub(crate) fn validate_program_context_ghost_apis(
                 .collect(),
             next_permission_origin: 0,
             validate_program_context_apis,
+            validate_ghost_value_uses,
             check_permission_identity: !is_erasure,
-            snapshot_capture_depth: 0,
+            snapshot_capture_depth: usize::from(closure_is_inside_snapshot_capture(
+                tcx,
+                typeck_results,
+                local_def_id,
+            )),
+            typing_env: rustc_middle::ty::TypingEnv::post_analysis(tcx, local_def_id),
             errors: Vec::new(),
         };
         validator.visit_body(body);
@@ -407,6 +435,55 @@ pub(crate) fn validate_program_context_ghost_apis(
     }
 
     all_errors
+}
+
+/// Whether the closure `def_id` is written inside a snapshot capture, whose
+/// argument never runs: `snapshot!` keeps the capture under `cfg(trust_wp)`
+/// and behind `if false` otherwise. The enclosing body's walk visits the
+/// closure at a raised `snapshot_capture_depth`, but the body-owner loop
+/// visits it again as a body of its own, where the depth would start at zero
+/// (should_succeed `such_that.rs`: `snapshot!(|x: Int| mapping[x] + 1 == 0)`).
+///
+/// Only a capture trust-wp's `snapshot!` expansion wrote is one that never
+/// runs: the same shape written by hand, or by a user's macro, runs in every
+/// build, so a closure inside it is validated as program code
+/// (snapshot_capture_call_closure_ghost_deref_in_program_context_panics,
+/// snapshot_capture_in_user_macro_runs_ghost_deref).
+fn closure_is_inside_snapshot_capture(
+    tcx: TyCtxt<'_>,
+    typeck_results: &TypeckResults<'_>,
+    def_id: LocalDefId,
+) -> bool {
+    if tcx.def_kind(def_id) != rustc_hir::def::DefKind::Closure {
+        return false;
+    }
+    for (_, node) in tcx.hir_parent_iter(tcx.local_def_id_to_hir_id(def_id)) {
+        match node {
+            rustc_hir::Node::Expr(expr) => match expr.kind {
+                ExprKind::Call(callee, _)
+                    if program_context::is_macro_snapshot_capture_call(
+                        tcx,
+                        typeck_results,
+                        callee,
+                    ) =>
+                {
+                    return true;
+                }
+                ExprKind::Block(block, _)
+                    if program_context::is_macro_snapshot_block(tcx, typeck_results, block) =>
+                {
+                    return true;
+                }
+                _ => {}
+            },
+            // The closure's own item: nothing above it is its body.
+            rustc_hir::Node::Item(_)
+            | rustc_hir::Node::ImplItem(_)
+            | rustc_hir::Node::TraitItem(_) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Validate `Tokens::new` creation sites.
@@ -427,6 +504,11 @@ pub(crate) fn validate_tokens_new(tcx: TyCtxt<'_>) -> Vec<GhostValidationError> 
     let mut sites = Vec::new();
 
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         let body = tcx.hir_body_owned_by(local_def_id);
         let typeck_results = tcx.typeck_body(body.id());
         let mut validator = TokensNewValidator {
@@ -471,6 +553,9 @@ impl<'tcx> Visitor<'tcx> for TokensNewValidator<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         if let ExprKind::Loop(..) = expr.kind {
             self.loop_depth += 1;
             walk_expr(self, expr);
@@ -541,12 +626,18 @@ struct ProgramContextGhostApiValidator<'a, 'tcx> {
     resource_params: HashSet<HirId>,
     next_permission_origin: usize,
     validate_program_context_apis: bool,
+    /// Whether a ghost value read outside `ghost!` runs: `true` for every
+    /// body but a logic function's, `#[check(ghost)]` ones included.
+    validate_ghost_value_uses: bool,
     /// `false` for `#[erasure(...)]` functions, which are the ghost-bearing
     /// implementation half of an erasure pair and legitimately receive both
     /// resource and permission as function inputs without a local same-origin
     /// witness. See `validate_program_context_ghost_apis` for context.
     check_permission_identity: bool,
     snapshot_capture_depth: usize,
+    /// The body's typing environment, in which a call is resolved to the impl
+    /// it runs (`program_context::divergent_run_time_operation`).
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
     errors: Vec<GhostValidationError>,
 }
 
@@ -555,6 +646,30 @@ struct PermissionOrigin(usize);
 
 const MIXED_PERMISSION_ORIGIN: PermissionOrigin = PermissionOrigin(usize::MAX);
 
+const IMPLICIT_GHOST_DEREF_MESSAGE: &str = "trust-wp: a ghost value is dereferenced outside \
+     ghost!(...) by a `Deref` the compiler inserts (a coercion, a field read or a method call \
+     through a `Ghost` or `Snapshot`); it panics at run time. Move the use into ghost!(...)";
+
+/// A trait use on a ghost operand whose run-time body differs from its
+/// logical reading (`ProgramContextGhostApiValidator::ghost_operand_trait_use`).
+enum GhostTraitUse {
+    Comparison,
+    Borrow,
+}
+
+const GHOST_BORROW_TRAIT_MESSAGE: &str = "trust-wp: cannot extract a ghost value in program \
+     context: `Borrow`/`BorrowMut` of a `Ghost` panics at run time; use ghost!(...) for \
+     ghost-only computation";
+
+const GHOST_COMPARISON_MESSAGE: &str = "trust-wp: ghost values are compared outside \
+     ghost!(...); `==` on a `Ghost` or `Snapshot` is `true` at run time whatever the values. \
+     Compare them in ghost!(...) or a proof_assert!";
+
+const GHOST_HOLDER_COMPARISON_MESSAGE: &str = "trust-wp: a value holding a `Ghost` or \
+     `Snapshot` is compared or hashed outside ghost!(...); the ghost's run-time `eq` is `true` \
+     and its `hash` a constant whatever the values. Compare them in ghost!(...) or a \
+     proof_assert!";
+
 impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
     type MaybeTyCtxt = TyCtxt<'tcx>;
@@ -562,6 +677,14 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
     }
+
+    /// An anonymous constant (an array length, a const generic argument) is
+    /// typechecked apart from the body that spells it, so this body's
+    /// `typeck_results` hold no type for its nodes and reading one is an ICE
+    /// (`[T; 2]` in should_succeed `lang/size_of.rs`). It is a body owner of
+    /// its own, and `validate_program_context_ghost_apis` visits it with its
+    /// own results, so nothing it holds goes unvalidated.
+    fn visit_anon_const(&mut self, _: &'tcx rustc_hir::AnonConst) {}
 
     fn visit_stmt(&mut self, stmt: &'tcx Stmt<'tcx>) {
         if let StmtKind::Let(let_stmt) = stmt.kind {
@@ -602,24 +725,87 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         if self.is_in_ghost_context(expr.span) {
             return;
         }
 
-        // Statement-form snapshot macros (`snapshot! { stmt; }`) lower to a
-        // block whose tail expression is `Snapshot::<()>::new_phantom()`,
-        // not a `Snapshot::capture(...)` call. The preceding statements
-        // carry the captured ghost code under `cfg(trust_wp)`. Walk these
-        // blocks with `snapshot_capture_depth` elevated so any ghost
-        // extraction calls inside the captured statements suppress the
-        // program-context diagnostics, matching the binding-form
-        // (`Snapshot::capture(...)`) behaviour. (#9)
+        // The statement-form `snapshot! { stmt; }` lowers to a block ending in
+        // `Snapshot::<()>::new_phantom()` whose statements sit under
+        // `cfg(trust_wp)`, and the dispatch form to a block ending in
+        // `snapshot_capture_select(..).capture()`: neither runs, so the
+        // block is a capture like a `Snapshot::capture(..)` argument. Only
+        // the blocks the expansion wrote (`program_context`).
         if let ExprKind::Block(block, _) = expr.kind {
-            if is_unit_block_snapshot_pattern(block) || is_dispatch_snapshot_block(block) {
+            if program_context::is_macro_snapshot_block(self.tcx, self.typeck_results, block) {
                 self.snapshot_capture_depth += 1;
                 intravisit::walk_expr(self, expr);
                 self.snapshot_capture_depth -= 1;
                 return;
+            }
+        }
+
+        if self.validate_ghost_value_uses && self.snapshot_capture_depth == 0 {
+            if self.has_implicit_ghost_deref(expr) {
+                self.errors.push(GhostValidationError {
+                    span: expr.span,
+                    message: IMPLICIT_GHOST_DEREF_MESSAGE.to_string(),
+                });
+            }
+            match self.ghost_operand_trait_use(expr) {
+                Some(GhostTraitUse::Comparison) => self.errors.push(GhostValidationError {
+                    span: expr.span,
+                    message: GHOST_COMPARISON_MESSAGE.to_string(),
+                }),
+                Some(GhostTraitUse::Borrow) => self.errors.push(GhostValidationError {
+                    span: expr.span,
+                    message: GHOST_BORROW_TRAIT_MESSAGE.to_string(),
+                }),
+                None if self.asks_ghost_holder_for_comparison_or_hash(expr) => {
+                    self.errors.push(GhostValidationError {
+                        span: expr.span,
+                        message: GHOST_HOLDER_COMPARISON_MESSAGE.to_string(),
+                    });
+                }
+                None => {}
+            }
+            match program_context::divergent_run_time_operation(
+                self.tcx,
+                self.typing_env,
+                self.typeck_results,
+                expr,
+            )
+            .or_else(|| {
+                program_context::divergent_unsize_coercion(
+                    self.tcx,
+                    self.typing_env,
+                    self.typeck_results,
+                    expr,
+                )
+            }) {
+                Some(program_context::Divergence::Operation(operation)) => {
+                    self.errors.push(GhostValidationError {
+                        span: expr.span,
+                        message: format!(
+                            "trust-wp: `{operation}` runs outside ghost!(...) and snapshot!(...), \
+                             where its run-time body is not the logical operation the verifier \
+                             reads; move it into ghost!(...), snapshot!(...) or a specification"
+                        ),
+                    });
+                }
+                Some(program_context::Divergence::Unread(trait_ref)) => {
+                    self.errors.push(GhostValidationError {
+                        span: expr.span,
+                        message: format!(
+                            "trust-wp: cannot read which impl this call's bound `{trait_ref}` \
+                             runs, so whether it runs a ghost or logic body outside ghost!(...) \
+                             is unknown; refusing"
+                        ),
+                    });
+                }
+                None => {}
             }
         }
 
@@ -642,17 +828,17 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
                 if self.validate_program_context_apis && self.is_ghost_new_callee(callee) {
                     self.errors.push(GhostValidationError {
                         span: expr.span,
-                        message: "cannot create a ghost variable in program context; \
+                        message: "trust-wp: cannot create a ghost variable in program context; \
                                   wrap this expression in ghost!(...)"
                             .to_string(),
                     });
                 }
 
-                if self.validate_program_context_apis && self.snapshot_capture_depth == 0 {
+                if self.validate_ghost_value_uses && self.snapshot_capture_depth == 0 {
                     if self.is_ghost_extraction_callee(callee) {
                         self.errors.push(GhostValidationError {
                             span: expr.span,
-                            message: "cannot extract a ghost value in program context; \
+                            message: "trust-wp: cannot extract a ghost value in program context; \
                                       use ghost!(...) for ghost-only computation"
                                 .to_string(),
                         });
@@ -661,9 +847,10 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
                     if self.is_ghost_deref_callee(callee, args) {
                         self.errors.push(GhostValidationError {
                             span: expr.span,
-                            message: "cannot dereference a ghost value in program context; \
+                            message:
+                                "trust-wp: cannot dereference a ghost value in program context; \
                                       use ghost!(...) for ghost-only computation"
-                                .to_string(),
+                                    .to_string(),
                         });
                     }
                 }
@@ -677,7 +864,7 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
                     }
                 }
 
-                if self.validate_program_context_apis
+                if self.validate_ghost_value_uses
                     && self.snapshot_capture_depth == 0
                     && self.is_ghost_extraction_method(expr, path.ident.as_str())
                     && type_helpers::is_ghost_like_type(
@@ -687,26 +874,26 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
                 {
                     self.errors.push(GhostValidationError {
                         span: expr.span,
-                        message: "cannot extract a ghost value in program context; \
+                        message: "trust-wp: cannot extract a ghost value in program context; \
                                   use ghost!(...) for ghost-only computation"
                             .to_string(),
                     });
                 }
 
-                if self.validate_program_context_apis
+                if self.validate_ghost_value_uses
                     && self.snapshot_capture_depth == 0
                     && self.is_ghost_deref_method(expr, receiver, path.ident.as_str())
                 {
                     self.errors.push(GhostValidationError {
                         span: expr.span,
-                        message: "cannot dereference a ghost value in program context; \
+                        message: "trust-wp: cannot dereference a ghost value in program context; \
                                   use ghost!(...) for ghost-only computation"
                             .to_string(),
                     });
                 }
             }
             ExprKind::Unary(UnOp::Deref, inner)
-                if self.validate_program_context_apis
+                if self.validate_ghost_value_uses
                     && self.snapshot_capture_depth == 0
                     // Only the ghost `Deref` (`*snap` extracting the logical
                     // inner value of a bare `Snapshot`/`Ghost`) is forbidden in
@@ -722,7 +909,7 @@ impl<'tcx> Visitor<'tcx> for ProgramContextGhostApiValidator<'_, 'tcx> {
             {
                 self.errors.push(GhostValidationError {
                     span: expr.span,
-                    message: "cannot dereference a ghost value in program context; \
+                    message: "trust-wp: cannot dereference a ghost value in program context; \
                               use ghost!(...) for ghost-only computation"
                         .to_string(),
                 });
@@ -810,9 +997,7 @@ impl<'a, 'tcx> ProgramContextGhostApiValidator<'a, 'tcx> {
     }
 
     fn is_snapshot_capture_callee(&self, callee: &Expr<'_>) -> bool {
-        self.call_def_id(callee)
-            .is_some_and(|def_id| is_snapshot_capture_call(self.tcx, def_id))
-            || callee_path_is_snapshot_method(callee, "capture")
+        program_context::is_macro_snapshot_capture_call(self.tcx, self.typeck_results, callee)
     }
 
     fn is_ghost_extraction_method(&self, expr: &Expr<'_>, method_name: &str) -> bool {
@@ -840,6 +1025,115 @@ impl<'a, 'tcx> ProgramContextGhostApiValidator<'a, 'tcx> {
             .is_none_or(|def_id| {
                 is_ghost_api_call(self.tcx, def_id, &["deref", "deref_mut"])
                     || is_deref_trait_call(self.tcx, def_id)
+            })
+    }
+
+    /// Whether rustc derefs a `Ghost` or `Snapshot` in `expr` by an adjustment
+    /// of its own: a deref coercion, a field read or a method call through the
+    /// ghost. Each is a run-time `Deref::deref` of the ghost, which panics.
+    fn has_implicit_ghost_deref(&self, expr: &Expr<'tcx>) -> bool {
+        let mut ty = self.typeck_results.expr_ty(expr);
+        for adjustment in self.typeck_results.expr_adjustments(expr) {
+            if matches!(
+                adjustment.kind,
+                Adjust::Deref(DerefAdjustKind::Overloaded(_))
+            ) && type_helpers::is_ghost_like_type(self.tcx, ty)
+            {
+                return true;
+            }
+            ty = adjustment.target;
+        }
+        false
+    }
+
+    /// A trait method `expr` calls on a `Ghost` or `Snapshot` operand, as an
+    /// operator, a method call or a path call, whose run-time body in
+    /// trust-wp-std is not the logical operation the verifier reads:
+    /// `PartialEq`/`PartialOrd` return `true` whatever the values, since
+    /// neither carries one, and `Borrow`/`BorrowMut` of a `Ghost<Box<T>>`
+    /// panic.
+    fn ghost_operand_trait_use(&self, expr: &Expr<'tcx>) -> Option<GhostTraitUse> {
+        let (def_id, operand) = match expr.kind {
+            ExprKind::Binary(op, lhs, _) => {
+                use rustc_hir::BinOpKind::{Eq, Ge, Gt, Le, Lt, Ne};
+                if !matches!(op.node, Eq | Ne | Lt | Le | Gt | Ge) {
+                    return None;
+                }
+                (self.typeck_results.type_dependent_def_id(expr.hir_id), lhs)
+            }
+            ExprKind::MethodCall(_, receiver, _, _) => (
+                self.typeck_results.type_dependent_def_id(expr.hir_id),
+                receiver,
+            ),
+            ExprKind::Call(callee, [first, ..]) => (self.call_def_id(callee), first),
+            _ => return None,
+        };
+        let trait_id = self.tcx.trait_of_assoc(def_id?)?;
+        if !type_helpers::is_ghost_like_type(self.tcx, self.typeck_results.expr_ty(operand)) {
+            return None;
+        }
+        let lang_items = self.tcx.lang_items();
+        let diagnostic = |name: &str| {
+            self.tcx
+                .get_diagnostic_item(rustc_span::Symbol::intern(name))
+                == Some(trait_id)
+        };
+        if Some(trait_id) == lang_items.eq_trait()
+            || Some(trait_id) == lang_items.partial_ord_trait()
+        {
+            Some(GhostTraitUse::Comparison)
+        } else if diagnostic("Borrow") || diagnostic("BorrowMut") {
+            Some(GhostTraitUse::Borrow)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `expr` calls a function, method or operator whose bounds, as
+    /// the call instantiates them, ask a type holding a `Ghost` or `Snapshot`
+    /// for `PartialEq`, `PartialOrd`, `Eq`, `Ord` or `Hash`:
+    /// `Option<Ghost<T>> == ..`, `v.contains(&g)`, `set.insert(g)`, or a
+    /// generic `T: PartialEq` function given one, or a `T: Same` one whose
+    /// `Same: PartialEq` (ghost_holder_supertrait_comparison_returns_wrong_value).
+    /// The call runs the ghost's
+    /// own `eq` or `hash`, which are `true` and a constant whatever the
+    /// values, inside code the verifier reads through a spec of logical
+    /// equality. Creusot's ghost types implement none of these traits, so
+    /// each such call is one that does not compile there. A comparison whose
+    /// operand is the ghost itself is `ghost_operand_trait_use`'s.
+    fn asks_ghost_holder_for_comparison_or_hash(&self, expr: &Expr<'tcx>) -> bool {
+        // A function named as a callee or as a value: its item type carries
+        // the instantiation.
+        let Some((def_id, args)) = program_context::call_instantiation(self.typeck_results, expr)
+        else {
+            return false;
+        };
+        let lang_items = self.tcx.lang_items();
+        let asked = |trait_id: DefId| {
+            Some(trait_id) == lang_items.eq_trait()
+                || Some(trait_id) == lang_items.partial_ord_trait()
+                || ["Eq", "Ord", "Hash"].iter().any(|name| {
+                    self.tcx
+                        .get_diagnostic_item(rustc_span::Symbol::intern(name))
+                        == Some(trait_id)
+                })
+        };
+        let holds_ghost = |ty: rustc_middle::ty::Ty<'tcx>| {
+            ty.walk().any(|arg| {
+                arg.as_type()
+                    .is_some_and(|ty| type_helpers::is_ghost_like_type(self.tcx, ty))
+            })
+        };
+        // A trait's own method asks its `Self` (and `Rhs`) for the trait, and
+        // a bound is asked with what the instance must meet to meet it (a
+        // supertrait, a selected impl's where-clauses): the bounds
+        // `program_context` reads for every call that runs. A call whose
+        // bounds cannot be read is refused there.
+        program_context::asked_trait_bounds(self.tcx, self.typing_env, def_id, args)
+            .unwrap_or_default()
+            .iter()
+            .any(|bound| {
+                asked(bound.trait_ref.def_id) && bound.trait_ref.args.types().any(holds_ghost)
             })
     }
 
@@ -1028,13 +1322,6 @@ fn callee_path_is_deref_trait_method(callee: &Expr<'_>) -> bool {
         || callee_path_is_owner_method(callee, &["DerefMut"], "deref_mut")
 }
 
-fn callee_path_is_snapshot_method(callee: &Expr<'_>, method_name: &str) -> bool {
-    let ExprKind::Path(qpath) = &callee.kind else {
-        return false;
-    };
-    qpath_is_snapshot_method(qpath, method_name)
-}
-
 fn callee_path_is_tokens_new(callee: &Expr<'_>) -> bool {
     let ExprKind::Path(qpath) = &callee.kind else {
         return false;
@@ -1107,99 +1394,6 @@ fn qpath_is_ghost_method(qpath: &QPath<'_>, method_name: &str) -> bool {
     }
 }
 
-fn qpath_is_snapshot_method(qpath: &QPath<'_>, method_name: &str) -> bool {
-    match qpath {
-        QPath::Resolved(_, path) => {
-            let mut segments = path.segments.iter().rev();
-            let Some(method) = segments.next() else {
-                return false;
-            };
-            if method.ident.as_str() != method_name {
-                return false;
-            }
-            segments
-                .next()
-                .is_some_and(|owner| owner.ident.as_str() == "Snapshot")
-        }
-        QPath::TypeRelative(ty, segment) => {
-            if segment.ident.as_str() != method_name {
-                return false;
-            }
-            matches!(
-                ty.kind,
-                HirTyKind::Path(QPath::Resolved(_, path))
-                    if path.segments.last().is_some_and(|owner| {
-                        owner.ident.as_str() == "Snapshot"
-                    })
-            )
-        }
-    }
-}
-
-/// Recognise the HIR shape emitted by `snapshot! { stmt; }` (statement-form,
-/// unit-block snapshots).
-///
-/// The `snapshot!` proc macro lowers a unit-returning block (e.g.
-/// `snapshot! { logi_drop(x); }`) to:
-///
-/// ```text
-/// {
-///     #[cfg(trust_wp)] { /* user ghost statements */ }
-///     ::trust_wp_std::ghost::Snapshot::<()>::new_phantom()
-/// }
-/// ```
-///
-/// This branch does NOT call `Snapshot::capture(...)`, so the regular
-/// `is_snapshot_capture_callee` detection in `ProgramContextGhostApiValidator`
-/// does not fire and the `snapshot_capture_depth` counter stays at zero
-/// while the validator descends into the user's ghost statements. That left
-/// ghost-API checks armed inside what is conceptually a snapshot body, which
-/// rejected legitimate programs like
-/// `reference/creusot/tests/should_succeed/syntax/12_ghost_code.rs`.
-///
-/// We detect the pattern by looking for an `ExprBlock` whose tail expression
-/// is a call to `Snapshot::new_phantom`. Detecting on the path lets us match
-/// the bare path callee emitted by `quote!` (resolution at this point relies
-/// on the import surface of `creusot-std`/`trust-wp-std`, so we keep this
-/// purely syntactic — type-resolution lookups would not buy us anything
-/// here). (#9)
-fn is_unit_block_snapshot_pattern(block: &Block<'_>) -> bool {
-    let Some(tail) = block.expr else {
-        return false;
-    };
-    let ExprKind::Call(callee, _) = tail.kind else {
-        return false;
-    };
-    callee_path_is_snapshot_method(callee, "new_phantom")
-}
-
-/// Recognise the type-directed `snapshot!` capture dispatch block
-/// `{ snapshot_capture_select(&(expr)).capture() }`. The captured `expr` lives
-/// in the `snapshot_capture_select` argument, so the whole block is a snapshot
-/// capture context (elevate `snapshot_capture_depth`). (bug/869)
-fn is_dispatch_snapshot_block(block: &Block<'_>) -> bool {
-    let Some(tail) = block.expr else {
-        return false;
-    };
-    let ExprKind::MethodCall(seg, receiver, _, _) = tail.kind else {
-        return false;
-    };
-    if seg.ident.as_str() != "capture" {
-        return false;
-    }
-    let ExprKind::Call(callee, _) = receiver.kind else {
-        return false;
-    };
-    let ExprKind::Path(qpath) = &callee.kind else {
-        return false;
-    };
-    let last_segment = match qpath {
-        QPath::Resolved(_, path) => path.segments.last().map(|s| s.ident.as_str()),
-        QPath::TypeRelative(_, segment) => Some(segment.ident.as_str()),
-    };
-    last_segment == Some("snapshot_capture_select")
-}
-
 fn qpath_is_owner_method(qpath: &QPath<'_>, owner_names: &[&str], method_name: &str) -> bool {
     match qpath {
         QPath::Resolved(_, path) => {
@@ -1256,10 +1450,6 @@ fn qpath_is_tokens_new(qpath: &QPath<'_>) -> bool {
 
 fn is_ghost_new_call(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     is_ghost_api_call(tcx, def_id, &["new"])
-}
-
-fn is_snapshot_capture_call(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    is_ghost_api_call(tcx, def_id, &["capture"])
 }
 
 fn is_ghost_extraction_method(tcx: TyCtxt<'_>, def_id: DefId) -> bool {

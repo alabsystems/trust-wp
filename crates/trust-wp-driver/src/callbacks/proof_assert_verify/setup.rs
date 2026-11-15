@@ -4,10 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustc_hir::{
-    def::DefKind,
-    def_id::{DefId, LocalDefId},
-};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::TyCtxt;
 use tracing::debug;
 use trust_wp_core::{contract_parser::parse_contract, formula::PureExpr, logic::LogicFnDef};
@@ -78,36 +75,12 @@ pub(in crate::callbacks) fn build_proof_assert_setup<'a>(
                 .first()
                 .is_some_and(|param| param == "self")
         })
-        .map(|logic_fn| logic_fn.name().to_string())
+        .map(|logic_fn| logic_fn.short_name().to_string())
         .collect();
 
     // Resolve crate-level const items for substitution into proof_assert
     // expressions, matching the const resolution in verify_contracts(). (#1588)
-    let const_item_substitutions: HashMap<String, PureExpr> = {
-        let mut map = HashMap::new();
-        for local_def_id in tcx.hir_body_owners() {
-            let def_id = local_def_id.to_def_id();
-            if !matches!(
-                tcx.def_kind(def_id),
-                DefKind::Const { .. } | DefKind::AssocConst { .. }
-            ) {
-                continue;
-            }
-            if let Some(expr) =
-                crate::mir_analysis::translate::resolve_const_item_value(tcx, def_id)
-            {
-                let full_path = tcx.def_path_str(def_id);
-                if let Some(short_name) = full_path.rsplit("::").next() {
-                    map.insert(short_name.to_string(), expr);
-                }
-            }
-        }
-        // Generic associated constant definitions: <SelfType as Trait>::CONST (#2550)
-        let generic_assoc_consts =
-            crate::mir_analysis::extract::collect_generic_assoc_const_definitions(tcx);
-        map.extend(generic_assoc_consts);
-        map
-    };
+    let const_item_substitutions = crate::callbacks::const_items::const_item_substitutions(tcx);
 
     (
         ProofAssertSetup {

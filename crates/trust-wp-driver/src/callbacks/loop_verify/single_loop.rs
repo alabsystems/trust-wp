@@ -36,6 +36,7 @@ use super::{
         infer_stable_loop_invariants, infer_stable_type_invariant_clauses,
     },
     old_rewrite::rewrite_loop_postcondition_old,
+    pre_loop_store::PreLoopStoreLinks,
     reporting::{emit_loop_verification_diagnostics, loop_verification_evidence_gap_reasons},
     span_matching::{find_loop_invariants, select_loop_variant},
     transition_facts::{
@@ -47,7 +48,7 @@ use super::{
 };
 use crate::{
     callbacks::helpers::extract_final_vars,
-    mir_analysis::{resolve_pre_loop_calls, ChangedPlaces, LoopAnalysis},
+    mir_analysis::{resolve_pre_loop_calls, ChangedPlaces, ChangedPlacesTree, LoopAnalysis},
 };
 
 fn annotate_seq_loop_var(expr: &PureExpr, var_name: &str) -> PureExpr {
@@ -399,7 +400,7 @@ fn nested_loop_exit_transition_facts(
     loop_idx: usize,
     per_loop_effective_invariants: &[Vec<PureExpr>],
     per_loop_conditions: &PerLoopConditions,
-    logic_fns: Option<&[LogicFnDef]>,
+    logic_fns: Option<(&[LogicFnDef], &dyn Fn(&LogicFnDef) -> Option<i64>)>,
 ) -> Vec<PureExpr> {
     let current_loop = &loop_analysis.loops[loop_idx];
     let mut facts = Vec::new();
@@ -421,13 +422,14 @@ fn nested_loop_exit_transition_facts(
             }
         }
 
-        let Some(logic_fns) = logic_fns else {
+        let Some((logic_fns, cons_discriminant)) = logic_fns else {
             continue;
         };
         for derived in synthesize_nested_match_exit_facts(
             &per_loop_effective_invariants[other_idx],
             &facts,
             logic_fns,
+            cons_discriminant,
         ) {
             if !facts.contains(&derived) {
                 facts.push(derived);
@@ -484,6 +486,7 @@ fn synthesize_nested_match_exit_facts(
     invariants: &[PureExpr],
     exit_facts: &[PureExpr],
     logic_fns: &[LogicFnDef],
+    cons_discriminant: &dyn Fn(&LogicFnDef) -> Option<i64>,
 ) -> Vec<PureExpr> {
     let mut synthesized = Vec::new();
     for invariant in invariants {
@@ -494,9 +497,17 @@ fn synthesize_nested_match_exit_facts(
             let Some(match_info) = option_identity_match_none_branch(match_side, parsed.var) else {
                 continue;
             };
-            if !has_completed_list_cons_exit(exit_facts, match_info.receiver)
-                || !logic_get_returns_none_after_cons_exit(logic_fns, match_info.method)
-            {
+            // The exit fact says the receiver is `Nil` only for the
+            // discriminant its enum gives `Cons` (D-237).
+            let Some(cons) = crate::callbacks::list_match_exit::list_exit_discriminant(
+                logic_fns,
+                match_info.method,
+                list_get_definition_has_nil_none_cons_recursive,
+                cons_discriminant,
+            ) else {
+                continue;
+            };
+            if !has_completed_list_cons_exit(exit_facts, match_info.receiver, cons) {
                 continue;
             }
 
@@ -580,10 +591,14 @@ fn logic_or_method_call(expr: &PureExpr) -> Option<(&PureExpr, &str, &[PureExpr]
     }
 }
 
-fn has_completed_list_cons_exit(preconditions: &[PureExpr], receiver: &PureExpr) -> bool {
+fn has_completed_list_cons_exit(
+    preconditions: &[PureExpr],
+    receiver: &PureExpr,
+    cons_discriminant: i64,
+) -> bool {
     preconditions
         .iter()
-        .any(|pre| is_not_discriminant_value(pre, receiver, 1))
+        .any(|pre| is_not_discriminant_value(pre, receiver, cons_discriminant))
 }
 
 fn is_not_discriminant_value(expr: &PureExpr, receiver: &PureExpr, discriminant: i64) -> bool {
@@ -620,12 +635,6 @@ fn discriminant_call_matches(
                 args,
             } if method == "discriminant" && args.is_empty() && proof_expr_equiv(call_receiver, receiver)
         )
-}
-
-fn logic_get_returns_none_after_cons_exit(logic_fns: &[LogicFnDef], method: &str) -> bool {
-    logic_fns
-        .iter()
-        .any(|def| def.name() == method && list_get_definition_has_nil_none_cons_recursive(def))
 }
 
 fn list_get_definition_has_nil_none_cons_recursive(def: &LogicFnDef) -> bool {
@@ -821,8 +830,9 @@ fn proof_expr_equiv(lhs: &PureExpr, rhs: &PureExpr) -> bool {
                 args: rhs_args,
             },
         ) => {
-            short_constructor_name(lhs_name) == short_constructor_name(rhs_name)
-                && expr_slices_equiv(lhs_args, rhs_args)
+            // Two logic functions that share a last path segment are two
+            // functions (D-237).
+            lhs_name == rhs_name && expr_slices_equiv(lhs_args, rhs_args)
         }
         (
             PureExpr::MethodCall {
@@ -940,7 +950,7 @@ fn decompose_struct_variant_to_field_sum(
             let variant_def = adt_def.non_enum_variant();
             let mut field_getters = Vec::new();
             for (idx, field) in variant_def.fields.iter().enumerate() {
-                let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                 match field_ty.kind() {
                     TyKind::Int(_) | TyKind::Uint(_) => {
                         let getter_name = tuple_field_logic_fn_name(idx);
@@ -1019,6 +1029,17 @@ pub(super) fn verify_single_loop(
             (None, None)
         };
 
+    // Whether the walk that fills `changed_places` / `pre_loop_deref_stored_names`
+    // / `post_loop_deref_final_values` ran at all. Without it those records are
+    // empty for want of a walk, not for want of writes, and nothing may be
+    // inferred from their emptiness.
+    let loop_body_extracted = loop_body_expr.is_some();
+
+    // prophecy-store: see `LoopBodyExpr::pre_loop_deref_stored_names`.
+    let pre_loop_deref_stored_names: std::collections::HashSet<String> = loop_body_expr
+        .as_ref()
+        .map(|expr| expr.pre_loop_deref_stored_names.clone())
+        .unwrap_or_default();
     let (
         mut loop_condition,
         condition_is_body_break,
@@ -1035,6 +1056,10 @@ pub(super) fn verify_single_loop(
         for_loop_state,
         pre_loop_init_facts,
         borrow_backing_names,
+        call_facts,
+        dropped_premises,
+        condition_facts,
+        condition_unstated,
     ) = if let Some(expr) = loop_body_expr {
         let resolved_calls = resolve_pre_loop_calls(
             tcx,
@@ -1060,6 +1085,10 @@ pub(super) fn verify_single_loop(
             expr.for_loop_state,
             expr.pre_loop_init_facts,
             expr.borrow_backing_names,
+            expr.call_facts,
+            expr.dropped_premises,
+            expr.condition_facts,
+            expr.condition_unstated,
         )
     } else {
         (
@@ -1078,6 +1107,15 @@ pub(super) fn verify_single_loop(
             None,
             Vec::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
+            vec![crate::mir_analysis::DroppedPremise {
+                block: loop_info.header,
+                what: "the loop body, which was not extracted".to_string(),
+                iterator_step: false,
+                only_about: None,
+            }],
+            Vec::new(),
+            None,
         )
     };
     let filtered_postcondition_deref =
@@ -1093,6 +1131,9 @@ pub(super) fn verify_single_loop(
         );
     }
 
+    // What the loops before this one may have changed, for the entry-value
+    // check below.
+    let written_by_earlier_loops: std::collections::HashSet<String> = all_modified_vars.clone();
     all_modified_vars.extend(modified_vars.iter().cloned());
 
     let frame_contributions = {
@@ -1156,6 +1197,21 @@ pub(super) fn verify_single_loop(
         loop_header_byte_pos,
     )?
     .cloned();
+    // A variant names the bindings visible at its loop, as an invariant does
+    // (D-237, D-238): read by its source name it would be the parameter a
+    // shadowing `let` hides, or a macro's hygienic binding.
+    if let Some(v) = variant.take() {
+        variant = match crate::callbacks::try_get_body_with_context(tcx, req.contract.local_def_id)
+        {
+            Some(body_with_facts) => crate::mir_analysis::binding_identity::resolve_loop_clauses(
+                crate::mir_analysis::get_mir_body(&body_with_facts),
+                loop_info.header,
+                vec![v],
+            )
+            .pop(),
+            None => Some(v),
+        };
+    }
 
     // Decompose struct-typed variants into integer field sums (#2665).
     // WellFounded variant types (e.g., CustomVariant(u32, u32)) encode
@@ -1181,6 +1237,16 @@ pub(super) fn verify_single_loop(
             &parsed.loop_fields.all_loop_spans,
             header_pos,
         );
+        // An invariant names the bindings visible at its loop (D-237).
+        let invs = match crate::callbacks::try_get_body_with_context(tcx, req.contract.local_def_id)
+        {
+            Some(body_with_facts) => crate::mir_analysis::binding_identity::resolve_loop_clauses(
+                crate::mir_analysis::get_mir_body(&body_with_facts),
+                loop_info.header,
+                invs,
+            ),
+            None => invs,
+        };
         if verbose {
             debug!(
                 header_pos,
@@ -1190,8 +1256,17 @@ pub(super) fn verify_single_loop(
         }
         invs
     } else {
-        parsed.loop_fields.invariants.clone()
+        match crate::callbacks::try_get_body_with_context(tcx, req.contract.local_def_id) {
+            Some(body_with_facts) => crate::mir_analysis::binding_identity::resolve_loop_clauses(
+                crate::mir_analysis::get_mir_body(&body_with_facts),
+                loop_info.header,
+                parsed.loop_fields.invariants.clone(),
+            ),
+            None => parsed.loop_fields.invariants.clone(),
+        }
     };
+    // Everything pushed below is inferred; the stated clauses stay in front.
+    let stated_invariant_count = effective_invariants.len();
     let structural_state = for_loop_state.as_ref();
     for inv in inferred_unsigned_invariants {
         if is_for_loop_element_nonnegative_invariant(inv, structural_state) {
@@ -1260,23 +1335,39 @@ pub(super) fn verify_single_loop(
         if !final_params_in_ensures.contains(param) {
             continue;
         }
-        // Only skip identity synthesis when the parameter itself is directly
-        // reassigned (ChangedPlacesTree::Changed at root). When only the
-        // pointee is modified (Deref(...)), the reference parameter itself is
-        // unchanged, and the identity `param_final == *param_current` is still
-        // correct for borrow resolution. (#2698)
+        // What this mints is `param_final == *param_current`, and
+        // `*param_current` is the pointee at FUNCTION ENTRY — so the identity
+        // claims the whole function leaves the pointee alone, not merely the
+        // loop. The lane may say that only where it SAW every write that could
+        // contradict it, and the three places a write can hide are the three
+        // guards below:
         //
-        // Example: `nested_loops(x: &mut i32)` with `*x = 0` in a nested
-        // loop. The outer loop's changed_places has `x -> Deref(Changed)`,
-        // meaning only `*x` is modified. The reference `x` itself is stable,
-        // so `x_final == *x` at loop exit is correct.
-        if let Some(tree) = changed_places.0.get(param) {
-            use crate::mir_analysis::ChangedPlacesTree;
-            if matches!(tree, ChangedPlacesTree::Changed) {
-                continue;
-            }
-            // Deref(...) or Fields(...) — parameter itself is unchanged;
-            // fall through to synthesize identity final value.
+        //   - inside the loop: `changed_places` records a store through `*p`
+        //     as `Deref(..)` under `p`, a reassignment of `p` itself as
+        //     `Changed`, and an escape into a mutating call the same way. ANY
+        //     entry against `p` is a write this identity would erase, so a
+        //     `Deref(..)` is a refusal exactly like a `Changed`
+        //     (`annotated_loop_param_write_prophecy_lost`,
+        //     `annotated_loop_mutating_call_write_lost`,
+        //     `annotated_loop_slot_alias_write_lost`).
+        //   - before the loop: a store through a reference reaching the header
+        //     is what `pre_loop_deref_stored_names` is; the loop body this lane
+        //     walked never contained it
+        //     (`annotated_loop_prior_write_prophecy_erased`).
+        //   - after the loop: such a write already has its own extracted entry,
+        //     which the lane must not overwrite with the identity.
+        //
+        // With no loop-body extraction at all there is no evidence of any kind,
+        // and an identity minted from an empty record is a grant made by code
+        // that saw nothing.
+        if !loop_body_extracted {
+            continue;
+        }
+        if changed_places.0.contains_key(param) {
+            continue;
+        }
+        if pre_loop_deref_stored_names.contains(param) {
+            continue;
         }
         if post_loop_deref_final_values.contains_key(param) {
             continue;
@@ -1606,13 +1697,25 @@ pub(super) fn verify_single_loop(
     }
     let mut transition_facts =
         structural_state.map_or_else(Vec::new, build_transition_facts_for_loop_state);
+    let cons_discriminant =
+        |get: &LogicFnDef| crate::callbacks::list_match_exit::cons_discriminant_of(tcx, get);
     for fact in nested_loop_exit_transition_facts(
         loop_analysis,
         loop_idx,
         per_loop_effective_invariants,
         per_loop_conditions,
-        req.logic_fns,
+        req.logic_fns.map(|fns| {
+            (
+                fns,
+                &cons_discriminant as &dyn Fn(&LogicFnDef) -> Option<i64>,
+            )
+        }),
     ) {
+        if !transition_facts.contains(&fact) {
+            transition_facts.push(fact);
+        }
+    }
+    for fact in call_facts {
         if !transition_facts.contains(&fact) {
             transition_facts.push(fact);
         }
@@ -1737,6 +1840,13 @@ pub(super) fn verify_single_loop(
         }
     }
     let mut post_facts = build_for_loop_completion_facts(&effective_invariants, structural_state);
+    // The exit assumptions negate the condition, and the condition's call
+    // runs once more at the exit, in the exit state.
+    for fact in &condition_facts {
+        if !continuation_assumptions.contains(fact) {
+            continuation_assumptions.push(fact.clone());
+        }
+    }
     for fact in &post_facts {
         if !continuation_assumptions.contains(fact) {
             continuation_assumptions.push(fact.clone());
@@ -1933,9 +2043,20 @@ pub(super) fn verify_single_loop(
 
     let modified_vars_refs: Vec<&str> = modified_vars.iter().map(String::as_str).collect();
 
+    if std::env::var_os("TRUST_WP_LOOP_EFFECT_DUMP").is_some() {
+        let def_path = req.def_path;
+        eprintln!(
+            "TRUST_WP_LOOP_EFFECT_DUMP def_path={def_path} loop={loop_idx} \
+             invariants={effective_invariants:?} condition={loop_condition:?} \
+             transition_facts={transition_facts:?} init_facts={init_facts:?}"
+        );
+    }
+
     let mut config = encoder_config_from_req(req)
         .with_transition_facts(&transition_facts)
-        .with_bridge_facts(&bridge_facts);
+        .with_bridge_facts(&bridge_facts)
+        .with_condition_facts(&condition_facts)
+        .with_stated_invariants(stated_invariant_count);
     if !borrow_vars.is_empty() {
         config = config.with_loop_element_borrow_vars(borrow_vars);
     }
@@ -1967,7 +2088,167 @@ pub(super) fn verify_single_loop(
     if let Some(ref ret) = return_expr {
         loop_ctx = loop_ctx.with_return_expr(ret);
     }
-    let loop_outcome = verify_loop_invariant_outcome(&loop_ctx)?;
+    let mut loop_outcome = verify_loop_invariant_outcome(&loop_ctx)?;
+    // prophecy-store: the initialization VC binds every name to its
+    // function-entry value (`*bor` = `bor_current`). A store through a
+    // reference before loop entry (`*bor = 5`, `let r = &mut v; *r = 5`) is
+    // not reflected there, so an invariant that reads such a name at entry
+    // would be credited against a stale value. Fail closed. `^x` and
+    // `old(..)` subterms are unaffected by a store and do not count. Whether
+    // a model of such a VC is a run of the program is `PreLoopStoreLinks`'s
+    // question, below.
+    if matches!(
+        loop_outcome.initialization.result,
+        trust_wp_ay::VerificationResult::Verified(_)
+    ) && invariant_reads_pre_loop_store_at_entry(
+        effective_invariants.iter(),
+        &pre_loop_deref_stored_names,
+    ) {
+        if verbose {
+            debug!(
+                names = ?pre_loop_deref_stored_names,
+                "loop initialization reads a value stored through a reference before loop entry; failing closed"
+            );
+        }
+        loop_outcome.initialization = trust_wp_ay::VerificationOutcome::without_provenance(
+            trust_wp_ay::VerificationResult::Unknown(trust_wp_ay::UnknownReason::Unsupported),
+        );
+    }
+    let stale_store = PreLoopStoreLinks::new(
+        &pre_loop_deref_stored_names,
+        effective_requires
+            .iter()
+            .chain(&effective_invariants)
+            .chain(loop_condition.as_ref())
+            .chain(variant.as_ref())
+            .chain(&transition_facts)
+            .chain(&bridge_facts)
+            .chain(&condition_facts)
+            .chain(&init_facts)
+            .chain(&post_facts),
+        [
+            &body_effect,
+            &deref_body_effect,
+            &double_deref_body_effect,
+            &filtered_postcondition_deref,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(
+            pre_loop_assignments
+                .iter()
+                .map(|(name, binding)| (name, &binding.value)),
+        ),
+    );
+    // A model of a one-iteration VC is a counterexample only if it satisfies
+    // every premise the iteration supplies. A premise the VC left out can rule
+    // the model out, so the refutation is withheld rather than reported as a
+    // run of the program (loop_body_call_postcondition_premise_control).
+    let mut iteration_goals: Vec<&PureExpr> = effective_invariants
+        .iter()
+        .take(stated_invariant_count)
+        .collect();
+    iteration_goals.extend(variant.as_ref());
+    if condition_is_body_break {
+        iteration_goals.extend(loop_condition.as_ref());
+    }
+    if let Some(reason) = unstated_iteration_premise(
+        &dropped_premises,
+        &iteration_goals,
+        &modified_vars,
+        &changed_places,
+        [&body_effect, &deref_body_effect, &double_deref_body_effect],
+    ) {
+        withhold_refutation(&mut loop_outcome.preservation, &reason);
+        if let Some(decrease) = loop_outcome.variant_decrease.as_mut() {
+            withhold_refutation(decrease, &reason);
+        }
+        if condition_is_body_break {
+            // The exit test reads the post-iteration state.
+            withhold_refutation(&mut loop_outcome.postcondition, &reason);
+        }
+    }
+    if let Some(reason) = stale_store.reason(iteration_goals.iter().copied()) {
+        withhold_refutation(&mut loop_outcome.preservation, &reason);
+        for variant_check in [
+            loop_outcome.variant_nonneg.as_mut(),
+            loop_outcome.variant_decrease.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            withhold_refutation(variant_check, &reason);
+        }
+        if condition_is_body_break {
+            withhold_refutation(&mut loop_outcome.postcondition, &reason);
+        }
+    }
+    // Every VC but initialization assumes the loop condition or its
+    // negation; when that reads a call result no premise constrains, a model
+    // picks it freely (loop_condition_call_unstated_control).
+    if let Some(what) = condition_unstated.as_deref() {
+        let reason = format!("the loop condition reads a value the loop VC does not state: {what}");
+        withhold_refutation(&mut loop_outcome.preservation, &reason);
+        if let Some(decrease) = loop_outcome.variant_decrease.as_mut() {
+            withhold_refutation(decrease, &reason);
+        }
+        withhold_refutation(&mut loop_outcome.postcondition, &reason);
+    }
+    // The initialization VC reads every variable at loop entry, and a model
+    // of it is a counterexample only if each value it picks is one the
+    // program can hold there.
+    let stated_goals: Vec<&PureExpr> = effective_invariants
+        .iter()
+        .take(stated_invariant_count)
+        .collect();
+    let entry = EntryPremises {
+        pre_loop_assignments: &pre_loop_assignments,
+        init_facts: &init_facts,
+        arg_names: &parsed.arg_names,
+        pre_loop_written_params: &pre_loop_written_params,
+        written_by_earlier_loops: &written_by_earlier_loops,
+    };
+    if let Some(name) = entry.first_unbound(&stated_goals, |_| true) {
+        let reason = format!("the loop VC does not determine `{name}` at loop entry");
+        withhold_refutation(&mut loop_outcome.initialization, &reason);
+    }
+    if let Some(reason) = stale_store.reason(stated_goals.iter().copied()) {
+        withhold_refutation(&mut loop_outcome.initialization, &reason);
+    }
+    // The exit VC reads the state the loop leaves through its goals and the
+    // invariants and negated condition it assumes.
+    if !condition_is_body_break {
+        // `result` is the return expression's value, not a variable of the
+        // exit state.
+        let ensures_read: Vec<PureExpr> = effective_ensures
+            .iter()
+            .map(|ensure| match return_expr.as_ref() {
+                Some(ret) => ensure.substitute(&std::collections::HashMap::from([(
+                    "result".to_string(),
+                    ret.clone(),
+                )])),
+                None => ensure.clone(),
+            })
+            .collect();
+        let mut exit_reads: Vec<&PureExpr> = stated_goals.clone();
+        exit_reads.extend(ensures_read.iter());
+        exit_reads.extend(loop_condition.as_ref());
+        if let Some(reason) = unstated_exit_premise(
+            &exit_reads,
+            &modified_vars,
+            &changed_places,
+            [&body_effect, &deref_body_effect, &double_deref_body_effect],
+            &entry,
+        ) {
+            withhold_refutation(&mut loop_outcome.postcondition, &reason);
+        }
+        // A name the loop does not write keeps its entry value there, and a
+        // final value `^p` is read at the pointee the loop leaves
+        // (loop_postcondition_after_param_store_control).
+        if let Some(reason) = stale_store.reason(exit_reads.iter().copied()) {
+            withhold_refutation(&mut loop_outcome.postcondition, &reason);
+        }
+    }
     emit_loop_verification_diagnostics(req.def_path, &loop_outcome);
     let evidence_gap_reasons = loop_verification_evidence_gap_reasons(&loop_outcome);
     let loop_result = loop_outcome.as_result();
@@ -2001,6 +2282,244 @@ pub(super) fn verify_single_loop(
         effective_invariants,
         evidence_gap_reasons,
     })
+}
+
+/// Why a one-iteration refutation over this loop body is not a statement
+/// about the program, if it is not.
+///
+/// Two ways: the body walk left out a premise some path supplies (a
+/// postcondition it could not state, a walk that did not finish), which may
+/// constrain any value; or a variable a goal reads after the iteration has a
+/// changed part the VC gives no value, or only one naming a placeholder, so the
+/// model picks it freely although the program determines it.
+fn unstated_iteration_premise(
+    dropped_premises: &[crate::mir_analysis::DroppedPremise],
+    goals: &[&PureExpr],
+    modified_vars: &[String],
+    changed_places: &ChangedPlaces,
+    [direct, deref, double_deref]: [&std::collections::HashMap<String, PureExpr>; 3],
+) -> Option<String> {
+    if let Some(premise) = dropped_premises
+        .iter()
+        .find(|premise| premise.only_about.is_none())
+    {
+        return Some(format!("the loop VC does not state {}", premise.what));
+    }
+    let mut read: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for goal in goals {
+        read.extend(expr_referenced_vars(goal));
+    }
+    let mut about_read: Vec<&crate::mir_analysis::DroppedPremise> = dropped_premises
+        .iter()
+        .filter(|premise| {
+            premise
+                .only_about
+                .as_ref()
+                .is_some_and(|name| read.contains(name))
+        })
+        .collect();
+    about_read.sort_by(|a, b| a.only_about.cmp(&b.only_about));
+    if let Some(premise) = about_read.first() {
+        return Some(format!("the loop VC does not state {}", premise.what));
+    }
+    undetermined_after_iteration(
+        &read,
+        modified_vars,
+        changed_places,
+        [direct, deref, double_deref],
+    )
+    .map(|name| format!("the loop VC does not determine `{name}` after an iteration"))
+}
+
+/// The first variable of `read` the body writes to (by the modified-variable
+/// scan) whose new value the walk does not determine: no effect for the part
+/// that changes, or one naming a placeholder.
+fn undetermined_after_iteration<'a>(
+    read: &std::collections::HashSet<String>,
+    modified_vars: &'a [String],
+    changed_places: &ChangedPlaces,
+    [direct, deref, double_deref]: [&std::collections::HashMap<String, PureExpr>; 3],
+) -> Option<&'a String> {
+    let determined = |map: &std::collections::HashMap<String, PureExpr>, name: &str| {
+        map.get(name)
+            .is_some_and(|value| !names_a_placeholder(value))
+    };
+    let mut undetermined: Vec<&String> = modified_vars
+        .iter()
+        .filter(|name| read.contains(name.as_str()))
+        .filter(|name| {
+            let direct = determined(direct, name);
+            let through_ref = determined(deref, name) || determined(double_deref, name);
+            match changed_places.0.get(name.as_str()) {
+                Some(ChangedPlacesTree::Deref(_)) => !through_ref,
+                Some(_) => !direct,
+                None => !direct && !through_ref,
+            }
+        })
+        .collect();
+    undetermined.sort();
+    undetermined.first().copied()
+}
+
+/// Why a refutation of the loop's exit VC is not a statement about the
+/// program, if it is not.
+///
+/// The exit VC reads the state the loop leaves: a variable the loop writes
+/// holds whatever the invariant and the negated condition allow, and one it
+/// does not write keeps its entry value. A variable the scan counts as
+/// written but whose change the walk never determines may keep its entry
+/// value, a frame the VC does not state (cc/fmap's `snap_k`, a snapshot the
+/// body never assigns); a variable the loop does not write whose entry value
+/// the VC leaves free is picked by the model.
+fn unstated_exit_premise(
+    goals: &[&PureExpr],
+    modified_vars: &[String],
+    changed_places: &ChangedPlaces,
+    effects: [&std::collections::HashMap<String, PureExpr>; 3],
+    entry: &EntryPremises<'_>,
+) -> Option<String> {
+    let mut read: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for goal in goals {
+        read.extend(expr_referenced_vars(goal));
+    }
+    if let Some(name) = undetermined_after_iteration(&read, modified_vars, changed_places, effects)
+    {
+        return Some(format!(
+            "the loop VC does not determine `{name}` after the loop"
+        ));
+    }
+    let written: std::collections::HashSet<&str> =
+        modified_vars.iter().map(String::as_str).collect();
+    entry
+        .first_unbound(goals, |name| !written.contains(name))
+        .map(|name| format!("the loop VC does not determine `{name}`, which the loop keeps"))
+}
+
+/// What the initialization VC states about each variable's value at loop
+/// entry.
+struct EntryPremises<'a> {
+    pre_loop_assignments:
+        &'a std::collections::HashMap<String, trust_wp_core::formula::NamedBindingValue>,
+    init_facts: &'a [PureExpr],
+    arg_names: &'a [String],
+    pre_loop_written_params: &'a std::collections::HashSet<String>,
+    written_by_earlier_loops: &'a std::collections::HashSet<String>,
+}
+
+impl EntryPremises<'_> {
+    /// The first variable the goals read, among those `consider` admits, whose
+    /// entry value the VC leaves free although the program determines it.
+    ///
+    /// A pre-loop binding or an initialization fact describes a variable; a
+    /// parameter no code before the loop writes is free exactly as the
+    /// function's caller leaves it. Anything else — a value an earlier loop
+    /// left (bug/164's second loop reads the `x` its first loop's `break`
+    /// set), a variable of an enclosing loop, a pre-loop value that did not
+    /// translate — is picked freely by the model. A binding or fact whose value
+    /// is a stand-in nothing constrains (merge_fmaps' `snapshot!` of a
+    /// closure-taking call) describes nothing.
+    fn first_unbound(
+        &self,
+        goals: &[&PureExpr],
+        consider: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let mut read: Vec<String> = goals
+            .iter()
+            .flat_map(|goal| expr_referenced_vars(goal))
+            .filter(|name| consider(name))
+            .collect();
+        read.sort();
+        read.dedup();
+        let described_by_facts = |name: &str| {
+            self.init_facts.iter().any(|fact| {
+                expr_referenced_vars(fact).contains(name)
+                    && !self.names_unconstrained_stand_in(fact, Some(fact))
+            })
+        };
+        read.into_iter().find(|name| {
+            if let Some(binding) = self.pre_loop_assignments.get(name) {
+                if !self.names_unconstrained_stand_in(&binding.value, None) {
+                    return false;
+                }
+                return !described_by_facts(name);
+            }
+            if self.written_by_earlier_loops.contains(name) {
+                return true;
+            }
+            let untouched_parameter =
+                self.arg_names.contains(name) && !self.pre_loop_written_params.contains(name);
+            !untouched_parameter && !described_by_facts(name)
+        })
+    }
+
+    /// Whether `expr` names a stand-in no initialization fact constrains: a
+    /// value that did not translate, or a call result no fact but `expr`
+    /// itself mentions.
+    fn names_unconstrained_stand_in(&self, expr: &PureExpr, itself: Option<&PureExpr>) -> bool {
+        let mut stand_ins: Vec<String> = Vec::new();
+        expr.for_each_recursive(|node| {
+            if let PureExpr::Var(name, _) = node {
+                if names_a_placeholder(node) {
+                    stand_ins.push(name.clone());
+                }
+            }
+        });
+        stand_ins.iter().any(|name| {
+            if !name.starts_with("$_") {
+                return true;
+            }
+            !self.init_facts.iter().any(|fact| {
+                !itself.is_some_and(|itself| std::ptr::eq(itself, fact))
+                    && expr_referenced_vars(fact).contains(name.as_str())
+            })
+        })
+    }
+}
+
+/// Whether an effect value names a stand-in for a value the walk could not
+/// translate, which leaves the variable it describes free in the VC.
+fn names_a_placeholder(value: &PureExpr) -> bool {
+    let mut found = false;
+    value.for_each_recursive(|node| {
+        if let PureExpr::Var(name, _) = node {
+            if name == trust_wp_core::formula::INDEX_MUT_OPAQUE_VALUE
+                || name.starts_with("$_")
+                || crate::mir_analysis::is_fallback_arg_placeholder(name)
+            {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Whether any of `exprs` reads, at loop entry, a name a store through a
+/// reference before the loop may have changed (`pre_loop_deref_stored_names`).
+/// An `old(..)` subterm reads the function-entry value, and a final value `^p`
+/// is a prophecy; no store decides either.
+fn invariant_reads_pre_loop_store_at_entry<'a>(
+    exprs: impl IntoIterator<Item = &'a PureExpr>,
+    stored: &std::collections::HashSet<String>,
+) -> bool {
+    !stored.is_empty()
+        && exprs.into_iter().any(|expr| {
+            expr.rewrite_bottom_up(|e| match e {
+                PureExpr::Old(_) | PureExpr::Final(_) => PureExpr::Bool(true),
+                other => other,
+            })
+            .any_free_var(|name, _| stored.contains(name))
+        })
+}
+
+/// Replace a refutation with the withheld verdict naming `reason`.
+fn withhold_refutation(outcome: &mut trust_wp_ay::VerificationOutcome, reason: &str) {
+    if matches!(outcome.result, trust_wp_ay::VerificationResult::Failed(_)) {
+        *outcome = trust_wp_ay::VerificationOutcome::without_provenance(
+            trust_wp_ay::VerificationResult::Unknown(trust_wp_ay::UnknownReason::SolverMessage(
+                format!("{}: {reason}", trust_wp_ay::REFUTATION_AUTHORITY_MESSAGE),
+            )),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2204,5 +2723,178 @@ mod tests {
             .is_empty(),
             "inner loop should not inherit enclosing-loop exit facts as transition facts"
         );
+    }
+
+    mod unstated_premises {
+        use std::collections::{HashMap, HashSet};
+
+        use trust_wp_core::formula::NamedBindingValue;
+
+        use super::{
+            super::{
+                invariant_reads_pre_loop_store_at_entry, unstated_exit_premise, ChangedPlaces,
+                EntryPremises,
+            },
+            eq_expr, var, PureExpr,
+        };
+
+        fn binding(value: PureExpr) -> NamedBindingValue {
+            NamedBindingValue { sort: None, value }
+        }
+
+        fn first_unbound(
+            goal: &PureExpr,
+            assignments: &HashMap<String, NamedBindingValue>,
+            facts: &[PureExpr],
+        ) -> Option<String> {
+            let none = HashSet::new();
+            let entry = EntryPremises {
+                pre_loop_assignments: assignments,
+                init_facts: facts,
+                arg_names: &[],
+                pre_loop_written_params: &none,
+                written_by_earlier_loops: &none,
+            };
+            entry.first_unbound(&[goal], |_| true)
+        }
+
+        /// merge_fmaps: `merge` is bound to a value that did not translate,
+        /// and the one fact about it equates it with a call result nothing
+        /// else describes, so the model picks it.
+        #[test]
+        fn a_binding_to_an_unconstrained_stand_in_binds_nothing() {
+            let assignments =
+                HashMap::from([("merge".to_string(), binding(var("$fallback_arg0_6")))]);
+            let facts = [eq_expr(var("merge"), var("$_call_11"))];
+            assert_eq!(
+                first_unbound(
+                    &eq_expr(var("merge"), PureExpr::Int(5)),
+                    &assignments,
+                    &facts
+                )
+                .as_deref(),
+                Some("merge")
+            );
+        }
+
+        #[test]
+        fn a_call_result_another_fact_describes_binds() {
+            let assignments = HashMap::from([("x".to_string(), binding(var("$_call_7")))]);
+            let facts = [eq_expr(var("$_call_7"), PureExpr::Int(0))];
+            assert_eq!(
+                first_unbound(&eq_expr(var("x"), PureExpr::Int(0)), &assignments, &facts),
+                None
+            );
+            let lone: [PureExpr; 0] = [];
+            assert_eq!(
+                first_unbound(&eq_expr(var("x"), PureExpr::Int(0)), &assignments, &lone).as_deref(),
+                Some("x")
+            );
+        }
+
+        /// cc/fmap: the scan counts `snap` as written, the walk records no
+        /// write, so the exit VC may have dropped its frame.
+        #[test]
+        fn an_exit_read_of_a_variable_the_walk_never_writes_is_unstated() {
+            let none_set = HashSet::new();
+            let no_assignments = HashMap::new();
+            let entry = EntryPremises {
+                pre_loop_assignments: &no_assignments,
+                init_facts: &[],
+                arg_names: &[],
+                pre_loop_written_params: &none_set,
+                written_by_earlier_loops: &none_set,
+            };
+            let modified = vec!["i".to_string(), "snap".to_string()];
+            let direct = HashMap::from([(
+                "i".to_string(),
+                PureExpr::BinOp(
+                    std::sync::Arc::new(var("i")),
+                    super::BinOp::Add,
+                    std::sync::Arc::new(PureExpr::Int(1)),
+                ),
+            )]);
+            let empty = HashMap::new();
+            let effects = [&direct, &empty, &empty];
+            let reads_i = eq_expr(var("i"), PureExpr::Int(10));
+            assert_eq!(
+                unstated_exit_premise(
+                    &[&reads_i],
+                    &modified,
+                    &ChangedPlaces::default(),
+                    effects,
+                    &entry
+                ),
+                None,
+                "a written variable the walk determines is the invariant's to constrain"
+            );
+            let reads_snap = eq_expr(var("snap"), PureExpr::Int(1));
+            assert!(unstated_exit_premise(
+                &[&reads_snap],
+                &modified,
+                &ChangedPlaces::default(),
+                effects,
+                &entry
+            )
+            .is_some_and(|reason| reason.contains("`snap`")));
+        }
+
+        #[test]
+        fn an_exit_read_of_a_kept_variable_needs_its_entry_value() {
+            let none_set = HashSet::new();
+            let assignments = HashMap::from([("k".to_string(), binding(var("$fallback_arg0_1")))]);
+            let entry = EntryPremises {
+                pre_loop_assignments: &assignments,
+                init_facts: &[],
+                arg_names: &["n".to_string()],
+                pre_loop_written_params: &none_set,
+                written_by_earlier_loops: &none_set,
+            };
+            let empty = HashMap::new();
+            let effects = [&empty, &empty, &empty];
+            let reads_n = eq_expr(var("n"), PureExpr::Int(1));
+            assert_eq!(
+                unstated_exit_premise(&[&reads_n], &[], &ChangedPlaces::default(), effects, &entry),
+                None,
+                "an untouched parameter is free exactly as the caller leaves it"
+            );
+            let reads_k = eq_expr(var("k"), PureExpr::Int(1));
+            assert!(unstated_exit_premise(
+                &[&reads_k],
+                &[],
+                &ChangedPlaces::default(),
+                effects,
+                &entry
+            )
+            .is_some_and(|reason| reason.contains("`k`")));
+        }
+
+        /// An invariant read at loop entry through the pointee sees the stale
+        /// value; `old(..)` and a prophecy `^p` do not
+        /// (loop_invariant_entry_after_param_store_false).
+        #[test]
+        fn an_entry_read_of_a_stored_pointee_is_stale_and_old_and_prophecy_are_not() {
+            let stored = HashSet::from(["a".to_string()]);
+            let pointee = PureExpr::Deref(std::sync::Arc::new(var("a")));
+            let prophecy = PureExpr::Final(std::sync::Arc::new(var("a")));
+            let entry_value = PureExpr::Old(std::sync::Arc::new(pointee.clone()));
+            assert!(invariant_reads_pre_loop_store_at_entry([&pointee], &stored));
+            assert!(!invariant_reads_pre_loop_store_at_entry(
+                [&prophecy],
+                &stored
+            ));
+            assert!(!invariant_reads_pre_loop_store_at_entry(
+                [&entry_value],
+                &stored
+            ));
+            assert!(!invariant_reads_pre_loop_store_at_entry(
+                [&var("b")],
+                &stored
+            ));
+            assert!(!invariant_reads_pre_loop_store_at_entry(
+                [&pointee],
+                &HashSet::new()
+            ));
+        }
     }
 }

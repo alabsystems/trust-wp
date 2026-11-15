@@ -42,6 +42,7 @@ use trust_wp_driver::StdSpec;
 #[cfg(test)]
 use super::{call_resolve::resolve_arg_names_or_warn, spec_apply::TranslatedArg};
 mod assertion;
+pub(in crate::mir_analysis) use assertion::machine_int_range_fact;
 mod block_visitor;
 mod borrow_carriers;
 // #prophecy-slots M5: the caller-side expiry lane reuses the #124 ground-value
@@ -51,37 +52,73 @@ mod branching;
 mod branching_diag;
 mod call_args;
 mod call_effect_blocks;
+mod call_effect_paths;
+mod call_effect_reach;
 mod call_resolve_shared;
 mod call_resolve_util;
 mod call_spec;
+pub(in crate::mir_analysis) use call_spec::callee_invariant_premises;
 mod cell_builtin;
 mod closure;
+pub(crate) mod collect_gate;
 mod cutoff;
 mod default_postcondition;
+pub(in crate::mir_analysis) mod drop_glue_writes;
+pub(crate) use drop_glue_writes::params_rebound_by_handoffs;
+mod param_writes;
+pub(crate) use param_writes::{
+    param_writes_before, params_with_renamable_entry, params_written_before,
+    PARAM_ENTRY_VALUE_SUFFIX,
+};
 mod entrypoints;
 mod helpers;
-pub(in crate::mir_analysis) use helpers::source_name_for_local;
-pub(crate) use helpers::collect_generic_assoc_const_definitions;
+pub(in crate::mir_analysis) use helpers::{
+    block_must_diverge, source_name_for_local, translate_rvalue_with_enum_variants,
+};
+pub(crate) use helpers::{
+    body_entry_diverges_via_panic, body_has_reachable_obligation_source,
+    body_reaches_diverging_call, body_reaches_runtime_check,
+    collect_generic_assoc_const_definitions,
+};
 mod loop_body;
+mod loop_condition_writes;
+pub(crate) use loop_condition_writes::loop_condition_exit_write;
+mod loop_merges;
+#[cfg(test)]
+pub(in crate::mir_analysis) use loop_merges::{
+    compute_skipped_loop_merges, loop_exit_edge, region_effects,
+};
+pub(crate) use loop_merges::{
+    loop_condition_block, loop_exit_arm_dominating, loop_has_unmodeled_exit, loop_head_rebinds,
+    loop_head_symbol, loop_lane_exit, switch_arm_dominating, LaneExit, LOOP_HEAD_SYMBOL_PREFIX,
+};
 mod name_substitutions;
+mod panic_site_coverage;
 mod param_destructuring;
+mod past_loop_names;
 mod primary;
+pub(crate) use primary::body_returns_a_stale_store_read;
 pub(crate) mod program_point_state;
+mod reborrow_handback;
 mod spanned_extract;
 mod substitution;
 mod try_operator;
+mod unannotated_loops;
+mod write_aliases;
 
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use assertion::*;
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use branching::*;
+pub(in crate::mir_analysis) use call_args::stale_arguments;
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use call_args::*;
-pub(crate) use call_effect_blocks::collect_call_effects_for_blocks;
+pub(crate) use call_effect_blocks::{collect_call_effects_for_blocks, LoopEntryValues};
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use call_resolve_util::*;
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use call_spec::*;
+pub(crate) use closure::ty_exposes_interior_mutability;
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use closure::*;
 pub(crate) use cutoff::PROOF_ASSERT_STATE_MARKER_NAME;
@@ -102,17 +139,25 @@ pub(crate) use entrypoints::{
 pub(super) use entrypoints::{extract_return_expr_impl, ExtractionConfig};
 #[allow(unused_imports)] // Re-exported for tests and sibling modules via `use super::*`
 use helpers::*;
+#[cfg(test)]
+pub(crate) use loop_body::collect_loop_body_call_obligations;
 pub(crate) use loop_body::{
-    collect_loop_body_call_obligations, extract_recursive_call_args, LoopBodySpecContext,
-    RecursiveCallSite,
+    collect_arithmetic_panic_obligations, collect_loop_body_call_obligations_split,
+    collect_post_loop_arithmetic_obligations, collect_unannotated_loop_arithmetic_obligations,
+    extract_recursive_call_args, loop_assigned_locals_by_header, unwalked_charged_assert_sites,
+    with_charged_assert_recording, ArithmeticRegion, LoopBodySpecContext, RecursiveCallSite,
 };
 pub(crate) use name_substitutions::NameSubstitutions;
+pub(crate) use panic_site_coverage::{
+    unchecked_panic_sites, with_dead_edge_recording, EnteredBody, ProvedDeadEdges,
+};
 pub(crate) use param_destructuring::extract_param_destructuring_substitutions;
 pub(super) use primary::{extract_from_block_with_context, BlockExtractionContext};
 pub(crate) use spanned_extract::extract_return_expr_spanned;
 pub(super) use substitution::SubstitutionExtractionContext;
 #[allow(unused_imports)] // Re-exported for tests via `use super::*`
 use try_operator::*;
+pub(crate) use unannotated_loops::collect_unannotated_loop_obligations;
 
 #[cfg(test)]
 mod tests;

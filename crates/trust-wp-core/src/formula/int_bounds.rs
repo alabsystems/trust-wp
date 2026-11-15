@@ -16,6 +16,28 @@ use std::sync::Arc;
 
 use super::{BinOp, PureExpr};
 
+/// Represent an unsigned machine literal exactly in the mathematical integer
+/// AST. The radix limbs fit signed literals even when the complete value does
+/// not. No bit pattern is reinterpreted as a signed integer.
+#[must_use]
+pub fn unsigned_literal_expr(value: u64) -> PureExpr {
+    if let Ok(value) = i64::try_from(value) {
+        return PureExpr::Int(value);
+    }
+    let [a, b, c, d, e, f, g, h] = value.to_le_bytes();
+    let high = PureExpr::Int(i64::from(u32::from_le_bytes([e, f, g, h])));
+    let low = PureExpr::Int(i64::from(u32::from_le_bytes([a, b, c, d])));
+    PureExpr::BinOp(
+        Arc::new(PureExpr::BinOp(
+            Arc::new(high),
+            BinOp::Mul,
+            Arc::new(PureExpr::Int(1_i64 << 32)),
+        )),
+        BinOp::Add,
+        Arc::new(low),
+    )
+}
+
 /// Build a `PureExpr` representing `2^exp` using repeated squaring.
 ///
 /// Keeps expression depth logarithmic in `exp` to stay well within the ay

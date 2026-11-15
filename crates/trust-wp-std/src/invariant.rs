@@ -14,7 +14,13 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! `inv` is specification-only: `Invariant::invariant` is a `#[logic(open)]`
+//! method, so its body is erased and calling it at runtime panics with
+//! "logic functions are erased at runtime". The example therefore compiles but
+//! does not run (`no_run`) — it shows the shape a contract uses, not a value a
+//! program may observe.
+//!
+//! ```rust,no_run
 //! use trust_wp_std::invariant::{inv, Invariant};
 //!
 //! // Primitive/std types implement Invariant with a default `true` predicate.

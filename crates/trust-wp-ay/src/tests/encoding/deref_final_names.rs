@@ -742,7 +742,7 @@ fn test_container_carveout_does_not_widen_fix_a_guard() {
         ExprSort::Int,
         ExprSort::Bool,
         ExprSort::Unit,
-        ExprSort::Float,
+        ExprSort::Float(trust_wp_core::formula::FloatWidth::F64),
         ExprSort::Tuple(2),
         ExprSort::Ref(Box::new(ExprSort::Int)),
         ExprSort::MutRef(Box::new(ExprSort::Int)),

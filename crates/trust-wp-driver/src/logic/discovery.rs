@@ -8,14 +8,17 @@
 //! metadata (params, contracts, body text), and parses bodies into
 //! [`LogicFnDef`] structures.
 
+use rustc_attr_ir::Attribute;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, LocalDefId},
-    Attribute, Node, TraitFn, TraitItemKind,
+    Node, TraitFn, TraitItemKind,
 };
 use rustc_middle::ty::TyCtxt;
 use trust_wp_core::{
-    contract_parser::{parse_contract, parse_contract_body_with_leading_exprs},
+    contract_parser::{
+        parse_contract, parse_contract_body_with_leading_exprs, parse_logic_body_expr_with_elisions,
+    },
     formula::{internal::tuple_lowering::tuple_logic_fn_name, ExprSort, PureExpr},
     logic::{LogicFnDef, LogicMode},
 };
@@ -23,6 +26,54 @@ use trust_wp_core::{
 use super::attrs::{
     append_opaque_guard_if_needed, extract_ensures, extract_requires, extract_variants,
 };
+
+/// Width and signedness of a Rust machine-integer parameter (`u8`..`u128`,
+/// `usize`, `i8`..`i128`, `isize`), recovered from the real signature because
+/// `ExprSort` collapses every integer type to `Int`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MachineIntWidth {
+    pub(crate) signed: bool,
+    pub(crate) bits: u32,
+}
+
+/// `min <= expr && expr <= max` for a machine integer of `width`.
+pub(crate) fn machine_int_range(expr: &PureExpr, width: MachineIntWidth) -> [PureExpr; 2] {
+    use std::sync::Arc;
+
+    use trust_wp_core::formula::{
+        int_bounds::{signed_bounds_expr, unsigned_max_expr},
+        BinOp,
+    };
+
+    let (min, max) = if width.signed {
+        signed_bounds_expr(width.bits)
+    } else {
+        (PureExpr::Int(0), unsigned_max_expr(width.bits))
+    };
+    [
+        PureExpr::BinOp(Arc::new(min), BinOp::Le, Arc::new(expr.clone())),
+        PureExpr::BinOp(Arc::new(expr.clone()), BinOp::Le, Arc::new(max)),
+    ]
+}
+
+/// Rust type-range requires of the machine-integer parameters. Nothing is
+/// stated when the width list is not parallel to `params`.
+pub(crate) fn machine_int_parameter_range_requires(
+    params: &[String],
+    param_int_widths: &[Option<MachineIntWidth>],
+) -> Vec<PureExpr> {
+    if params.len() != param_int_widths.len() {
+        return Vec::new();
+    }
+    params
+        .iter()
+        .zip(param_int_widths)
+        .filter_map(|(name, width)| {
+            width.map(|w| machine_int_range(&PureExpr::Var(name.clone(), Some(ExprSort::Int)), w))
+        })
+        .flatten()
+        .collect()
+}
 
 /// A logic function found in the crate.
 #[derive(Debug)]
@@ -33,8 +84,11 @@ pub(crate) struct LogicFunction {
     pub(crate) full_path: String,
     /// Parameter names
     pub(crate) params: Vec<String>,
-    /// Preconditions (from #[requires(...)])
+    /// Preconditions (from #[requires(...)]), then any facts discovery adds.
     pub(crate) requires: Vec<String>,
+    /// How many leading `requires` are the user's own `#[requires]` clauses
+    /// (`LogicFnDef::written_requires`).
+    pub(crate) written_requires: usize,
     /// Postconditions (from #[ensures(...)]).
     /// When non-empty, the logic function's body is verified against these.
     pub(crate) ensures: Vec<String>,
@@ -53,9 +107,15 @@ pub(crate) struct LogicFunction {
     pub(crate) mode: LogicMode,
     /// Whether this is an associated function declared in a trait.
     pub(crate) is_trait_method: bool,
+    /// Whether this is ANY associated function (trait declaration, trait impl
+    /// or inherent impl), i.e. not a free function.
+    pub(crate) is_associated_fn: bool,
     /// Sort annotations for parameters (parallel to `params`).
     /// Extracted from `tcx` function signatures. `None` = default (Int).
     pub(crate) param_sort_hints: Vec<Option<ExprSort>>,
+    /// Machine-integer width per parameter (parallel to `params`); `None` for
+    /// every non-machine-integer parameter and for const generic parameters.
+    pub(crate) param_int_widths: Vec<Option<MachineIntWidth>>,
     /// Sort annotation for the return type. Extracted from the function signature.
     pub(crate) return_sort_hint: Option<ExprSort>,
     /// Function body as source text (to be parsed)
@@ -77,6 +137,10 @@ pub(crate) struct LogicFunction {
     ///   resolution could not run; callers DEFAULT-REJECT (fall back to the
     ///   conservative text-scan behavior) on `None`.
     pub(crate) deep_model_dispatch_targets: Option<std::collections::HashSet<String>>,
+    /// What the parameter patterns bind, as projections of the registered
+    /// parameter names (D-177). `to_logic_fn_def` destructures the body and the
+    /// clauses with it, so no pattern binding is left free in the definition.
+    pub(crate) param_bindings: crate::param_patterns::ParamPatternBindings,
 }
 
 /// Find all functions marked with `#[logic]` attribute.
@@ -115,8 +179,11 @@ pub(crate) fn find_logic_functions(tcx: TyCtxt<'_>) -> Vec<LogicFunction> {
         params.extend(get_param_names_from_hir(tcx, local_def_id));
         let mut param_sort_hints = vec![Some(ExprSort::Int); const_param_names.len()];
         param_sort_hints.extend(get_param_sort_hints(tcx, def_id));
+        let mut param_int_widths = vec![None; const_param_names.len()];
+        param_int_widths.extend(get_param_int_widths(tcx, def_id));
         let return_sort_hint = get_return_sort_hint(tcx, def_id);
         let mut requires = extract_requires(attrs);
+        let written_requires = requires.len();
         let ensures = extract_ensures(attrs);
         // Recover the erased `>= 0` invariant of unsigned-integer parameters
         // (ExprSort collapses signedness), but ONLY for logic fns whose contract
@@ -151,22 +218,24 @@ pub(crate) fn find_logic_functions(tcx: TyCtxt<'_>) -> Vec<LogicFunction> {
         let is_trusted = has_trusted_doc_marker(attrs) || inherits_trusted_from_trait(tcx, def_id);
         let is_law = has_law_doc_marker(attrs);
         let mode = extract_logic_mode(attrs);
+        let is_associated_fn = tcx.opt_associated_item(def_id).is_some();
         let is_trait_method = tcx.opt_associated_item(def_id).is_some_and(|assoc| {
             matches!(assoc.container, rustc_middle::ty::AssocContainer::Trait)
         });
 
         // Try to extract body text from doc marker first (reliable),
         // then fall back to HIR extraction (may get erased body).
-        let body_text =
-            extract_body_text_from_doc(attrs).or_else(|| extract_body_text(tcx, local_def_id));
+        let body_text = logic_body_text(tcx, local_def_id);
 
         let deep_model_dispatch_targets = compute_deep_model_dispatch_targets(tcx, def_id, &name);
+        let param_bindings = crate::param_patterns::param_pattern_bindings(tcx, local_def_id);
 
         logic_fns.push(LogicFunction {
             name,
             full_path,
             params,
             requires,
+            written_requires,
             ensures,
             variants,
             is_opaque,
@@ -174,10 +243,13 @@ pub(crate) fn find_logic_functions(tcx: TyCtxt<'_>) -> Vec<LogicFunction> {
             is_law,
             mode,
             is_trait_method,
+            is_associated_fn,
             param_sort_hints,
+            param_int_widths,
             return_sort_hint,
             body_text,
             deep_model_dispatch_targets,
+            param_bindings,
         });
     }
 
@@ -258,12 +330,23 @@ fn unsigned_nonneg_requires(
         .collect()
 }
 
-/// Check if the attributes include `#[doc = "trust-wp:logic:"]`.
+/// Recognize the bare registered `#[trust_wp::logic]` tool marker or the
+/// existing `#[doc = "trust-wp:logic:..."]` proc-macro marker.
 ///
 /// The `#[logic]` proc macro embeds this doc marker because proc macro attributes
 /// are consumed during expansion and not visible to tcx.get_all_attrs().
 pub(crate) fn has_logic_marker(attrs: &[Attribute]) -> bool {
     for attr in attrs {
+        if matches!(
+            attr,
+            Attribute::Tool(item)
+                if item.path.segments.len() == 2
+                    && item.path.segments[0].as_str() == "trust_wp"
+                    && item.path.segments[1].as_str() == "logic"
+                    && matches!(&item.args, rustc_attr_ir::AttrArgs::Empty)
+        ) {
+            return true;
+        }
         if let Some(value) = crate::attr_utils::doc_marker_str(attr) {
             if value.as_str().starts_with("trust-wp:logic:") {
                 return true;
@@ -399,7 +482,7 @@ fn compute_deep_model_dispatch_targets(
     let mut field_types: Vec<rustc_middle::ty::Ty<'_>> = Vec::new();
     for variant in self_adt.variants() {
         for field in &variant.fields {
-            field_types.push(field.ty(tcx, self_substs).skip_norm_wip());
+            field_types.push(field.ty(tcx, *self_substs).skip_norm_wip());
         }
     }
     for field_ty in field_types {
@@ -516,21 +599,24 @@ pub(super) fn extract_function_name(full_path: &str) -> String {
 
 /// Get parameter names from HIR.
 fn get_param_names_from_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Vec<String> {
-    let mut names = Vec::new();
-
+    // Unnamed (`_` or destructuring) parameters get a positional fallback name
+    // through `name_unnamed_params`, which never duplicates a real parameter
+    // name: a positional fallback colliding with a real parameter literally
+    // named the same would make the later binding win during unfolding and
+    // silently substitute the wrong argument.
     if let Some(hir_body_id) = tcx.hir_node_by_def_id(def_id).body_id() {
         let hir_body = tcx.hir_body(hir_body_id);
-        for param in hir_body.params {
-            if let rustc_hir::PatKind::Binding(_, _, ident, _) = param.pat.kind {
-                names.push(ident.as_str().to_string());
-            } else {
-                names.push(format!("arg{}", names.len()));
-            }
+        let raw: Vec<Option<String>> = hir_body
+            .params
+            .iter()
+            .map(|param| match param.pat.kind {
+                rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        if !raw.is_empty() {
+            return crate::mir_analysis::name_unnamed_params(raw);
         }
-    }
-
-    if !names.is_empty() {
-        return names;
     }
 
     // Trait method declarations without default bodies have no HIR body. Reuse
@@ -538,25 +624,20 @@ fn get_param_names_from_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Vec<String> 
     // the correct arity and receiver name for later dispatch.
     if let Node::TraitItem(trait_item) = tcx.hir_node_by_def_id(def_id) {
         if let TraitItemKind::Fn(_, TraitFn::Required(param_names)) = trait_item.kind {
-            return param_names
+            let raw: Vec<Option<String>> = param_names
                 .iter()
-                .enumerate()
-                .map(|(idx, ident)| match ident {
-                    Some(ident) => {
+                .map(|ident| {
+                    ident.and_then(|ident| {
                         let name = ident.as_str();
-                        if name.is_empty() || name == "_" {
-                            format!("arg{idx}")
-                        } else {
-                            name.to_string()
-                        }
-                    }
-                    None => format!("arg{idx}"),
+                        (!name.is_empty() && name != "_").then(|| name.to_string())
+                    })
                 })
                 .collect();
+            return crate::mir_analysis::name_unnamed_params(raw);
         }
     }
 
-    names
+    Vec::new()
 }
 
 fn get_const_generic_param_names(tcx: TyCtxt<'_>, def_id: DefId) -> Vec<String> {
@@ -592,6 +673,31 @@ fn get_param_sort_hints(tcx: TyCtxt<'_>, def_id: DefId) -> Vec<Option<ExprSort>>
     sig.inputs()
         .iter()
         .map(|ty| sort_for_ty(tcx, *ty))
+        .collect()
+}
+
+/// Machine-integer width of each value parameter, from the `fn_sig` inputs.
+fn get_param_int_widths(tcx: TyCtxt<'_>, def_id: DefId) -> Vec<Option<MachineIntWidth>> {
+    use rustc_middle::ty::TyKind;
+
+    use crate::callbacks::integer_range::{int_bit_width, uint_bit_width};
+
+    let pointer_bits = u32::try_from(tcx.data_layout.pointer_size().bits()).unwrap_or(64);
+    let sig = tcx.fn_sig(def_id).instantiate_identity();
+    let sig = sig.skip_binder();
+    sig.inputs()
+        .iter()
+        .map(|ty| match ty.kind() {
+            TyKind::Uint(uint_ty) => Some(MachineIntWidth {
+                signed: false,
+                bits: uint_bit_width(*uint_ty, pointer_bits),
+            }),
+            TyKind::Int(int_ty) => Some(MachineIntWidth {
+                signed: true,
+                bits: int_bit_width(*int_ty, pointer_bits),
+            }),
+            _ => None,
+        })
         .collect()
 }
 
@@ -635,6 +741,15 @@ fn sort_for_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: rustc_middle::ty::Ty<'tcx>) -> Optio
     // ExprSort::Datatype(name). Falls through to ty_to_expr_sort for
     // non-ADT types (Bool, Int, TypeParam, Tuple, etc.).
     crate::mir_analysis::translate::ty_to_expr_sort_enriched(tcx, ty)
+}
+
+/// The text of the logic function `def_id`'s body, as discovery reads it:
+/// the macro's doc marker, else the source. The one reader of it, so that
+/// the reading installed for the text (`callbacks::spec_arith`) is the
+/// reading the body is parsed with.
+pub(crate) fn logic_body_text(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<String> {
+    extract_body_text_from_doc(tcx.get_all_attrs(def_id.to_def_id()))
+        .or_else(|| extract_body_text(tcx, def_id))
 }
 
 /// Extract logic function body text from doc marker.
@@ -700,6 +815,15 @@ pub(crate) fn to_logic_fn_def(logic_fn: &LogicFunction) -> Option<LogicFnDef> {
         match logic_fn.body_text.as_ref() {
             Some(body_text) => {
                 match parse_logic_body(body_text, logic_fn.return_sort_hint.as_ref()) {
+                    Ok(body) if lost_a_proof_assert(logic_fn, body_text, &body) => {
+                        crate::result_protocol_state::record_parse_error();
+                        eprintln!(
+                            "trust-wp: error: logic function body for {} parsed without one of \
+                             its proof_assert!s, a goal of the function; refused",
+                            logic_fn.full_path
+                        );
+                        return None;
+                    }
                     Ok(body) => body,
                     Err(e) => {
                         // Bodies that are intentionally unparseable ghost stubs
@@ -732,6 +856,23 @@ pub(crate) fn to_logic_fn_def(logic_fn: &LogicFunction) -> Option<LogicFnDef> {
     // be unsatisfiable (`false => body_eq`), which is semantically inert.
     append_opaque_guard_if_needed(&mut requires, is_opaque);
 
+    // A `#[variant]` logic fn over machine-integer parameters is defined only
+    // on those parameters' Rust type ranges. The ranges join its requires, so
+    // (a) the defining axiom and every unfolding are guarded by them (requires
+    // guard the definition everywhere: `guard_with_requires`), and (b) the
+    // variant-decrease check may use them as hypotheses (it reads the parsed
+    // requires). (b) is sound only because of (a): without the guard,
+    // `#[variant(x)] fn k(x: u8) -> Int { if x@ > 300 { k(x) + 1 } else { 0 } }`
+    // passes the decrease check vacuously (`0 <= x <= 255, x > 300` is
+    // unsatisfiable) while the Int-model equation `k(400) = k(400) + 1` stays
+    // usable. With the guard, `k` outside `0..=255` is unconstrained.
+    if !logic_fn.variants.is_empty() {
+        requires.extend(machine_int_parameter_range_requires(
+            &logic_fn.params,
+            &logic_fn.param_int_widths,
+        ));
+    }
+
     let ensures = parse_contract_clauses(logic_fn.ensures.iter(), logic_fn, "ensures")?;
 
     // Parse `#[variant(...)]` measures leniently. A variant is OPTIONAL metadata
@@ -744,6 +885,34 @@ pub(crate) fn to_logic_fn_def(logic_fn: &LogicFunction) -> Option<LogicFnDef> {
         .filter_map(|v| parse_contract(v).ok())
         .collect();
 
+    // D-177: the names a parameter pattern binds are projections of the
+    // parameter, in the body and in every clause alike. A definition that
+    // mentions one it cannot project is kept opaque with no clauses: every use
+    // would otherwise read that name in the scope of whoever unfolds it. What
+    // is dropped (its clauses, and any goal its body held) is then examined by
+    // nobody, so the run is refused as for a clause that does not parse.
+    let (body, requires, ensures, parsed_variants, pattern_refused) =
+        match destructure_logic_fn_parts(logic_fn, body, requires, ensures, parsed_variants) {
+            Ok(parts) => (parts.0, parts.1, parts.2, parts.3, false),
+            Err(reason) => {
+                crate::result_protocol_state::record_parse_error();
+                eprintln!(
+                    "trust-wp: error: logic function `{}` is kept opaque and its clauses are \
+                     refused: {reason}",
+                    logic_fn.full_path
+                );
+                let mut guard = Vec::new();
+                append_opaque_guard_if_needed(&mut guard, true);
+                (
+                    declaration_only_trait_logic_body_for_trusted(logic_fn),
+                    guard,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )
+            }
+        };
+
     let mut def = LogicFnDef::new_with_requires(
         logic_fn.name.clone(),
         logic_fn.full_path.clone(),
@@ -754,13 +923,38 @@ pub(crate) fn to_logic_fn_def(logic_fn: &LogicFunction) -> Option<LogicFnDef> {
     .with_param_sorts(logic_fn.param_sort_hints.clone())
     .with_return_sort(logic_fn.return_sort_hint.clone())
     .with_variants(parsed_variants)
-    .with_opaque(is_opaque || declaration_only_trait_body)
+    .with_written_requires(logic_fn.written_requires)
+    .with_opaque(is_opaque || declaration_only_trait_body || pattern_refused)
     .with_trusted(logic_fn.is_trusted || force_opaque)
     .with_law(logic_fn.is_law)
     .with_mode(logic_fn.mode)
     .detect_recursion();
     def.set_ensures(ensures);
     Some(def)
+}
+
+type LogicFnParts = (PureExpr, Vec<PureExpr>, Vec<PureExpr>, Vec<PureExpr>);
+
+/// The body, requires, ensures and variants of `logic_fn` with every free
+/// pattern binding replaced by its parameter projection (D-177).
+fn destructure_logic_fn_parts(
+    logic_fn: &LogicFunction,
+    body: PureExpr,
+    requires: Vec<PureExpr>,
+    ensures: Vec<PureExpr>,
+    variants: Vec<PureExpr>,
+) -> Result<LogicFnParts, String> {
+    let bindings = &logic_fn.param_bindings;
+    if bindings.is_empty() {
+        return Ok((body, requires, ensures, variants));
+    }
+    let one = |expr: PureExpr| -> Result<PureExpr, String> {
+        Ok(crate::param_patterns::destructure_expr(&expr, bindings)?.unwrap_or(expr))
+    };
+    let all = |exprs: Vec<PureExpr>| -> Result<Vec<PureExpr>, String> {
+        exprs.into_iter().map(one).collect()
+    };
+    Ok((one(body)?, all(requires)?, all(ensures)?, all(variants)?))
 }
 
 /// Detect bodies that are ghost-only stubs whose source intentionally uses
@@ -780,6 +974,38 @@ fn is_ghost_stub_body(body_text: &str) -> bool {
         .any(|prefix| core.starts_with(prefix))
 }
 
+/// Whether parsing dropped a `proof_assert!` of a contracted logic function.
+///
+/// The assertions are goals of such a function (the logic lane states them
+/// from the parsed body), and a parse that discards a statement — the
+/// single-expression fallback below keeps only the trailing expression — would
+/// discard the goal with it. Counting the macro in the source text is
+/// deliberately coarse: a stray spelling in a comment refuses the function,
+/// it never lets an assertion go unexamined.
+fn lost_a_proof_assert(logic_fn: &LogicFunction, body_text: &str, body: &PureExpr) -> bool {
+    use trust_wp_core::formula::PureExprDepthLimitedTraversalExt as _;
+    if logic_fn.requires.is_empty() && logic_fn.ensures.is_empty() && logic_fn.variants.is_empty() {
+        return false;
+    }
+    let written = body_text
+        .match_indices("proof_assert")
+        .filter(|(at, word)| body_text[at + word.len()..].trim_start().starts_with('!'))
+        .count();
+    if written == 0 {
+        return false;
+    }
+    let mut parsed = 0usize;
+    let too_deep = body.any_recursive_with_depth_limit(200, true, |node| {
+        if matches!(node, PureExpr::LogicFnCall { name, .. }
+            if name == "proof_assert" || name.ends_with("::proof_assert"))
+        {
+            parsed += 1;
+        }
+        false
+    });
+    too_deep || parsed < written
+}
+
 /// Parse a logic function body, preserving leading expression statements.
 ///
 /// Logic bodies like `{ lemma_a(x); lemma_b(x); body_expr }` must retain the
@@ -788,13 +1014,16 @@ fn is_ghost_stub_body(body_text: &str) -> bool {
 /// leading expressions into nested `PureExpr::Let` carriers (`__stmt0`, `__stmt1`,
 /// ...) matching the shape expected by the manual verification tests.
 ///
-/// Falls back to `parse_contract` when the input is not a block (no braces).
+/// Falls back to `parse_contract` for a body the block parser does not read
+/// as a whole (a block followed by more expression: `{ a } && b`), but only
+/// when that reading drops no statement: `parse_contract` discards statements
+/// without checking them, so a statement the block parser refused (an
+/// annotation its binder contradicts) would vanish from the body instead of
+/// refusing it, and the block parser's error stands.
 fn parse_logic_body(
     body_text: &str,
     return_sort_hint: Option<&ExprSort>,
 ) -> Result<PureExpr, trust_wp_core::contract_parser::ParseError> {
-    // Try the block-body parser first. If the body is not a block (e.g., a
-    // simple expression like `x + 1`), it may fail — fall back to parse_contract.
     match parse_contract_body_with_leading_exprs(body_text) {
         Ok((mut leading, tail)) if !leading.is_empty() => {
             if matches!(return_sort_hint, Some(ExprSort::Unit)) {
@@ -805,7 +1034,14 @@ fn parse_logic_body(
             }
         }
         Ok((_, tail)) => Ok(tail),
-        Err(_) => parse_contract(body_text),
+        Err(block_error) => {
+            let (expr, elisions) = parse_logic_body_expr_with_elisions(body_text)?;
+            if elisions.discarded_statements.is_empty() {
+                Ok(expr)
+            } else {
+                Err(block_error)
+            }
+        }
     }
 }
 
@@ -818,7 +1054,7 @@ fn wrap_leading_exprs_as_lets(leading: Vec<PureExpr>, tail: PureExpr) -> PureExp
         .enumerate()
         .rev()
         .fold(tail, |body, (idx, expr)| PureExpr::Let {
-            var: format!("__stmt{idx}"),
+            var: format!("$stmt{idx}"),
             value: std::sync::Arc::new(expr),
             body: std::sync::Arc::new(body),
         })
@@ -877,4 +1113,44 @@ fn declaration_only_trait_logic_body_for_trusted(
     _logic_fn: &LogicFunction,
 ) -> trust_wp_core::formula::PureExpr {
     trust_wp_core::formula::PureExpr::Int(0)
+}
+
+#[cfg(test)]
+mod parse_logic_body_tests {
+    use super::parse_logic_body;
+
+    /// A leading statement the block parser refuses (its annotation reads a
+    /// bound name at a sort the binder does not give it) refuses the body.
+    /// The fallback parse dropped the statement unchecked and the body read
+    /// as its tail alone.
+    #[test]
+    fn a_refused_leading_statement_refuses_the_body() {
+        for body in [
+            "{ forall<v: bool> (v : Int) + 1 > (v : Int); true }",
+            "{ exists<w: Int> (w : bool); x + 1 > x }",
+            "{ lemma(x); forall<p: &bool> { let t = *p; (t : Int) > 0 }; x > 0 }",
+        ] {
+            let error = parse_logic_body(body, None)
+                .expect_err(&format!("`{body}` drops a refused statement"));
+            assert!(
+                error.message.contains("is annotated at sort"),
+                "`{body}` must be refused by the scope check: {error}"
+            );
+        }
+    }
+
+    /// Controls: a plain expression, a block with statements the block
+    /// parser reads, and a block followed by more expression (the fallback's
+    /// own case) still parse.
+    #[test]
+    fn bodies_the_block_parser_or_its_fallback_read_whole_still_parse() {
+        for body in [
+            "x + 1",
+            "{ lemma(x); x + 1 }",
+            "{ let t: Int = x; t + 1 }",
+            "{ x } + 1",
+        ] {
+            parse_logic_body(body, None).unwrap_or_else(|error| panic!("`{body}`: {error}"));
+        }
+    }
 }

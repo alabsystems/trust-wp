@@ -10,8 +10,8 @@ use super::*;
 
 #[test]
 fn is_call_result_var_accepts_supported_prefixes() {
-    assert!(is_call_result_var("call_0"));
-    assert!(is_call_result_var("_call_42"));
+    assert!(is_call_result_var("$call_0"));
+    assert!(is_call_result_var("$_call_42"));
     assert!(!is_call_result_var("call"));
     assert!(!is_call_result_var("tmp_0"));
 }
@@ -19,7 +19,7 @@ fn is_call_result_var_accepts_supported_prefixes() {
 #[test]
 fn collect_equality_substitutions_uses_call_var_on_lhs() {
     let assumptions = vec![PureExpr::BinOp(
-        Arc::new(PureExpr::Var("call_1".into(), None)),
+        Arc::new(PureExpr::Var("$call_1".into(), None)),
         BinOp::Eq,
         Arc::new(PureExpr::Int(7)),
     )];
@@ -27,7 +27,7 @@ fn collect_equality_substitutions_uses_call_var_on_lhs() {
     let substitutions = collect_equality_substitutions(&assumptions);
 
     let mut expected = HashMap::new();
-    expected.insert("call_1".to_string(), PureExpr::Int(7));
+    expected.insert("$call_1".to_string(), PureExpr::Int(7));
     assert_eq!(substitutions, expected);
 }
 
@@ -36,13 +36,13 @@ fn collect_equality_substitutions_uses_call_var_on_rhs() {
     let assumptions = vec![PureExpr::BinOp(
         Arc::new(PureExpr::Int(7)),
         BinOp::Eq,
-        Arc::new(PureExpr::Var("_call_2".into(), None)),
+        Arc::new(PureExpr::Var("$_call_2".into(), None)),
     )];
 
     let substitutions = collect_equality_substitutions(&assumptions);
 
     let mut expected = HashMap::new();
-    expected.insert("_call_2".to_string(), PureExpr::Int(7));
+    expected.insert("$_call_2".to_string(), PureExpr::Int(7));
     assert_eq!(substitutions, expected);
 }
 
@@ -50,7 +50,7 @@ fn collect_equality_substitutions_uses_call_var_on_rhs() {
 fn collect_equality_substitutions_uses_deref_call_var_on_lhs() {
     let assumptions = vec![PureExpr::BinOp(
         Arc::new(PureExpr::Deref(Arc::new(PureExpr::Var(
-            "_call_3".into(),
+            "$_call_3".into(),
             None,
         )))),
         BinOp::Eq,
@@ -61,7 +61,7 @@ fn collect_equality_substitutions_uses_deref_call_var_on_lhs() {
 
     let mut expected = HashMap::new();
     expected.insert(
-        "_call_3".to_string(),
+        "$_call_3".to_string(),
         PureExpr::Var("x".into(), Some(ExprSort::Int)),
     );
     assert_eq!(substitutions, expected);
@@ -73,7 +73,7 @@ fn collect_equality_substitutions_uses_deref_call_var_on_rhs() {
         Arc::new(PureExpr::Var("x".into(), Some(ExprSort::Int))),
         BinOp::Eq,
         Arc::new(PureExpr::Deref(Arc::new(PureExpr::Var(
-            "call_4".into(),
+            "$call_4".into(),
             None,
         )))),
     )];
@@ -82,7 +82,7 @@ fn collect_equality_substitutions_uses_deref_call_var_on_rhs() {
 
     let mut expected = HashMap::new();
     expected.insert(
-        "call_4".to_string(),
+        "$call_4".to_string(),
         PureExpr::Var("x".into(), Some(ExprSort::Int)),
     );
     assert_eq!(substitutions, expected);
@@ -97,7 +97,7 @@ fn collect_equality_substitutions_ignores_non_call_results() {
             Arc::new(PureExpr::Int(1)),
         ),
         PureExpr::MethodCall {
-            receiver: Arc::new(PureExpr::Var("call_1".into(), None)),
+            receiver: Arc::new(PureExpr::Var("$call_1".into(), None)),
             method: "get".to_string(),
             args: vec![PureExpr::Int(1)],
         },

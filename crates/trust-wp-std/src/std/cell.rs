@@ -115,12 +115,6 @@ impl<T> View for PermCell<T> {
     }
 }
 
-impl<T> Clone for PermCell<T> {
-    fn clone(&self) -> Self {
-        panic!("PermCell::clone called at runtime - only valid in ghost code")
-    }
-}
-
 impl<T> PermCell<T> {
     /// Create a new `PermCell` with the given initial value.
     ///
@@ -344,6 +338,7 @@ pub mod specs {
     /// Contract for `PredCell::as_slice_of_cells`.
     pub const PREDCELL_AS_SLICE_OF_CELLS: &str = r"
         params: self, _pred
+        requires: forall<s: _> self@[s] == (_pred.len() == s@.len() && forall<i: Int> 0 <= i && i < s@.len() ==> _pred[i][s[i]])
         ensures: result@.len() == _pred.len()
         ensures: forall<i: Int> 0 <= i && i < _pred.len() ==> result[i]@ == _pred[i]
         ensures: forall<i: Int, x: _> 0 <= i && i < _pred.len() ==> result[i]@[x] == _pred[i][x]
@@ -353,29 +348,34 @@ pub mod specs {
     pub const PERMCELL_NEW: &str = r"
         params: value
         ensures: result.0@ == value
+        ensures: result.0 == *result.1.ward()
     ";
 
     /// Contract for `PermCell::set`.
     pub const PERMCELL_SET: &str = r"
         params: self, _perm, value
+        requires: self == _perm.ward()
         ensures: (^self)@ == value
     ";
 
     /// Contract for `PermCell::get`.
     pub const PERMCELL_GET: &str = r"
         params: self, _perm
+        requires: self == _perm.ward()
         ensures: result == self@
     ";
 
     /// Contract for `PermCell::borrow`.
     pub const PERMCELL_BORROW: &str = r"
         params: self, _perm
+        requires: self == _perm.ward()
         ensures: *result == self@
     ";
 
     /// Contract for `PermCell::borrow_mut`.
     pub const PERMCELL_BORROW_MUT: &str = r"
         params: self, _perm
+        requires: self == _perm.ward()
         ensures: *result == self@
         ensures: ^result == (^self)@
     ";
@@ -383,6 +383,7 @@ pub mod specs {
     /// Contract for `PermCell::replace`.
     pub const PERMCELL_REPLACE: &str = r"
         params: self, _perm, value
+        requires: self == _perm.ward()
         ensures: result == self@
         ensures: (^self)@ == value
     ";
@@ -390,6 +391,7 @@ pub mod specs {
     /// Contract for `PermCell::into_inner`.
     pub const PERMCELL_INTO_INNER: &str = r"
         params: self, _perm
+        requires: self == *_perm.ward()
         ensures: result == self@
     ";
 
@@ -398,11 +400,13 @@ pub mod specs {
         params: t
         ensures: result.0@ == *t
         ensures: (^result.0)@ == ^t
+        ensures: result.0 == result.1.ward()
     ";
 
     /// Contract for `PermCell::take`.
     pub const PERMCELL_TAKE: &str = r"
         params: self, _perm
+        requires: self == _perm.ward()
         ensures: result == self@
         ensures: core::default::Default::default.postcondition((), (^self)@)
     ";

@@ -52,12 +52,11 @@ pub mod tracing_init;
 /// Higher precision is more complete but slower.
 ///
 /// Modeled after trust-mc's `--ay-chc-track` and `SeaHorn`'s `--track` flags.
-/// See `designs/2026-02-02-precision-knobs.md` for design rationale.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TrackLevel {
     /// Automatic track selection (default).
-    /// Currently falls back to `Reg` behavior. MIR-based auto-detection is not yet implemented.
+    /// The ay backend treats it as `Reg`; there is no MIR-based auto-detection.
     #[default]
     Auto,
     /// Register-only: no heap operations, fastest.

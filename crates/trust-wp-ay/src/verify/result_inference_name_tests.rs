@@ -2,12 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Edge-case tests for `detect_body_constructor_name` and
-//! `result_collection_sort_from_postcondition`.
-//!
-//! The 12 tests in `verify/tests/mod.rs` cover standard constructor names
-//! (Some, None, Ok, Err, qualified paths, user variants, literals). These
-//! tests cover named-struct brace syntax and underscore-prefixed temporaries.
+//! Edge-case tests for `result_collection_sort_from_postcondition`.
 //!
 //! The collection sort tests exercise `result_collection_sort_from_postcondition`
 //! through the `expr_collection_sort_for_result` → `infer_expr_sort` path,
@@ -16,53 +11,11 @@
 use ay_dpll::api::Sort;
 use ntest::timeout;
 
-use super::{detect_body_constructor_name, result_collection_sort_from_postcondition};
+use super::result_collection_sort_from_postcondition;
 use crate::{
-    tests::helpers::{eq, int, logic_fn_call, var, var_with_sort},
+    tests::helpers::{eq, int, var, var_with_sort},
     BinOp, ExprSort, PureExpr,
 };
-
-// --- detect_body_constructor_name edge cases ---
-
-/// Named struct literal: `Named{x,y}` → `short_constructor_name` strips braces → "Named".
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_named_struct_literal() {
-    let expr = logic_fn_call("Named{x,y}", vec![int(0), int(1)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Named"));
-}
-
-/// Named enum variant: `ENamed::A{x,y}` → strips path and braces → "A".
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_named_variant_literal() {
-    let expr = logic_fn_call("ENamed::A{x,y}", vec![int(0), int(1)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("A"));
-}
-
-/// Underscore-prefixed MIR temporary (`_call_0`) — lowercase-first, not a constructor.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_underscore_temporary_returns_none() {
-    let expr = var("_call_0");
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-/// Numeric string variable (rare MIR artifact) — not uppercase-first.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_numeric_var_returns_none() {
-    let expr = var("0");
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-/// Empty-arg LogicFnCall with uppercase name — still detected as constructor.
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_nullary_uppercase() {
-    let expr = logic_fn_call("Unit", vec![]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Unit"));
-}
 
 // --- result_collection_sort_from_postcondition ---
 

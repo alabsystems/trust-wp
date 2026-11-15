@@ -21,6 +21,11 @@ fn make_parsed_contract() -> ParsedContract {
         call_obligations: Vec::new(),
         pre_loop_call_obligations: Vec::new(),
         post_loop_call_obligations: Vec::new(),
+        returning_path_facts: Vec::new(),
+        extraction_fail_closed_reason: None,
+        panic_unreachability_obligations: 0,
+        user_written_false_obligations: 0,
+        proved_dead_edges: Default::default(),
         loop_fields: LoopFields {
             invariants: Vec::new(),
             per_loop_invariants: Vec::new(),
@@ -33,7 +38,9 @@ fn make_parsed_contract() -> ParsedContract {
         mut_borrow: MutBorrowFields {
             mut_borrow_body: None,
             mut_ref_param_names: HashSet::new(),
+            state_params: HashSet::new(),
             projected_final_pins: Vec::new(),
+            stale_call_final_params: HashSet::new(),
         },
         reborrow_prophecy: None,
     }

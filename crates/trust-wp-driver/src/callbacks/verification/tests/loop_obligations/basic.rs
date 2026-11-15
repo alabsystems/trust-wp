@@ -2,21 +2,24 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use trust_wp_ay::VerificationResult;
 use trust_wp_core::{
-    formula::{BinOp, PureExpr},
+    formula::{BinOp, PureExpr, UnOp},
     TrackLevel,
 };
 
 use crate::{
     callbacks::{
-        indexed_write_synthesis::synthesize_indexed_write_postconditions,
+        indexed_write_synthesis::indexed_write_final_value_facts,
         parsing::LoopObligationGroup,
         verification::loop_contract::{verify_loop_call_obligations, LoopCallObligationContext},
     },
-    mir_analysis::IndexedWrite,
+    mir_analysis::{IndexedWrite, MutBorrowBody},
 };
 
 fn is_len_call(expr: &PureExpr) -> bool {
@@ -26,20 +29,69 @@ fn is_len_call(expr: &PureExpr) -> bool {
     )
 }
 
-fn count_top_level_point_writes(requires: &[PureExpr]) -> usize {
-    requires
-        .iter()
-        .filter(|expr| {
-            matches!(
-                expr,
-                PureExpr::BinOp(lhs, BinOp::Eq, _)
-                if matches!(
-                    lhs.as_ref(),
-                    PureExpr::MethodCall { method, .. } if method == "index_logic"
-                )
-            )
-        })
-        .count()
+fn var(name: &str) -> PureExpr {
+    PureExpr::Var(name.to_string(), None)
+}
+
+fn entry(name: &str) -> PureExpr {
+    PureExpr::Deref(Arc::new(var(name)))
+}
+
+fn set(receiver: PureExpr, index: PureExpr, value: PureExpr) -> PureExpr {
+    PureExpr::MethodCall {
+        receiver: Arc::new(PureExpr::View(Arc::new(receiver))),
+        method: "set".to_string(),
+        args: vec![index, value],
+    }
+}
+
+fn indexed_write(param: &str, index: PureExpr, value: PureExpr) -> IndexedWrite {
+    IndexedWrite {
+        param_name: param.to_string(),
+        index,
+        value,
+    }
+}
+
+fn body_with(final_values: Vec<(&str, PureExpr)>, writes: Vec<IndexedWrite>) -> MutBorrowBody {
+    MutBorrowBody {
+        final_values: final_values
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<HashMap<_, _>>(),
+        indexed_writes: writes,
+        resolve_results: None,
+        finality: HashMap::new(),
+        borrow_id_origins: HashMap::new(),
+        delayed_writeback_assumptions: vec![],
+        mutation_continued_params: HashSet::new(),
+        nested_slot_resolutions: vec![],
+        nested_transfer_params: HashSet::new(),
+        lent_path_resolutions: vec![],
+    }
+}
+
+fn is_point_write(expr: &PureExpr) -> bool {
+    matches!(
+        expr,
+        PureExpr::BinOp(lhs, BinOp::Eq, _)
+        if matches!(lhs.as_ref(), PureExpr::MethodCall { method, .. } if method == "index_logic")
+    )
+}
+
+/// The antecedent of `guard ==> fact`, or `None` for an unconditional fact.
+fn antecedent(expr: &PureExpr) -> Option<&PureExpr> {
+    match expr {
+        PureExpr::BinOp(lhs, BinOp::Implies, _) => Some(lhs.as_ref()),
+        _ => None,
+    }
+}
+
+fn consequent(expr: &PureExpr) -> &PureExpr {
+    match expr {
+        PureExpr::BinOp(_, BinOp::Implies, rhs) => rhs.as_ref(),
+        other => other,
+    }
 }
 
 fn collect_frame_excluded_int_indices(expr: &PureExpr, out: &mut Vec<i64>) {
@@ -59,101 +111,132 @@ fn collect_frame_excluded_int_indices(expr: &PureExpr, out: &mut Vec<i64>) {
     }
 }
 
+/// Two writes on one path: the last write is stated as it is, the earlier one
+/// only where the later write hits another index, and one frame excludes both.
 #[test]
-fn indexed_write_synthesis_combines_frame_for_same_parameter() {
-    let indexed_writes = vec![
-        IndexedWrite {
-            param_name: "a".to_string(),
-            index: PureExpr::Int(0),
-            value: PureExpr::Int(10),
-        },
-        IndexedWrite {
-            param_name: "a".to_string(),
-            index: PureExpr::Int(1),
-            value: PureExpr::Int(20),
-        },
-    ];
-    let mut requires = Vec::new();
-
-    synthesize_indexed_write_postconditions(&indexed_writes, &mut requires, false);
-
-    assert_eq!(count_top_level_point_writes(&requires), 2);
-    assert_eq!(
-        requires
-            .iter()
-            .filter(|expr| matches!(expr, PureExpr::Forall { .. }))
-            .count(),
-        1,
-        "multiple writes to same parameter should produce one combined frame"
+fn final_value_facts_state_a_write_only_where_no_later_write_may_overwrite_it() {
+    let final_value = set(
+        set(entry("a"), var("i"), PureExpr::Int(10)),
+        var("j"),
+        PureExpr::Int(20),
     );
-    assert_eq!(
-        requires
-            .iter()
-            .filter(|expr| {
-                matches!(expr, PureExpr::BinOp(lhs, BinOp::Eq, rhs) if is_len_call(lhs) && is_len_call(rhs))
-            })
-            .count(),
-        1,
-        "multiple writes to same parameter should produce one length preservation fact"
+    let body = body_with(
+        vec![("a", final_value)],
+        vec![
+            indexed_write("a", var("i"), PureExpr::Int(10)),
+            indexed_write("a", var("j"), PureExpr::Int(20)),
+        ],
     );
 
-    let frame = requires
+    let facts = indexed_write_final_value_facts(&body, None, false);
+
+    let point_writes: Vec<&PureExpr> = facts
         .iter()
-        .find(|expr| matches!(expr, PureExpr::Forall { .. }))
-        .expect("combined frame should exist");
-    let mut excluded = Vec::new();
-    if let PureExpr::Forall { body, .. } = frame {
-        if let PureExpr::BinOp(antecedent, BinOp::Implies, _) = body.as_ref() {
-            collect_frame_excluded_int_indices(antecedent, &mut excluded);
-        } else {
-            panic!("frame body should be implication");
-        }
-    }
-    excluded.sort_unstable();
+        .filter(|fact| is_point_write(consequent(fact)))
+        .collect();
+    assert_eq!(point_writes.len(), 2);
+    let last = point_writes
+        .iter()
+        .find(|fact| antecedent(fact).is_none())
+        .expect("the last write holds on its whole path");
+    assert!(
+        matches!(consequent(last), PureExpr::BinOp(_, BinOp::Eq, value) if **value == PureExpr::Int(20))
+    );
+    let earlier = point_writes
+        .iter()
+        .find(|fact| antecedent(fact).is_some())
+        .expect("the earlier write is guarded by the later write's index");
     assert_eq!(
-        excluded,
-        vec![0, 1],
-        "combined frame should exclude every written index"
+        antecedent(earlier),
+        Some(&PureExpr::BinOp(
+            Arc::new(var("i")),
+            BinOp::Ne,
+            Arc::new(var("j"))
+        ))
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| matches!(fact, PureExpr::BinOp(lhs, BinOp::Eq, rhs) if is_len_call(lhs) && is_len_call(rhs)))
+            .count(),
+        1
+    );
+    let frame = facts
+        .iter()
+        .find(|fact| matches!(fact, PureExpr::Forall { .. }))
+        .expect("the path over the entry value has a frame");
+    let PureExpr::Forall { body, .. } = frame else {
+        unreachable!()
+    };
+    let PureExpr::BinOp(frame_antecedent, BinOp::Implies, _) = body.as_ref() else {
+        panic!("frame body should be an implication");
+    };
+    let mut excluded = Vec::new();
+    collect_frame_excluded_int_indices(frame_antecedent, &mut excluded);
+    assert!(
+        excluded.is_empty(),
+        "symbolic indices are excluded as terms, not literals"
+    );
+    assert!(format!("{frame_antecedent:?}").contains("\"j\""));
+}
+
+/// A write on one arm is a fact only under that arm's condition; the arm that
+/// skips it keeps the whole entry value.
+#[test]
+fn final_value_facts_hold_only_on_the_writing_path() {
+    let flag = PureExpr::Var("flag".to_string(), None);
+    let final_value = PureExpr::Ite(
+        Arc::new(flag.clone()),
+        Arc::new(set(entry("a"), PureExpr::Int(0), PureExpr::Int(3))),
+        Arc::new(entry("a")),
+    );
+    let body = body_with(
+        vec![("a", final_value)],
+        vec![indexed_write("a", PureExpr::Int(0), PureExpr::Int(3))],
+    );
+
+    let facts = indexed_write_final_value_facts(&body, None, false);
+
+    let point_writes: Vec<&PureExpr> = facts
+        .iter()
+        .filter(|fact| is_point_write(consequent(fact)))
+        .collect();
+    assert_eq!(point_writes.len(), 1);
+    assert_eq!(antecedent(point_writes[0]), Some(&flag));
+    let not_flag = PureExpr::UnOp(UnOp::Not, Arc::new(flag.clone()));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| !matches!(fact, PureExpr::Forall { .. })
+                || format!("{fact:?}").contains("flag")),
+        "every frame carries its path's condition"
+    );
+    assert!(facts.iter().any(|fact| antecedent(fact) == Some(&not_flag)));
+    assert!(
+        facts
+            .iter()
+            .all(|fact| antecedent(fact).is_some() || matches!(fact, PureExpr::Forall { .. })),
+        "no fact about this final value holds on every path"
     );
 }
 
+/// A parameter the lane could not track exactly has no final value to read,
+/// and one whose final value the dispatch replaces is not bound to the value
+/// the facts would be read from.
 #[test]
-fn indexed_write_synthesis_keeps_frames_separate_per_parameter() {
-    let indexed_writes = vec![
-        IndexedWrite {
-            param_name: "a".to_string(),
-            index: PureExpr::Int(0),
-            value: PureExpr::Int(10),
-        },
-        IndexedWrite {
-            param_name: "b".to_string(),
-            index: PureExpr::Int(1),
-            value: PureExpr::Int(20),
-        },
-    ];
-    let mut requires = Vec::new();
-
-    synthesize_indexed_write_postconditions(&indexed_writes, &mut requires, false);
-
-    assert_eq!(count_top_level_point_writes(&requires), 2);
-    assert_eq!(
-        requires
-            .iter()
-            .filter(|expr| matches!(expr, PureExpr::Forall { .. }))
-            .count(),
-        2,
-        "distinct parameters should each get their own frame"
+fn final_value_facts_skip_a_parameter_not_bound_to_its_final_value() {
+    let mut body = body_with(
+        vec![("a", set(entry("a"), PureExpr::Int(0), PureExpr::Int(3)))],
+        vec![indexed_write("a", PureExpr::Int(0), PureExpr::Int(3))],
     );
-    assert_eq!(
-        requires
-            .iter()
-            .filter(|expr| {
-                matches!(expr, PureExpr::BinOp(lhs, BinOp::Eq, rhs) if is_len_call(lhs) && is_len_call(rhs))
-            })
-            .count(),
-        2,
-        "distinct parameters should each get their own length preservation fact"
-    );
+    assert!(!indexed_write_final_value_facts(&body, None, false).is_empty());
+    let overridden = HashMap::from([("a".to_string(), entry("a"))]);
+    assert!(indexed_write_final_value_facts(&body, Some(&overridden), false).is_empty());
+    body.mutation_continued_params.insert("a".to_string());
+    assert!(indexed_write_final_value_facts(&body, None, false).is_empty());
+    body.mutation_continued_params.clear();
+    body.final_values.clear();
+    assert!(indexed_write_final_value_facts(&body, None, false).is_empty());
 }
 
 /// Pre-loop obligation `i > 0` fails when invariant only gives `i >= 0`.
@@ -178,7 +261,7 @@ fn loop_call_obligations_fail_when_not_implied_by_invariants() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &obligations,
         loop_obligation_groups: &[],
         logic_fns_opt: None,
@@ -186,6 +269,7 @@ fn loop_call_obligations_fail_when_not_implied_by_invariants() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -198,9 +282,12 @@ fn loop_call_obligations_fail_when_not_implied_by_invariants() {
     );
 }
 
-/// Pre-loop obligation `i > 0` passes when invariant gives `i > 0`.
+/// A pre-loop obligation `i > 0` is NOT discharged by a loop invariant `i > 0`:
+/// no loop invariant holds before the first loop runs
+/// (`s40v5_preloop_call_later_invariant.rs`:
+/// `need_pos(x); x = 5; #[invariant(x > 0)] loop {}` must not verify).
 #[test]
-fn loop_call_obligations_verify_when_implied_by_invariants() {
+fn pre_loop_obligations_do_not_assume_loop_invariants() {
     let base_requires = vec![PureExpr::BinOp(
         Arc::new(PureExpr::Var("n".to_string(), None)),
         BinOp::Ge,
@@ -220,7 +307,7 @@ fn loop_call_obligations_verify_when_implied_by_invariants() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &obligations,
         loop_obligation_groups: &[],
         logic_fns_opt: None,
@@ -228,6 +315,7 @@ fn loop_call_obligations_verify_when_implied_by_invariants() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -235,8 +323,8 @@ fn loop_call_obligations_verify_when_implied_by_invariants() {
         verify_loop_call_obligations(&ctx).expect("loop obligation verification should encode");
 
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "expected verified loop call obligations, got {result:?}"
+        matches!(result, VerificationResult::Failed(_)),
+        "a pre-loop obligation must not assume a loop invariant, got {result:?}"
     );
 }
 
@@ -268,6 +356,11 @@ fn in_loop_call_obligations_fail_when_not_implied_by_invariant_plus_condition() 
     );
 
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: in_loop_obligations,
         condition: Some(loop_condition),
@@ -275,7 +368,7 @@ fn in_loop_call_obligations_fail_when_not_implied_by_invariant_plus_condition() 
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -283,6 +376,7 @@ fn in_loop_call_obligations_fail_when_not_implied_by_invariant_plus_condition() 
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -331,6 +425,11 @@ fn in_loop_call_obligations_verify_when_implied_by_invariant_plus_condition() {
     );
 
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: in_loop_obligations,
         condition: Some(loop_condition),
@@ -338,7 +437,7 @@ fn in_loop_call_obligations_verify_when_implied_by_invariant_plus_condition() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -346,6 +445,7 @@ fn in_loop_call_obligations_verify_when_implied_by_invariant_plus_condition() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -386,6 +486,11 @@ fn loop_call_obligations_no_short_circuit_on_pre_loop_failure() {
     )];
 
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: in_loop_obligations,
         condition: None,
@@ -393,7 +498,7 @@ fn loop_call_obligations_no_short_circuit_on_pre_loop_failure() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &pre_loop_obligations,
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -401,6 +506,7 @@ fn loop_call_obligations_no_short_circuit_on_pre_loop_failure() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -447,6 +553,11 @@ fn loop_call_obligations_pre_loop_fail_in_loop_verify() {
     );
 
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: in_loop_obligations,
         condition: Some(loop_condition),
@@ -454,7 +565,7 @@ fn loop_call_obligations_pre_loop_fail_in_loop_verify() {
     let ctx = LoopCallObligationContext {
         base_requires: &base_requires,
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &pre_loop_obligations,
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -462,6 +573,7 @@ fn loop_call_obligations_pre_loop_fail_in_loop_verify() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };
@@ -499,6 +611,11 @@ fn guarded_in_loop_obligation_verifies_with_guard_providing_precondition() {
     let in_loop_obligations = vec![guarded_obligation];
 
     let groups = [LoopObligationGroup {
+        loop_index: Some(0),
+        condition_unstated: None,
+        pre_loop_stored_names: Default::default(),
+        unstated_entry_values: Default::default(),
+        injected_fail_closed: false,
         assumptions: Vec::new(),
         obligations: in_loop_obligations,
         condition: None,
@@ -506,7 +623,7 @@ fn guarded_in_loop_obligation_verifies_with_guard_providing_precondition() {
     let ctx = LoopCallObligationContext {
         base_requires: &[],
         pre_loop_assumptions: &[],
-        invariants: &invariants,
+        per_loop_invariants: std::slice::from_ref(&invariants),
         pre_loop_obligations: &[],
         loop_obligation_groups: &groups,
         logic_fns_opt: None,
@@ -514,6 +631,7 @@ fn guarded_in_loop_obligation_verifies_with_guard_providing_precondition() {
         type_invariants_opt: None,
         type_constants_opt: None,
         adt_decls_opt: None,
+        adt_field_ranges_opt: None,
         track_level: TrackLevel::Auto,
         timeout: None,
     };

@@ -18,14 +18,19 @@ progress toward Creusot feature parity. It supports three canonical test lanes:
 It:
 
 1. Transforms Creusot test syntax to trust-wp syntax (best-effort)
-2. Runs `cargo trust-wp` on each test
+2. Runs `targo trust-wp` on each test
 3. Classifies results as pass/fail/skip/error
 4. Outputs results to the selected lane's canonical JSON baseline
+
+Recorded runs (`tests/creusot_compat/*.json`) are not part of the public
+snapshot. There the harness is reference code: a fresh clone runs it to
+produce its own baseline, and any baseline named below exists only in the
+development tree.
 
 ## Prerequisites
 
 - Creusot reference at `reference/creusot/` (gitignored)
-- Built `cargo-trust-wp` binary: `cargo build --locked -p cargo-trust-wp`
+- Built `targo-trust-wp` binary: `targo --unverified build --locked -p targo-trust-wp`
 - Python 3.10+
 
 ## Usage
@@ -228,28 +233,20 @@ stale entry cannot mask a fixed test).
 feature reasons and classification-only reasons used to keep parity metrics
 actionable.
 
-Unsupported feature reasons include (non-exhaustive), along with a few
-harness-policy categories where the classifier is still stricter than the core
-parser/verifier:
-- `loop invariants` - `#[invariant(...)]` syntax not implemented
-- `terminates` - `#[terminates]` attribute not implemented
-- `trait specs` - trait contract specifications
-- `closures` - Closure verification
-- `type invariants` - `impl Invariant for ...` patterns not yet supported
-- `prophetic logic` - **REMOVED** (#2683): `#[logic(prophetic)]` is now
-  supported. The Resolve trait has `resolve_coherence`, the blanket impl was
-  removed, and prophetic functions compile and verify natively
-- `bitwise proofs` - `#[bitwise_proof]` not yet supported
-- `snapshot module` - `snapshot::...` module patterns not yet supported
-- `open functions` - the skip reason refers to Creusot's standalone `#[open]`
-  attribute. trust-wp already supports open-body logic through
-  `#[logic(open)]`, `#[logic(open(self))]`, and the accepted
-  `open(crate)` / `open(super)` forms, which currently normalize to open
-  behavior
-- `impl blocks` - impl-level verification forms not yet supported
-- `derive macros` - derive-related verification forms not yet supported
-- ~~`dyn Trait`~~ - removed (#2685): trust-wp correctly rejects unsound dyn usage
-- ~~`or-patterns`~~ - removed (#2685): rustc desugars or-patterns before MIR
+The source and diagnostic matchers live in
+[`harness_classify_signals.py`](harness_classify_signals.py). Its source-based
+unsupported reasons are:
+
+- `snapshot module` for `snapshot::` syntax
+- `open functions` for Creusot's standalone `#[open]` attribute; this is distinct
+  from the supported `#[logic(open)]` form
+- `ghost closures` for `FnGhost`
+
+The diagnostic matchers can also report `trait specs`, `closures`, `impl blocks`
+and `derive macros` when the driver's output explicitly says that the relevant
+construct is unsupported. These categories describe a particular result, not
+an inventory of features the verifier lacks. Use a fresh lane run to assess
+coverage; an old skip reason does not establish a current capability gap.
 
 Classification-only reasons include:
 - `no contracts` - legacy reason that may still appear in older committed

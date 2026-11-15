@@ -324,3 +324,42 @@ fn fset_remove_contains_through_proxy_variable() {
          got: {result:?}. If Sat/Unknown, E-matching doesn't fire through proxy variables."
     );
 }
+
+/// Remove-len through peek with no `contains` in the query:
+/// `!is_empty(s) ==> len(remove(s, peek(s))) < len(s)`.
+///
+/// A logic function's variant decrease (`s.remove(s.peek()).len() < s.len()`)
+/// names `len`, `remove`, `peek` and `is_empty` only; the linking axioms that
+/// relate them go through membership, which the query never declares.
+#[test]
+#[timeout(30000)]
+fn fset_remove_peek_len_decreases_without_contains_in_the_query() {
+    let mut encoder = AYEncoder::new_with_quantifiers();
+
+    let fset_is_empty = encoder.get_or_declare_spec_fn("fset_is_empty", &[Sort::Int], Sort::Bool);
+    let fset_peek = encoder.get_or_declare_spec_fn("fset_peek", &[Sort::Int], Sort::Int);
+    let fset_remove =
+        encoder.get_or_declare_spec_fn("fset_remove", &[Sort::Int, Sort::Int], Sort::Int);
+    let fset_len = encoder.get_or_declare_spec_fn("fset_len", &[Sort::Int], Sort::Int);
+
+    encoder.assert_fset_axioms();
+
+    let s = encoder.solver.fresh_var("s", Sort::Int);
+    let is_empty_s = encoder.solver.apply(&fset_is_empty, &[s]);
+    let not_empty = encoder.solver.not(is_empty_s);
+    encoder.solver.assert_term(not_empty);
+
+    // Negate: len(remove(s, peek(s))) >= len(s)
+    let peek_s = encoder.solver.apply(&fset_peek, &[s]);
+    let removed = encoder.solver.apply(&fset_remove, &[s, peek_s]);
+    let len_removed = encoder.solver.apply(&fset_len, &[removed]);
+    let len_s = encoder.solver.apply(&fset_len, &[s]);
+    let not_smaller = encoder.solver.ge(len_removed, len_s);
+    encoder.solver.assert_term(not_smaller);
+
+    let result = encoder.check_sat();
+    assert!(
+        matches!(result, SolveResult::Unsat(_)),
+        "len(remove(s, peek(s))) >= len(s) with !is_empty(s) should be UNSAT, got: {result:?}"
+    );
+}

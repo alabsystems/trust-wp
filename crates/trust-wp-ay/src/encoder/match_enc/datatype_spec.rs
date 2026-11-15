@@ -211,6 +211,11 @@ impl AYEncoder {
                 {
                     return Ok(payload);
                 }
+                if let Some(payload) =
+                    self.try_generic_option_carrier_payload(receiver_term, &receiver_sort)
+                {
+                    return Ok(payload);
+                }
                 let accessor = self.get_or_declare_accessor_for_sorts(
                     "spec_unwrap",
                     &receiver_sort,
@@ -396,6 +401,36 @@ impl AYEncoder {
         } else {
             false
         }
+    }
+
+    /// The payload of a value held in the generic `Option` carrier, read
+    /// through the carrier's bridge to the native `OptionInt` datatype.
+    ///
+    /// The carrier is an uninterpreted sort with no selector, so without this
+    /// a spec's `opt.unwrap()` is a function of `opt` that nothing else
+    /// mentions, while a callee's `Some(result) == self` reaches the same value
+    /// only as `bridge(opt) == Some(result)` (the bridge `harmonize_eq_or_ite_terms`
+    /// builds for that equality). Reading the payload through the same bridge
+    /// makes the two one term. It asserts only what the bridge asserts for any
+    /// equality, ground injectivity and variant preservation, both true of one
+    /// value re-encoded; the selector of `None` is as unconstrained as `unwrap`
+    /// of `None` is. Only when the query already declares `OptionInt`, so no
+    /// native datatype is introduced beside a user enum with the same
+    /// constructor names.
+    fn try_generic_option_carrier_payload(
+        &mut self,
+        receiver_term: Term,
+        receiver_sort: &Sort,
+    ) -> Option<Term> {
+        if !matches!(receiver_sort, Sort::Uninterpreted(name) if name == "Option") {
+            return None;
+        }
+        let option_int = self
+            .get_datatype_decl(SwitchTarget::OptionInt.datatype().name.as_str())
+            .cloned()?;
+        let target = Sort::Datatype(option_int);
+        let bridged = self.bridge_structural_sort(receiver_term, receiver_sort, &target);
+        self.try_native_payload_selector_for_any(bridged, &["Some"])
     }
 
     fn receiver_native_datatype(&self, receiver_term: Term) -> Option<DatatypeSort> {

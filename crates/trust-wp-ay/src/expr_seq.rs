@@ -53,6 +53,7 @@ pub(crate) fn expr_has_seq_method_needing_quantifiers(expr: &PureExpr) -> bool {
                     "reverse" | "sum" | "contains" | "concat" | "subsequence"
                         | "ext_eq" | "push_back" | "push_front" | "push_front_ghost"
                         | "set" | "tail" | "pop_front" | "pop_back" | "to_owned_seq"
+                        | "exchange" | "permutation_of"
                 )
         ) || matches!(
             e,

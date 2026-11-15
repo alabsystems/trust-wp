@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Simple trust-wp Examples - Phase 6 Completion Criteria
+//! Simple trust-wp Examples
 //!
 //! This module contains examples demonstrating trust-wp's core verification
-//! features as defined in `designs/2026-02-02-simple-creusot-criteria.md`.
+//! features, one feature per example.
 //!
 //! # Feature Coverage
 //!
@@ -26,12 +26,11 @@
 //!
 //! Loop invariants (`#[invariant]`) are specified as function-level attributes.
 //! They work on stable Rust. Not shown here to keep examples simple.
-//! See `designs/2026-02-01-loop-verification-alternatives.md` for design.
 //!
 //! # Running Verification
 //!
 //! ```bash
-//! cargo trust-wp --manifest-path tests/fixtures/simple_examples/Cargo.toml
+//! targo trust-wp --manifest-path tests/fixtures/simple_examples/Cargo.toml
 //! ```
 
 use trust_wp::{ensures, logic, proof_assert, requires, variant};
@@ -48,7 +47,9 @@ use trust_wp_std::{
 /// Increment a positive number.
 ///
 /// Demonstrates: `#[requires]` precondition, `#[ensures]` postcondition
-#[requires(x > 0)]
+///
+/// `x < i32::MAX` is the tightest bound that keeps `x + 1` from overflowing.
+#[requires(x > 0 && x < i32::MAX)]
 #[ensures(result > x)]
 pub fn increment(x: i32) -> i32 {
     x + 1
@@ -89,6 +90,10 @@ pub fn abs(x: i32) -> i32 {
 /// Increment a mutable value.
 ///
 /// Demonstrates: `old()` to reference pre-call value
+///
+/// `*x += 1` overflows at `i32::MAX`, so the contract needs the precondition;
+/// without it the body's overflow obligation is genuinely violable.
+#[requires(*x < i32::MAX)]
 #[ensures(*x == old(*x) + 1)]
 pub fn increment_mut(x: &mut i32) {
     *x += 1;
@@ -109,6 +114,11 @@ pub fn swap(a: &mut i32, b: &mut i32) {
 /// Add to a mutable value.
 ///
 /// Demonstrates: old() with arithmetic expression
+///
+/// `*x + amount` overflows in either direction, so the tightest correct
+/// precondition is the mathematical sum staying in `i32` range (stated over
+/// the `@` views, so the precondition's own arithmetic cannot overflow).
+#[requires((*x)@ + amount@ <= 2147483647 && (*x)@ + amount@ >= -2147483648)]
 #[ensures(*x == old(*x) + amount)]
 pub fn add_to(x: &mut i32, amount: i32) {
     *x += amount;
@@ -116,14 +126,20 @@ pub fn add_to(x: &mut i32, amount: i32) {
 
 /// Double a mutable value.
 ///
-/// **Regression test for #414**: Tests postcondition transform for mut refs.
-/// The postcondition `*x == old(*x) * 2` requires the driver to:
+/// **Regression test for #414**: the postcondition transform for mut refs.
+/// The postcondition `(*x)@ == old((*x)@) * 2` requires the driver to:
 /// - Transform `*x` (outside old) to `^x` (final value)
 /// - Leave `old(*x)` unchanged (initial/current value)
 ///
-/// Without the transform, ay sees `*x == *x * 2` which is only true for 0,
-/// causing false counterexamples.
-#[ensures(*x == old(*x) * 2)]
+/// Without the transform, ay sees `x@ == x@ * 2` which is only true for 0,
+/// causing false counterexamples. The product is over views: on `i32`
+/// itself `*` is the oracle's wrapping product (D-232).
+///
+/// `*x * 2` overflows outside `[i32::MIN / 2, i32::MAX / 2]` =
+/// `[-1073741824, 1073741823]` (division is not a logic operation on
+/// machine integers, so the bounds are spelled out).
+#[requires(*x >= -1073741824 && *x <= 1073741823)]
+#[ensures((*x)@ == old((*x)@) * 2)]
 pub fn double_mut(x: &mut i32) {
     *x *= 2;
 }
@@ -137,7 +153,8 @@ pub fn double_mut(x: &mut i32) {
 /// Demonstrates: `^v` final value syntax for mutable borrows.
 /// `^v` represents the value of `v` when the borrow ends (prophecy/final value).
 /// This is equivalent to `*v == old(*v) + 1` but uses prophecy style.
-#[requires(*v > i32::MIN)]
+/// (`*v += 1` overflows at `i32::MAX`, the upper end — not at `i32::MIN`.)
+#[requires(*v < i32::MAX)]
 #[ensures(^v == old(*v) + 1)]
 pub fn increment_prophecy(v: &mut i32) {
     *v += 1;
@@ -234,7 +251,7 @@ fn max_logic(a: i32, b: i32) -> i32 {
 
 /// Logical predicate: is a value positive?
 ///
-/// Demonstrates: `#[logic]` predicate returning bool (fixed in #289)
+/// Demonstrates: `#[logic]` predicate returning bool (#289)
 #[logic]
 fn is_positive(x: i32) -> bool {
     x > 0
@@ -319,6 +336,9 @@ pub fn double_increment(x: &mut i32) {
 /// Demonstrates: `ghost!` macro and `Ghost<T>` for proof-only values.
 /// Ghost blocks are erased at runtime but verified by trust-wp.
 /// Uses stable Rust `if false` pattern (no nightly features required).
+///
+/// `x < i32::MAX` is the tightest bound that keeps `x + 1` from overflowing.
+#[requires(x < i32::MAX)]
 #[ensures(result == x + 1)]
 pub fn ghost_example(x: i32) -> i32 {
     // Ghost block - erased at runtime, available for verification

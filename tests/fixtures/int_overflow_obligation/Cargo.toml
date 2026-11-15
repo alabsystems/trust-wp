@@ -1,0 +1,240 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "int-overflow-obligation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table to exclude from parent workspace
+[workspace]
+
+[dependencies]
+trust-wp = { path = "../../../crates/trust-wp" }
+trust-wp-std = { path = "../../../crates/trust-wp-std" }
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+
+[[bin]]
+name = "should_fail_add_u8"
+path = "src/should_fail_add_u8.rs"
+
+[[bin]]
+name = "should_fail_sub_i8"
+path = "src/should_fail_sub_i8.rs"
+
+[[bin]]
+name = "should_fail_mul_u8"
+path = "src/should_fail_mul_u8.rs"
+
+[[bin]]
+name = "should_fail_neg_i8"
+path = "src/should_fail_neg_i8.rs"
+
+[[bin]]
+name = "should_fail_div_signed"
+path = "src/should_fail_div_signed.rs"
+
+[[bin]]
+name = "should_fail_loop_unbounded"
+path = "src/should_fail_loop_unbounded.rs"
+
+[[bin]]
+name = "should_fail_inline_const"
+path = "src/should_fail_inline_const.rs"
+
+[[bin]]
+name = "should_fail_inline_const_contractless"
+path = "src/should_fail_inline_const_contractless.rs"
+
+[[bin]]
+name = "should_fail_contractless_add"
+path = "src/should_fail_contractless_add.rs"
+
+[[bin]]
+name = "should_verify"
+path = "src/should_verify.rs"
+
+[[bin]]
+name = "should_verify_loop"
+path = "src/should_verify_loop.rs"
+
+[[bin]]
+name = "should_verify_inline_const"
+path = "src/should_verify_inline_const.rs"
+
+[[bin]]
+name = "should_fail_div_zero"
+path = "src/should_fail_div_zero.rs"
+
+[[bin]]
+name = "should_fail_post_loop_stale"
+path = "src/should_fail_post_loop_stale.rs"
+
+[[bin]]
+name = "should_fail_param_reassigned"
+path = "src/should_fail_param_reassigned.rs"
+
+[[bin]]
+name = "should_fail_mut_ref_write"
+path = "src/should_fail_mut_ref_write.rs"
+
+[[bin]]
+name = "should_fail_param_carried"
+path = "src/should_fail_param_carried.rs"
+
+[[bin]]
+name = "should_fail_seq_loop_stale"
+path = "src/should_fail_seq_loop_stale.rs"
+
+[[bin]]
+name = "should_fail_branch_preloop"
+path = "src/should_fail_branch_preloop.rs"
+
+[[bin]]
+name = "should_fail_field_write"
+path = "src/should_fail_field_write.rs"
+
+[[bin]]
+name = "should_verify_regions"
+path = "src/should_verify_regions.rs"
+
+[[bin]]
+name = "should_fail_conflate_post"
+path = "src/should_fail_conflate_post.rs"
+
+[[bin]]
+name = "should_fail_conflate_loop"
+path = "src/should_fail_conflate_loop.rs"
+
+[[bin]]
+name = "should_fail_conflate_contractless"
+path = "src/should_fail_conflate_contractless.rs"
+
+[[bin]]
+name = "should_fail_assert_contractless"
+path = "src/should_fail_assert_contractless.rs"
+
+[[bin]]
+name = "should_fail_ref_add"
+path = "src/should_fail_ref_add.rs"
+
+[[bin]]
+name = "should_fail_ref_sub"
+path = "src/should_fail_ref_sub.rs"
+
+[[bin]]
+name = "should_fail_ref_add_assign"
+path = "src/should_fail_ref_add_assign.rs"
+
+[[bin]]
+name = "should_fail_ref_add_assign_twice"
+path = "src/should_fail_ref_add_assign_twice.rs"
+
+[[bin]]
+name = "should_fail_closure_add"
+path = "src/should_fail_closure_add.rs"
+
+[[bin]]
+name = "should_verify_overflow_v2"
+path = "src/should_verify_overflow_v2.rs"
+
+[[bin]]
+name = "should_verify_index_contractless"
+path = "src/should_verify_index_contractless.rs"
+
+[[bin]]
+name = "should_verify_assert_contractless"
+path = "src/should_verify_assert_contractless.rs"
+
+[[bin]]
+name = "should_fail_index_contractless"
+path = "src/should_fail_index_contractless.rs"
+
+[[bin]]
+name = "should_fail_closure_body_only"
+path = "src/should_fail_closure_body_only.rs"
+
+[[bin]]
+name = "should_verify_closure_body"
+path = "src/should_verify_closure_body.rs"
+
+[[bin]]
+name = "should_fail_explicit_add"
+path = "src/should_fail_explicit_add.rs"
+
+[[bin]]
+name = "should_fail_method_add"
+path = "src/should_fail_method_add.rs"
+
+[[bin]]
+name = "should_fail_explicit_add_assign"
+path = "src/should_fail_explicit_add_assign.rs"
+
+[[bin]]
+name = "should_fail_shl_ref"
+path = "src/should_fail_shl_ref.rs"
+
+[[bin]]
+name = "should_fail_neg_ref"
+path = "src/should_fail_neg_ref.rs"
+
+[[bin]]
+name = "should_verify_operator_calls"
+path = "src/should_verify_operator_calls.rs"
+
+[[bin]]
+name = "should_verify_neg_ref"
+path = "src/should_verify_neg_ref.rs"
+
+[[bin]]
+name = "should_fail_cell_nc2"
+path = "src/should_fail_cell_nc2.rs"
+
+[[bin]]
+name = "should_verify_cell_twin"
+path = "src/should_verify_cell_twin.rs"
+
+[[bin]]
+name = "should_fail_vec_remove"
+path = "src/should_fail_vec_remove.rs"
+
+[[bin]]
+name = "should_verify_checked_callee"
+path = "src/should_verify_checked_callee.rs"
+
+[[bin]]
+name = "should_fail_dropper"
+path = "src/should_fail_dropper.rs"
+
+[[bin]]
+name = "should_verify_no_drop_glue"
+path = "src/should_verify_no_drop_glue.rs"
+
+[[bin]]
+name = "should_fail_fnptr_add"
+path = "src/should_fail_fnptr_add.rs"
+
+[[bin]]
+name = "should_verify_fnptr_add"
+path = "src/should_verify_fnptr_add.rs"
+
+[[bin]]
+name = "should_fail_sum"
+path = "src/should_fail_sum.rs"
+
+[[bin]]
+name = "should_verify_len_twin"
+path = "src/should_verify_len_twin.rs"
+
+[[bin]]
+name = "should_fail_div_zero_discarded"
+path = "src/should_fail_div_zero_discarded.rs"
+
+[[bin]]
+name = "should_fail_rem_zero_discarded"
+path = "src/should_fail_rem_zero_discarded.rs"

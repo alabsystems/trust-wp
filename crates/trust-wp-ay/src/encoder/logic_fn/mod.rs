@@ -25,9 +25,12 @@
 mod batch;
 mod call_encoding;
 mod ground_instances;
+mod identity_dispatch;
 mod param_sort_infer;
 mod registration;
 mod signature;
 mod type_invariant;
 
 pub(crate) use call_encoding::transparent_adapter_inner;
+pub(crate) use identity_dispatch::note_logic_fn_placeholder;
+pub(in crate::encoder) use identity_dispatch::FamilyResolution;

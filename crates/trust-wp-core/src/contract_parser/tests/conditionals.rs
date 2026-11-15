@@ -452,6 +452,8 @@ fn test_if_let_tuple_pattern() {
 
 /// Wildcard pattern in if-let: `if let _ = x { 1 } else { 0 }` desugars to
 /// Match with a Wildcard pattern arm (always matches). (#1360)
+/// `if let _ = x { 1 } else { 0 }` cannot take the `else`, but it reads
+/// `x`, so the `match` is kept whole.
 #[test]
 fn test_if_let_wildcard() {
     let expr = parse_ok("if let _ = x { 1 } else { 0 }");
@@ -467,4 +469,5 @@ fn test_if_let_wildcard() {
     } else {
         panic!("expected Match expression, got {expr:?}");
     }
+    assert_eq!(parse_ok("if let _ = 0 { 1 } else { 0 }"), PureExpr::Int(1));
 }

@@ -91,9 +91,15 @@ fn test_finality_fresh_borrow_no_extra_assertion() {
     )
     .expect("encoding should succeed");
 
+    // SOUNDNESS PIN (s32, following the s30 review): a `Fresh` (non-final)
+    // reborrow's final is NOT the parent's value at any single program point
+    // (the parent place is used again after the reborrow), and `y_current` is
+    // the entry-time symbol. The former writeback `y_current == y_rb5_final`
+    // therefore manufactured `^y == 5`; it is no longer asserted, so the
+    // clause is not provable from these premises.
     assert!(
-        matches!(result, VerificationResult::Verified(_)),
-        "fresh borrow: ^y == 5 should still verify via standard writeback (#2181): got {result:?}"
+        !matches!(result, VerificationResult::Verified(_)),
+        "fresh borrow: ^y == 5 must not follow from a Fresh child's final: got {result:?}"
     );
 }
 

@@ -116,20 +116,6 @@ where
         }
     }
 
-    /// Create a mapping from a closure (compatibility shim).
-    ///
-    /// In Creusot, closure syntax can denote mappings in logical contexts.
-    /// This runtime model does not execute the closure; it keeps a default map
-    /// value sufficient for compilation and ghost-only typing.
-    pub fn from_closure<F>(f: F) -> Self
-    where
-        B: Default,
-        F: Fn(A) -> B,
-    {
-        let _ = f;
-        Self::cst(B::default())
-    }
-
     /// Extensional equality — two mappings are `ext_eq` if they produce
     /// the same output for every input.
     ///
@@ -163,6 +149,28 @@ where
             }
         }
         true
+    }
+}
+
+/// Construction from a closure carries no bounds on the key or the value.
+///
+/// A pearlite closure DENOTES a mapping; it is not code the model may run, and
+/// the value it denotes is fixed by the specification it appears in. A
+/// `Default` or `Hash` requirement here would be a bound the proof never
+/// needed, surfacing in the signature of every generic function whose contract
+/// mentions one — which is exactly how a logical shim stops being writable.
+impl<A, B> Mapping<A, B> {
+    /// Create a mapping from a closure (compatibility shim).
+    ///
+    /// In Creusot, closure syntax denotes a mapping in logical contexts. The
+    /// closure body is never executed here: `Fn(A) -> B` is kept so the
+    /// closure's shape is still type-checked against the mapping it denotes.
+    pub fn from_closure<F>(f: F) -> Self
+    where
+        F: Fn(A) -> B,
+    {
+        let _ = f;
+        panic!("ghost code only")
     }
 }
 

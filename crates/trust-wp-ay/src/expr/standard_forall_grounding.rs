@@ -184,9 +184,10 @@ fn int_literal(expr: &PureExpr) -> Option<i64> {
 /// observed keys cannot represent the universal emptiness claim. Callers that
 /// drop standard foralls after grounding must NOT drop these: they produced
 /// no instances, so dropping them erases the premise entirely (neither
-/// grounded nor asserted). That ground-then-drop mismatch fabricated the
-/// ghost_set `forall<k> !set.contains(k)` counterexample. (ce-census
-/// 2026-08-20, ghost_set proof_assert lib.rs:8)
+/// grounded nor asserted). That ground-then-drop mismatch fabricates a
+/// counterexample to a goal the ghost_set `forall<k> !set.contains(k)`
+/// premise discharges; pinned by
+/// `grounding_exempt_negative_contains_forall_is_asserted_not_dropped`.
 pub(crate) fn is_grounding_exempt_standard_forall(expr: &PureExpr) -> bool {
     let PureExpr::Forall { var, body, .. } = expr else {
         return false;
@@ -563,7 +564,13 @@ fn candidate_can_be_int(candidate: &PureExpr) -> bool {
         PureExpr::MethodCall { method, .. } if method == "len" => true,
         PureExpr::BinOp(
             left,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::DivTrunc
+            | BinOp::RemTrunc,
             right,
         ) => candidate_can_be_int(left) && candidate_can_be_int(right),
         PureExpr::View(inner)

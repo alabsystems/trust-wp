@@ -2,120 +2,128 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Global solver instance limiter for test builds.
+//! Process-local solver instance limiter for test builds.
 //!
-//! # Problem
+//! Encoder instances own substantial solver state. A counting semaphore bounds
+//! live encoders within each test process, independently of test-thread count.
+//! `TRUST_WP_MAX_TEST_SOLVERS` overrides the default permit limit.
 //!
-//! The trust-wp-ay test suite has ~6700 tests, most of which create at least one
-//! `AYEncoder` (and thus a ay-dpll `Solver` instance). Each solver allocates
-//! significant memory for its internal clause database, theory solvers, and
-//! proof-production state. With Rust's default test parallelism (= CPU count,
-//! e.g. 12 on an M2 Max), peak resident memory can hit 26GB, which has caused
-//! macOS kernel panics (OOM kills). (#2710)
+//! Each process owns its synchronization and diagnostics. A forked verifier
+//! child must not wait on permits owned by parent threads, or touch a mutex
+//! copied while those threads held it. Published states are identified by PID;
+//! the child's first use installs fresh state before taking any lock. Permits
+//! copied from a parent do not release the child's permits when dropped.
 //!
-//! The `.cargo/config.toml` setting `RUST_TEST_THREADS=4` caps test threads,
-//! but tests within each thread cycle through many encoders, and some tests
-//! create multiple encoders. The thread cap alone does not bound peak solver
-//! instance count.
-//!
-//! # Solution
-//!
-//! A global counting semaphore limits the number of **live** `AYEncoder`
-//! instances across all test threads. When the limit is reached, new
-//! `AYEncoder` constructors block until an existing encoder is dropped.
-//!
-//! The permit is acquired in `AYEncoder::from_solver_and_mem_state()` (the
-//! single internal constructor all public constructors funnel through) and
-//! released automatically via `Drop for AYEncoder`. This makes the limiter
-//! completely transparent to all ~2200 call sites.
-//!
-//! # Configuration
-//!
-//! - Default limit: [`DEFAULT_MAX_CONCURRENT_SOLVERS`] (8)
-//! - Override via env var: `TRUST_WP_MAX_TEST_SOLVERS=N`
-//!
-//! The default of 8 is chosen to allow moderate parallelism (tests that create
-//! a solver, do a quick check, and drop it benefit from >4 permits even with
-//! 4 test threads) while keeping peak RSS well under 16GB.
-//!
-//! # Production builds
-//!
-//! This module is `#[cfg(test)]` only. Production solver instances are not
-//! throttled — the production pipeline creates at most one solver per
-//! verification function, with natural serialization from the driver.
+//! This module is excluded from production builds.
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Condvar, Mutex, OnceLock,
+    atomic::{AtomicPtr, AtomicUsize, Ordering},
+    Condvar, Mutex,
 };
 
 /// Default maximum concurrent solver instances in test builds.
 ///
-/// 8 permits with 4 test threads allows 2 encoders per thread on average,
-/// covering tests that create multiple encoders without excessive memory.
-/// Peak RSS at 8 concurrent solvers is approximately 8-12GB depending on
-/// logic complexity (QF_LIA < QF_AUFLIA < ALL).
+/// Leave room for tests that temporarily hold more than one encoder while
+/// still bounding the solver memory used by parallel test threads.
 const DEFAULT_MAX_CONCURRENT_SOLVERS: usize = 8;
 
 /// Global state for the solver instance limiter.
 struct SolverLimiter {
+    /// Forked children cannot wait on a parent thread's copied mutex or count.
+    owner_pid: u32,
     /// Maximum concurrent solvers allowed.
     max: usize,
     /// Current number of live solver instances.
     count: Mutex<usize>,
     /// Notified when a solver is dropped (permit released).
     released: Condvar,
+    live: AtomicUsize,
+    peak: AtomicUsize,
+    acquired: AtomicUsize,
 }
 
-/// Global solver limiter singleton, initialized on first use.
-static LIMITER: OnceLock<SolverLimiter> = OnceLock::new();
-
-/// Number of currently live solver permits (for diagnostics/testing).
-static LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// High-water mark: peak number of concurrent solver permits observed.
-/// Updated on each acquire. Useful for verifying the limiter is actually
-/// capping concurrent instances during test runs.
-static PEAK_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Total number of solver permits acquired since process start.
-/// Useful for verifying that tests are actually going through the limiter.
-static TOTAL_ACQUIRED: AtomicUsize = AtomicUsize::new(0);
+// Published states live until process exit: a permit may still refer to an old
+// state's address after fork. Avoid OnceLock here, because fork may copy it
+// while another parent thread is initializing it, just as it may copy a held
+// limiter mutex. Only the atomic pointer and immutable PID are read before a
+// child replaces inherited state.
+static LIMITER: AtomicPtr<SolverLimiter> = AtomicPtr::new(std::ptr::null_mut());
 
 fn get_limiter() -> &'static SolverLimiter {
-    LIMITER.get_or_init(|| {
-        let max = std::env::var("TRUST_WP_MAX_TEST_SOLVERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_SOLVERS);
-
-        SolverLimiter {
+    let owner_pid = std::process::id();
+    loop {
+        let current = LIMITER.load(Ordering::Acquire);
+        let previous = if current.is_null() {
+            None
+        } else {
+            // SAFETY: every published state is fully initialized before the
+            // release store and is never freed; only immutable fields are read.
+            Some(unsafe { &*current })
+        };
+        if let Some(limiter) = previous {
+            if limiter.owner_pid == owner_pid {
+                return limiter;
+            }
+        }
+        // Preserve the parent's configured limit without consulting copied
+        // environment locks in the child. Its live permits belong to parent
+        // threads, so the child starts with fresh counters and synchronization.
+        let max = previous.map_or_else(
+            || {
+                std::env::var("TRUST_WP_MAX_TEST_SOLVERS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_MAX_CONCURRENT_SOLVERS)
+            },
+            |limiter| limiter.max,
+        );
+        let replacement = Box::into_raw(Box::new(SolverLimiter {
+            owner_pid,
             max,
             count: Mutex::new(0),
             released: Condvar::new(),
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            acquired: AtomicUsize::new(0),
+        }));
+        if LIMITER
+            .compare_exchange(current, replacement, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // SAFETY: this state was just published and will never be freed.
+            return unsafe { &*replacement };
         }
-    })
+        // SAFETY: the failed CAS never published replacement, so this thread
+        // still exclusively owns it and no permit can refer to it.
+        unsafe { drop(Box::from_raw(replacement)) };
+    }
 }
 
 /// RAII permit for a solver instance. Releases the permit on drop.
 ///
 /// This is stored as a field in `AYEncoder` (test builds only).
-/// The permit is zero-sized in terms of data — it's just a marker that
-/// the semaphore count has been incremented. The actual counting is
-/// managed by the global `SolverLimiter`.
+/// A permit retains the state it charged. A copied parent permit must never
+/// decrement the fresh child count, or lock the inherited parent state.
 pub(crate) struct SolverPermit {
-    /// Prevent construction outside this module.
-    _private: (),
+    limiter: &'static SolverLimiter,
 }
 
 impl Drop for SolverPermit {
     fn drop(&mut self) {
-        let limiter = get_limiter();
+        let limiter = self.limiter;
+        if limiter.owner_pid != std::process::id()
+            || !std::ptr::eq(limiter, LIMITER.load(Ordering::Acquire))
+        {
+            return;
+        }
         {
             let mut count = limiter.count.lock().expect("solver limiter mutex poisoned");
             *count = count.saturating_sub(1);
+            // Keep diagnostics in the same critical section as the permit
+            // count. Otherwise an acquire can overtake this decrement and
+            // record a peak larger than the actual semaphore limit.
+            limiter.live.fetch_sub(1, Ordering::Relaxed);
         }
-        LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
         limiter.released.notify_one();
     }
 }
@@ -135,24 +143,28 @@ pub(crate) fn acquire_solver_permit() -> SolverPermit {
             .expect("solver limiter mutex poisoned during wait");
     }
     *count += 1;
-    let new_live = LIVE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let new_live = limiter.live.fetch_add(1, Ordering::Relaxed) + 1;
     // Update peak high-water mark (lock-free CAS loop).
-    let mut peak = PEAK_COUNT.load(Ordering::Relaxed);
+    let mut peak = limiter.peak.load(Ordering::Relaxed);
     while new_live > peak {
-        match PEAK_COUNT.compare_exchange_weak(peak, new_live, Ordering::Relaxed, Ordering::Relaxed)
-        {
+        match limiter.peak.compare_exchange_weak(
+            peak,
+            new_live,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => break,
             Err(current) => peak = current,
         }
     }
-    TOTAL_ACQUIRED.fetch_add(1, Ordering::Relaxed);
-    SolverPermit { _private: () }
+    limiter.acquired.fetch_add(1, Ordering::Relaxed);
+    SolverPermit { limiter }
 }
 
 /// Returns the current number of live solver permits (for diagnostics).
 #[cfg(test)]
 pub(crate) fn live_solver_count() -> usize {
-    LIVE_COUNT.load(Ordering::Relaxed)
+    get_limiter().live.load(Ordering::Relaxed)
 }
 
 /// Returns the configured maximum concurrent solvers (for diagnostics).
@@ -168,7 +180,7 @@ pub(crate) fn max_concurrent_solvers() -> usize {
 /// test run, `peak_solver_count()` should be `<= max_concurrent_solvers()`.
 #[cfg(test)]
 pub(crate) fn peak_solver_count() -> usize {
-    PEAK_COUNT.load(Ordering::Relaxed)
+    get_limiter().peak.load(Ordering::Relaxed)
 }
 
 /// Returns the total number of solver permits acquired since process start.
@@ -177,7 +189,7 @@ pub(crate) fn peak_solver_count() -> usize {
 /// After a full trust-wp-ay test run, this should be in the thousands.
 #[cfg(test)]
 pub(crate) fn total_permits_acquired() -> usize {
-    TOTAL_ACQUIRED.load(Ordering::Relaxed)
+    get_limiter().acquired.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -187,21 +199,80 @@ mod tests {
     // Note: these tests use `>=` / range checks rather than exact equality
     // because other test threads may concurrently acquire/release permits
     // (every AYEncoder::new() in the test suite acquires a permit). The
-    // global LIVE_COUNT is shared across all threads.
+    // process-local live count is shared across all threads.
+
+    #[cfg(unix)]
+    #[test]
+    fn forked_child_replaces_locked_parent_limiter_and_ignores_parent_permits() {
+        let parent_permit = acquire_solver_permit();
+        let parent_limiter = get_limiter();
+        // Keep the copied mutex locked until the child finishes. Reusing or
+        // resetting it in the child would deadlock even if its count were zero.
+        let held = parent_limiter.count.lock().expect("parent limiter lock");
+        // SAFETY: the child only exercises the limiter and exits with _exit;
+        // the parent reaps exactly this PID and retains all its own state.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let permit = acquire_solver_permit();
+            let fresh = get_limiter();
+            let independent = !std::ptr::eq(fresh, parent_limiter)
+                && fresh.max == parent_limiter.max
+                && live_solver_count() == 1
+                && total_permits_acquired() == 1;
+            drop(parent_permit);
+            let inherited_drop_ignored = live_solver_count() == 1;
+            drop(permit);
+            let released = live_solver_count() == 0;
+            // SAFETY: skip destructors for the copied, locked parent state.
+            unsafe {
+                libc::_exit(i32::from(
+                    !(independent && inherited_drop_ignored && released),
+                ))
+            };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut status = 0;
+        let completed = loop {
+            // SAFETY: status is writable and child is the PID from our fork.
+            let observed = unsafe { libc::waitpid(child, &raw mut status, libc::WNOHANG) };
+            if observed == child {
+                break true;
+            }
+            if observed < 0 || std::time::Instant::now() >= deadline {
+                // SAFETY: kill and reap only this test's child on a failure.
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &raw mut status, 0);
+                }
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        drop(held);
+        drop(parent_permit);
+        assert!(completed, "child blocked on the inherited limiter");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: {status}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "child limiter state was not independent"
+        );
+    }
 
     #[test]
     fn test_acquire_and_release_permit() {
-        let before = live_solver_count();
+        let before = total_permits_acquired();
         let permit = acquire_solver_permit();
-        // Count must have increased (at least by 1, possibly more from
-        // other threads).
-        assert!(
-            live_solver_count() > before,
-            "acquiring a permit should increase the live count"
-        );
+        // Other threads may release their permits while we acquire ours.
+        // The cumulative counter is monotone; a held permit guarantees only
+        // that the current live count is positive, not a net increase.
+        assert!(total_permits_acquired() > before);
+        assert!(live_solver_count() >= 1);
         drop(permit);
-        // After dropping our permit, the count should be <= what it was
-        // right after we acquired (could be less if other threads also dropped).
     }
 
     #[test]
@@ -290,18 +361,12 @@ mod tests {
 
     #[test]
     fn test_limiter_works_with_real_encoder() {
-        // Verify that AYEncoder instances actually go through the limiter.
-        // Creating a AYEncoder should increase the live count.
-        let before = live_solver_count();
+        // A real encoder must acquire a permit even when other tests release
+        // their own encoders concurrently.
+        let before = total_permits_acquired();
         let encoder = crate::AYEncoder::new();
-        let during = live_solver_count();
-        assert!(
-            during > before,
-            "creating a AYEncoder should acquire a solver permit: \
-             before={before}, during={during}"
-        );
+        assert!(total_permits_acquired() > before);
+        assert!(live_solver_count() >= 1);
         drop(encoder);
-        // After dropping, count should decrease (barring exact-concurrent
-        // activity from other test threads).
     }
 }

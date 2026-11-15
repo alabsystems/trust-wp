@@ -39,16 +39,18 @@ installed — no rustc, no sysroot, no solver, no network:
 ## Building
 
 ```sh
-cargo build --release -p trust-wp-cli      # target/release/trust-wp
+targo --unverified build --release -p trust-wp-cli      # target/release/trust-wp
 ```
 
+`targo` is the Trust toolchain's cargo (`rust-toolchain.toml` pins it);
+`--unverified` names the lane that builds with the Trust verification pass off.
 That is enough for every in-process verb. `verify` additionally needs the
-engine, which does require the Trust toolchain:
+engine, which links the Trust compiler itself:
 
 ```sh
-cargo build --release -p trust-wp-driver --bin trust-wp-rustc   # single-file mode
-cargo build --release -p targo-trust-wp                         # crate mode
-cargo build --release -p trust-wp                               # contract crate, for single-file mode
+targo --unverified build --release -p trust-wp-driver --bin trust-wp-rustc   # single-file mode
+targo --unverified build --release -p targo-trust-wp                         # crate mode
+targo --unverified build --release -p trust-wp                               # contract crate, for single-file mode
 ```
 
 `trust-wp doctor` reports which of these are in place. It finds each binary by

@@ -43,7 +43,6 @@ impl Callbacks for LogicFnSkipCallbacks {
         let logic_fns = crate::logic::extract_logic_fn_defs(tcx);
         let trait_specs: HashMap<rustc_hir::def_id::DefId, StdSpec> = HashMap::new();
         let trait_contracts: &[crate::contracts::TraitMethodContract] = &[];
-        let trait_refinement_overrides = HashSet::new();
         let recursive_fns = HashSet::new();
         let extern_specs: HashMap<String, StdSpec> = HashMap::new();
         let run_config = VerificationRunConfig {
@@ -53,7 +52,6 @@ impl Callbacks for LogicFnSkipCallbacks {
             type_invariant_defs: &[] as &[TypeInvariantDef],
             trait_specs: &trait_specs,
             trait_contracts,
-            trait_refinement_overrides: &trait_refinement_overrides,
             recursive_fns: &recursive_fns,
             extern_specs: &extern_specs,
             verbose: false,
@@ -89,6 +87,7 @@ impl Callbacks for LogicFnSkipCallbacks {
                     SkipDecision::LogicFnAxiom => "LogicFnAxiom",
                     SkipDecision::LogicFnEnsures => "LogicFnEnsures",
                     SkipDecision::BodylessTraitMethod => "BodylessTraitMethod",
+                    SkipDecision::CoroutineBody => "CoroutineBody",
                 };
                 (def_path, decision)
             })
@@ -151,14 +150,14 @@ mod specs {
 }
 
 #[test]
-fn concrete_law_postconditions_are_axiomatized_while_trait_laws_still_verify() {
+fn concrete_and_trait_law_postconditions_are_both_verified() {
     let source = r#"
 mod specs {
     #[doc = "trust-wp:logic:open:"]
     #[doc = "trust-wp:logic_law:"]
     #[doc = "trust-wp:logic_body:0"]
     #[doc = "trust-wp:ensures:result > 0"]
-    pub fn assumed_law() -> i32 {
+    pub fn concrete_law() -> i32 {
         0
     }
 
@@ -180,24 +179,28 @@ pub trait Laws {
 "#;
 
     let snapshot = collect_logic_fn_skip_snapshot(source);
-    let assumed_full = format!("{TEST_CRATE_NAME}::specs::assumed_law");
+    let concrete_full = format!("{TEST_CRATE_NAME}::specs::concrete_law");
     let checked_full = format!("{TEST_CRATE_NAME}::specs::checked");
     let trait_full = format!("{TEST_CRATE_NAME}::Laws::trait_law");
 
-    assert!(snapshot.logic_fn_paths.contains(&assumed_full));
+    assert!(snapshot.logic_fn_paths.contains(&concrete_full));
     assert!(snapshot.logic_fn_paths.contains(&checked_full));
     assert!(snapshot.logic_fn_paths.contains(&trait_full));
 
-    assert!(!snapshot.logic_fn_has_ensures.contains(&assumed_full));
-    assert!(!snapshot.logic_fn_has_ensures.contains("specs::assumed_law"));
+    // A concrete law is a proof obligation like any logic function with an
+    // ensures, never an axiom registered without one.
+    assert!(snapshot.logic_fn_has_ensures.contains(&concrete_full));
+    assert!(snapshot
+        .logic_fn_has_ensures
+        .contains("specs::concrete_law"));
     assert!(snapshot.logic_fn_has_ensures.contains(&checked_full));
     assert!(snapshot.logic_fn_has_ensures.contains("specs::checked"));
     assert!(snapshot.logic_fn_has_ensures.contains(&trait_full));
     assert!(snapshot.logic_fn_has_ensures.contains("Laws::trait_law"));
 
     assert_eq!(
-        snapshot.skip_decisions.get("specs::assumed_law"),
-        Some(&"LogicFnAxiom")
+        snapshot.skip_decisions.get("specs::concrete_law"),
+        Some(&"LogicFnEnsures")
     );
     assert_eq!(
         snapshot.skip_decisions.get("specs::checked"),

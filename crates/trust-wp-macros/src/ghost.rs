@@ -161,37 +161,37 @@ impl<'ast> Visit<'ast> for GhostValidator {
 
             // Track loop entry for break/continue validation
             Expr::Loop(expr_loop) => {
-                self.loop_depth += 1;
+                self.loop_depth = self.loop_depth.saturating_add(1);
                 syn::visit::visit_expr_loop(self, expr_loop);
-                self.loop_depth -= 1;
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return;
             }
 
             Expr::While(expr_while) => {
-                self.loop_depth += 1;
+                self.loop_depth = self.loop_depth.saturating_add(1);
                 syn::visit::visit_expr_while(self, expr_while);
-                self.loop_depth -= 1;
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return;
             }
 
             Expr::ForLoop(expr_for) => {
-                self.loop_depth += 1;
+                self.loop_depth = self.loop_depth.saturating_add(1);
                 syn::visit::visit_expr_for_loop(self, expr_for);
-                self.loop_depth -= 1;
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 return;
             }
 
             // Track closure boundaries. `return`/`break`/`continue` inside
             // a closure affect the closure, not the ghost block.
             Expr::Closure(expr_closure) => {
-                self.closure_depth += 1;
+                self.closure_depth = self.closure_depth.saturating_add(1);
                 // Reset loop_depth inside the closure — loops in the
                 // enclosing scope don't apply inside the closure.
                 let saved_loop_depth = self.loop_depth;
                 self.loop_depth = 0;
                 syn::visit::visit_expr_closure(self, expr_closure);
                 self.loop_depth = saved_loop_depth;
-                self.closure_depth -= 1;
+                self.closure_depth = self.closure_depth.saturating_sub(1);
                 return;
             }
 
@@ -256,7 +256,7 @@ mod tests {
             {
                 let mut i = 0;
                 while i < 10 {
-                    i += 1;
+                    i = i.saturating_add(1);
                 }
             }
         })
@@ -281,7 +281,7 @@ mod tests {
             {
                 let mut i = 0;
                 while i < 10 {
-                    i += 1;
+                    i = i.saturating_add(1);
                     if i == 5 {
                         continue;
                     }

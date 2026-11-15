@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
+use trust_wp_core::formula::UnOp;
+
 use super::*;
+use crate::verify::VerificationOutcome;
 
 // --- helpers ---
 
@@ -944,7 +947,7 @@ fn fmap_deref_prophecy_bridge_preservation_verifies() {
     let modified_vars = vec!["k2", "v2", "produced"];
 
     // Direct body effects: destructuring from iterator tuple
-    let elem = int_var("__trust_wp_for_iter_elem");
+    let elem = int_var("$for_iter_elem");
     let tuple_get_0 = PureExpr::LogicFnCall {
         name: "__trust_wp_tuple_get_0".to_string(),
         args: vec![elem.clone()],
@@ -1052,7 +1055,7 @@ fn fmap_snapshot_alias_bridge_preservation_verifies() {
     );
 
     let modified_vars = vec!["k2", "v2", "produced"];
-    let elem = int_var("__trust_wp_for_iter_elem");
+    let elem = int_var("$for_iter_elem");
     let mut body_effect = HashMap::new();
     body_effect.insert(
         "k2".to_string(),
@@ -1130,5 +1133,78 @@ fn fmap_snapshot_alias_bridge_preservation_verifies() {
         "snapshot-alias preservation should verify once bridge facts pull the \
          yielded borrow locals into the same slice as `snap_k`/`snap_v`. Got: {:?}",
         result.preservation
+    );
+}
+
+// --- a name bound before the loop keeps the facts that describe it ---
+
+/// `let result = FMap::new()` binds `result` to `fmap_empty`, and the
+/// initialization VC substitutes that value into the invariant, so the slice
+/// no longer names `result`. The facts the driver states about the call
+/// (`result == c`, `forall k. !c.contains(k)`) are the only ones that say the
+/// map holds no key; `fmap_empty`'s own axioms ride on `fmap_insert` and are
+/// absent from a VC without one.
+fn empty_map_bound_before_loop(invariant_body: PureExpr) -> VerificationOutcome {
+    let invariant = PureExpr::Forall {
+        var: "k".to_string(),
+        var_sort: None,
+        body: Arc::new(invariant_body),
+        triggers: vec![],
+    };
+    let pre_loop_assignments = HashMap::from([(
+        "result".to_string(),
+        NamedBindingValue::new(
+            Some(ExprSort::FMap),
+            PureExpr::LogicFnCall {
+                name: "fmap_empty".to_string(),
+                args: vec![],
+            },
+        ),
+    )]);
+    let init_facts = vec![
+        PureExpr::BinOp(
+            Arc::new(fmap_var("result")),
+            BinOp::Eq,
+            Arc::new(fmap_var("$_call_6")),
+        ),
+        PureExpr::Forall {
+            var: "k".to_string(),
+            var_sort: None,
+            body: Arc::new(PureExpr::UnOp(
+                UnOp::Not,
+                Arc::new(fmap_contains(fmap_var("$_call_6"), int_var("k"))),
+            )),
+            triggers: vec![],
+        },
+    ];
+    verify_initialization_outcome(
+        &[],
+        &[invariant],
+        &pre_loop_assignments,
+        &init_facts,
+        &LoopEncoderConfig::default(),
+    )
+    .expect("initialization should encode")
+}
+
+#[test]
+#[timeout(30000)]
+fn initialization_states_the_facts_of_a_name_its_binding_replaced() {
+    let holds_no_key = empty_map_bound_before_loop(PureExpr::UnOp(
+        UnOp::Not,
+        Arc::new(fmap_contains(fmap_var("result"), int_var("k"))),
+    ));
+    assert!(
+        !matches!(holds_no_key.result, VerificationResult::Failed(_)),
+        "an empty map holds no key at loop entry; a model that gives it one \
+         never saw the facts about `result`: {:?}",
+        holds_no_key.result
+    );
+    let holds_every_key =
+        empty_map_bound_before_loop(fmap_contains(fmap_var("result"), int_var("k")));
+    assert!(
+        matches!(holds_every_key.result, VerificationResult::Failed(_)),
+        "an empty map does not hold every key; the refutation must stand: {:?}",
+        holds_every_key.result
     );
 }

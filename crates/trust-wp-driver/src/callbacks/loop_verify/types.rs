@@ -68,6 +68,11 @@ pub(in crate::callbacks) struct LoopWithInvariantRequest<'a> {
 /// across the loop. Frame constraints express `var == pre_loop_value` for each
 /// variable NOT in the loop's `modified_vars` set.
 pub(in crate::callbacks) struct LoopVerificationOutput {
+    /// Whether the dispatcher may add a single loop's negated condition to
+    /// the exit facts: every return passes through the loop (D-224). With
+    /// several loops, each one's negated condition is already in
+    /// `continuation_assumptions` when it holds at every return.
+    pub(in crate::callbacks) exit_condition_holds_at_return: bool,
     /// The inductive verification results (init, preservation, postcondition, variant).
     pub(in crate::callbacks) result: LoopVerificationResult,
     /// Frame constraints for variables not modified by the loop body.
@@ -102,12 +107,15 @@ pub(in crate::callbacks) struct LoopVerificationOutput {
     /// including effective invariants used across all loops and guarded
     /// call-obligation facts that are not raw loop invariants.
     ///
-    /// Previously, the call obligation checker only received user-written
-    /// invariants from `parsed.loop_fields.invariants`, missing auto-synthesized
-    /// invariants that provide critical facts like `i >= 0`, `v.len() > 0`, etc.
-    /// This caused spurious "loop call obligations FAILED" for tests like
-    /// all_zero, 100doors, insertion_sort, knuth_shuffle, etc.
-    pub(in crate::callbacks) effective_invariants: Vec<PureExpr>,
+    /// The checker needs the effective list, not the user-written
+    /// `parsed.loop_fields.invariants` alone: the synthesized invariants carry
+    /// facts like `i >= 0` and `v.len() > 0` that in-loop call preconditions
+    /// depend on, and a check without them fails for want of facts the loop
+    /// proof already had.
+    ///
+    /// Indexed like `loop_analysis.loops`: entry `k` holds only at loop `k`, so
+    /// a consumer must never pool entries across loops.
+    pub(in crate::callbacks) per_loop_effective_invariants: Vec<Vec<PureExpr>>,
     /// Verified-shaped loop phase outcomes that lacked accepted solver proof
     /// evidence. The dispatcher records these as evidence gaps before counting
     /// the loop path as cleanly verified.

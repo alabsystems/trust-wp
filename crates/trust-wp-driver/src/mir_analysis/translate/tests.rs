@@ -9,13 +9,27 @@ use super::*;
 mod binop_unop;
 
 mod float_helper_tests {
-    use rustc_middle::ty::FloatTy;
-    use trust_wp_core::formula::FloatBits;
+    use rustc_middle::{mir::BinOp as MirBinOp, ty::FloatTy};
+    use trust_wp_core::formula::{
+        ieee::{IeeeFn, IeeeOp, OpaqueFloatFn, OpaqueFormat, OpaqueOp, OpaquePeer},
+        FloatBits, FloatWidth,
+    };
 
     use super::*;
 
+    fn f64_lit(v: f64) -> PureExpr {
+        PureExpr::Float(FloatBits::from_f64(v))
+    }
+
+    fn call_name(expr: &PureExpr) -> Option<IeeeFn> {
+        match expr {
+            PureExpr::LogicFnCall { name, .. } => IeeeFn::parse(name),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn test_translate_float_scalar_bits_supports_f32_and_f64() {
+    fn test_translate_float_scalar_bits_keeps_the_format() {
         assert_eq!(
             super::float::translate_float_scalar_bits(FloatTy::F32, f32::to_bits(-0.0) as u128),
             Some(PureExpr::Float(FloatBits::from_f32(-0.0))),
@@ -23,106 +37,332 @@ mod float_helper_tests {
         );
         assert_eq!(
             super::float::translate_float_scalar_bits(FloatTy::F64, f64::to_bits(1.5) as u128),
-            Some(concrete_float_expr_f64(1.5)),
+            Some(f64_lit(1.5)),
             "f64 translation should decode the scalar bits"
         );
     }
 
     #[test]
-    fn test_translate_float_scalar_bits_rejects_out_of_range_and_unsupported_widths() {
+    fn test_translate_float_scalar_bits_rejects_out_of_range_widths() {
         assert_eq!(
             super::float::translate_float_scalar_bits(FloatTy::F32, u32::MAX as u128 + 1),
-            None,
-            "f32 translation must reject payloads that do not fit in 32 bits"
+            None
         );
         assert_eq!(
             super::float::translate_float_scalar_bits(FloatTy::F64, u64::MAX as u128 + 1),
-            None,
-            "f64 translation must reject payloads that do not fit in 64 bits"
+            None
         );
         assert_eq!(
-            super::float::translate_float_scalar_bits(FloatTy::F16, 0),
-            None,
-            "f16 constants are intentionally unsupported"
-        );
-        assert_eq!(
-            super::float::translate_float_scalar_bits(FloatTy::F128, 0),
-            None,
-            "f128 constants are intentionally unsupported"
+            super::float::translate_float_scalar_bits(FloatTy::F16, u16::MAX as u128 + 1),
+            None
         );
     }
 
-    #[test]
-    fn test_fold_concrete_float_unop_negates_and_rejects_other_inputs() {
-        assert_eq!(
-            super::float::fold_concrete_float_unop(UnOp::Neg, &concrete_float_expr_f64(2.5)),
-            Some(concrete_float_expr_f64(-2.5)),
-            "Neg should fold concrete floats"
-        );
-        assert_eq!(
-            super::float::fold_concrete_float_unop(UnOp::Not, &concrete_float_expr_f64(2.5)),
-            None,
-            "unsupported unary float operators must stay unfused"
-        );
-        assert_eq!(
-            super::float::fold_concrete_float_unop(UnOp::Neg, &PureExpr::Int(7)),
-            None,
-            "non-float operands must not be treated as concrete floats"
-        );
-    }
-
-    #[test]
-    fn test_fold_concrete_float_binop_comparisons_cover_supported_relations() {
-        let left = concrete_float_expr_f64(1.0);
-        let right = concrete_float_expr_f64(2.0);
-        let cases = [
-            (BinOp::Eq, false),
-            (BinOp::Ne, true),
-            (BinOp::Lt, true),
-            (BinOp::Le, true),
-            (BinOp::Gt, false),
-            (BinOp::Ge, false),
-        ];
-
-        for (op, expected) in cases {
-            assert_eq!(
-                super::float::fold_concrete_float_binop(&left, op, &right),
-                Some(PureExpr::Bool(expected)),
-                "expected {op:?} to fold to {expected}"
-            );
+    fn opaque_name(expr: &PureExpr) -> Option<OpaqueFloatFn> {
+        match expr {
+            PureExpr::LogicFnCall { name, .. } => OpaqueFloatFn::parse(name),
+            _ => None,
         }
     }
 
     #[test]
-    fn test_fold_concrete_float_binop_handles_nan_and_rejects_non_float_or_non_compare_ops() {
-        let nan = concrete_float_expr_f64(f64::NAN);
-        let one = concrete_float_expr_f64(1.0);
+    fn test_opaque_literal_is_a_function_of_its_bits() {
+        let lit = super::float::translate_float_scalar_bits(FloatTy::F16, 0x3c00).unwrap();
+        assert_eq!(
+            lit,
+            PureExpr::LogicFnCall {
+                name: OpaqueFloatFn::new(OpaqueOp::Literal, OpaqueFormat::F16).name(),
+                args: vec![PureExpr::Int(0x3c00)],
+            }
+        );
+        let wide = super::float::translate_float_scalar_bits(FloatTy::F128, u128::MAX).unwrap();
+        assert_eq!(
+            opaque_name(&wide),
+            Some(OpaqueFloatFn::new(OpaqueOp::Literal, OpaqueFormat::F128))
+        );
+    }
 
+    #[test]
+    fn test_opaque_operators_and_casts_are_functions_of_their_operands() {
+        let h = PureExpr::Var("h".to_string(), None);
+        let g = PureExpr::Var("g".to_string(), None);
+        let f16 = OpaqueFormat::F16;
+        for (mir, op) in [
+            (MirBinOp::Add, OpaqueOp::Add),
+            (MirBinOp::Sub, OpaqueOp::Sub),
+            (MirBinOp::Mul, OpaqueOp::Mul),
+            (MirBinOp::Div, OpaqueOp::Div),
+            (MirBinOp::Rem, OpaqueOp::Rem),
+            (MirBinOp::Eq, OpaqueOp::Eq),
+            (MirBinOp::Lt, OpaqueOp::Lt),
+            (MirBinOp::Le, OpaqueOp::Le),
+            (MirBinOp::Gt, OpaqueOp::Gt),
+            (MirBinOp::Ge, OpaqueOp::Ge),
+        ] {
+            let call =
+                super::float::translate_opaque_binop(mir, f16, h.clone(), g.clone()).unwrap();
+            assert_eq!(
+                opaque_name(&call),
+                Some(OpaqueFloatFn::new(op, f16)),
+                "{mir:?}"
+            );
+            assert_ne!(call, h, "{mir:?} is never its operand");
+        }
+        let ne = super::float::translate_opaque_binop(MirBinOp::Ne, f16, h.clone(), g).unwrap();
+        let eq = Some(OpaqueFloatFn::new(OpaqueOp::Eq, f16));
+        assert!(matches!(&ne, PureExpr::UnOp(UnOp::Not, inner) if opaque_name(inner) == eq));
         assert_eq!(
-            super::float::fold_concrete_float_binop(&nan, BinOp::Eq, &one),
-            Some(PureExpr::Bool(false)),
-            "NaN == x should follow IEEE semantics and stay false"
+            opaque_name(&super::float::translate_opaque_neg(f16, h.clone())),
+            Some(OpaqueFloatFn::new(OpaqueOp::Neg, f16))
+        );
+        use super::float::FloatClass;
+        let opaque = FloatClass::Opaque(f16);
+        let u32_int = Some((false, 32));
+        let u32_peer = OpaquePeer::Int {
+            signed: false,
+            bits: 32,
+        };
+        let f32_class = FloatClass::Float(FloatWidth::F32);
+        let f64_class = FloatClass::Float(FloatWidth::F64);
+        let f128_class = FloatClass::Opaque(OpaqueFormat::F128);
+        for (source, target, int, op) in [
+            (
+                opaque,
+                FloatClass::NotFloat,
+                u32_int,
+                OpaqueOp::To(u32_peer),
+            ),
+            (
+                FloatClass::NotFloat,
+                opaque,
+                u32_int,
+                OpaqueOp::From(u32_peer),
+            ),
+            (
+                opaque,
+                f32_class,
+                None,
+                OpaqueOp::To(OpaquePeer::Float(FloatWidth::F32)),
+            ),
+            (
+                f64_class,
+                opaque,
+                None,
+                OpaqueOp::From(OpaquePeer::Float(FloatWidth::F64)),
+            ),
+            (
+                opaque,
+                f128_class,
+                None,
+                OpaqueOp::To(OpaquePeer::Opaque(OpaqueFormat::F128)),
+            ),
+        ] {
+            let cast = super::float::translate_opaque_cast(source, target, int, h.clone()).unwrap();
+            let expected = OpaqueFloatFn::new(op, f16);
+            assert_eq!(
+                opaque_name(&cast),
+                Some(expected),
+                "{source:?} -> {target:?}"
+            );
+        }
+        assert_eq!(
+            super::float::translate_opaque_cast(opaque, opaque, None, h.clone()),
+            Some(h.clone()),
+            "a cast within one format changes nothing"
         );
         assert_eq!(
-            super::float::fold_concrete_float_binop(&nan, BinOp::Ne, &one),
-            Some(PureExpr::Bool(true)),
-            "NaN != x should follow IEEE semantics and stay true"
-        );
-        assert_eq!(
-            super::float::fold_concrete_float_binop(&nan, BinOp::Lt, &one),
-            Some(PureExpr::Bool(false)),
-            "ordered comparisons against NaN should stay false"
-        );
-        assert_eq!(
-            super::float::fold_concrete_float_binop(&one, BinOp::Add, &one),
+            super::float::translate_opaque_cast(opaque, FloatClass::NotFloat, None, h.clone()),
             None,
-            "arithmetic float binops should stay symbolic"
+            "an integer side needs its width"
         );
         assert_eq!(
-            super::float::fold_concrete_float_binop(&PureExpr::Int(1), BinOp::Eq, &one),
+            super::float::translate_opaque_cast(
+                FloatClass::Float(FloatWidth::F32),
+                FloatClass::Float(FloatWidth::F64),
+                None,
+                h
+            ),
             None,
-            "non-float operands must not be folded as concrete float comparisons"
+            "no opaque side"
         );
+    }
+
+    #[test]
+    fn test_float_operators_become_ieee_calls() {
+        let x = PureExpr::Var("x".into(), None);
+        let y = PureExpr::Var("y".into(), None);
+        for (mir, op) in [
+            (MirBinOp::Add, IeeeOp::Add),
+            (MirBinOp::Sub, IeeeOp::Sub),
+            (MirBinOp::Mul, IeeeOp::Mul),
+            (MirBinOp::Div, IeeeOp::Div),
+            (MirBinOp::Rem, IeeeOp::Rem),
+            (MirBinOp::Eq, IeeeOp::Eq),
+            (MirBinOp::Lt, IeeeOp::Lt),
+            (MirBinOp::Le, IeeeOp::Le),
+            (MirBinOp::Gt, IeeeOp::Gt),
+            (MirBinOp::Ge, IeeeOp::Ge),
+        ] {
+            let got =
+                super::float::translate_float_binop(mir, FloatWidth::F32, x.clone(), y.clone())
+                    .expect("translates");
+            assert_eq!(
+                call_name(&got),
+                Some(IeeeFn::new(op, FloatWidth::F32)),
+                "{mir:?}"
+            );
+        }
+        let ne = super::float::translate_float_binop(MirBinOp::Ne, FloatWidth::F64, x.clone(), y)
+            .expect("translates");
+        match ne {
+            PureExpr::UnOp(UnOp::Not, inner) => assert_eq!(
+                call_name(&inner),
+                Some(IeeeFn::new(IeeeOp::Eq, FloatWidth::F64))
+            ),
+            other => panic!("`!=` must be the negation of IEEE `==`, got {other:?}"),
+        }
+        assert_eq!(
+            call_name(&super::float::translate_float_neg(FloatWidth::F64, x)),
+            Some(IeeeFn::new(IeeeOp::Neg, FloatWidth::F64))
+        );
+    }
+
+    #[test]
+    fn test_literal_comparisons_fold_by_ieee_rules() {
+        let nan = f64_lit(f64::NAN);
+        let one = f64_lit(1.0);
+        let fold = |op, l: &PureExpr, r: &PureExpr| {
+            super::float::translate_float_binop(op, FloatWidth::F64, l.clone(), r.clone())
+        };
+        assert_eq!(
+            fold(MirBinOp::Lt, &one, &f64_lit(2.0)),
+            Some(PureExpr::Bool(true))
+        );
+        assert_eq!(fold(MirBinOp::Eq, &nan, &nan), Some(PureExpr::Bool(false)));
+        assert_eq!(fold(MirBinOp::Ne, &nan, &nan), Some(PureExpr::Bool(true)));
+        assert_eq!(fold(MirBinOp::Ge, &nan, &one), Some(PureExpr::Bool(false)));
+        assert_eq!(
+            fold(MirBinOp::Eq, &f64_lit(0.0), &f64_lit(-0.0)),
+            Some(PureExpr::Bool(true))
+        );
+        assert_eq!(
+            fold(MirBinOp::Add, &f64_lit(1.0e16), &one),
+            Some(f64_lit(1.0e16)),
+            "literal arithmetic folds by IEEE rounding, not over the reals"
+        );
+        assert_eq!(
+            fold(MirBinOp::Sub, &f64_lit(0.3), &f64_lit(0.1)),
+            Some(f64_lit(0.3 - 0.1))
+        );
+        assert!(
+            matches!(fold(MirBinOp::Div, &f64_lit(0.0), &f64_lit(0.0)), Some(PureExpr::Float(bits)) if bits.to_f64().is_nan())
+        );
+        assert_eq!(
+            fold(MirBinOp::Rem, &f64_lit(-7.0), &f64_lit(5.0)),
+            Some(f64_lit(-2.0)),
+            "`%` truncates the quotient, so the remainder takes the dividend's sign"
+        );
+        let f32_sum = super::float::translate_float_binop(
+            MirBinOp::Add,
+            FloatWidth::F32,
+            PureExpr::Float(FloatBits::from_f32(16_777_216.0)),
+            PureExpr::Float(FloatBits::from_f32(1.0)),
+        );
+        assert_eq!(
+            f32_sum,
+            Some(PureExpr::Float(FloatBits::from_f32(16_777_216.0)))
+        );
+    }
+
+    #[test]
+    fn test_literal_negation_and_conversion_keep_the_format() {
+        assert_eq!(
+            super::float::translate_float_neg(
+                FloatWidth::F32,
+                PureExpr::Float(FloatBits::from_f32(0.1))
+            ),
+            PureExpr::Float(FloatBits::from_f32(-0.1))
+        );
+        assert_eq!(
+            super::float::translate_float_to_float(FloatWidth::F64, FloatWidth::F32, f64_lit(0.1)),
+            PureExpr::Float(FloatBits::from_f32(0.1_f64 as f32))
+        );
+        let x = PureExpr::Var("x".into(), None);
+        assert_eq!(
+            super::float::translate_float_to_float(FloatWidth::F64, FloatWidth::F64, x.clone()),
+            x
+        );
+    }
+
+    #[test]
+    fn test_literal_float_to_int_folds_by_rust_as() {
+        let to_int = |value: f64, signed, bits| {
+            super::float::translate_float_to_int(FloatWidth::F64, signed, bits, f64_lit(value))
+        };
+        assert_eq!(
+            to_int(300.0, false, 8),
+            PureExpr::Int(255),
+            "saturates high"
+        );
+        assert_eq!(to_int(-1.5, false, 8), PureExpr::Int(0), "saturates low");
+        assert_eq!(
+            to_int(-2.7, true, 32),
+            PureExpr::Int(-2),
+            "truncates toward zero"
+        );
+        assert_eq!(to_int(f64::NAN, true, 32), PureExpr::Int(0), "NaN is zero");
+        assert_eq!(
+            to_int(f64::NEG_INFINITY, true, 16),
+            PureExpr::Int(i64::from(i16::MIN))
+        );
+        assert_eq!(
+            super::float::translate_float_to_int(
+                FloatWidth::F32,
+                true,
+                8,
+                PureExpr::Float(FloatBits::from_f32(127.9))
+            ),
+            PureExpr::Int(127)
+        );
+        // A literal of the other format is not this cast's operand: no fold.
+        let foreign = super::float::translate_float_to_int(FloatWidth::F32, true, 8, f64_lit(1.0));
+        assert!(matches!(foreign, PureExpr::LogicFnCall { .. }));
+    }
+
+    #[test]
+    fn test_literal_int_to_float_folds_by_rust_as_within_the_source_range() {
+        assert_eq!(
+            super::float::translate_int_to_float(
+                true,
+                32,
+                FloatWidth::F32,
+                PureExpr::Int(16_777_217)
+            ),
+            PureExpr::Float(FloatBits::from_f32(16_777_216.0)),
+            "rounds to nearest-even"
+        );
+        assert_eq!(
+            super::float::translate_int_to_float(false, 64, FloatWidth::F64, PureExpr::Int(3)),
+            f64_lit(3.0)
+        );
+        assert_eq!(
+            super::float::translate_int_to_float(true, 128, FloatWidth::F64, PureExpr::Int(-5)),
+            f64_lit(-5.0),
+            "an i128 literal folds like a narrower one"
+        );
+        // A value its source type cannot hold is not folded.
+        for (signed, bits, value) in [(false, 8, 256), (false, 8, -1), (true, 8, 128)] {
+            let cast = super::float::translate_int_to_float(
+                signed,
+                bits,
+                FloatWidth::F64,
+                PureExpr::Int(value),
+            );
+            assert!(
+                matches!(cast, PureExpr::LogicFnCall { .. }),
+                "{signed} {bits} {value}"
+            );
+        }
     }
 }
 
@@ -680,7 +920,9 @@ mod translate_helpers_tests {
                 let empty: HashMap<Local, PureExpr> = HashMap::new();
                 assert_eq!(
                     translate_operand(&operand, &empty),
-                    Some(concrete_float_expr_f64(1.5))
+                    Some(PureExpr::Float(
+                        trust_wp_core::formula::FloatBits::from_f64(1.5)
+                    ))
                 );
                 self.ran = true;
                 Compilation::Stop
@@ -915,77 +1157,35 @@ mod translate_helpers_tests {
         assert_eq!(diag.detail, "missing local expression for _7");
     }
 
+    /// Without a MIR body no operand type is known, and a float operator read
+    /// as a generic `BinOp`/`UnOp` would be integer arithmetic or logical
+    /// equality: an operand that is syntactically a float is refused.
     #[test]
-    fn test_translate_rvalue_unary_neg_folds_concrete_float() {
+    fn test_translate_rvalue_float_operator_without_body_is_refused() {
+        let lit = |v: f64| PureExpr::Float(trust_wp_core::formula::FloatBits::from_f64(v));
         let mut locals = HashMap::new();
-        locals.insert(Local::from_usize(1), concrete_float_expr_f64(2.0));
-        let float_place = Place::from(Local::from_usize(1));
-        let unary = Rvalue::UnaryOp(MirUnOp::Neg, Operand::Copy(float_place));
-
-        assert_eq!(
-            translate_rvalue(&unary, &locals, None),
-            Some(concrete_float_expr_f64(-2.0))
+        locals.insert(Local::from_usize(1), lit(1.5));
+        locals.insert(Local::from_usize(2), lit(2.0));
+        let unary = Rvalue::UnaryOp(
+            MirUnOp::Neg,
+            Operand::Copy(Place::from(Local::from_usize(1))),
         );
-    }
-
-    #[test]
-    fn test_translate_rvalue_comparison_folds_concrete_floats() {
-        let mut locals = HashMap::new();
-        locals.insert(Local::from_usize(1), concrete_float_expr_f64(1.0));
-        locals.insert(Local::from_usize(2), concrete_float_expr_f64(2.0));
-        locals.insert(Local::from_usize(3), concrete_float_expr_f64(-2.0));
-
-        let cases = [
-            (MirBinOp::Eq, 1, 2, false),
-            (MirBinOp::Lt, 1, 2, true),
-            (MirBinOp::Le, 1, 2, true),
-            (MirBinOp::Gt, 2, 1, true),
-            (MirBinOp::Ge, 2, 1, true),
-            (MirBinOp::Le, 3, 1, true),
-        ];
-
-        for (op, left_local, right_local, expected) in cases {
-            let left = Place::from(Local::from_usize(left_local));
-            let right = Place::from(Local::from_usize(right_local));
-            let rvalue =
-                Rvalue::BinaryOp(op, Box::new((Operand::Copy(left), Operand::Copy(right))));
-            assert_eq!(
-                translate_rvalue(&rvalue, &locals, None),
-                Some(PureExpr::Bool(expected)),
-                "expected {op:?} on locals {left_local}/{right_local} to fold to {expected}",
-            );
-        }
-    }
-
-    #[test]
-    fn test_translate_rvalue_float_arithmetic_preserves_binop() {
-        let mut locals = HashMap::new();
-        locals.insert(Local::from_usize(1), concrete_float_expr_f64(1.5));
-        locals.insert(Local::from_usize(2), concrete_float_expr_f64(2.0));
-
-        let cases = [
-            (MirBinOp::Add, BinOp::Add),
-            (MirBinOp::Sub, BinOp::Sub),
-            (MirBinOp::Mul, BinOp::Mul),
-            (MirBinOp::Div, BinOp::Div),
-        ];
-
-        for (mir_op, expected_op) in cases {
+        assert_eq!(translate_rvalue(&unary, &locals, None), None);
+        for op in [
+            MirBinOp::Add,
+            MirBinOp::Sub,
+            MirBinOp::Mul,
+            MirBinOp::Div,
+            MirBinOp::Eq,
+            MirBinOp::Ne,
+            MirBinOp::Lt,
+            MirBinOp::Ge,
+        ] {
             let left = Place::from(Local::from_usize(1));
             let right = Place::from(Local::from_usize(2));
-            let rvalue = Rvalue::BinaryOp(
-                mir_op,
-                Box::new((Operand::Copy(left), Operand::Copy(right))),
-            );
-            assert_eq!(
-                translate_rvalue(&rvalue, &locals, None),
-                Some(PureExpr::BinOp(
-                    Arc::new(concrete_float_expr_f64(1.5)),
-                    expected_op,
-                    Arc::new(concrete_float_expr_f64(2.0)),
-                )),
-                "expected {mir_op:?} to remain a symbolic float binop"
-            );
+            let rvalue =
+                Rvalue::BinaryOp(op, Box::new((Operand::Copy(left), Operand::Copy(right))));
+            assert_eq!(translate_rvalue(&rvalue, &locals, None), None, "{op:?}");
         }
     }
 
@@ -1965,7 +2165,7 @@ mod translate_helpers_tests {
                     // Scan MIR for a constant operand of tuple type
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let rustc_middle::mir::StatementKind::Assign(box (
+                            if let rustc_middle::mir::StatementKind::Assign((
                                 _,
                                 Rvalue::Use(Operand::Constant(ref c), _),
                             )) = stmt.kind
@@ -2063,7 +2263,7 @@ mod translate_helpers_tests {
                     let body = tcx.optimized_mir(local_def_id.to_def_id());
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let rustc_middle::mir::StatementKind::Assign(box (
+                            if let rustc_middle::mir::StatementKind::Assign((
                                 _,
                                 Rvalue::Use(Operand::Constant(ref c), _),
                             )) = stmt.kind
@@ -2161,7 +2361,7 @@ mod translate_helpers_tests {
                     let body = tcx.optimized_mir(local_def_id.to_def_id());
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let rustc_middle::mir::StatementKind::Assign(box (
+                            if let rustc_middle::mir::StatementKind::Assign((
                                 _,
                                 Rvalue::Use(Operand::Constant(ref c), _),
                             )) = stmt.kind
@@ -2259,7 +2459,7 @@ mod translate_helpers_tests {
                     let body = tcx.optimized_mir(local_def_id.to_def_id());
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let rustc_middle::mir::StatementKind::Assign(box (
+                            if let rustc_middle::mir::StatementKind::Assign((
                                 _,
                                 Rvalue::Use(Operand::Constant(ref c), _),
                             )) = stmt.kind
@@ -2373,7 +2573,7 @@ mod translate_helpers_tests {
                     let body = tcx.optimized_mir(local_def_id.to_def_id());
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let rustc_middle::mir::StatementKind::Assign(box (
+                            if let rustc_middle::mir::StatementKind::Assign((
                                 _,
                                 Rvalue::Use(Operand::Constant(ref c), _),
                             )) = stmt.kind
@@ -2487,12 +2687,11 @@ mod translate_helpers_tests {
                     let body = tcx.optimized_mir(local_def_id.to_def_id());
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            let rustc_middle::mir::StatementKind::Assign(box (_, rvalue)) =
-                                &stmt.kind
+                            let rustc_middle::mir::StatementKind::Assign((_, rvalue)) = &stmt.kind
                             else {
                                 continue;
                             };
-                            if !matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Adt(..), _)) {
+                            if !matches!(rvalue, Rvalue::Aggregate(AggregateKind::Adt(..), _)) {
                                 continue;
                             }
                             let locals: HashMap<Local, PureExpr> = HashMap::new();
@@ -2639,42 +2838,6 @@ mod translate_helpers_tests {
         );
     }
 
-    fn dependency_dir() -> std::path::PathBuf {
-        std::env::current_exe()
-            .expect("current test executable path")
-            .parent()
-            .expect("test executable should live under deps/")
-            .to_path_buf()
-    }
-
-    fn dependency_artifact(crate_name: &str) -> std::path::PathBuf {
-        let prefix = format!("lib{crate_name}-");
-        let mut candidates: Vec<_> = std::fs::read_dir(dependency_dir())
-            .expect("read dependency dir")
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                let file_name = path.file_name()?.to_string_lossy();
-                if !file_name.starts_with(&prefix) {
-                    return None;
-                }
-                match path.extension().and_then(|ext| ext.to_str()) {
-                    Some("rmeta" | "rlib") => Some(path),
-                    _ => None,
-                }
-            })
-            .collect();
-        candidates.sort_by_key(|path| match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rmeta") => (0_u8, path.clone()),
-            Some("rlib") => (1_u8, path.clone()),
-            _ => (2_u8, path.clone()),
-        });
-        candidates
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("missing dependency artifact for {crate_name}"))
-    }
-
     #[test]
     fn test_ty_to_expr_sort_enriched_snapshot_and_ghost_preserve_inner_bool_sort() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2736,9 +2899,9 @@ mod translate_helpers_tests {
         )
         .unwrap();
 
-        let deps_dir = dependency_dir();
-        let trust_wp_std = dependency_artifact("trust_wp_std");
-        let args = vec![
+        let units = trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe();
+        let trust_wp_std = units.artifact("trust_wp_std", &["rmeta", "rlib"]);
+        let mut args = vec![
             "rustc".to_string(),
             source_path.to_string_lossy().into_owned(),
             "--crate-name".to_string(),
@@ -2748,11 +2911,10 @@ mod translate_helpers_tests {
             "--edition=2021".to_string(),
             "--out-dir".to_string(),
             temp_dir.to_string_lossy().into_owned(),
-            "-L".to_string(),
-            format!("dependency={}", deps_dir.display()),
             "--extern".to_string(),
             format!("trust_wp_std={}", trust_wp_std.display()),
         ];
+        args.extend(units.search_args());
 
         let mut callbacks = WrapperSortCallbacks {
             snapshot_bool: None,
@@ -3015,9 +3177,9 @@ mod translate_helpers_tests {
         )
         .unwrap();
 
-        let deps_dir = dependency_dir();
-        let trust_wp_std = dependency_artifact("trust_wp_std");
-        let args = vec![
+        let units = trust_wp_test_utils::unit_dirs::UnitDirs::of_current_exe();
+        let trust_wp_std = units.artifact("trust_wp_std", &["rmeta", "rlib"]);
+        let mut args = vec![
             "rustc".to_string(),
             source_path.to_string_lossy().into_owned(),
             "--crate-name".to_string(),
@@ -3027,11 +3189,10 @@ mod translate_helpers_tests {
             "--edition=2021".to_string(),
             "--out-dir".to_string(),
             temp_dir.to_string_lossy().into_owned(),
-            "-L".to_string(),
-            format!("dependency={}", deps_dir.display()),
             "--extern".to_string(),
             format!("trust_wp_std={}", trust_wp_std.display()),
         ];
+        args.extend(units.search_args());
 
         let mut callbacks = PredCellSliceSortCallbacks {
             predcell_slice: None,
@@ -3546,7 +3707,7 @@ mod translate_cast_tests {
                     // Find the first Cast rvalue in MIR statements.
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let StatementKind::Assign(box (_, ref rvalue)) = stmt.kind {
+                            if let StatementKind::Assign((_, ref rvalue)) = stmt.kind {
                                 if matches!(rvalue, Rvalue::Cast(..)) {
                                     self.result =
                                         Some(translate_rvalue(rvalue, &locals, Some(body)));
@@ -3635,104 +3796,414 @@ mod translate_cast_tests {
         );
     }
 
-    // FloatToInt: now translates to trunc-toward-zero + clamp. (#1802)
+    fn ieee_fn_of(expr: &PureExpr) -> trust_wp_core::formula::ieee::IeeeFn {
+        match expr {
+            PureExpr::LogicFnCall { name, args } => {
+                assert_eq!(args.len(), 1, "a cast has one operand: {expr:?}");
+                trust_wp_core::formula::ieee::IeeeFn::parse(name)
+                    .unwrap_or_else(|| panic!("expected a reserved IEEE call, got {expr:?}"))
+            }
+            other => panic!("expected a reserved IEEE call, got {other:?}"),
+        }
+    }
+
+    // `as` between a float and an integer, or between the two float formats,
+    // is its IEEE conversion, named with both sides' types.
     #[test]
-    fn test_cast_float_to_int_signed() {
-        let result = run_cast_test(
+    fn test_cast_float_to_int_is_the_ieee_conversion() {
+        use trust_wp_core::formula::{
+            ieee::{IeeeFn, IeeeOp},
+            FloatWidth,
+        };
+        let signed = run_cast_test(
             "#[allow(clippy::cast_possible_truncation)]\npub fn float_to_int(x: f64) -> i32 { x as i32 }",
             "float_to_int",
+        )
+        .expect("f64 as i32 translates");
+        assert_eq!(
+            ieee_fn_of(&signed),
+            IeeeFn::new(
+                IeeeOp::ToInt {
+                    signed: true,
+                    bits: 32
+                },
+                FloatWidth::F64
+            )
         );
-        assert!(
-            result.is_some(),
-            "FloatToInt cast should now translate (not None)"
-        );
-        let expr = result.unwrap();
-        // Top-level should be a Let binding.
-        match &expr {
-            PureExpr::Let { var, value, body } => {
-                assert_eq!(var, "__trust_wp_float_to_int_trunc");
-                // value is the trunc_zero Ite
-                assert!(
-                    matches!(value.as_ref(), PureExpr::Ite(..)),
-                    "Let value should be trunc_zero Ite, got {value:?}"
-                );
-                // body is the clamp Ite
-                assert!(
-                    matches!(body.as_ref(), PureExpr::Ite(..)),
-                    "Let body should be clamp Ite, got {body:?}"
-                );
-            }
-            other => panic!("Expected PureExpr::Let, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_cast_float_to_int_unsigned() {
-        let result = run_cast_test(
-            "#[allow(clippy::cast_possible_truncation)]\npub fn float_to_uint(x: f64) -> u32 { x as u32 }",
+        let unsigned = run_cast_test(
+            "#[allow(clippy::cast_possible_truncation)]\npub fn float_to_uint(x: f32) -> u8 { x as u8 }",
             "float_to_uint",
+        )
+        .expect("f32 as u8 translates");
+        assert_eq!(
+            ieee_fn_of(&unsigned),
+            IeeeFn::new(
+                IeeeOp::ToInt {
+                    signed: false,
+                    bits: 8
+                },
+                FloatWidth::F32
+            )
         );
-        assert!(
-            result.is_some(),
-            "FloatToInt (unsigned) cast should translate"
-        );
-        let expr = result.unwrap();
-        match &expr {
-            PureExpr::Let { var, .. } => {
-                assert_eq!(var, "__trust_wp_float_to_int_trunc");
-            }
-            other => panic!("Expected PureExpr::Let, got {other:?}"),
-        }
     }
 
-    // FloatToInt trunc_zero negative branch should be -floor(-x), not floor(x).
     #[test]
-    fn test_cast_float_to_int_trunc_zero_negative_branch() {
+    fn test_cast_int_to_float_is_the_ieee_conversion() {
+        use trust_wp_core::formula::{
+            ieee::{IeeeFn, IeeeOp},
+            FloatWidth,
+        };
         let result = run_cast_test(
-            "#[allow(clippy::cast_possible_truncation)]\npub fn f2i(x: f64) -> i32 { x as i32 }",
-            "f2i",
-        );
-        let expr = result.unwrap();
-        if let PureExpr::Let { value, .. } = &expr {
-            // value = Ite(x >= 0.0, floor(x), -floor(-x))
-            if let PureExpr::Ite(_, _, else_branch) = value.as_ref() {
-                // else_branch = UnOp(Neg, floor(-x))
-                assert!(
-                    matches!(else_branch.as_ref(), PureExpr::UnOp(UnOp::Neg, inner) if matches!(inner.as_ref(), PureExpr::LogicFnCall { .. })),
-                    "Negative branch should be -floor(-x), got {else_branch:?}"
-                );
-            } else {
-                panic!("Let value should be Ite");
-            }
-        } else {
-            panic!("Expected Let");
-        }
-    }
-
-    // IntToFloat: identity (every integer is exactly representable as Real). (#1802)
-    #[test]
-    fn test_cast_int_to_float_passes_through() {
-        let result = run_cast_test(
-            "pub fn int_to_float(x: i32) -> f64 { x as f64 }",
+            "pub fn int_to_float(x: u64) -> f64 { x as f64 }",
             "int_to_float",
-        );
-        assert!(
-            result.is_some(),
-            "IntToFloat cast should translate as identity"
+        )
+        .expect("u64 as f64 translates");
+        assert_eq!(
+            ieee_fn_of(&result),
+            IeeeFn::new(
+                IeeeOp::FromInt {
+                    signed: false,
+                    bits: 64
+                },
+                FloatWidth::F64
+            ),
+            "not the identity: 2^53 + 1 is no f64 value"
         );
     }
 
-    // FloatToFloat: identity (all floats modeled as Real). (#1802)
     #[test]
-    fn test_cast_float_to_float_passes_through() {
+    fn test_cast_float_to_float_rounds_through_the_ieee_conversion() {
+        use trust_wp_core::formula::{
+            ieee::{IeeeFn, IeeeOp},
+            FloatWidth,
+        };
         let result = run_cast_test(
-            "pub fn float_narrow(x: f64) -> f32 { x as f32 }",
+            "#[allow(clippy::cast_possible_truncation)]\npub fn float_narrow(x: f64) -> f32 { x as f32 }",
             "float_narrow",
+        )
+        .expect("f64 as f32 translates");
+        assert_eq!(
+            ieee_fn_of(&result),
+            IeeeFn::new(IeeeOp::ToFloat(FloatWidth::F32), FloatWidth::F64)
+        );
+    }
+
+    fn ptr_thin_of(operand: PureExpr) -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: trust_wp_core::formula::internal::builtins::PTR_THIN_LOGIC_FN.to_string(),
+            args: vec![operand],
+        }
+    }
+
+    // PtrToPtr between thin pointers keeps the pointer: the identity.
+    #[test]
+    fn test_cast_thin_ptr_to_thin_ptr_is_identity() {
+        let result = run_cast_test(
+            "pub fn t(p: *const u32) -> *const u8 { p as *const u8 }",
+            "t",
+        );
+        assert_eq!(result, Some(PureExpr::Var("__1".into(), None)));
+    }
+
+    // A fat pointer cast to a thin one drops the length: two slice pointers
+    // that differ only in length have equal casts, so the cast is `thin`,
+    // never its operand.
+    #[test]
+    fn test_cast_fat_ptr_to_thin_ptr_is_thin() {
+        let result = run_cast_test(
+            "pub fn t(p: *const [u8]) -> *const u8 { p as *const u8 }",
+            "t",
+        );
+        assert_eq!(result, Some(ptr_thin_of(PureExpr::Var("__1".into(), None))));
+    }
+
+    // The same pointee keeps the metadata whatever it is, `?Sized` included.
+    #[test]
+    fn test_cast_same_unsized_pointee_is_identity() {
+        let result = run_cast_test(
+            "pub fn t<T: ?Sized>(p: *const T) -> *mut T { p as *mut T }",
+            "t",
+        );
+        assert_eq!(result, Some(PureExpr::Var("__1".into(), None)));
+    }
+
+    // A `?Sized` pointee cast to a sized one may drop metadata: `thin`.
+    #[test]
+    fn test_cast_maybe_unsized_to_sized_is_thin() {
+        let result = run_cast_test(
+            "pub fn t<T: ?Sized>(p: *const T) -> *const u8 { p as *const u8 }",
+            "t",
+        );
+        assert_eq!(result, Some(ptr_thin_of(PureExpr::Var("__1".into(), None))));
+    }
+
+    // Unsizing a raw pointer adds a length: `p as *const [u8; 4]` and
+    // `p as *const [u8; 8]` unsized to `*const [u8]` differ, so each is its
+    // own type pair's function of the operand, never the operand.
+    #[test]
+    fn test_cast_raw_ptr_unsize_is_its_pair_function() {
+        let four = run_cast_test("pub fn t(p: *const [u8; 4]) -> *const [u8] { p }", "t");
+        let eight = run_cast_test("pub fn t(p: *const [u8; 8]) -> *const [u8] { p }", "t");
+        let prefix = trust_wp_core::formula::internal::builtins::PTR_PAIR_LOGIC_FN_PREFIX;
+        match (four, eight) {
+            (
+                Some(PureExpr::LogicFnCall { name: four, args }),
+                Some(PureExpr::LogicFnCall { name: eight, .. }),
+            ) => {
+                assert!(
+                    four.starts_with(prefix) && eight.starts_with(prefix),
+                    "{four} {eight}"
+                );
+                assert_ne!(four, eight);
+                assert_eq!(args, vec![PureExpr::Var("__1".into(), None)]);
+            }
+            other => panic!("expected two unsizing functions, got {other:?}"),
+        }
+    }
+
+    // A generic pair is its function too (keyed by the body's owner as
+    // well), never the identity: lengths `N` and `M` of one address differ.
+    #[test]
+    fn test_cast_raw_ptr_unsize_generic_pair_is_a_function() {
+        let result = run_cast_test(
+            "pub fn t<const N: usize>(p: *const [u8; N]) -> *const [u8] { p }",
+            "t",
+        );
+        let prefix = trust_wp_core::formula::internal::builtins::PTR_PAIR_LOGIC_FN_PREFIX;
+        assert!(
+            matches!(&result, Some(PureExpr::LogicFnCall { name, .. }) if name.starts_with(prefix)),
+            "{result:?}"
+        );
+    }
+
+    // The operand's type is followed through a field projection, so a field's
+    // fat pointer cast to a thin one is `thin`.
+    #[test]
+    fn test_cast_fat_ptr_field_to_thin_ptr_is_thin() {
+        let result = run_cast_test(
+            "pub struct S { pub p: *const [u8], pub n: u8 }\n\
+             pub fn t(s: &S) -> *const u8 { s.p as *const u8 }",
+            "t",
         );
         assert!(
-            result.is_some(),
-            "FloatToFloat cast should translate as identity"
+            matches!(
+                &result,
+                Some(PureExpr::LogicFnCall { name, .. })
+                    if name == trust_wp_core::formula::internal::builtins::PTR_THIN_LOGIC_FN
+            ),
+            "{result:?}"
         );
+    }
+
+    /// The `PtrToPtr` cast of field 0 behind a deref of `t`'s first parameter
+    /// (a `Box` of a struct) to `t`'s return type, translated in `t`'s body.
+    ///
+    /// The cast is built here rather than found: the optimized MIR a unit test
+    /// can read has already elaborated a `Box` deref into a transmute of the
+    /// box's inner pointer (and inlined the box's deallocation, itself a
+    /// `PtrToPtr`), while the borrow-checked MIR the driver translates spells
+    /// the access `(*s).p`, a `Deref` of the `Box` local.
+    fn run_ptr_cast_through_box_param_test(source: &str) -> Option<PureExpr> {
+        use rustc_middle::{
+            mir::{CastKind, Operand, Place, ProjectionElem, RETURN_PLACE},
+            ty::TyKind,
+        };
+
+        struct BoxCallbacks {
+            result: Option<Option<PureExpr>>,
+        }
+
+        impl Callbacks for BoxCallbacks {
+            #[allow(clippy::elidable_lifetime_names)]
+            fn after_analysis<'tcx>(
+                &mut self,
+                _compiler: &Compiler,
+                tcx: TyCtxt<'tcx>,
+            ) -> Compilation {
+                for local_def_id in tcx.hir_body_owners() {
+                    if tcx.def_path_str(local_def_id) != "t" {
+                        continue;
+                    }
+                    let body = tcx.optimized_mir(local_def_id.to_def_id());
+                    let param = Local::from_u32(1);
+                    let Some(boxed) = body.local_decls[param].ty.boxed_ty() else {
+                        panic!("`t`'s first parameter must be a Box");
+                    };
+                    let TyKind::Adt(adt, args) = boxed.kind() else {
+                        panic!("`t`'s Box must hold a struct");
+                    };
+                    let field_ty = adt.non_enum_variant().fields[rustc_abi::FieldIdx::ZERO]
+                        .ty(tcx, *args)
+                        .skip_norm_wip();
+                    let target = body.local_decls[RETURN_PLACE].ty;
+                    let locals: HashMap<_, _> = body
+                        .local_decls
+                        .indices()
+                        .map(|idx| (idx, PureExpr::Var(format!("__{}", idx.index()), None)))
+                        .collect();
+                    let place = Place {
+                        local: param,
+                        projection: tcx.mk_place_elems(&[
+                            ProjectionElem::Deref,
+                            ProjectionElem::Field(rustc_abi::FieldIdx::ZERO, field_ty),
+                        ]),
+                    };
+                    let rvalue = Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(place), target);
+                    self.result = Some(translate_rvalue(&rvalue, &locals, Some(body)));
+                }
+                Compilation::Stop
+            }
+        }
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "trust_wp_box_cast_test_{}_{}",
+            std::process::id(),
+            unique,
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source_path = temp_dir.join("test.rs");
+        std::fs::write(&source_path, source).unwrap();
+        let args = vec![
+            "rustc".to_string(),
+            source_path.to_string_lossy().into_owned(),
+            "--crate-name".to_string(),
+            "trust_wp_box_cast_test".to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition=2021".to_string(),
+            "--out-dir".to_string(),
+            temp_dir.to_string_lossy().into_owned(),
+        ];
+        let mut callbacks = BoxCallbacks { result: None };
+        run_compiler(&args, &mut callbacks);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        callbacks
+            .result
+            .expect("failed to locate `t` in rustc callback")
+    }
+
+    // A `Box` deref is followed too: the boxed field's fat pointer cast to a
+    // thin one is `thin`, never untranslated.
+    #[test]
+    fn test_cast_fat_ptr_in_box_to_thin_ptr_is_thin() {
+        let result = run_ptr_cast_through_box_param_test(
+            "pub struct S { pub p: *const [u8], pub n: u8 }\n\
+             pub fn t(s: Box<S>) -> *const u8 { s.p as *const u8 }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Some(PureExpr::LogicFnCall { name, .. })
+                    if name == trust_wp_core::formula::internal::builtins::PTR_THIN_LOGIC_FN
+            ),
+            "{result:?}"
+        );
+    }
+
+    // A cast to a custom unsized pointee keeps a length the classifier does
+    // not read: it is its pair's function of the operand, neither the
+    // identity nor untranslated (an untranslated right-hand side shares its
+    // source name with a shadowing binding).
+    #[test]
+    fn test_cast_to_custom_unsized_pointee_is_its_pair_function() {
+        let result = run_cast_test(
+            "pub struct D { pub n: u8, pub tail: [u8] }\n\
+             pub fn t(p: *const [u8]) -> *const D { p as *const D }",
+            "t",
+        );
+        let prefix = trust_wp_core::formula::internal::builtins::PTR_PAIR_LOGIC_FN_PREFIX;
+        match result {
+            Some(PureExpr::LogicFnCall { name, args }) => {
+                assert!(name.starts_with(prefix), "{name}");
+                assert_eq!(args, vec![PureExpr::Var("__1".into(), None)]);
+            }
+            other => panic!("expected the pair's function, got {other:?}"),
+        }
+    }
+
+    // A reference's unsizing keeps its value (the value model): the identity.
+    #[test]
+    fn test_cast_reference_unsize_is_identity() {
+        let result = run_cast_test("pub fn t(a: &[u8; 4]) -> &[u8] { a }", "t");
+        assert_eq!(result, Some(PureExpr::Var("__1".into(), None)));
+    }
+
+    /// `ptr_cast_kind` from the pointee of `t`'s first parameter to the
+    /// pointee of its second, in `t`'s environment.
+    fn run_ptr_cast_kind_test(source: &str) -> Option<super::super::ptr_cast::PtrCastKind> {
+        struct KindCallbacks {
+            result: Option<Option<super::super::ptr_cast::PtrCastKind>>,
+        }
+
+        impl Callbacks for KindCallbacks {
+            #[allow(clippy::elidable_lifetime_names)]
+            fn after_analysis<'tcx>(
+                &mut self,
+                _compiler: &Compiler,
+                tcx: TyCtxt<'tcx>,
+            ) -> Compilation {
+                for local_def_id in tcx.hir_body_owners() {
+                    if tcx.def_path_str(local_def_id) != "t" {
+                        continue;
+                    }
+                    let def_id = local_def_id.to_def_id();
+                    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
+                    let sig = tcx.liberate_late_bound_regions(def_id, sig);
+                    let inputs = sig.inputs();
+                    let pointee = super::super::ptr_cast::raw_pointee;
+                    let (Some(from), Some(to)) = (pointee(inputs[0]), pointee(inputs[1])) else {
+                        panic!("both parameters of `t` must be raw pointers");
+                    };
+                    self.result =
+                        Some(super::super::ptr_cast::ptr_cast_kind(tcx, def_id, from, to));
+                }
+                Compilation::Stop
+            }
+        }
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "trust_wp_ptr_cast_kind_test_{}_{}",
+            std::process::id(),
+            unique,
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source_path = temp_dir.join("test.rs");
+        std::fs::write(&source_path, source).unwrap();
+        let args = vec![
+            "rustc".to_string(),
+            source_path.to_string_lossy().into_owned(),
+            "--crate-name".to_string(),
+            "trust_wp_ptr_cast_kind_test".to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition=2021".to_string(),
+            "--out-dir".to_string(),
+            temp_dir.to_string_lossy().into_owned(),
+        ];
+        let mut callbacks = KindCallbacks { result: None };
+        run_compiler(&args, &mut callbacks);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        callbacks
+            .result
+            .expect("failed to locate `t` in rustc callback")
+    }
+
+    // A clause's `p as *const [u8]` from `*const [u8; 4]` reaches the
+    // classifier untyped: it is an unsizing, which adds a length, never the
+    // identity (Creusot's rule reads any fat target as the identity).
+    #[test]
+    fn test_ptr_cast_kind_sized_to_fat_is_neither() {
+        let kind = run_ptr_cast_kind_test("pub fn t(_p: *const [u8; 4], _q: *const [u8]) {}");
+        assert_eq!(kind, None);
+    }
+
+    // Between two fat pointees the metadata is kept: the identity.
+    #[test]
+    fn test_ptr_cast_kind_fat_to_fat_is_identity() {
+        let kind = run_ptr_cast_kind_test("pub fn t(_p: *const str, _q: *const [u8]) {}");
+        assert_eq!(kind, Some(super::super::ptr_cast::PtrCastKind::Id));
     }
 
     // ---------------------------------------------------------------------------
@@ -3782,7 +4253,7 @@ mod translate_cast_tests {
 
                     for bb in body.basic_blocks.iter() {
                         for stmt in &bb.statements {
-                            if let StatementKind::Assign(box (_, ref rvalue)) = stmt.kind {
+                            if let StatementKind::Assign((_, ref rvalue)) = stmt.kind {
                                 if matches!(rvalue, Rvalue::Cast(..)) {
                                     // Snapshot before translation to measure the delta.
                                     let before = trust_wp_ay::unsoundness::snapshot();

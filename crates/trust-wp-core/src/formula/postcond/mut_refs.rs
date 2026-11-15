@@ -8,6 +8,9 @@
 //! - `Deref(Var(x))` → `Final(Var(x))` outside `old(...)` for mut-ref params
 //! - `Old(Deref(Var(x)))` stays unchanged (already references initial value)
 //! - Bare `Var(x)` for mut-ref params → `Deref(Var(x))` (normalizes to `x_current`)
+//! - `View(Var(x))` → `View(Final(Var(x)))` or `View(Deref(Var(x)))`, as `*x`
+//!   is read
+//! - A binder of a mut-ref param's name is renamed apart first
 //!
 //! Also includes the pre-scan that detects explicit `Final(Var(x))` usage,
 //! which suppresses the automatic `Deref` → `Final` transform for that param.
@@ -26,7 +29,25 @@ pub(crate) fn transform_postcondition_for_mut_refs(
     expr: &PureExpr,
     mut_ref_params: &HashSet<String>,
 ) -> PureExpr {
-    let explicit_final_vars = collect_explicit_final_mut_refs(expr, mut_ref_params);
+    transform_postcondition_for_mut_refs_keeping_current(expr, mut_ref_params, &HashSet::new())
+}
+
+/// As [`transform_postcondition_for_mut_refs`], but `*p` for every param in
+/// `keep_current` is left a CURRENT (entry) read, exactly as if the clause
+/// mentioned `^p` explicitly. Used for `&mut` params whose borrow is lent into
+/// the return value: their prophecy is not the entry value, so rewriting a
+/// Creusot `*p` (entry) to `^p` would change the claim being proved.
+pub(crate) fn transform_postcondition_for_mut_refs_keeping_current(
+    expr: &PureExpr,
+    mut_ref_params: &HashSet<String>,
+    keep_current: &HashSet<String>,
+) -> PureExpr {
+    // The rewrite below reads a name as the parameter: a binder of that name
+    // (`let p = e; p@`, `forall<p: Int> ..`) is renamed apart first, so the
+    // rewrite reaches only the parameter.
+    let expr = &expr.rename_binders_apart(|name| mut_ref_params.contains(name));
+    let mut explicit_final_vars = collect_explicit_final_mut_refs(expr, mut_ref_params);
+    explicit_final_vars.extend(keep_current.iter().cloned());
     rewrite_with_old_context(expr, false, &mut |node, inside_old| {
         rewrite_mut_ref_node(node, inside_old, mut_ref_params, &explicit_final_vars)
     })
@@ -111,6 +132,25 @@ fn rewrite_mut_ref_node(
                 }
             }
             None // not a mut-ref param — let generic recursion handle it
+        }
+        // `x@` of a &mut param, whatever `x`'s sort, is `(*x)@` (trust-wp-std's
+        // `impl View for &mut T` is its referent's view), read at the state
+        // `*x` is read at in this clause. Left whole, `x@ == old(x@)` read one
+        // value on both sides, and held of `*x += 1` beside `*x == old(*x) + 1`.
+        PureExpr::View(inner) => {
+            if let PureExpr::Var(name, sort) = inner.as_ref() {
+                if mut_ref_params.contains(name) {
+                    let v = Arc::new(PureExpr::Var(name.clone(), sort.clone()));
+                    return Some(PureExpr::View(Arc::new(
+                        if !inside_old && !explicit_final_vars.contains(name) {
+                            PureExpr::Final(v)
+                        } else {
+                            PureExpr::Deref(v)
+                        },
+                    )));
+                }
+            }
+            None
         }
         // Already Final — if inner is a mut-ref Var, don't recurse to avoid
         // double-wrapping Var → Deref(Var). (#609)

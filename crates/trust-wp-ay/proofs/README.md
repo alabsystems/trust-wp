@@ -33,7 +33,7 @@ Each proof document includes:
 Run all memory model proofs:
 
 ```bash
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib -- memory_model
+targo --unverified test -p trust-wp-ay --lib -- memory_model
 ```
 
 Individual theorem verification commands are listed in each proof document.

@@ -21,7 +21,7 @@ use super::{
         },
         AYEncoder, NumericOperandMode,
     },
-    fold_int_truncate_const, parse_int_truncate_name,
+    fold_int_truncate_const, parse_int_truncate_name, strip_low_bitop_marker,
 };
 use crate::{
     encoder::{
@@ -156,7 +156,7 @@ fn positive_const_div_comparison_expr(
     dividend: &PureExpr,
     divisor: i64,
     op: BinOp,
-) -> PureExpr {
+) -> Option<PureExpr> {
     let divisor_expr = PureExpr::Int(divisor);
     let quotient_times_divisor = bin_expr(quotient.clone(), BinOp::Mul, divisor_expr.clone());
     let next_quotient = bin_expr(quotient.clone(), BinOp::Add, PureExpr::Int(1));
@@ -164,7 +164,7 @@ fn positive_const_div_comparison_expr(
     let exact_multiple = bin_expr(quotient_times_divisor.clone(), BinOp::Eq, dividend.clone());
 
     match op {
-        BinOp::Eq => bin_expr(
+        BinOp::Eq => Some(bin_expr(
             exact_multiple,
             BinOp::Or,
             bin_expr(
@@ -176,8 +176,8 @@ fn positive_const_div_comparison_expr(
                     next_quotient_times_divisor.clone(),
                 ),
             ),
-        ),
-        BinOp::Ne => bin_expr(
+        )),
+        BinOp::Ne => Some(bin_expr(
             bin_expr(dividend.clone(), BinOp::Lt, quotient_times_divisor.clone()),
             BinOp::Or,
             bin_expr(
@@ -185,8 +185,12 @@ fn positive_const_div_comparison_expr(
                 BinOp::Le,
                 dividend.clone(),
             ),
-        ),
-        _ => unreachable!("positive const div comparison only handles Eq/Ne"),
+        )),
+        // The sole caller reaches this only for Eq/Ne, but a caller's guard is
+        // not this function's contract and `unreachable!` is a panic the
+        // verifier has to discharge. `None` routes the impossible case through
+        // the "cannot encode this" path the caller already has.
+        _ => None,
     }
 }
 
@@ -197,7 +201,7 @@ fn nonnegative_single_bit_mask(expr: &PureExpr) -> Option<u64> {
 }
 
 fn bitand_single_bit_mask(expr: &PureExpr) -> Option<(&PureExpr, u64)> {
-    let PureExpr::BinOp(left, BinOp::BitAnd, right) = expr else {
+    let PureExpr::BinOp(left, BinOp::BitAnd, right) = strip_low_bitop_marker(expr) else {
         return None;
     };
     if let Some(mask) = nonnegative_single_bit_mask(right) {
@@ -207,14 +211,14 @@ fn bitand_single_bit_mask(expr: &PureExpr) -> Option<(&PureExpr, u64)> {
 }
 
 fn shl_one_mask(expr: &PureExpr) -> Option<&PureExpr> {
-    let PureExpr::BinOp(left, BinOp::Shl, shift) = expr else {
+    let PureExpr::BinOp(left, BinOp::Shl, shift) = strip_low_bitop_marker(expr) else {
         return None;
     };
     (int_literal(left) == Some(1)).then_some(shift.as_ref())
 }
 
 fn bitand_shl_one_mask(expr: &PureExpr) -> Option<(&PureExpr, &PureExpr)> {
-    let PureExpr::BinOp(left, BinOp::BitAnd, right) = expr else {
+    let PureExpr::BinOp(left, BinOp::BitAnd, right) = strip_low_bitop_marker(expr) else {
         return None;
     };
     if let Some(shift) = shl_one_mask(right) {
@@ -473,16 +477,16 @@ impl AYEncoder {
         expr: &PureExpr,
     ) -> Option<(PureExpr, PureExpr, PureExpr)> {
         let expr = self.bitwise_alias_expr(expr);
-        let PureExpr::BinOp(left, BinOp::BitAnd, right) = expr else {
+        let PureExpr::BinOp(left, BinOp::BitAnd, right) = strip_low_bitop_marker(&expr) else {
             return None;
         };
 
-        let left = self.bitwise_alias_expr(&left);
-        let right = self.bitwise_alias_expr(&right);
-        if let PureExpr::BinOp(or_left, BinOp::BitOr, or_right) = left {
+        let left = self.bitwise_alias_expr(left);
+        let right = self.bitwise_alias_expr(right);
+        if let PureExpr::BinOp(or_left, BinOp::BitOr, or_right) = strip_low_bitop_marker(&left) {
             return Some((or_left.as_ref().clone(), or_right.as_ref().clone(), right));
         }
-        if let PureExpr::BinOp(or_left, BinOp::BitOr, or_right) = right {
+        if let PureExpr::BinOp(or_left, BinOp::BitOr, or_right) = strip_low_bitop_marker(&right) {
             return Some((or_left.as_ref().clone(), or_right.as_ref().clone(), left));
         }
         None
@@ -746,7 +750,10 @@ impl AYEncoder {
         match expr {
             PureExpr::Bool(_) => Some(Sort::Bool),
             PureExpr::Int(_) => Some(Sort::Int),
-            PureExpr::Float(_) => Some(Sort::Real),
+            PureExpr::Float(bits) => Some(super::ieee::float_sort(
+                bits.width()
+                    .unwrap_or(trust_wp_core::formula::FloatWidth::F64),
+            )),
             PureExpr::Var(_, Some(sort)) => Some(self.sort_from_expr_sort(sort.clone())),
             PureExpr::BinOp(_, op, _) => match op {
                 BinOp::Eq
@@ -763,6 +770,8 @@ impl AYEncoder {
                 | BinOp::Mul
                 | BinOp::Div
                 | BinOp::Mod
+                | BinOp::DivTrunc
+                | BinOp::RemTrunc
                 | BinOp::Shl
                 | BinOp::Shr
                 | BinOp::BitAnd
@@ -809,13 +818,12 @@ impl AYEncoder {
         // UFs: the dispatch level routes them to dedicated axiom-backed
         // encoders (`seq![v]` → seq_singleton, `seq![]`/`Seq::empty()` →
         // seq_empty, `FMap::empty()` → the fmap_empty constant). A
-        // context-derived return sort here can be arbitrarily wrong — observed
-        // live: `s@ == seq!['Ã']` with `s: String` preseeded
+        // context-derived return sort here can be arbitrarily wrong: `s@ ==
+        // seq!['Ã']` with `s: String` preseeds
         // `logic_seq__placeholder_i__ret_d537472696e67` (ret = the String
         // datatype), whose declaration panics in ay-dpll's core-identity gate
         // (function_declarations.rs) — the third declare-collision route
-        // beyond #2706's two. (ce-census 2026-08-20, cc/string
-        // test_string_len encoder panic)
+        // beyond #2706's two (cc/string `test_string_len`).
         if matches!(
             name.as_str(),
             "seq" | "seq_empty" | "Seq::empty" | "Seq::singleton" | "fmap_empty" | "FMap::empty"
@@ -1178,7 +1186,10 @@ impl AYEncoder {
             return Ok(None);
         }
 
-        let normalized = positive_const_div_comparison_expr(quotient, dividend, divisor, op);
+        let Some(normalized) = positive_const_div_comparison_expr(quotient, dividend, divisor, op)
+        else {
+            return Ok(None);
+        };
         self.encode_pure_impl(&normalized, prefix).map(Some)
     }
 
@@ -1189,6 +1200,102 @@ impl AYEncoder {
     /// propagation, and sort preference for `eq_or_iff`.
     #[allow(clippy::too_many_lines)]
     pub(super) fn encode_binop_expr(
+        &mut self,
+        l: &PureExpr,
+        op: BinOp,
+        r: &PureExpr,
+        prefix: Option<crate::encoder::sort_context::DerivedKind>,
+    ) -> Result<Term, EncodingError> {
+        if !matches!(op, BinOp::Eq) {
+            return self.encode_binop_expr_inner(l, op, r, prefix);
+        }
+        // Constructor-equality consequences discovered while encoding this
+        // equality are collected, not asserted: they hold only when the
+        // equality itself holds, and this equality may be a (negated) goal.
+        // Asserting them bare made `Err(3) == Err(0)` assert both
+        // `get0(Err 0) = 3` and `get0(Err 3) = 0` — a contradictory base that
+        // "proved" any goal (s25_ctor_eq_goal_payload_facts.rs).
+        let saved = self.constructor_alias_fact_buffer.replace(Vec::new());
+        let result = self.encode_binop_expr_inner(l, op, r, prefix);
+        let facts =
+            std::mem::replace(&mut self.constructor_alias_fact_buffer, saved).unwrap_or_default();
+        let equality = result?;
+        if !facts.is_empty() {
+            self.flush_guarded_constructor_alias_facts(equality, facts);
+        }
+        Ok(equality)
+    }
+
+    /// Assert each deferred constructor-equality consequence as
+    /// `equality => fact`. SOUND: every fact is a consequence of the equality
+    /// (`alias == Ctor(args)` entails `field_i(alias) == args[i]`), so the
+    /// implication is valid in every model; when the equality is a premise the
+    /// fact follows by modus ponens, and when it is a negated goal nothing is
+    /// assumed. Dropped (completeness only) inside quantifier bodies, where the
+    /// terms mention bound variables, and when the equality is not Bool-sorted.
+    fn flush_guarded_constructor_alias_facts(
+        &mut self,
+        equality: Term,
+        facts: Vec<super::super::ConstructorAliasFact>,
+    ) {
+        if self.quantifier_state.quantifier_depth() != 0
+            || self.solver.get_sort(equality) != Sort::Bool
+        {
+            return;
+        }
+        for fact in facts {
+            match fact {
+                super::super::ConstructorAliasFact::Equality { label, lhs, rhs } => {
+                    let fact_term = self.seq_aware_equality_term(lhs, rhs);
+                    let guarded = self.solver.implies(equality, fact_term);
+                    self.assert_solver_term(label, guarded);
+                }
+                super::super::ConstructorAliasFact::Registration {
+                    datatype,
+                    constructor_name,
+                    alias,
+                    args,
+                } => {
+                    let symbol =
+                        Self::native_constructor_ground_symbol(&datatype.name, &constructor_name);
+                    let mut path_conditions = self.active_path_conditions_cloned();
+                    path_conditions.push(equality);
+                    self.ground_pool
+                        .register_term_application_with_path_conditions(
+                            &symbol,
+                            alias,
+                            args,
+                            path_conditions,
+                        );
+                }
+            }
+        }
+    }
+
+    fn defer_constructor_alias_equality(&mut self, label: &'static str, lhs: Term, rhs: Term) {
+        if let Some(buffer) = self.constructor_alias_fact_buffer.as_mut() {
+            buffer.push(super::super::ConstructorAliasFact::Equality { label, lhs, rhs });
+        }
+    }
+
+    fn defer_constructor_alias_registration(
+        &mut self,
+        datatype: &DatatypeSort,
+        constructor_name: &str,
+        alias: Term,
+        args: &[Term],
+    ) {
+        if let Some(buffer) = self.constructor_alias_fact_buffer.as_mut() {
+            buffer.push(super::super::ConstructorAliasFact::Registration {
+                datatype: datatype.clone(),
+                constructor_name: constructor_name.to_string(),
+                alias,
+                args: args.to_vec(),
+            });
+        }
+    }
+
+    fn encode_binop_expr_inner(
         &mut self,
         l: &PureExpr,
         op: BinOp,
@@ -1214,6 +1321,8 @@ impl AYEncoder {
                 | BinOp::Mul
                 | BinOp::Div
                 | BinOp::Mod
+                | BinOp::DivTrunc
+                | BinOp::RemTrunc
                 | BinOp::Lt
                 | BinOp::Le
                 | BinOp::Gt
@@ -1391,6 +1500,10 @@ impl AYEncoder {
             )
         };
         if matches!(op, BinOp::Eq | BinOp::Ne) {
+            lt = self.fit_unsuffixed_float_literal(l, lt, rt)?;
+            rt = self.fit_unsuffixed_float_literal(r, rt, lt)?;
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
             // `seq.index_logic(i)` still encodes through the Int carrier.
             // When equality gives us a richer peer sort (for example Mapping
             // in `result[i]@ == pred[i]`), restore the seq element first so
@@ -1437,7 +1550,7 @@ impl AYEncoder {
         // collapsed `MutRef(T)` carrier. Because the `Box` indirection is
         // collapsed, `&mut **x` IS the reborrow `x` itself, so the equality is a
         // whole-mut-ref equality `result == x`. But the extra `Deref` over the
-        // `MutRef`-carrier `Final(x)` encodes (Phase 2 naming / scalar collapse)
+        // `MutRef`-carrier `Final(x)` encodes (under scalar collapse)
         // to a non-`MutRef` leaf, so `result(MutRef) == leaf` sort-coerces into a
         // fresh unconstrained const and the goal becomes trivially SAT.
         //
@@ -1450,7 +1563,7 @@ impl AYEncoder {
         // collapsed carrier IS `^x`'s carrier `x` — an exact rewrite, never an
         // added assumption. Guarded on a *scalar* (non-reference) referent so a
         // genuine nested `&mut &mut T` (where the inner deref is a real reference
-        // peel) is left to the legacy path.
+        // peel) is left to the general path.
         if matches!(op, BinOp::Eq | BinOp::Ne) {
             if self.is_mut_ref_sorted(rt) && !self.is_mut_ref_sorted(lt) {
                 if let Some(carrier) = box_collapsed_reborrow_carrier(l) {
@@ -1515,7 +1628,7 @@ impl AYEncoder {
         }
         // Pass operand sort for Eq/Ne so encode_binop can preserve
         // equality-sort bookkeeping even though the native equality
-        // helper no longer needs a Bool-specific branch.
+        // helper has no Bool-specific branch.
         // When inferred sorts disagree, prefer the more specific sort:
         // Bool > Seq/Uninterpreted/Datatype > Int (the default). (#1805)
         let eq_sort = equality_target_sort;
@@ -1618,7 +1731,7 @@ impl AYEncoder {
                     if candidate_sort == field_sort
                         || (is_seq_family_sort(&candidate_sort) && is_seq_family_sort(&field_sort))
                     {
-                        self.assert_ground_equality_with_seq_propagation(
+                        self.defer_constructor_alias_equality(
                             "datatype_constructor/ground_erased_alias_payload",
                             candidate,
                             *arg_term,
@@ -1652,7 +1765,7 @@ impl AYEncoder {
                         &projection_decl,
                         &[alias_term],
                     )?;
-                    self.assert_ground_equality_with_seq_propagation(
+                    self.defer_constructor_alias_equality(
                         "datatype_constructor/ground_alias_tuple_get",
                         projection,
                         *arg_term,
@@ -1666,7 +1779,7 @@ impl AYEncoder {
             return Ok(());
         }
 
-        self.register_ground_native_constructor_application(
+        self.defer_constructor_alias_registration(
             &datatype,
             &constructor_name,
             alias_term,
@@ -1683,7 +1796,7 @@ impl AYEncoder {
                 else {
                     continue;
                 };
-                self.assert_ground_equality_with_seq_propagation(
+                self.defer_constructor_alias_equality(
                     "datatype_constructor/ground_alias_selector",
                     selector_term,
                     arg_term,

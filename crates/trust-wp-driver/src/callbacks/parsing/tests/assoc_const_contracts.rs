@@ -18,11 +18,14 @@ struct QualifiedAssocConstContractProbe {
 
 impl Callbacks for GenericAssocConstDefinitionProbe {
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        self.definitions =
-            crate::mir_analysis::extract::collect_generic_assoc_const_definitions(tcx);
-        self.ran = true;
-        Compilation::Stop
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            self.definitions =
+                crate::mir_analysis::extract::collect_generic_assoc_const_definitions(tcx);
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 
@@ -32,26 +35,30 @@ impl Callbacks for QualifiedAssocConstContractProbe {
     }
 
     #[allow(clippy::elidable_lifetime_names)]
-    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let contracts = find_contract_functions(tcx);
-        let Some(contract) = contracts
-            .iter()
-            .find(|contract| tcx.def_path_str(contract.def_id).ends_with("nat_i3_logic"))
-        else {
-            return Compilation::Stop;
-        };
-        let user_specs = HashMap::new();
-        let trait_specs = HashMap::new();
-        let extern_specs = HashMap::new();
-        let extraction_ctx =
-            ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, false, false);
+    fn after_expansion<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        crate::callbacks::thread_locals::with_mir_session(tcx, || {
+            let _ = tcx.analysis(());
+            let contracts = find_contract_functions(tcx);
+            let Some(contract) = contracts
+                .iter()
+                .find(|contract| tcx.def_path_str(contract.def_id).ends_with("nat_i3_logic"))
+            else {
+                return Compilation::Stop;
+            };
+            let user_specs = HashMap::new();
+            let trait_specs = HashMap::new();
+            let extern_specs = HashMap::new();
+            let extraction_ctx =
+                ExtractionContext::new(&user_specs, &trait_specs, &extern_specs, &[], false, false);
 
-        let parsed = parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
-            .expect("nat_i3_logic contract should parse and extract");
+            let parsed =
+                parse_and_extract_contract(tcx, contract, &HashSet::new(), &extraction_ctx)
+                    .expect("nat_i3_logic contract should parse and extract");
 
-        self.ensures = parsed.ensures.clone();
-        self.ran = true;
-        Compilation::Stop
+            self.ensures = parsed.ensures.clone();
+            self.ran = true;
+            Compilation::Stop
+        })
     }
 }
 

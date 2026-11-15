@@ -2,7 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Unit pins for the 2026-08-20 CE-census fixes.
+//! Unit pins for the CE-census fixes: counterexamples the census traced to
+//! encoder seams rather than to the program under verification.
 //!
 //! One pin per seam, each with verified teeth (fails unfixed):
 //! 1. Ground-then-drop coherence: grounding-exempt negative-contains standard

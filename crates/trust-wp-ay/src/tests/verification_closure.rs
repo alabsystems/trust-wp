@@ -456,6 +456,12 @@ fn test_closure_existential_via_axiom_no_resolve() {
 /// 3. resolve(f2) on a quantifier-bound variable collapses to true
 ///
 /// Part of #970 (closure specification encoding, Step 2).
+///
+/// Not credited since D-127: `f2` is written without a sort, so it ranges
+/// over closure states that may hold the caller's borrow, and its final value
+/// is refused rather than collapsed onto the binder. The collapse also
+/// verified the same claim of a function that RETURNS the state
+/// (v13_returned_closure_state_resolved_unannotated).
 #[test]
 #[timeout(30000)]
 fn test_closure_fnmut_existential_postcondition() {
@@ -499,13 +505,9 @@ fn test_closure_fnmut_existential_postcondition() {
         VerificationRequest::new(&all_requires, &all_ensures).return_expr(Some(&body)),
     );
     assert!(
-        result.is_ok(),
-        "FnMut existential postcondition should not error: {result:?}"
-    );
-    let vr = result.unwrap();
-    assert!(
-        matches!(vr, VerificationResult::Verified(_)),
-        "weaken_2_std should verify via fn_mut_once law + existential: {vr:?}"
+        !matches!(result, Ok(VerificationResult::Verified(_))),
+        "weaken_2_std's resolve of an unannotated closure-state binder must not be credited \
+         (D-127): {result:?}"
     );
 }
 
@@ -576,6 +578,9 @@ fn test_closure_fn_postcondition_from_existential_assumption() {
 /// This matches the real `weaken_std` pipeline shape more closely than the
 /// precondition-only regression above: the existential arrives from a callee
 /// ensures clause wrapped in `LetAssume`, not directly in `requires`.
+///
+/// Not credited since D-127: the assumption resolves `f2`, a binder written
+/// without a sort, whose final value is refused rather than collapsed.
 #[test]
 #[timeout(30000)]
 fn test_closure_fn_postcondition_from_body_existential_assumption() {
@@ -609,13 +614,9 @@ fn test_closure_fn_postcondition_from_body_existential_assumption() {
         VerificationRequest::new(&[user_req], &[user_ens]).return_expr(Some(&body)),
     );
     assert!(
-        result.is_ok(),
-        "Fn postcondition from body existential assumption should not error: {result:?}"
-    );
-    let vr = result.unwrap();
-    assert!(
-        matches!(vr, VerificationResult::Verified(_)),
-        "weaken_std LetAssume existential should verify via eager body Skolemization + fn_mut law: {vr:?}"
+        !matches!(result, Ok(VerificationResult::Verified(_))),
+        "weaken_std's assumed resolve of an unannotated closure-state binder must not be read \
+         as its collapse (D-127): {result:?}"
     );
 }
 

@@ -35,9 +35,9 @@ use super::{
         },
         effects::{CallEffects, ExtractionSession},
         spec_apply::{
-            apply_postconditions_with_effects, apply_postconditions_with_self_and_effects,
-            apply_preconditions_with_effects, apply_preconditions_with_self_and_effects,
-            TranslatedArg,
+            apply_invariant_preconditions_with_effects, apply_postconditions_with_effects,
+            apply_postconditions_with_self_and_effects, apply_preconditions_with_effects,
+            apply_preconditions_with_self_and_effects, TranslatedArg,
         },
         translate::{translate_operand, ty_to_expr_sort_enriched},
     },
@@ -52,7 +52,7 @@ use super::{
     call_resolve_util::{extend_call_with_const_generic_args, wrap_call_context},
     cell_builtin::handle_cell_builtin_call,
     closure::{
-        call_mutates_closure_state, closure_capture_bindings, first_call_arg_is_mut_ref,
+        call_mutates_closure_state, closure_call_capture_bindings, first_call_arg_is_mut_ref,
         propagate_mutating_receiver_state_with_captures, propagate_mutating_ref_arg_states,
         propagate_mutating_ref_arg_states_for_positions, spec_mutates_closure_state,
         spec_mutating_ref_arg_positions, substitute_capture_fields_in_postcondition,
@@ -165,13 +165,13 @@ fn is_canonical_agree_path(path: &str) -> bool {
 /// argument is the RA type parameter `R` itself — inspect `substs[0]`, exactly
 /// as [`self_ty_inner_ra_is_excl`] does. (#quantifier-frontier)
 fn self_ty_inner_ra_is_agree<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return false;
     };
     let rustc_middle::ty::TyKind::FnDef(_, substs) = constant.const_.ty().kind() else {
         return false;
     };
-    let Some(ra_ty) = substs.first().and_then(|arg| arg.as_type()) else {
+    let Some(ra_ty) = substs.skip_binder().first().and_then(|arg| arg.as_type()) else {
         return false;
     };
     matches!(
@@ -213,15 +213,15 @@ fn self_ty_inner_ra_is_agree<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> b
 /// It is NOT a theorem for any RA with non-trivial inclusion: for `Frac`,
 /// `Auth`/ViewRA or `FMapRA`, `a.incl(c) && b.incl(c)` says only that both sit
 /// below the join, and two distinct fragments join without being equal.
-/// Asserting the equality generically was the pre-2026-08-27 defect; the gate
-/// below is what keeps it confined.
+/// Asserting the equality generically is the false accept the gate below
+/// confines to `Ag`.
 ///
 /// The `requires(self.id() == other.id())` clause stays committed and is
 /// emitted as a caller obligation on EVERY RA including `Ag` — without it the
 /// join relates unrelated resources and the derivation above does not apply.
 ///
 /// Returns `Some(augmented)` when the gate fires, `None` to use the spec's own
-/// `ensures` unchanged. (#quantifier-frontier)
+/// `ensures` unchanged.
 fn ag_join_shared_ensures<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &Operand<'tcx>,
@@ -398,14 +398,14 @@ mod gate_tests {
 /// exclusive RA, whose `op` is always `None`. Agree/Frac (whose `op` may be
 /// `Some`, so two valid resources may share an id) MUST NOT match.
 fn self_ty_inner_ra_is_excl<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return false;
     };
     let rustc_middle::ty::TyKind::FnDef(_, substs) = constant.const_.ty().kind() else {
         return false;
     };
     // substs[0] is the RA type parameter `R` of `Resource<R>` — here `Excl<_>`.
-    let Some(ra_ty) = substs.first().and_then(|arg| arg.as_type()) else {
+    let Some(ra_ty) = substs.skip_binder().first().and_then(|arg| arg.as_type()) else {
         return false;
     };
     matches!(
@@ -444,17 +444,17 @@ fn self_ty_inner_ra_is_excl<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bo
 ///
 /// The committed spec's `self@.op(other@) != None` clause is UNENCODABLE — the
 /// ay encoder has no `op` method and `Excl` is erased before encoding, so that
-/// clause raises a hard `unknown method op` encoding error (which is why
-/// `excl.rs` currently fails). For Excl we therefore DROP that unencodable
+/// clause raises a hard `unknown method op` encoding error. For Excl we
+/// therefore DROP that unencodable
 /// clause and substitute its sound, derived consequence `self.id() != other.id()`.
 /// The `^self == *self` clause (encodable, sound) is kept. This is not a
 /// weakening: `id != id` is exactly what `requires(id==id) ∧ (op==None) ∧
-/// (op!=None)` entails for an exclusive RA. We never assert the false
-/// `op != None` itself (that was the 9aec447 false-accept hazard).
+/// (op!=None)` entails for an exclusive RA. We never assert `op != None`
+/// itself: for Excl it is false, and a false premise makes every goal at the
+/// call site vacuous.
 ///
 /// SOUNDNESS NOTE — why injecting `id != id` is sound even though trust-wp does
-/// not separately encode Excl exclusivity (two adversarial audits flagged this;
-/// both were empirically refuted — see below). `self.id() != other.id()` is
+/// not separately encode Excl exclusivity. `self.id() != other.id()` is
 /// asserted as a DERIVED AXIOM: it is TRUE in the intended resource-algebra model
 /// (Excl exclusivity — no two valid `Excl` resources share an id), but the SMT
 /// solver cannot *derive* it because exclusivity is not separately encoded.
@@ -467,12 +467,11 @@ fn self_ty_inner_ra_is_excl<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bo
 /// the driver's vacuity detector reports the obligation VACUOUS (verified=0) —
 /// never `verified=1`, never a genuine proof; (b) is unconstructible because
 /// `Resource::split`'s precondition (`incl_eq_op`) is unsatisfiable for Excl
-/// (`op` always `None`). Verified empirically: `requires(id==id) ensures(false)`
-/// and `ensures(result==1)` exploits report `verified=0, vacuous=1`; the split
-/// construction is rejected; the no-lemma copy is rejected; should_fail holds
-/// 0 false-accepts. `excl.rs` itself verifies NON-vacuously (`verified=1,
-/// vacuous=0`): the `id==id` branch is dead and the reachable path proves the
-/// true postcondition `id != id`.
+/// (`op` always `None`). The exploits this rules out — `requires(id==id)
+/// ensures(false)`, `ensures(result==1)` — come out vacuous, never verified;
+/// the split construction and the no-lemma copy are rejected. `excl.rs` itself
+/// verifies NON-vacuously: the `id==id` branch is dead and the reachable path
+/// proves the true postcondition `id != id`.
 ///
 /// The single SOUNDNESS GATE shared by the Excl `valid_op_lemma` specialization:
 /// fires iff the call is `Resource::valid_op_lemma` (carrier `Resource`;
@@ -481,7 +480,6 @@ fn self_ty_inner_ra_is_excl<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bo
 /// `ensures` rewrite (`excl_valid_op_lemma_ensures`) and the `requires` clearing
 /// (`excl_valid_op_lemma_clear_requires`) are conditioned on exactly this
 /// predicate, so the specialization can never partially apply to a non-Excl RA.
-/// (#2315)
 fn excl_valid_op_lemma_gate<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>, def_id: DefId) -> bool {
     callee_is_valid_op_lemma(tcx, def_id) && self_ty_inner_ra_is_excl(tcx, func)
 }
@@ -568,4 +566,8 @@ pub(in crate::mir_analysis::extract) use dispatch::handle_call_terminator;
 #[cfg(test)]
 pub(in crate::mir_analysis::extract) use mapping_closure::{
     collect_equality_substitutions, is_call_result_var,
+};
+pub(in crate::mir_analysis) use spec_resolution::callee_invariant_premises;
+pub(in crate::mir_analysis::extract) use spec_resolution::{
+    charge_callee_invariant_grant, entered_body_def_id,
 };

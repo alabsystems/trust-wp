@@ -288,3 +288,57 @@ fn test_infer_method_call_usage_sorts_batch_fset_and_fmap() {
         "batch should record FMap argument usage for merge(n)"
     );
 }
+
+#[test]
+fn exchange_infers_both_sequence_carriers_and_integer_indices() {
+    let body = method_call(
+        var("after"),
+        "exchange",
+        vec![var("before"), var("i"), var("j")],
+    );
+    let batch = infer_method_call_usage_sorts_batch(&body, &["after", "before", "i", "j"]);
+    for (name, expected) in [
+        ("after", Sort::seq(Sort::Int)),
+        ("before", Sort::seq(Sort::Int)),
+        ("i", Sort::Int),
+        ("j", Sort::Int),
+    ] {
+        assert_eq!(
+            infer_method_call_usage_sort(&body, name),
+            Some(expected.clone())
+        );
+        assert_eq!(batch.get(name), Some(&expected));
+    }
+}
+
+#[test]
+fn malformed_exchange_does_not_supply_binder_sorts() {
+    for args in [
+        vec![var("before")],
+        vec![var("before"), var("i")],
+        vec![var("before"), var("i"), var("j"), var("extra")],
+    ] {
+        let body = method_call(var("after"), "exchange", args);
+        let names = ["after", "before", "i", "j", "extra"];
+        assert!(infer_method_call_usage_sorts_batch(&body, &names).is_empty());
+        for name in names {
+            assert_eq!(infer_method_call_usage_sort(&body, name), None);
+        }
+    }
+}
+
+#[test]
+fn exchange_on_views_does_not_change_the_owner_carriers() {
+    let body = method_call(
+        view(var("after")),
+        "exchange",
+        vec![view(var("before")), var("i"), var("j")],
+    );
+    let batch = infer_method_call_usage_sorts_batch(&body, &["after", "before", "i", "j"]);
+    for name in ["after", "before"] {
+        assert_eq!(infer_method_call_usage_sort(&body, name), None);
+        assert!(!batch.contains_key(name));
+    }
+    assert_eq!(batch.get("i"), Some(&Sort::Int));
+    assert_eq!(batch.get("j"), Some(&Sort::Int));
+}

@@ -89,6 +89,20 @@ pub(crate) struct VerificationBase<'a> {
     /// UF approximations. Enabled by default for all functions (#2666).
     /// The `#[bitwise_proof]` annotation is no longer required.
     pub(crate) bitwise_proof: bool,
+    /// This VC's goal set carries a fail-closed `false` obligation the DRIVER
+    /// injected because it could not model something (an unspecified callee, a
+    /// dropped spec clause, an exhausted walk — see
+    /// [`crate::verify::goals_carry_fail_closed_marker`]).
+    ///
+    /// The marker is correct and must never be dropped: it makes the VC
+    /// unprovable by construction, which is the fail-closed reading. What it
+    /// must NOT do is license a refutation. A SAT model for a goal set
+    /// containing `false` refutes a clause TRUST-WP manufactured, not one the
+    /// program broke, so the verdict is withheld at the boundary.
+    ///
+    /// Defaults to `false` — "every goal here is a clause somebody wrote" —
+    /// so a caller that does not set it keeps its pre-existing verdicts.
+    pub(crate) injected_fail_closed_goal: bool,
 }
 
 impl<'a> VerificationBase<'a> {
@@ -114,6 +128,7 @@ impl<'a> VerificationBase<'a> {
             unsoundness_snapshot: None,
             logic_ground_mode: LogicGroundInstantiationMode::default(),
             bitwise_proof: true,
+            injected_fail_closed_goal: false,
         }
     }
 
@@ -219,6 +234,14 @@ impl<'a> VerificationBase<'a> {
         self.bitwise_proof = enabled;
         self
     }
+
+    /// Declare that this VC's goals include a driver-injected fail-closed
+    /// `false`. See [`VerificationBase::injected_fail_closed_goal`].
+    #[must_use]
+    pub(crate) fn injected_fail_closed_goal(mut self, injected: bool) -> Self {
+        self.injected_fail_closed_goal = injected;
+        self
+    }
 }
 
 // Keep the public request-bundle setters in sync while the actual field
@@ -320,6 +343,15 @@ macro_rules! impl_shared_request_builders {
         #[must_use]
         pub fn bitwise_proof(mut self, enabled: bool) -> Self {
             self.base = self.base.bitwise_proof(enabled);
+            self
+        }
+
+        /// Declare that this VC's goal set carries a driver-injected
+        /// fail-closed `false` obligation, so no refutation from it may be
+        /// published. Off by default.
+        #[must_use]
+        pub fn injected_fail_closed_goal(mut self, injected: bool) -> Self {
+            self.base = self.base.injected_fail_closed_goal(injected);
             self
         }
     };

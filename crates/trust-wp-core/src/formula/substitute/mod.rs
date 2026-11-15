@@ -9,6 +9,8 @@
 //! plus the capture-avoiding `substitute_capture_avoiding()` helper.
 
 mod capture_avoiding;
+#[cfg(test)]
+mod hygiene_tests;
 mod overlay;
 mod plain;
 pub(crate) mod rename;

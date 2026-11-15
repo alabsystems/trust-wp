@@ -24,7 +24,7 @@ impl super::super::AYEncoder {
     /// capped by the caller-provided remaining budget so Mapping cannot outrun
     /// the shared standard-library ceiling on its own. (#2707)
     pub(super) fn assert_mapping_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         let budget = remaining_budget.min(TRUST_WP_MAPPING_FAMILY_BUDGET);
 
         if budget == 0 {
@@ -103,7 +103,7 @@ impl super::super::AYEncoder {
                 let get_set_k = self.solver.apply(get_decl, &[set_app, k]);
                 let eq = self.eq_term(get_set_k, v);
                 self.assert_solver_term("ground/mapping_set_get", eq);
-                count += 1;
+                count = count.saturating_add(1);
 
                 for (get_app, get_args) in &get_entries {
                     if get_args.len() != 2 {
@@ -135,7 +135,7 @@ impl super::super::AYEncoder {
                     let frame_eq = self.eq_term(*get_app, get_m_k2);
                     let frame = self.solver.implies(premise, frame_eq);
                     self.assert_solver_term("ground/mapping_set_get_frame", frame);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
 
@@ -150,7 +150,7 @@ impl super::super::AYEncoder {
                     let get_cst_k = self.solver.apply(get_decl, &[*cst_app, k]);
                     let eq = self.eq_term(get_cst_k, v);
                     self.assert_solver_term("ground/mapping_cst_get", eq);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -222,7 +222,7 @@ impl super::super::AYEncoder {
             closure_keys.iter().copied().collect();
         self.collect_mapping_get_keys_from_assertions(&mut closure_keys, &mut seen_keys);
 
-        let mut count = 0;
+        let mut count = 0usize;
         for (closure_map, bound_var, body_int) in &closure_axioms {
             let var_sort = self.solver.get_sort(*bound_var);
             for &k in &closure_keys {
@@ -241,7 +241,7 @@ impl super::super::AYEncoder {
                 // quantifier-unhandled.
                 let eq = self.eq_term_no_ite_expand(get_closure_k, body_k);
                 self.assert_solver_term("ground/mapping_closure_get", eq);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
         count

@@ -6,7 +6,7 @@
 //!
 //! Coverage gap: `switch_target.rs` (241 LOC) had zero tests for
 //! `short_constructor_name`, `normalize_constructor_name`, `SwitchTarget::from_arms`,
-//! `pattern_arity`, `infer_adt_name`, `value_constructor_name`, and `datatype()`.
+//! `pattern_arity`, `infer_adt_name`, and `datatype()`.
 
 use ay_dpll::api::Sort;
 use ntest::timeout;
@@ -212,44 +212,6 @@ fn from_arms_wildcard_plus_constructor() {
         SwitchTarget::from_arms(&arms),
         Some(SwitchTarget::OptionInt)
     );
-}
-
-// --- value_constructor_name ---
-
-#[test]
-#[timeout(30000)]
-fn value_constructor_name_option() {
-    assert_eq!(SwitchTarget::OptionInt.value_constructor_name(), "Some");
-}
-
-#[test]
-#[timeout(30000)]
-fn value_constructor_name_result() {
-    assert_eq!(SwitchTarget::ResultIntInt.value_constructor_name(), "Ok");
-}
-
-#[test]
-#[timeout(30000)]
-fn value_constructor_name_user_defined_picks_first_with_payload() {
-    let target = SwitchTarget::UserDefined {
-        adt_name: "MyEnum".to_string(),
-        constructors: vec![
-            ("MyEnum::Empty".to_string(), vec![]),
-            ("MyEnum::Data".to_string(), vec![Sort::Int]),
-        ],
-    };
-    assert_eq!(target.value_constructor_name(), "Data");
-}
-
-#[test]
-#[timeout(30000)]
-fn value_constructor_name_user_defined_fallback_first() {
-    // All constructors have arity 0; falls back to first
-    let target = SwitchTarget::UserDefined {
-        adt_name: "Unit2".to_string(),
-        constructors: vec![("A".to_string(), vec![]), ("B".to_string(), vec![])],
-    };
-    assert_eq!(target.value_constructor_name(), "A");
 }
 
 // --- infer_adt_name ---

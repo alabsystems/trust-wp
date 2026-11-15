@@ -2,94 +2,117 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
 use trust_wp_core::formula::{BinOp, PureExpr};
 
 use crate::callbacks::{
-    closure_enrichment::rewrite_trivial_closure_precondition_goal,
+    closure_enrichment::{
+        rewrite_contract_free_closure_precondition_goal, ClosurePreconditions,
+        ContractFreeClosureReceivers,
+    },
     ghost_context::{
         assumption_targets_focus_vars, collect_focus_var_names, select_focus_connected_assumptions,
     },
 };
 
-#[test]
-fn trivial_closure_precondition_goal_rewrites_direct_receiver() {
-    let mut goal = PureExpr::MethodCall {
-        receiver: Arc::new(PureExpr::Var("c".to_string(), None)),
+fn precondition_goal(receiver: PureExpr) -> PureExpr {
+    PureExpr::MethodCall {
+        receiver: Arc::new(receiver),
         method: "precondition".to_string(),
         args: vec![PureExpr::LogicFnCall {
             name: "__trust_wp_tuple0".to_string(),
             args: vec![],
         }],
-    };
-    let trivial_receivers = HashSet::from(["c".to_string()]);
-
-    let rewritten = rewrite_trivial_closure_precondition_goal(&mut goal, &trivial_receivers);
-    assert!(rewritten, "precondition(c, ..) should be discharged");
-    assert_eq!(goal, PureExpr::Bool(true));
+    }
 }
 
+fn named_receivers(names: &[&str]) -> ContractFreeClosureReceivers {
+    ContractFreeClosureReceivers {
+        names: names
+            .iter()
+            .map(|name| ((*name).to_string(), DefId::from(CRATE_DEF_ID)))
+            .collect(),
+        env_arities: HashMap::new(),
+    }
+}
+
+/// A contract-free closure's precondition is its body's weakest precondition,
+/// so a lane that cannot compute that WP has nothing to substitute and must
+/// leave the obligation standing. Discharging it as `true` is the false accept
+/// this identification exists to close.
 #[test]
-fn trivial_closure_precondition_goal_rewrites_wrapped_receiver() {
-    let mut goal = PureExpr::MethodCall {
-        receiver: Arc::new(PureExpr::Final(Arc::new(PureExpr::Deref(Arc::new(
-            PureExpr::Var("c".to_string(), None),
+fn contract_free_closure_precondition_is_withheld_when_the_body_wp_is_unavailable() {
+    for receiver in [
+        PureExpr::Var("c".to_string(), None),
+        PureExpr::Final(Arc::new(PureExpr::Deref(Arc::new(PureExpr::Var(
+            "c".to_string(),
+            None,
         ))))),
-        method: "precondition".to_string(),
-        args: vec![PureExpr::LogicFnCall {
-            name: "__trust_wp_tuple0".to_string(),
-            args: vec![],
-        }],
-    };
-    let trivial_receivers = HashSet::from(["c".to_string()]);
+    ] {
+        let original = precondition_goal(receiver);
+        let mut goal = original.clone();
+        let rewritten = rewrite_contract_free_closure_precondition_goal(
+            &mut goal,
+            &named_receivers(&["c"]),
+            &ClosurePreconditions::withholding(),
+        );
+        assert!(!rewritten, "an unavailable body WP discharges nothing");
+        assert_eq!(goal, original);
+    }
+}
 
-    let rewritten = rewrite_trivial_closure_precondition_goal(&mut goal, &trivial_receivers);
-    assert!(
-        rewritten,
-        "wrapped receiver should still resolve to closure `c`"
-    );
-    assert_eq!(goal, PureExpr::Bool(true));
+/// An environment-constructor receiver carries capture VALUES, not identity, so
+/// it identifies a closure only through the sole-owner census. An arity no
+/// contract-free closure solely owns resolves to nothing, and a resolver with
+/// no body WP substitutes nothing (D-30).
+#[test]
+fn contract_free_closure_precondition_is_withheld_for_an_unowned_environment_receiver() {
+    let original = precondition_goal(PureExpr::LogicFnCall {
+        name: "__trust_wp_tuple1".to_string(),
+        args: vec![PureExpr::Var("x".to_string(), None)],
+    });
+    for receivers in [
+        ContractFreeClosureReceivers {
+            names: HashMap::new(),
+            env_arities: HashMap::from([(1, DefId::from(CRATE_DEF_ID))]),
+        },
+        named_receivers(&["c"]),
+        ContractFreeClosureReceivers {
+            names: HashMap::new(),
+            env_arities: HashMap::from([
+                (0, DefId::from(CRATE_DEF_ID)),
+                (2, DefId::from(CRATE_DEF_ID)),
+            ]),
+        },
+    ] {
+        let mut goal = original.clone();
+        assert!(!rewrite_contract_free_closure_precondition_goal(
+            &mut goal,
+            &receivers,
+            &ClosurePreconditions::withholding(),
+        ));
+        assert_eq!(goal, original);
+    }
 }
 
 #[test]
-fn trivial_closure_precondition_goal_rewrites_tuple_receiver() {
-    let mut goal = PureExpr::MethodCall {
-        receiver: Arc::new(PureExpr::LogicFnCall {
-            name: "__trust_wp_tuple1".to_string(),
-            args: vec![PureExpr::Var("x".to_string(), None)],
-        }),
-        method: "precondition".to_string(),
-        args: vec![PureExpr::LogicFnCall {
-            name: "__trust_wp_tuple0".to_string(),
-            args: vec![],
-        }],
-    };
-    let trivial_receivers = HashSet::from(["c".to_string()]);
-
-    let rewritten = rewrite_trivial_closure_precondition_goal(&mut goal, &trivial_receivers);
-    assert!(
-        rewritten,
-        "tuple-encoded closure receiver should be discharged when trivial closure set is non-empty"
-    );
-    assert_eq!(goal, PureExpr::Bool(true));
-}
-
-#[test]
-fn trivial_closure_precondition_goal_keeps_non_trivial_receiver() {
-    let original = PureExpr::MethodCall {
-        receiver: Arc::new(PureExpr::Var("f".to_string(), None)),
-        method: "precondition".to_string(),
-        args: vec![PureExpr::LogicFnCall {
-            name: "__trust_wp_tuple0".to_string(),
-            args: vec![],
-        }],
-    };
+fn contract_free_closure_precondition_keeps_an_unidentified_receiver() {
+    let original = precondition_goal(PureExpr::Var("f".to_string(), None));
     let mut goal = original.clone();
-    let trivial_receivers = HashSet::from(["c".to_string()]);
-
-    let rewritten = rewrite_trivial_closure_precondition_goal(&mut goal, &trivial_receivers);
-    assert!(!rewritten, "receiver `f` is not a concrete trivial closure");
+    let rewritten = rewrite_contract_free_closure_precondition_goal(
+        &mut goal,
+        &named_receivers(&["c"]),
+        &ClosurePreconditions::withholding(),
+    );
+    assert!(
+        !rewritten,
+        "receiver `f` is not a concrete closure of this body"
+    );
     assert_eq!(goal, original);
 }
 

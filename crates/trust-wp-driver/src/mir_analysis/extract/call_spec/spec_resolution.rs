@@ -23,10 +23,10 @@ pub(super) fn handle_direct_spec_call<'tcx>(
         ctx,
         projected_write_facts,
     } = call_site;
-    // Per-borrow prophecy carriers (#124), Phase A — BEFORE argument
+    // Per-borrow prophecy carriers, Phase A — BEFORE argument
     // translation: a mutating `&mut` argument whose tracked value is a ground
-    // constant (the locally-rooted-borrow shape behind the closed
-    // `^<constant>` false accept) is rebound to a freshly minted MutRef
+    // constant (the locally-rooted-borrow shape, where `^<constant>` would
+    // otherwise be a literal) is rebound to a freshly minted MutRef
     // carrier keyed on the borrow LOCAL, so the callee's contract
     // instantiates `^arg`/`*arg` against a real prophecy variable instead of
     // a literal. The callee-entry binding `*carrier == <value>` lands in the
@@ -37,6 +37,9 @@ pub(super) fn handle_direct_spec_call<'tcx>(
         args,
         spec,
         (!mint_param_names.is_empty()).then_some(mint_param_names.as_slice()),
+        // User/trait lane: the borrow-forwarding exception never applies to a
+        // body trust-wp does not fix (see `callee_forwards_mut_borrow`).
+        false,
     );
     let pending_advancement = super::super::borrow_carriers::mint_carriers_for_call_args(
         tcx,
@@ -47,8 +50,8 @@ pub(super) fn handle_direct_spec_call<'tcx>(
         &mut local_exprs,
         &mut session.effects.assumptions,
     );
-    // Per-borrow prophecy carriers, closure-capture lane
-    // (#closure-capture-carriers), Phase A — BEFORE argument translation: a
+    // Per-borrow prophecy carriers, closure-capture lane,
+    // Phase A — BEFORE argument translation: a
     // state-mutating call consuming a closure whose by-`&mut` captures track
     // ground constants gets those environment fields rebound to freshly
     // minted MutRef carriers keyed on the capture borrow locals, so the
@@ -96,7 +99,7 @@ pub(super) fn handle_direct_spec_call<'tcx>(
     let obligations_before = session.effects.obligations.len();
     let assumptions_before = session.effects.assumptions.len();
 
-    // Excl-gated `valid_op_lemma` exclusivity fact (#2315). When the callee is
+    // Excl-gated `valid_op_lemma` exclusivity fact. When the callee is
     // `valid_op_lemma` on a `Resource<Excl<_>>` receiver, the committed
     // `requires: self.id() == other.id()` becomes a caller obligation that
     // contradicts excl.rs's own `id != id` postcondition. For Excl the precond
@@ -111,7 +114,35 @@ pub(super) fn handle_direct_spec_call<'tcx>(
             &mut *session.effects,
         );
     }
-    // Excl-gated `valid_op_lemma` exclusivity fact (#2315). When the callee is
+    // The callee's synthesized parameter type invariants. Its own body is
+    // verified WITH these as premises; this is the code that makes the caller
+    // pay for them. Not gated by the Excl lemma rewrite above: that gate
+    // concerns one committed `requires` string, not the invariant of a value
+    // this call hands over.
+    //
+    // `spec` is NOT the vector to read: a contract written on a trait
+    // DECLARATION reaches this call site out of the trait spec table, which
+    // carries no invariant clauses at all, while the body that runs is an
+    // impl's and was granted its own. Read the grant itself, over the
+    // parameter names the granting body wrote it against — `param_names` here
+    // is the CALLEE SPEC's basis, and a body whose parameters are named
+    // differently would have its clauses substituted at the wrong positions.
+    if charge_callee_invariant_grant(
+        tcx,
+        body,
+        func,
+        def_id,
+        (ctx.user_specs, ctx.trait_specs),
+        &translated_args,
+        &mut *session.effects,
+    )
+    .is_err()
+    {
+        session
+            .effects
+            .record_injected_fail_closed_obligation("trait-call-typeinv-grant-unidentified");
+    }
+    // Excl-gated `valid_op_lemma` exclusivity fact. When the callee is
     // `valid_op_lemma` on a `Resource<Excl<_>>` receiver, append the sound,
     // op-free consequence `self.id() != other.id()` so the lemma's intended
     // effect reaches the VC (the `op != None` ensures is unencodable because
@@ -128,6 +159,12 @@ pub(super) fn handle_direct_spec_call<'tcx>(
     let ensures: &[String] = ag_ensures.as_deref().unwrap_or(ensures);
     let result_expr = apply_postconditions_with_effects(
         ensures,
+        &crate::mir_analysis::call_signature(
+            tcx,
+            def_id,
+            param_names,
+            Some(crate::mir_analysis::CallSite { body, func }),
+        ),
         &result_var,
         &translated_args,
         param_names,
@@ -151,6 +188,11 @@ pub(super) fn handle_direct_spec_call<'tcx>(
         obligations_before,
         assumptions_before,
     );
+    // wp(call) = pre && (post ==> Q): the postconditions this call produced
+    // are never premises of its own preconditions.
+    session
+        .effects
+        .scope_call_postconditions_under_preconditions(obligations_before, assumptions_before);
 
     // `snapshot!(*a)` for `a: &mut T` lowers to a shared reborrow chain
     // `_t = &(*a); _u = &(*_t); capture(_u)`. Reborrow cancellation in the
@@ -162,13 +204,23 @@ pub(super) fn handle_direct_spec_call<'tcx>(
     // intervening `&mut` call, `*a_p` then incorrectly follows `^a`. When
     // the capture target `T` is a non-reference value (so the snapshot
     // stores a value, not a borrow) but the bound result is a `MutRef`-sorted
-    // var, a deref layer was over-cancelled: recover the current pointee. (#682)
+    // var, a deref layer was over-cancelled: recover the current pointee.
     let result_expr =
         recover_snapshot_capture_current_pointee(tcx, body, def_id, args, result_expr);
 
     let pre_call_self = translated_args.first().map(|arg| arg.expr.clone());
     let first_arg_mut_ref = first_call_arg_is_mut_ref(body, args);
-    let mutating_ref_positions = spec_mutating_ref_arg_positions(body, args, spec, param_names);
+    let interior_capability_roots =
+        interior_capability_roots_for_call(tcx, body, args, &local_exprs);
+    // `false`: user/trait lane — see `callee_forwards_mut_borrow`.
+    let mut mutating_ref_positions =
+        spec_mutating_ref_arg_positions(body, args, spec, param_names, false);
+    super::super::closure::union_interior_mutable_write_positions(
+        tcx,
+        body,
+        args,
+        &mut mutating_ref_positions,
+    );
     propagate_mutating_ref_arg_states_for_positions(
         &mut local_exprs,
         body,
@@ -178,9 +230,9 @@ pub(super) fn handle_direct_spec_call<'tcx>(
         Some(effects),
         None,
     );
-    // Per-borrow prophecy carriers (#124), Phase B — AFTER the shared
-    // receiver-state propagation (which now sees the carrier, not the raw
-    // constant, so its equality rewrite can no longer conflate every
+    // Per-borrow prophecy carriers, Phase B — AFTER the shared
+    // receiver-state propagation (which sees the carrier, not the raw
+    // constant, so its equality rewrite cannot conflate every
     // coincidentally-equal local): advance each base local in the consumed
     // borrow's chain to `Final(<carrier of the local that borrows it>)` and
     // arm the expiry resolution of the non-consumed chain borrows.
@@ -201,12 +253,18 @@ pub(super) fn handle_direct_spec_call<'tcx>(
                 body,
                 ctx.arg_names,
                 self_expr,
+                args.first().map(|arg| &arg.node),
                 None,
+            );
+            reattribute_projected_capture_credit(
+                self_expr,
+                &mut session.effects,
+                assumptions_before,
             );
         }
     }
-    // Closure-capture lane (#closure-capture-carriers), Phase B — AFTER the
-    // capture-state propagation (which now sees the carrier environment):
+    // Closure-capture lane, Phase B — AFTER the
+    // capture-state propagation (which sees the carrier environment):
     // advance each capture borrow's chain root to `Final(<carrier>)` and
     // re-arm the expiry of the non-consumed chain ancestors. The consumed
     // capture borrow itself gets no caller-side expiry fact (RustHorn).
@@ -219,6 +277,26 @@ pub(super) fn handle_direct_spec_call<'tcx>(
             &mut local_exprs,
         );
     }
+    // A call that reads through a shared reference to interior-mutable
+    // memory (`Cell::get`) returns a value observed at THIS program point:
+    // every variable root of a NESTED interior write capability is havocked
+    // here (D-37), and the destination is bound to the call's fresh result
+    // symbol rather than to the pre-state expression.
+    if let Some(roots) = interior_capability_roots {
+        super::super::closure::havoc_interior_capability_roots(
+            &mut local_exprs,
+            roots,
+            &mut effects.obligations,
+        );
+    }
+    // The shared interior-mutability rule for a call result (D-37).
+    let result_expr = super::super::closure::call_result_for_interior_mutable_args(
+        tcx,
+        body,
+        args,
+        result_expr,
+        &result_var,
+    );
     local_exprs.insert(destination.local, result_expr);
     wrap_call_context(
         wrap_projected_facts(
@@ -257,11 +335,16 @@ pub(super) fn handle_extern_spec_call<'tcx>(
         ctx,
         projected_write_facts,
     } = call_site;
-    let (mut effective_spec, effective_args, effective_param_names, effective_self_expr) =
-        resolve_effective_spec(tcx, body, func, args, &local_exprs, ctx, def_id, spec);
+    let (
+        mut effective_spec,
+        effective_args,
+        effective_param_names,
+        effective_self_expr,
+        effective_def_id,
+    ) = resolve_effective_spec(tcx, body, func, args, &local_exprs, ctx, def_id, spec);
     specialize_default_postconditions_for_call(tcx, body, args, def_id, &mut effective_spec);
 
-    // Excl-gated `valid_op_lemma` exclusivity fact (#2315). When the callee is
+    // Excl-gated `valid_op_lemma` exclusivity fact. When the callee is
     // `valid_op_lemma` on a `Resource<Excl<_>>` receiver, append the sound,
     // op-free consequence `self.id() != other.id()` so the lemma's intended
     // effect reaches the VC. The committed `op != None` ensures is unencodable
@@ -283,6 +366,28 @@ pub(super) fn handle_extern_spec_call<'tcx>(
     if excl_valid_op_lemma_clear_requires(tcx, func, def_id) {
         effective_spec.requires.clear();
     }
+    // A core operator-trait call on a primitive integer (`<u8 as Add>::add`,
+    // `<&u8 as Neg>::neg`, `AddAssign::add_assign(&mut x, 1)`, ...) that only
+    // the generic trait fallback resolved carries the opaque
+    // `T::m.precondition(..)`, which no proof discharges. The impl's
+    // precondition IS the primitive operation's panic condition (Rust
+    // semantics; Creusot's prelude `add`/`sub`/.. preconditions), which
+    // `operator_call_obligation` states exactly at this program point: owe that
+    // instead. Applied only when EVERY requires is the opaque fallback form, so
+    // a type-specific table spec keeps its own requires; an operand the exact
+    // obligation cannot translate yields `false` (fail closed).
+    if let Some(exact) = primitive_operator_fallback_obligation(
+        tcx,
+        body,
+        func,
+        args,
+        destination,
+        &local_exprs,
+        &effective_spec,
+    ) {
+        effective_spec.requires.clear();
+        session.effects.obligations.push(exact);
+    }
     // Ag-gated `join_shared` view-agreement fact (#quantifier-frontier). Same
     // shape as the Excl rewrite above and filtered on the EFFECTIVE ensures for
     // the same reason. See `ag_join_shared_ensures` for the derivation of why
@@ -292,6 +397,16 @@ pub(super) fn handle_extern_spec_call<'tcx>(
         effective_spec.ensures = augmented;
     }
     let result_var = call_result_symbol(body, destination.local, tcx);
+    // `map_inv(..).collect::<Vec<_>>()`: remember the translated MapInv
+    // receiver; the recorded view axioms are rooted at this call site's result
+    // below (see `MapInvClosureInfo::to_view_axioms`).
+    let is_vec_collect = super::super::collect_gate::is_collect_into_vec(tcx, func);
+    let map_inv_collect_source = if is_vec_collect {
+        args.first()
+            .and_then(|arg| translate_operand(&arg.node, &local_exprs))
+    } else {
+        None
+    };
     // Snapshot effect-vector lengths for the open-logic unfolding pass below, so
     // it rewrites only THIS call's freshly generated clauses. (#mutex)
     let unfold_obligations_before = session.effects.obligations.len();
@@ -307,6 +422,12 @@ pub(super) fn handle_extern_spec_call<'tcx>(
     let assumptions_before = session.effects.assumptions.len();
     let mut result_expr = apply_postconditions_with_self_and_effects(
         &effective_spec.ensures,
+        &crate::mir_analysis::call_signature(
+            tcx,
+            effective_def_id,
+            effective_param_names.as_deref(),
+            Some(crate::mir_analysis::CallSite { body, func }),
+        ),
         &result_var,
         &effective_args,
         effective_param_names.as_deref(),
@@ -327,10 +448,28 @@ pub(super) fn handle_extern_spec_call<'tcx>(
         unfold_obligations_before,
         unfold_assumptions_before,
     );
-
     if let Some(self_expr) = effective_self_expr.as_ref() {
-        let capture_bindings = closure_capture_bindings(self_expr);
+        let capture_bindings = closure_call_capture_bindings(tcx, effective_def_id, self_expr);
         if !capture_bindings.is_empty() {
+            // A closure's precondition reads its captures in the PRE-call
+            // state: project them from the closure's current state, exactly
+            // as `old(..)` in its postcondition. Left unsubstituted, a
+            // capture name resolves to the caller's variable of that name,
+            // so a second call `c(); c();` is checked against a stale state
+            // (`x@ < 1_000_000` with `x@ == 999_999` before the FIRST call).
+            for obligation in session
+                .effects
+                .obligations
+                .iter_mut()
+                .skip(unfold_obligations_before)
+            {
+                *obligation = substitute_capture_fields_in_postcondition(
+                    obligation,
+                    &capture_bindings,
+                    self_expr,
+                    true,
+                );
+            }
             result_expr = substitute_capture_fields_in_postcondition(
                 &result_expr,
                 &capture_bindings,
@@ -352,6 +491,17 @@ pub(super) fn handle_extern_spec_call<'tcx>(
             }
         }
     }
+    // wp(call) = pre && (post ==> Q): the postconditions this call produced
+    // are never premises of its own preconditions. Scoped AFTER the capture
+    // substitution, so the guard is the precondition over the pre-call
+    // closure state (a guard renamed with the postcondition's post-state
+    // projection could never be discharged).
+    session
+        .effects
+        .scope_call_postconditions_under_preconditions(
+            unfold_obligations_before,
+            unfold_assumptions_before,
+        );
 
     let pre_call_self = effective_self_expr
         .clone()
@@ -359,7 +509,7 @@ pub(super) fn handle_extern_spec_call<'tcx>(
     let first_arg_mut_ref = first_call_arg_is_mut_ref(body, args);
     let uses_concrete_closure_user_spec = extract_closure_def_id_from_fn_call(func)
         .is_some_and(|closure_def_id| ctx.user_specs.contains_key(&closure_def_id));
-    let mutating_ref_positions = if uses_concrete_closure_user_spec {
+    let mut mutating_ref_positions = if uses_concrete_closure_user_spec {
         if first_arg_mut_ref && spec_mutates_closure_state(&effective_spec) {
             vec![0]
         } else {
@@ -371,8 +521,18 @@ pub(super) fn handle_extern_spec_call<'tcx>(
             args,
             &effective_spec,
             effective_param_names.as_deref(),
+            super::super::closure::callee_forwards_mut_borrow(tcx, def_id, body, args),
         )
     };
+    // A shared reference to interior-mutable memory is a write capability.
+    let interior_capability_roots =
+        interior_capability_roots_for_call(tcx, body, args, &local_exprs);
+    super::super::closure::union_interior_mutable_write_positions(
+        tcx,
+        body,
+        args,
+        &mut mutating_ref_positions,
+    );
     propagate_mutating_ref_arg_states_for_positions(
         &mut local_exprs,
         body,
@@ -387,35 +547,123 @@ pub(super) fn handle_extern_spec_call<'tcx>(
     {
         effects.has_mutating_call_effect = true;
         if let Some(self_expr) = pre_call_self.as_ref() {
+            // The receiver operand locates the mutated place only when the
+            // self expression IS the first argument's translation.
+            let receiver_operand = if effective_self_expr.is_none() {
+                args.first().map(|arg| &arg.node)
+            } else {
+                None
+            };
             propagate_mutating_receiver_state_with_captures(
                 &mut local_exprs,
                 body,
                 ctx.arg_names,
                 self_expr,
+                receiver_operand,
                 None,
+            );
+            reattribute_projected_capture_credit(
+                self_expr,
+                &mut session.effects,
+                assumptions_before,
             );
         }
     }
     // `snapshot!(*a)` of a `&mut T` deref is resolved via the extern
     // `Snapshot::capture` spec. Freeze the current pointee value rather than
     // aliasing the mut-ref identity (which later follows the prophecy/final).
-    // See `recover_snapshot_capture_current_pointee`. (#682)
-    let result_expr =
+    // See `recover_snapshot_capture_current_pointee`.
+    let mut result_expr =
         recover_snapshot_capture_current_pointee(tcx, body, def_id, args, result_expr);
+    // A call that reads through a shared reference to interior-mutable
+    // memory (`Cell::get`) returns a value observed at THIS program point:
+    // every variable root of a NESTED interior write capability is havocked
+    // here (D-37), and the destination is bound to the call's fresh result
+    // symbol rather than to the pre-state expression.
+    if let Some(roots) = interior_capability_roots {
+        super::super::closure::havoc_interior_capability_roots(
+            &mut local_exprs,
+            roots,
+            &mut effects.obligations,
+        );
+    }
+    // The shared interior-mutability rule for a call result (D-37).
+    result_expr = super::super::closure::call_result_for_interior_mutable_args(
+        tcx,
+        body,
+        args,
+        result_expr,
+        &result_var,
+    );
+    // map_inv view facts. The facts become FUNCTION-LEVEL
+    // assumptions, so they are stated only when they describe the one
+    // collected value of every normally-terminating execution:
+    // - they are about a symbol naming only this collect call site
+    //   (`$call_<dest>_collect_bb<N>`), bound to the destination on the path
+    //   through this call (via `local_exprs`);
+    // - the receiver is the per-site symbol of exactly one DISTINCT recorded
+    //   `map_inv` info (`$call_<dest>_mapinv_bb<M>`);
+    // - `map_inv_collect_site_is_structural`: the `map_inv` block dominates
+    //   this block, this block dominates every return, neither is on a cycle;
+    // - every extraction of this site states the same facts: an extraction
+    //   that states none records an empty entry, which poisons the site
+    //   (`CallEffects::map_inv_collect_assumptions`).
+    // Anything else states nothing (completeness loss only).
+    if is_vec_collect {
+        let site_name = format!(
+            "$call_{}_collect_bb{}",
+            destination.local.as_u32(),
+            next_bb.as_u32()
+        );
+        let mut facts = Vec::new();
+        if let (Some(source), PureExpr::Var(_, sort)) =
+            (map_inv_collect_source.as_ref(), &result_var)
+        {
+            if result_expr == result_var {
+                let mut infos: Vec<crate::mir_analysis::effects::MapInvClosureInfo> = Vec::new();
+                for info in effects
+                    .map_inv_infos_for(source)
+                    .into_iter()
+                    .chain(session.effects.map_inv_infos_for(source))
+                {
+                    if !infos.contains(info) {
+                        infos.push(info.clone());
+                    }
+                }
+                let collect_block =
+                    super::super::collect_gate::call_block(body, destination, next_bb);
+                if let ([info], Some(collect_block)) = (infos.as_slice(), collect_block) {
+                    if super::super::collect_gate::map_inv_collect_site_is_structural(
+                        body,
+                        info.call_block,
+                        collect_block,
+                    ) {
+                        let site_var = PureExpr::Var(site_name.clone(), sort.clone());
+                        facts = info.to_view_axioms(&site_var);
+                        if !facts.is_empty() {
+                            result_expr = site_var;
+                        }
+                    }
+                }
+            }
+        }
+        effects.record_map_inv_collect_site(site_name.clone(), facts.clone());
+        session
+            .effects
+            .record_map_inv_collect_site(site_name, facts);
+    }
     local_exprs.insert(destination.local, result_expr);
+    let continuation = super::extract_from_block_with_context(
+        tcx,
+        body,
+        next_bb,
+        local_exprs,
+        visited,
+        ctx,
+        effects,
+    );
     wrap_call_context(
-        wrap_projected_facts(
-            projected_write_facts.to_vec(),
-            super::extract_from_block_with_context(
-                tcx,
-                body,
-                next_bb,
-                local_exprs,
-                visited,
-                ctx,
-                effects,
-            ),
-        ),
+        wrap_projected_facts(projected_write_facts.to_vec(), continuation),
         ctx.scope_call_context,
         &mut *session.effects,
     )
@@ -442,14 +690,19 @@ fn resolve_effective_spec<'tcx>(
     Vec<TranslatedArg>,
     Option<Vec<String>>,
     Option<PureExpr>,
+    DefId,
 ) {
     if let Some(closure_def_id) = extract_closure_def_id_from_fn_call(func) {
         if let Some(closure_spec) = ctx.user_specs.get(&closure_def_id) {
-            let closure_args = translate_call_args_for_substitutions_with_tcx(
-                &args[1..],
-                local_exprs,
-                Some(body),
-                Some(tcx),
+            let closure_args = super::super::closure::untupled_closure_call_args(
+                tcx,
+                closure_def_id,
+                translate_call_args_for_substitutions_with_tcx(
+                    &args[1..],
+                    local_exprs,
+                    Some(body),
+                    Some(tcx),
+                ),
             );
             let closure_param_names = arg_names_for_def_id(tcx, closure_def_id);
             let closure_self_expr = args
@@ -460,6 +713,7 @@ fn resolve_effective_spec<'tcx>(
                 closure_args,
                 closure_param_names,
                 closure_self_expr,
+                closure_def_id,
             );
         }
         let translated_args = translate_call_args_for_substitutions_with_tcx(
@@ -473,10 +727,25 @@ fn resolve_effective_spec<'tcx>(
             &tcx.def_path_str(def_id),
             derive_self_expr_from_args(&translated_args),
         );
-        return (spec.clone(), translated_args, param_names, self_expr);
+        return (
+            spec.clone(),
+            translated_args,
+            param_names,
+            self_expr,
+            def_id,
+        );
     }
     if let Some(fn_def_id) = extract_fn_item_def_id_from_fn_trait_call(func) {
-        if let Some(fn_spec) = ctx.user_specs.get(&fn_def_id) {
+        // The item's spec stands in for the `Fn*` spec only while its written
+        // `requires` is all a call into it owes. A body granted a parameter
+        // invariant is owed that grant on every route in (D-141), and this lane
+        // states the written clauses alone, so such an item keeps the `Fn*`
+        // spec's opaque `precondition`, which no proof discharges.
+        if let Some(fn_spec) = ctx
+            .user_specs
+            .get(&fn_def_id)
+            .filter(|fn_spec| fn_spec.inv_requires.is_empty())
+        {
             let fn_args = translate_call_args_for_substitutions_with_tcx(
                 &args[1.min(args.len())..],
                 local_exprs,
@@ -484,17 +753,463 @@ fn resolve_effective_spec<'tcx>(
                 Some(tcx),
             );
             let fn_param_names = arg_names_for_def_id(tcx, fn_def_id);
-            return (fn_spec.clone(), fn_args, fn_param_names, None);
+            return (fn_spec.clone(), fn_args, fn_param_names, None, fn_def_id);
         }
     }
-    let translated_args =
+    let mut translated_args =
         translate_call_args_for_substitutions_with_tcx(args, local_exprs, Some(body), Some(tcx));
+    super::super::closure::resolve_closed_thunk_closure_args(
+        tcx,
+        body,
+        args,
+        &mut translated_args,
+        ctx.user_specs,
+        ctx.trait_specs,
+        ctx.extern_specs,
+    );
     let param_names = resolve_spec_or_mir_arg_names(tcx, def_id, spec.param_names.as_ref());
     let self_expr = normalize_extern_spec_self_expr(
         &tcx.def_path_str(def_id),
         derive_self_expr_from_args(&translated_args),
     );
-    (spec.clone(), translated_args, param_names, self_expr)
+    (
+        spec.clone(),
+        translated_args,
+        param_names,
+        self_expr,
+        def_id,
+    )
+}
+
+/// Charge, at one call, the parameter type invariants the body it enters was
+/// granted: that body's clauses over the arguments handed in.
+///
+/// THE one charging step for a call that resolves to a user or trait spec,
+/// on every lane that walks such a call: the straight-line extractor, both
+/// loop lanes, and the block collector a function with a loop states its
+/// pre- and post-loop calls through. A lane that charged the written
+/// `requires` alone left the body's premise free wherever it walked.
+///
+/// `Err` when which clauses that body holds cannot be stated. The lane then
+/// owes a fail-closed `false`, which the verdict gate reads as a marker bare
+/// or behind a path guard (`trust_wp_ay::is_fail_closed_marker`): refuted by
+/// any model of the guard, it would otherwise be printed as a counterexample
+/// to a program nothing was wrong with.
+pub(in crate::mir_analysis::extract) fn charge_callee_invariant_grant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    def_id: DefId,
+    (user_specs, trait_specs): (&HashMap<DefId, StdSpec>, &HashMap<DefId, StdSpec>),
+    translated_args: &[TranslatedArg],
+    effects: &mut CallEffects,
+) -> Result<(), GrantNotIdentified> {
+    let granted = callee_invariant_requires(tcx, body, func, def_id, user_specs, trait_specs)?;
+    apply_invariant_preconditions_with_effects(
+        &granted.clauses,
+        translated_args,
+        (!granted.param_names.is_empty()).then_some(granted.param_names.as_slice()),
+        None,
+        effects,
+    );
+    Ok(())
+}
+
+/// The call site could not name the body that was granted the invariant
+/// premise, and some body reachable through this callee holds one the caller
+/// cannot state.
+pub(in crate::mir_analysis::extract) struct GrantNotIdentified;
+
+/// A grant read off the table, with the parameter names it is written over.
+///
+/// The names travel WITH the clauses because they are what binds a clause to
+/// an argument: substituting an impl's clauses against the trait
+/// declaration's names would land `inv` on whatever argument happens to sit
+/// at the position the name has THERE.
+pub(super) struct GrantedInvariants {
+    clauses: Vec<PureExpr>,
+    param_names: Vec<String>,
+}
+
+/// The callee's parameter type-invariant premises, stated at `translated_args`.
+///
+/// Reads the same grant [`callee_invariant_requires`] makes a caller pay for,
+/// so a lane that ASSUMES the callee's postcondition conditions it on exactly
+/// the premises the callee's body was verified under. `None` when the entered
+/// body cannot be named or a clause does not render at the arguments: a
+/// postcondition whose premises cannot be stated is not one a lane may carry.
+pub(crate) fn callee_invariant_premises<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    def_id: DefId,
+    user_specs: &HashMap<DefId, StdSpec>,
+    trait_specs: &HashMap<DefId, StdSpec>,
+    translated_args: &[TranslatedArg],
+) -> Option<Vec<PureExpr>> {
+    let granted =
+        callee_invariant_requires(tcx, body, func, def_id, user_specs, trait_specs).ok()?;
+    let mut effects = CallEffects::new();
+    apply_invariant_preconditions_with_effects(
+        &granted.clauses,
+        translated_args,
+        (!granted.param_names.is_empty()).then_some(granted.param_names.as_slice()),
+        None,
+        &mut effects,
+    );
+    (effects.dropped_spec_clauses == 0).then_some(effects.obligations)
+}
+
+/// The synthesized type-invariant clauses THIS call site owes.
+///
+/// The rule is identity, not similarity: the clauses a caller pays for must be
+/// the very vector the body that runs was granted, and that vector lives in the
+/// user spec table keyed on the body's own `DefId`. So the FIRST question is
+/// which body the call enters, on every dispatch route — reading the callee's
+/// own table entry first is how an overriding impl got its `inv(self)` for
+/// free through a default body, whose entry is in that table and whose vector
+/// would otherwise be read at the wrong type.
+///
+/// A body's vector is written over ITS generics, so a parameter typed by a
+/// type parameter holds `inv_T` there; the call owes that clause at the
+/// instantiation the call fixes (D-141). Creusot's `inv` at a type parameter is
+/// exactly this: opaque in the generic body, the instantiated type's invariant
+/// at the call.
+///
+/// When the entered body is not determined, the callee is a trait method and
+/// the caller can only state what the DECLARATION says, because that is all a
+/// generic call site can see. That vector is owed when it COVERS every body
+/// reachable through the method — instantiated at each body's own types, it
+/// states at least that body's grant — and `Err(GrantNotIdentified)`
+/// otherwise.
+fn callee_invariant_requires<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    def_id: DefId,
+    user_specs: &HashMap<DefId, StdSpec>,
+    trait_specs: &HashMap<DefId, StdSpec>,
+) -> Result<GrantedInvariants, GrantNotIdentified> {
+    if let Some((entered, entered_args)) = entered_body(tcx, body, func, def_id) {
+        // A body absent from the table was granted nothing: the table inserts
+        // an entry whenever it synthesizes a clause, so "no entry" is the same
+        // statement as "no premise".
+        return granted_invariants(tcx, user_specs, entered).instantiated_at(tcx, entered_args);
+    }
+    let call_args =
+        super::super::call_resolve_util::resolve_unique_call_fn_def(body, func).map(|(_, a)| a);
+    declaration_grant_covering_every_body(tcx, user_specs, trait_specs, def_id, call_args)
+        .ok_or(GrantNotIdentified)
+}
+
+/// The `DefId` of the body a call to `def_id` enters, or `None` when the call
+/// does not determine it (a trait method whose instance does not resolve: a
+/// generic receiver, a `dyn` vtable, a `Fn*` shim).
+///
+/// One answer for every consumer that asks which body runs: the invariant
+/// grant this call owes (`callee_invariant_requires`) and the panic account
+/// that credits the call (`panic_site_coverage`) read it from here, so neither
+/// can name a body the other did not.
+pub(in crate::mir_analysis::extract) fn entered_body_def_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    def_id: DefId,
+) -> Option<DefId> {
+    entered_body(tcx, body, func, def_id).map(|(entered, _)| entered)
+}
+
+/// `entered_body_def_id` with the generic arguments that body is entered at,
+/// when the call supplies them: a type-parameter clause of its grant is owed
+/// at exactly these.
+fn entered_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    def_id: DefId,
+) -> Option<(DefId, Option<rustc_middle::ty::GenericArgs<'tcx>>)> {
+    if let Some((entered, entered_args)) = resolve_callee_body(tcx, body, func) {
+        return Some((entered, Some(entered_args)));
+    }
+    // No dispatch to be unsure about: a free function, an inherent method or a
+    // trait IMPL method is the body, whatever stopped the instance resolving.
+    if is_trait_declared_method(tcx, def_id) {
+        return None;
+    }
+    let call_args =
+        super::super::call_resolve_util::resolve_unique_call_fn_def(body, func).map(|(_, a)| a);
+    Some((def_id, call_args))
+}
+
+/// The grant `body_def_id` was handed, over its own parameter names.
+fn granted_invariants(
+    tcx: TyCtxt<'_>,
+    user_specs: &HashMap<DefId, StdSpec>,
+    body_def_id: DefId,
+) -> GrantedInvariants {
+    let clauses = user_specs
+        .get(&body_def_id)
+        .map(|granted| granted.inv_requires.clone())
+        .unwrap_or_default();
+    GrantedInvariants {
+        param_names: if clauses.is_empty() {
+            Vec::new()
+        } else {
+            arg_names_for_def_id(tcx, body_def_id).unwrap_or_default()
+        },
+        clauses,
+    }
+}
+
+impl GrantedInvariants {
+    /// The grant with every type-parameter invariant stated at `args`, the
+    /// generic arguments of the body the clauses were built under. Refused
+    /// when a clause needs an instantiation the call does not supply, or one
+    /// that states nothing about the body a later hop enters.
+    fn instantiated_at<'tcx>(
+        self,
+        tcx: TyCtxt<'tcx>,
+        args: Option<rustc_middle::ty::GenericArgs<'tcx>>,
+    ) -> Result<Self, GrantNotIdentified> {
+        let has_type_param_clause = self
+            .clauses
+            .iter()
+            .any(crate::callbacks::mentions_type_param_invariant);
+        if !has_type_param_clause {
+            return Ok(self);
+        }
+        let args = args.ok_or(GrantNotIdentified)?;
+        let clauses = crate::callbacks::instantiate_type_param_invariants(tcx, &self.clauses, args)
+            .ok_or(GrantNotIdentified)?;
+        Ok(Self {
+            param_names: self.param_names,
+            clauses,
+        })
+    }
+}
+
+/// The body this call actually enters and the generic arguments it enters it
+/// at, when the call's own generic arguments determine them.
+///
+/// The callee and its generic arguments are read from ONE resolver, so the
+/// arguments an instance is resolved against always belong to the callee they
+/// came with — including through a reified fn pointer, where the operand is a
+/// local and the pair comes from the single constant that local can hold.
+fn resolve_callee_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgs<'tcx>)> {
+    use rustc_middle::ty::{Instance, InstanceKind, TypeVisitableExt, TypingEnv};
+    let (callee, args) = super::super::call_resolve_util::resolve_unique_call_fn_def(body, func)?;
+    // Resolution normalizes, and an unnormalizable projection can ICE; a
+    // refusal here reaches the covering rule below.
+    if args.has_aliases() || args.has_escaping_bound_vars() {
+        return None;
+    }
+    let args = tcx.erase_and_anonymize_regions(args);
+    let typing_env = TypingEnv::post_analysis(tcx, body.source.def_id());
+    let instance = Instance::try_resolve(tcx, typing_env, callee, args)
+        .ok()
+        .flatten()?;
+    let InstanceKind::Item(resolved) = instance.def else {
+        return None;
+    };
+    Some((resolved, instance.args))
+}
+
+/// Whether `def_id` is declared BY a trait — the only shape where the body a
+/// call enters can differ from the callee it names.
+fn is_trait_declared_method(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    matches!(
+        tcx.opt_associated_item(def_id).map(|assoc| assoc.container),
+        Some(rustc_middle::ty::AssocContainer::Trait)
+    )
+}
+
+/// The trait declaration's own invariant vector, when it covers the grant of
+/// every body this crate has behind `trait_method`, stated at the call's
+/// generic arguments.
+///
+/// Covering is positional: the clause the caller can state names a parameter
+/// of the DECLARATION, and it discharges a body's premise only if, stated at
+/// that body's own types, it is the same invariant at the same position. The
+/// declaration's `Self` clause at an impl for `Sum10` is `Sum10`'s invariant,
+/// so it covers that impl's `inv(self)`; a body granted anything the
+/// instantiated declaration does not state is not covered, and `None` refuses
+/// rather than charging a vector that leaves that premise free.
+///
+/// At the call, a type-parameter clause is owed at the call's own type for
+/// that parameter, and only where some body holds a premise at its position
+/// (no premise there, nothing to pay for). That type must itself be a type
+/// parameter of the caller — whose own callers paid for it — or trivially
+/// invariant-free: any other type at an undetermined dispatch (a trait
+/// object, an unnormalized projection) does not say which impl runs, so the
+/// call refuses.
+fn declaration_grant_covering_every_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    user_specs: &HashMap<DefId, StdSpec>,
+    trait_specs: &HashMap<DefId, StdSpec>,
+    trait_method: DefId,
+    call_args: Option<rustc_middle::ty::GenericArgs<'tcx>>,
+) -> Option<GrantedInvariants> {
+    // A type-parameter clause nested inside a tuple field or an enum arm names
+    // no single position a caller can state. It is left out, as it was before
+    // any such clause existed: a body granted anything there is refused by
+    // the positional comparison below, never charged less.
+    let declared: Vec<PureExpr> = trait_specs
+        .get(&trait_method)
+        .or_else(|| user_specs.get(&trait_method))
+        .map(|spec| spec.inv_requires.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|clause| {
+            !crate::callbacks::mentions_type_param_invariant(clause)
+                || crate::callbacks::type_param_invariant_of(clause).is_some()
+        })
+        .collect();
+    let declared_names = arg_names_for_def_id(tcx, trait_method).unwrap_or_default();
+    let declared_positions = invariant_clause_positions(&declared, &declared_names)?;
+    let mut held_positions = std::collections::HashSet::new();
+    for (body_def_id, spec) in user_specs {
+        if spec.inv_requires.is_empty() || !dispatches_from(tcx, *body_def_id, trait_method) {
+            continue;
+        }
+        let promised = declaration_stated_at_body(tcx, &declared, *body_def_id, trait_method)?;
+        let promised_positions = invariant_clause_positions(&promised, &declared_names)?;
+        let body_names = arg_names_for_def_id(tcx, *body_def_id).unwrap_or_default();
+        let body_positions = invariant_clause_positions(&spec.inv_requires, &body_names)?;
+        if !body_positions
+            .iter()
+            .all(|held| promised_positions.contains(held))
+        {
+            return None;
+        }
+        held_positions.extend(body_positions.into_iter().map(|(position, _)| position));
+    }
+    let mut owed = Vec::with_capacity(declared.len());
+    for (clause, (position, _)) in declared.iter().zip(&declared_positions) {
+        let Some(index) = crate::callbacks::type_param_invariant_of(clause) else {
+            owed.push(clause.clone());
+            continue;
+        };
+        if !held_positions.contains(position) {
+            continue;
+        }
+        let ty = call_args?.get(index as usize)?.as_type()?;
+        if crate::callbacks::is_trivially_invariant_free(ty) {
+            continue;
+        }
+        if !matches!(ty.kind(), rustc_middle::ty::TyKind::Param(_)) {
+            return None;
+        }
+        match crate::callbacks::type_param_invariant_at(tcx, ty, clause) {
+            crate::callbacks::TypeParamInvariantAt::Clause(stated) => owed.push(stated),
+            _ => return None,
+        }
+    }
+    Some(GrantedInvariants {
+        param_names: if owed.is_empty() {
+            Vec::new()
+        } else {
+            declared_names
+        },
+        clauses: owed,
+    })
+}
+
+/// The declaration's vector stated at the types `body_def_id` is written
+/// under: the trait's own generics for its default body, the impl's trait
+/// reference (and the method's own parameters) for an impl method. A vector
+/// with no type-parameter clause reads the same at every type.
+///
+/// A clause this cannot state is dropped rather than refused: the comparison
+/// that reads the result refuses any body granted a premise the declaration
+/// does not state, so a dropped clause can only refuse, never cover.
+fn declaration_stated_at_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    declared: &[PureExpr],
+    body_def_id: DefId,
+    trait_method: DefId,
+) -> Option<Vec<PureExpr>> {
+    use rustc_middle::ty::GenericArgs;
+    if body_def_id == trait_method
+        || !declared
+            .iter()
+            .any(crate::callbacks::mentions_type_param_invariant)
+    {
+        return Some(declared.to_vec());
+    }
+    let impl_def_id = tcx.parent(body_def_id);
+    let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).skip_binder();
+    let args = GenericArgs::identity_for_item(tcx, body_def_id).rebase_onto(
+        tcx,
+        impl_def_id,
+        impl_trait_ref.args,
+    );
+    let mut stated = Vec::with_capacity(declared.len());
+    for clause in declared {
+        let Some(index) = crate::callbacks::type_param_invariant_of(clause) else {
+            stated.push(clause.clone());
+            continue;
+        };
+        let ty = args.get(index as usize)?.as_type()?;
+        if let crate::callbacks::TypeParamInvariantAt::Clause(at_body) =
+            crate::callbacks::type_param_invariant_at(tcx, ty, clause)
+        {
+            stated.push(at_body);
+        }
+    }
+    Some(stated)
+}
+
+/// Whether a call naming `trait_method` can enter `body_def_id`: the trait's
+/// own default body, or an impl of it.
+fn dispatches_from(tcx: TyCtxt<'_>, body_def_id: DefId, trait_method: DefId) -> bool {
+    if body_def_id == trait_method {
+        return true;
+    }
+    matches!(
+        tcx.opt_associated_item(body_def_id).map(|assoc| assoc.container),
+        Some(rustc_middle::ty::AssocContainer::TraitImpl(Ok(declared))) if declared == trait_method
+    )
+}
+
+/// Each clause paired with the parameter POSITION it constrains.
+///
+/// A synthesized clause is `param.inv()`, or `(*param).inv()` for a `&mut`,
+/// and names nothing else. `None` for any other shape: the comparison this
+/// feeds decides whether a premise is covered, and a clause whose parameter
+/// cannot be located is one the comparison would have to guess about.
+fn invariant_clause_positions(
+    clauses: &[PureExpr],
+    arg_names: &[String],
+) -> Option<Vec<(usize, String)>> {
+    clauses
+        .iter()
+        .map(|clause| {
+            let PureExpr::MethodCall {
+                receiver,
+                method,
+                args,
+            } = clause
+            else {
+                return None;
+            };
+            if !args.is_empty() {
+                return None;
+            }
+            let receiver = match receiver.as_ref() {
+                PureExpr::Deref(inner) => inner.as_ref(),
+                other => other,
+            };
+            let PureExpr::Var(name, _) = receiver else {
+                return None;
+            };
+            let position = arg_names.iter().position(|arg| arg == name)?;
+            Some((position, method.clone()))
+        })
+        .collect()
 }
 
 fn preserves_empty_seq_constructor_carrier(expr: &PureExpr) -> bool {
@@ -503,4 +1218,156 @@ fn preserves_empty_seq_constructor_carrier(expr: &PureExpr) -> bool {
         PureExpr::LogicFnCall { name, args }
             if args.is_empty() && matches!(name.as_str(), "seq_empty" | "Seq::empty")
     )
+}
+
+/// Pre-call variable roots of the arguments whose type carries a NESTED
+/// interior write capability (`None` when there is no such argument; see
+/// `nested_interior_capability_arg_positions`).
+fn interior_capability_roots_for_call<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &rustc_middle::mir::Body<'tcx>,
+    args: &[rustc_span::Spanned<rustc_middle::mir::Operand<'tcx>>],
+    local_exprs: &std::collections::HashMap<rustc_middle::mir::Local, PureExpr>,
+) -> Option<Option<Vec<String>>> {
+    let nested = super::super::closure::nested_interior_capability_arg_positions(tcx, body, args);
+    (!nested.is_empty())
+        .then(|| super::super::closure::interior_capability_roots(local_exprs, args, &nested))
+}
+
+/// The exact primitive obligation replacing the generic operator-trait
+/// fallback's opaque `T::m.precondition(..)` requires (see
+/// `handle_extern_spec_call`), or `None` when the call is not a primitive
+/// integer operator call or the spec carries any other requires.
+fn primitive_operator_fallback_obligation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: rustc_middle::mir::Place<'tcx>,
+    local_exprs: &HashMap<Local, PureExpr>,
+    spec: &StdSpec,
+) -> Option<PureExpr> {
+    if spec.requires.is_empty()
+        || !spec
+            .requires
+            .iter()
+            .all(|req| req.trim_start().starts_with("T::") && req.contains(".precondition("))
+    {
+        return None;
+    }
+    let (def_id, generic_args) =
+        super::super::call_resolve_util::resolve_unique_call_fn_def(body, func)?;
+    if !super::super::assertion::is_integer_operator_call(tcx, def_id, generic_args) {
+        return None;
+    }
+    super::super::assertion::operator_call_obligation(
+        tcx,
+        func,
+        args,
+        destination.ty(&body.local_decls, tcx).ty,
+        local_exprs,
+        body,
+    )
+}
+
+/// Move this call's postcondition assumptions onto the capture carriers the
+/// place advance just installed.
+///
+/// The advance and the credit are two halves of one change: a closure's
+/// `#[ensures]` over a captured field, left on the owner's entry symbol while
+/// the place itself moved on, proves nothing about the place — and the entry
+/// premise it shares that symbol with then survives the write.
+fn reattribute_projected_capture_credit(
+    self_expr: &PureExpr,
+    effects: &mut CallEffects,
+    assumptions_before: usize,
+) {
+    let post_states = super::super::closure::projected_capture_post_states(self_expr);
+    if post_states.is_empty() {
+        return;
+    }
+    for assumption in effects.assumptions.iter_mut().skip(assumptions_before) {
+        *assumption = super::super::closure::attribute_capture_credit(assumption, &post_states);
+    }
+}
+
+#[cfg(test)]
+mod grant_position_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn inv(receiver: PureExpr, method: &str) -> PureExpr {
+        PureExpr::MethodCall {
+            receiver: Arc::new(receiver),
+            method: method.to_string(),
+            args: vec![],
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_clause_is_located_at_the_parameter_it_names() {
+        let clauses = vec![inv(PureExpr::Var("s".to_string(), None), "inv_Sum10")];
+        assert_eq!(
+            invariant_clause_positions(&clauses, &names(&["self", "s"])),
+            Some(vec![(1, "inv_Sum10".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_mut_ref_clause_is_located_under_its_deref() {
+        let clauses = vec![inv(
+            PureExpr::Deref(Arc::new(PureExpr::Var("x".to_string(), None))),
+            "inv_Sum10",
+        )];
+        assert_eq!(
+            invariant_clause_positions(&clauses, &names(&["x"])),
+            Some(vec![(0, "inv_Sum10".to_string())])
+        );
+    }
+
+    #[test]
+    fn two_bodies_naming_their_parameters_differently_disagree_on_position() {
+        // The defect this positioning exists to catch: the same NAME is the
+        // invariant-bearing parameter in one body and the other parameter in
+        // the other, so comparing clauses by name alone would call the two
+        // grants equal.
+        let declared = vec![inv(PureExpr::Var("s".to_string(), None), "inv_Sum10")];
+        let held = vec![inv(PureExpr::Var("k".to_string(), None), "inv_Sum10")];
+        assert_eq!(
+            invariant_clause_positions(&declared, &names(&["self", "s", "k"])),
+            Some(vec![(1, "inv_Sum10".to_string())])
+        );
+        assert_eq!(
+            invariant_clause_positions(&held, &names(&["self", "k", "s"])),
+            Some(vec![(1, "inv_Sum10".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_clause_naming_no_parameter_is_refused() {
+        // Refusing here is what stops the covering comparison from answering
+        // "covered" about a clause it could not place.
+        let clauses = vec![inv(
+            PureExpr::Var("elsewhere".to_string(), None),
+            "inv_Sum10",
+        )];
+        assert_eq!(invariant_clause_positions(&clauses, &names(&["s"])), None);
+    }
+
+    #[test]
+    fn a_clause_that_is_not_a_bare_invariant_call_is_refused() {
+        let clauses = vec![PureExpr::Bool(true)];
+        assert_eq!(invariant_clause_positions(&clauses, &names(&["s"])), None);
+        let with_args = vec![PureExpr::MethodCall {
+            receiver: Arc::new(PureExpr::Var("s".to_string(), None)),
+            method: "inv_Sum10".to_string(),
+            args: vec![PureExpr::Int(1)],
+        }];
+        assert_eq!(invariant_clause_positions(&with_args, &names(&["s"])), None);
+    }
 }

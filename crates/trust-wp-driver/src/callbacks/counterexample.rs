@@ -25,6 +25,7 @@ fn is_internal_var(name: &str) -> bool {
                 .strip_prefix(internal)
                 .is_some_and(|rest| rest.starts_with('_'))
     }) || name.starts_with("__trust_wp")
+        || name.contains(trust_wp_core::formula::SYNTHESIZED_NAME_SIGIL)
 }
 
 /// Drop `x_view` when `x` is present with the same value.

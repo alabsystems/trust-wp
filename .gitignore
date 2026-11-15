@@ -79,3 +79,28 @@ tests/creusot_compat/results-*.json
 
 # Publish tool work area (allowlisted-snapshot export, staging clone, reports)
 publish/.out/
+target.noindex/
+/target
+
+# Harness fixture build dirs. These are BUILD ARTIFACTS and must never be
+# untracked-but-visible: `tests/creusot_compat/harness_targets.py`
+# `_git_source_state` hashes the CONTENTS of every untracked file, and the
+# adversarial runner compares that fingerprint before and after building its
+# binaries. A live build dir inside the repo therefore changes the fingerprint
+# mid-build and the runner refuses with
+#   "harness source, path dependency, toolchain, or build environment changed
+#    while binaries were being built"
+# — a correct fail-closed refusal that makes the gate unrunnable. (2026-09-19)
+harness-target-probe/
+harness-target/
+
+# Scratch probe projects. Fix/review agents build one-off crates to reproduce a
+# defect; those are evidence, not source, and one set (proj/r1/test_project)
+# reached main on 2026-09-20 before this rule existed. Note the harness also
+# hashes untracked files for its build fingerprint, so leaving scratch crates
+# visible can make the adversarial gate refuse to run (see the harness-target
+# entry above).
+proj/
+probes/
+review-probes/
+.pytest_cache/

@@ -71,6 +71,7 @@ fn transform_contract_uses_typed_whole_borrow_inv_for_generic_mut_ref_params() {
         mutation_continued_params: HashSet::new(),
         nested_slot_resolutions: vec![],
         nested_transfer_params: HashSet::new(),
+        lent_path_resolutions: vec![],
     });
 
     let transformed = transform_contract(&parsed);
@@ -136,6 +137,7 @@ fn transform_contract_grounds_generic_deref_mut_precondition_quantifier() {
         mutation_continued_params: HashSet::new(),
         nested_slot_resolutions: vec![],
         nested_transfer_params: HashSet::new(),
+        lent_path_resolutions: vec![],
     });
 
     let transformed = transform_contract(&parsed);

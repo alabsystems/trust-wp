@@ -16,7 +16,7 @@ use rustc_middle::{
 };
 use trust_wp_core::formula::{NamedBindingValue, PureExpr};
 
-use super::{detection::LoopInfo, UnresolvedPreLoopCall};
+use super::{detection::LoopInfo, write_sites::WriteSites, UnresolvedPreLoopCall};
 
 /// Tree of sub-place changes (#1816).
 ///
@@ -148,6 +148,12 @@ pub(crate) struct LoopBodyExpr {
     /// AFTER the body effects execute. In preservation, the condition should be
     /// applied to primed (post-body) variables, not the pre-body state. (#1295)
     pub(crate) condition_is_body_break: bool,
+    /// The `SwitchInt` block whose in-body arm establishes `condition` (the
+    /// header condition switch, or the body-break switch). A consumer that
+    /// assumes `condition` at a program point may do so only on paths that
+    /// passed through that arm (loop-exit arms and code before the switch do
+    /// not satisfy it). `None` when no single switch establishes it.
+    pub(crate) condition_switch: Option<rustc_middle::mir::BasicBlock>,
     /// Variables modified in the loop
     pub(crate) modified_vars: Vec<String>,
     /// Projection-aware changed-place trees for sub-place granularity (#1816).
@@ -182,9 +188,14 @@ pub(crate) struct LoopBodyExpr {
     /// Used by `rewrite_loop_postcondition_old` to reject `old(x)` when `x`
     /// no longer holds its function-entry value at loop entry.
     pub(crate) pre_loop_written_params: HashSet<String>,
+    /// Named locals/parameters whose value (or pointee) may have been changed
+    /// by a store through a reference BEFORE loop entry (prophecy-store). The
+    /// initialization VC reads such names at their function-entry binding, so
+    /// an invariant mentioning one cannot be credited at loop entry.
+    pub(crate) pre_loop_deref_stored_names: HashSet<String>,
     /// Unresolved pre-loop function calls that need TyCtxt to resolve. (#1295)
     ///
-    /// Collected during MIR analysis (inside `MIR_BODIES.with`), then resolved
+    /// Collected during MIR analysis, then resolved
     /// by the caller using `resolve_pre_loop_calls(tcx, ...)` and merged into
     /// `pre_loop_assignments`.
     pub(crate) unresolved_pre_loop_calls: Vec<UnresolvedPreLoopCall>,
@@ -232,6 +243,22 @@ pub(crate) struct LoopBodyExpr {
     /// the iterable payload. When `Some`, the loop verifier can synthesize the
     /// structural invariant plus the one-step iterator transition fact.
     pub(crate) for_loop_state: Option<ForLoopGhostState>,
+    /// Callee postconditions from the body walk, each stated at its call's
+    /// result under the path and callee premises reaching it.
+    pub(crate) call_facts: Vec<PureExpr>,
+    /// Premises some path through the body supplies that the loop VC does not
+    /// state: while one stands, a model of the preservation VC is not a
+    /// counterexample to the program.
+    pub(crate) dropped_premises: Vec<super::DroppedPremise>,
+    /// The postcondition of the call whose result the loop condition reads,
+    /// stated at the header state. The call runs wherever the condition is
+    /// evaluated, so these are premises of every VC that assumes the
+    /// condition or its negation (loop_condition_call_postcondition_control).
+    pub(crate) condition_facts: Vec<PureExpr>,
+    /// Why the loop condition reads a call result no premise constrains, when
+    /// it does. A model of a VC that assumes the condition or its negation
+    /// then picks that value freely, so it is not a counterexample.
+    pub(crate) condition_unstated: Option<String>,
 }
 
 /// Collect variable names modified by assignments and call destinations in the
@@ -250,7 +277,7 @@ pub(super) fn extract_modified_vars(
     for &bb in &loop_info.body_blocks {
         let bb_data = &body.basic_blocks[bb];
         for stmt in &bb_data.statements {
-            if let StatementKind::Assign(box (place, _)) = &stmt.kind {
+            if let StatementKind::Assign((place, _)) = &stmt.kind {
                 modified_locals.insert(place.local);
                 // Writes through a borrow temp (`*_tmp = ...`) should attribute
                 // to the underlying named local. (#1816, Wave 7A)
@@ -264,6 +291,23 @@ pub(super) fn extract_modified_vars(
         }
         if let TerminatorKind::Call { destination, .. } = &bb_data.terminator().kind {
             modified_locals.insert(destination.local);
+        }
+    }
+    // Writes a `&mut` borrow carries into a call, and stores through a
+    // pointer, are write sites too. Counting only `Assign` and `Call`
+    // destinations leaves `x` in `while .. { setneg(&mut x) }` out of this
+    // set, and the loop frame then keeps its pre-loop value.
+    let write_sites = WriteSites::new(body);
+    for (local, write) in write_sites.writes_in_blocks(loop_info.body_blocks.iter().copied()) {
+        if local_to_name.contains_key(&local) {
+            modified_locals.insert(local);
+        } else if matches!(write.tree, ChangedPlacesTree::Deref(_)) {
+            // Only a write through the temporary's POINTEE reaches the local it
+            // borrows; a write of the temporary's own value (`_t = copy n`)
+            // reaches nothing.
+            if let Some(target) = alias_map.get(&local) {
+                modified_locals.insert(*target);
+            }
         }
     }
     modified_locals
@@ -329,13 +373,36 @@ pub(super) fn extract_changed_places(
     for &bb in &loop_info.body_blocks {
         let bb_data = &body.basic_blocks[bb];
         for stmt in &bb_data.statements {
-            if let StatementKind::Assign(box (place, _)) = &stmt.kind {
+            if let StatementKind::Assign((place, _)) = &stmt.kind {
                 record(place.local, place.projection, &mut trees);
             }
         }
         if let TerminatorKind::Call { destination, .. } = &bb_data.terminator().kind {
             record(destination.local, destination.projection, &mut trees);
         }
+    }
+
+    // The same write sites `extract_modified_vars` counts — a `&mut` borrow
+    // handed to a call, a store through a pointer — with the
+    // sub-place tree the write reaches. Merging only ever adds changed places.
+    let write_sites = WriteSites::new(body);
+    for (local, write) in write_sites.writes_in_blocks(loop_info.body_blocks.iter().copied()) {
+        let name = match local_to_name.get(&local) {
+            Some(name) => name.clone(),
+            // Only a write through the temporary's POINTEE reaches the local
+            // it borrows (see `extract_modified_vars`).
+            None if matches!(write.tree, ChangedPlacesTree::Deref(_)) => {
+                match alias_map.get(&local).and_then(|t| local_to_name.get(t)) {
+                    Some(name) => name.clone(),
+                    None => continue,
+                }
+            }
+            None => continue,
+        };
+        trees
+            .entry(name)
+            .and_modify(|existing| existing.merge(&write.tree))
+            .or_insert(write.tree);
     }
 
     ChangedPlaces(trees)
@@ -384,7 +451,7 @@ fn build_borrow_alias_map(
         for &bb in &loop_info.body_blocks {
             let bb_data = &body.basic_blocks[bb];
             for stmt in &bb_data.statements {
-                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                let StatementKind::Assign((place, rvalue)) = &stmt.kind else {
                     continue;
                 };
                 if !place.projection.is_empty() {

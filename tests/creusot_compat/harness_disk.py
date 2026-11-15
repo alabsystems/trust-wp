@@ -11,6 +11,7 @@ targets on ``harness.py`` continue to work after extraction.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -83,6 +84,42 @@ def _disk_usage_percent(path: Path) -> int | None:
 
     capacity = columns[4].rstrip("%")
     return int(capacity) if capacity.isdigit() else None
+
+
+# Target-cache pruning floor. The percentage threshold alone is a poor signal
+# on a large volume: at 90% of 1.8 TiB there are still ~200 GiB free, and a
+# harness start that prunes on that signal deletes the live driver build
+# caches, forcing a full rebuild per run and killing concurrent builds in the
+# same workspace. Pruning of workspace target caches therefore also requires
+# free space to be below this floor. Stale harness temp dirs (older than the
+# stale age) are still pruned whenever the percentage threshold is reached.
+PRUNE_MIN_FREE_ENV = "TRUST_WP_HARNESS_PRUNE_MIN_FREE_GIB"
+# Floor below which the harness prunes its own workspace's target/debug/deps,
+# incremental and every *_verify/*_tests fixture target. A floor as high as
+# 50 GiB fires on EVERY run of a machine that sits at 25-40 GiB free under
+# several concurrent workspaces, so each harness invocation rebuilds the
+# driver's dependency closure and races the concurrent builds
+# (`E0464 multiple candidates`, `could not write output ... No such file`).
+# Pruning is a last resort against running out, not a housekeeping default.
+PRUNE_MIN_FREE_GIB_DEFAULT = 10
+
+
+def _disk_free_bytes(path: Path) -> int | None:
+    """Return free bytes on the volume holding *path*, or ``None`` on failure."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def _prune_min_free_bytes() -> int:
+    """Free-space floor below which workspace target caches may be pruned."""
+    raw = os.environ.get(PRUNE_MIN_FREE_ENV, "").strip()
+    try:
+        gib = float(raw) if raw else float(PRUNE_MIN_FREE_GIB_DEFAULT)
+    except ValueError:
+        gib = float(PRUNE_MIN_FREE_GIB_DEFAULT)
+    return int(max(gib, 0.0) * 1024**3)
 
 
 def _directory_size_bytes(path: Path) -> int:
@@ -300,6 +337,16 @@ def _warn_if_disk_pressure(
 
     temp_root = Path(tempfile.gettempdir())
     temp_freed_bytes = harness._prune_stale_harness_temp_targets(temp_root=temp_root)
+    free_probe = getattr(harness, "_disk_free_bytes", _disk_free_bytes)
+    free_bytes = free_probe(workspace)
+    min_free_bytes = _prune_min_free_bytes()
+    if free_bytes is not None and free_bytes >= min_free_bytes:
+        print(
+            f"trust-wp-harness: warning: disk usage {usage_before}% >= {threshold_percent}% "
+            f"but {_format_bytes(free_bytes)} free >= {PRUNE_MIN_FREE_ENV} floor "
+            f"{_format_bytes(min_free_bytes)}; not pruning workspace target caches"
+        )
+        return
     usage_after = (
         harness._disk_usage_percent(workspace)
         if temp_freed_bytes > 0

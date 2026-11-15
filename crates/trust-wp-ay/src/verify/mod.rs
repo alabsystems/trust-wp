@@ -31,12 +31,14 @@
 mod eager_instantiation;
 mod expr_subst;
 pub(crate) mod function;
+pub(crate) mod guard_split;
 mod hard_timeout;
 mod loops;
 pub(crate) mod mut_borrow;
 pub(crate) mod obligation_slices;
 mod panic_boundary;
 pub(crate) mod pipeline;
+pub(crate) mod placement_gate;
 mod postcondition;
 mod process_isolation;
 // The wire frames only cross the fork(2) pipe, and fork does not exist on
@@ -110,7 +112,7 @@ pub(crate) use postcondition::{
     result_postcondition_matches_return_expr_via_logic_bodies,
 };
 pub(crate) use result_inference::{
-    detect_body_constructor_name, expr_contains_result_var, option_datatype_from_constructor_expr,
+    expr_contains_result_var, option_datatype_from_constructor_expr,
     result_collection_sort_from_postcondition_with_context,
     result_is_bool_by_postcondition_with_context, result_match_datatype_from_postcondition,
 };
@@ -127,10 +129,10 @@ use solver_tail::resolve_sat_result;
 pub(crate) use solver_tail::retry_check_sat_on_timeout;
 #[cfg(test)]
 use solver_tail::retry_disabled;
-// Compatibility re-exports: solver helpers moved to solver_tail.rs (#1576 Slice B).
-// These preserve existing import paths for loop modules and tests.
+// Re-exports so the loop modules and tests can keep importing the solver
+// helpers through `verify::` rather than `verify::solver_tail::`.
 pub(crate) use solver_tail::unknown_result_from_encoder;
-/// Re-export the proof_assert-mode guard for the driver. (#transpose)
+/// Re-export the proof_assert-mode guard for the driver.
 pub use solver_tail::ProofAssertModeGuard;
 pub(crate) use solver_tail::{active_proof_assert_slice_identity, in_proof_assert_mode};
 use solver_tail::{
@@ -141,12 +143,15 @@ use trust_wp_core::{formula::PureExpr, TrackLevel};
 pub(crate) use types::ClosureCaptureInfo;
 // Re-export public types
 pub use types::{
+    fail_closed_marker_count, goals_carry_fail_closed_marker, is_fail_closed_marker,
+    is_withheld_refutation, refutation_evidence_gap_reason, unpaired_fail_closed_marker_count,
     Counterexample, CounterexampleType, CounterexampleValue, LoopVerificationOutcome,
     LoopVerificationResult, MutBorrowRequest, PostconditionInfo, ProofCertificateSummary,
     SolveEvidenceSnapshot, SolveLimitKindSnapshot, SolveResourceSnapshot, SolveStatisticsSnapshot,
     SolveVerificationLevelSnapshot, SolveVerificationSnapshot, StrictProofReplayObservation,
     UnknownReason, VarOrigin, VerificationOutcome, VerificationProvenance, VerificationRequest,
-    VerificationResult,
+    VerificationResult, INJECTED_FAIL_CLOSED_GOAL_REASON, OPAQUE_TYPE_PARAM_INVARIANT_GOAL_REASON,
+    REFUTATION_AUTHORITY_MESSAGE,
 };
 
 /// Extract the strict proof authority produced by an AY solver's most recent
@@ -220,16 +225,6 @@ fn structural_solve_evidence() -> SolveEvidenceSnapshot {
         verification_level: SolveVerificationLevelSnapshot::Unknown,
         resource_usage: SolveResourceSnapshot::default(),
     }
-}
-
-/// Build a provisional outcome for a closed structural-induction precheck.
-///
-/// The recognizer may establish the mathematical argument, but it does not yet
-/// emit an AY-checkable certificate. Keep the result explicitly outside proof
-/// authority; the mandatory public boundary will downgrade it until the
-/// structural derivation has a replayable artifact.
-pub(crate) fn structural_induction_verified_outcome() -> VerificationOutcome {
-    structural_verified_outcome()
 }
 
 // --- Unsoundness demotion (#2106) ---
@@ -377,9 +372,9 @@ pub(crate) fn assert_closure_capture_projections(
             let closure_state_var = final_name_at_depth(param_name, depth);
             if !var_names.contains(&closure_state_var) {
                 // Auto-create `{param}_final` when a matching capture `_final`
-                // exists even if the closure pre-state was not materialized; this
-                // preserves the original #1543 behavior. Deeper states still need
-                // the prior closure state to avoid inventing disconnected chains.
+                // exists even if the closure pre-state was not materialized.
+                // Deeper states still need the prior closure state to avoid
+                // inventing disconnected chains.
                 let has_matching_capture_state = info
                     .captures()
                     .iter()
@@ -536,8 +531,7 @@ fn requires_inject_invariant_call(
 /// invariant injection is absent or only partial), spuriously certifying
 /// programs that are NOT safe. We therefore fail closed: no matching requires
 /// => no body asserted (the capture stays unconstrained and the VC is
-/// correctly unable to certify safety). (fix3-closure-typeinv; soundness fix
-/// 2026-06-02)
+/// correctly unable to certify safety).
 pub(crate) fn assert_captured_param_type_invariants(
     encoder: &mut AYEncoder,
     captures: &[ClosureCaptureInfo],
@@ -694,15 +688,12 @@ pub(crate) fn assert_container_element_invariants(
     Ok(())
 }
 
-// Generic solve helpers moved to solver_tail.rs (#1576 Slice B).
-// See re-exports at top of this file for backward compatibility.
-
 /// Register type invariant definitions as axioms on the encoder.
 ///
 /// For each `TypeInvariantDef`, registers sort hints for the body expression,
 /// resolves the parameter sort, and calls `register_type_invariant` to add
-/// the `∀ self. invariant(self) = body` axiom. (#785: lifted from loops.rs
-/// for shared use by function.rs and mut_borrow.rs.)
+/// the `∀ self. invariant(self) = body` axiom. Shared by the function and
+/// mut-borrow paths through the bootstrap.
 fn register_type_invariants_on_encoder(
     encoder: &mut AYEncoder,
     type_invariants: Option<&[trust_wp_core::logic::TypeInvariantDef]>,
@@ -746,7 +737,12 @@ fn new_encoder_for_track_with_arrays(
             // using store/select), escalate to array-capable logic. (#1317)
             if needs_array_theory {
                 if use_quantifiers {
-                    AYEncoder::try_new_with_quantifiers()
+                    AYEncoder::try_new_with_quantifiers().map(|mut encoder| {
+                        // Array projectors need AUFLIA; the sequence carrier
+                        // itself still uses the certifiable UF spelling.
+                        encoder.use_certifiable_seq_carrier();
+                        encoder
+                    })
                 } else {
                     AYEncoder::try_new()
                 }
@@ -761,13 +757,12 @@ fn new_encoder_for_track_with_arrays(
                 // uninterpreted carrier loses nothing and keeps the proof
                 // externally replayable.
                 //
-                // The reason this could not simply be switched on before is
-                // that the stateless sort converter hard-coded the native
-                // spelling, so choosing the uninterpreted carrier split the
+                // The carrier choice must also reach the sort converter. A
+                // converter that hard-codes the native spelling splits the
                 // encoder's Seq sort in two — variables declared `(Seq Int)`,
                 // projectors declared over `Seq`, and `Solver::apply` failing
-                // its domain check. The carrier is now threaded through to the
-                // converter, so both agree.
+                // its domain check — so `use_certifiable_seq_carrier` threads
+                // the carrier through to the converter and both agree.
                 AYEncoder::try_new_pure_with_quantifiers().map(|mut encoder| {
                     encoder.use_certifiable_seq_carrier();
                     encoder
@@ -796,3 +791,70 @@ mod counterexample_tests;
 mod shared_constraints_tests;
 #[cfg(test)]
 mod tests;
+
+/// Env-gated, verdict-neutral trace of proof-authority plumbing decisions.
+///
+/// Enabled by `TRUST_WP_AUTHORITY_TRACE`. Writes stderr only and returns
+/// nothing, so no acceptance path can read what it records.
+pub(crate) fn authority_trace(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("TRUST_WP_AUTHORITY_TRACE").is_some()) {
+        eprintln!("[TWP_AUTH] {}", message());
+    }
+}
+
+/// `Failed(Counterexample::empty())` built by a structural (no-solve) path,
+/// traced with its construction site under `TRUST_WP_AUTHORITY_TRACE`.
+#[track_caller]
+pub(crate) fn structural_failed_traced() -> VerificationResult {
+    let caller = std::panic::Location::caller();
+    authority_trace(|| {
+        format!(
+            "structural Failed(empty) built at {}:{}",
+            caller.file(),
+            caller.line()
+        )
+    });
+    VerificationResult::Failed(Counterexample::empty())
+}
+
+/// Compact tag of an outcome's solve evidence for [`authority_trace`].
+pub(crate) fn authority_evidence_tag(provenance: Option<&VerificationProvenance>) -> String {
+    match provenance.and_then(|p| p.solve_evidence.as_ref()) {
+        None if provenance.is_none() => "provenance=none".to_string(),
+        None => "evidence=none".to_string(),
+        Some(e) => format!(
+            "evidence={} validated={} accepted={} rejection={:?}",
+            e.result, e.model_validated, e.accepted_for_consumer, e.consumer_rejection
+        ),
+    }
+}
+
+/// [`authority_evidence_tag`] over an encoder's last cached solve evidence.
+pub(crate) fn authority_encoder_evidence_tag(encoder: &AYEncoder) -> String {
+    match encoder.last_solve_evidence() {
+        None => "encoder-evidence=none".to_string(),
+        Some(e) => format!(
+            "encoder-evidence={} validated={} accepted={} rejection={:?}",
+            e.result, e.model_validated, e.accepted_for_consumer, e.consumer_rejection
+        ),
+    }
+}
+
+/// Compact tag of a verdict and its certificate state for [`authority_trace`].
+pub(crate) fn authority_result_tag(result: &VerificationResult) -> String {
+    match result {
+        VerificationResult::Verified(None) => "Verified(None)".to_string(),
+        VerificationResult::Verified(Some(summary)) => format!(
+            "Verified(Some fully_verified={} strict={} trust={} fallback={} hole={})",
+            summary.is_fully_verified(),
+            summary.strict_verified,
+            summary.trust_count,
+            summary.trust_fallback_count,
+            summary.hole_count
+        ),
+        VerificationResult::Failed(_) => "Failed".to_string(),
+        VerificationResult::Assumed(reason) => format!("Assumed({reason})"),
+        VerificationResult::Unknown(reason) => format!("Unknown({})", reason.as_str()),
+    }
+}

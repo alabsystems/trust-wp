@@ -1,0 +1,69 @@
+{
+  "id": 0,
+  "name": "identity",
+  "ty": 0,
+  "entry": 0,
+  "blocks": [
+    {
+      "id": 0,
+      "params": [
+        [
+          0,
+          "Bool"
+        ]
+      ],
+      "body": [
+        {
+          "inst": {
+            "Copy": {
+              "ty": "Bool",
+              "operand": 0
+            }
+          },
+          "results": [
+            2
+          ],
+          "proofs": [],
+          "span": null,
+          "proof_context": null
+        },
+        {
+          "inst": {
+            "Return": {
+              "values": [
+                2
+              ]
+            }
+          },
+          "results": [],
+          "proofs": [],
+          "span": null,
+          "proof_context": null
+        }
+      ]
+    }
+  ],
+  "proofs": [
+    "Pure"
+  ],
+  "calling_conv": "C",
+  "linkage": "External",
+  "attrs": {
+    "readonly": false,
+    "readnone": false,
+    "inlinehint": false,
+    "cold": false,
+    "params": [],
+    "naked": false,
+    "target_features": []
+  },
+  "summary": null,
+  "producer": "TrustIr",
+  "value_names": null,
+  "scopes": null,
+  "source_provenance": null,
+  "body_gate": null,
+  "display_path": null,
+  "section": null,
+  "visibility": "Default"
+}

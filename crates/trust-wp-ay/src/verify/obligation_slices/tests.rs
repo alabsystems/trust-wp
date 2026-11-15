@@ -15,7 +15,7 @@ use super::{
     VerificationResult,
 };
 use crate::{
-    tests::helpers::{exists_with_sort, gt, int, var},
+    tests::helpers::{add, eq, exists_with_sort, forall, gt, int, method_call, var},
     verify::{
         ProofCertificateSummary, SolveEvidenceSnapshot, SolveResourceSnapshot,
         SolveVerificationLevelSnapshot, SolveVerificationSnapshot, VerificationProvenance,
@@ -826,4 +826,93 @@ fn aggregate_preserves_unknown_reason_variant() {
         VerificationResult::Unknown(UnknownReason::QuantifierRoundLimit) => {}
         other => panic!("expected Unknown(QuantifierRoundLimit), got {other:?}"),
     }
+}
+
+// ── Quantified Boolean equivalence split ─────────────────────────────
+//
+// `forall vs. L == R` with a quantifier on one side is a Boolean
+// equivalence, so it is sliced into its two directions. Both slices must
+// verify for the aggregate to verify (`aggregate_slice_results`), so the
+// rewrite adds obligations and can never widen acceptance; it exists because
+// the solver declines a quantifier nested under an iff (cc/fset `map_spec`).
+
+#[test]
+#[timeout(30000)]
+fn quantified_bool_iff_splits_into_both_directions() {
+    // forall y. contains(y) == (exists x. mem(x))
+    let lhs = method_call(var("s"), "contains", vec![var("y")]);
+    let rhs = exists_with_sort(
+        "x",
+        ExprSort::Int,
+        method_call(var("s"), "mem", vec![var("x")]),
+    );
+    let ensures = vec![forall("y", eq(lhs.clone(), rhs.clone()))];
+    let slices = split_ensures(&ensures);
+    assert_eq!(
+        slices.len(),
+        2,
+        "both directions must be sliced: {slices:?}"
+    );
+    assert!(slices.iter().all(|s| s.index == 0));
+    let forward = forall(
+        "y",
+        PureExpr::BinOp(Arc::new(lhs.clone()), BinOp::Implies, Arc::new(rhs.clone())),
+    );
+    let backward = forall(
+        "y",
+        PureExpr::BinOp(Arc::new(rhs), BinOp::Implies, Arc::new(lhs)),
+    );
+    assert_eq!(slices[0].ensure.as_ref(), &forward);
+    assert_eq!(slices[1].ensure.as_ref(), &backward);
+}
+
+#[test]
+#[timeout(30000)]
+fn quantified_bool_iff_split_needs_a_quantifier_side() {
+    // No quantifier on either side: left intact, one slice.
+    let ensures = vec![forall(
+        "y",
+        eq(
+            method_call(var("s"), "contains", vec![var("y")]),
+            method_call(var("t"), "contains", vec![var("y")]),
+        ),
+    )];
+    let slices = split_ensures(&ensures);
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].ensure.as_ref(), &ensures[0]);
+}
+
+#[test]
+#[timeout(30000)]
+fn quantified_iff_split_refuses_an_arithmetic_side() {
+    // An arithmetic side is not a Boolean equivalence: splitting it would read
+    // both operands through the bool coercion and be WEAKER than the equality.
+    // The fail-closed answer is to leave the obligation whole.
+    let arithmetic = add(var("n"), int(1));
+    let quantified = exists_with_sort("x", ExprSort::Int, gt(var("x"), int(0)));
+    let ensures = vec![forall("y", eq(arithmetic, quantified))];
+    let slices = split_ensures(&ensures);
+    assert_eq!(
+        slices.len(),
+        1,
+        "arithmetic side must not be split: {slices:?}"
+    );
+    assert_eq!(slices[0].ensure.as_ref(), &ensures[0]);
+}
+
+#[test]
+#[timeout(30000)]
+fn quantified_iff_split_needs_a_binder() {
+    // Unquantified `L == R` keeps its existing handling (no binder to rebuild).
+    let ensures = vec![eq(
+        method_call(var("s"), "contains", vec![var("y")]),
+        exists_with_sort(
+            "x",
+            ExprSort::Int,
+            method_call(var("s"), "mem", vec![var("x")]),
+        ),
+    )];
+    let slices = split_ensures(&ensures);
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].ensure.as_ref(), &ensures[0]);
 }

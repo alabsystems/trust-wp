@@ -19,8 +19,13 @@ fn ite_merge_uses_typed_pre_branch_binding_when_default_branch_is_missing() {
         "seq".to_string(),
         PureExpr::Var("seq_then".to_string(), Some(ExprSort::Seq)),
     );
+    let guard = PureExpr::BinOp(
+        Arc::new(discr_expr.clone()),
+        BinOp::Eq,
+        Arc::new(PureExpr::Int(1)),
+    );
     let branch_subs = vec![(
-        Some(1),
+        Some(guard),
         NameSubstitutions::new(
             then_subs,
             HashMap::from([("seq".to_string(), Some(ExprSort::Seq))]),
@@ -31,7 +36,7 @@ fn ite_merge_uses_typed_pre_branch_binding_when_default_branch_is_missing() {
         PureExpr::Var("seq".to_string(), Some(ExprSort::Seq)),
     )]);
 
-    let merged = build_ite_merged_substitutions(&discr_expr, &branch_subs, &fallback_exprs);
+    let merged = build_ite_merged_substitutions(&branch_subs, &fallback_exprs);
 
     assert_eq!(
         merged.get("seq"),

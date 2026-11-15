@@ -15,7 +15,8 @@ fn rewrites_named_field_to_tuple_get() {
         name: "__trust_wp_field_inner".to_string(),
         args: vec![PureExpr::Var("x".to_string(), None)],
     };
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     assert_eq!(
         result,
         PureExpr::LogicFnCall {
@@ -39,7 +40,8 @@ fn rewrites_nested_field_access() {
             args: vec![PureExpr::Var("x".to_string(), None)],
         }),
     );
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     assert_eq!(
         result,
         PureExpr::BinOp(
@@ -63,7 +65,8 @@ fn preserves_unknown_field_names() {
         name: "__trust_wp_field_other".to_string(),
         args: vec![PureExpr::Var("x".to_string(), None)],
     };
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     assert_eq!(result, expr, "unknown field names should be preserved");
 }
 
@@ -78,7 +81,8 @@ fn rewrites_multi_field_struct() {
         name: "__trust_wp_field_y".to_string(),
         args: vec![PureExpr::Var("p".to_string(), None)],
     };
-    let result = rewrite_named_field_access_expr(&expr, &field_map);
+    let result =
+        rewrite_named_field_access_expr(&expr, flat_tables(&field_map)).expect("resolvable");
     assert_eq!(
         result,
         PureExpr::LogicFnCall {

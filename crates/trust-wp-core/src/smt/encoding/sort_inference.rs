@@ -482,7 +482,7 @@ pub(crate) fn infer_var_sorts_multi(exprs: &[PureExpr]) -> HashMap<String, VarSo
 fn view_sort(sort: Option<&crate::formula::ExprSort>) -> VarSort {
     use crate::formula::ExprSort;
     match sort.map(peel_references) {
-        Some(ExprSort::Int | ExprSort::Float) => VarSort::Int,
+        Some(ExprSort::Int | ExprSort::Float(_)) => VarSort::Int,
         Some(ExprSort::Bool) => VarSort::Bool,
         _ => VarSort::Seq,
     }

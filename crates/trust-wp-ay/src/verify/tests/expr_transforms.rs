@@ -132,7 +132,7 @@ fn expr_mentions_bound_var_false_positive_on_match_arm_shadow() {
 fn substitute_vars_alpha_renames_let_to_avoid_capture() {
     // let x = 1 in y   with binding { y -> Var("x") }
     // Naive result: let x = 1 in x  (WRONG — free "x" captured by let)
-    // Correct: let x_α0 = 1 in x  (alpha-renamed binder, free "x" preserved)
+    // Correct: let x$α0 = 1 in x  (alpha-renamed binder, free "x" preserved)
     let expr = let_bind("x", int(1), var("y"));
     let mut binding = HashMap::new();
     binding.insert("y".to_string(), var("x"));
@@ -162,7 +162,7 @@ fn substitute_vars_alpha_renames_let_to_avoid_capture() {
 fn substitute_vars_alpha_renames_forall_to_avoid_capture() {
     // forall x. y > x   with binding { y -> Var("x") }
     // Naive: forall x. x > x  (WRONG — free "x" captured by forall)
-    // Correct: forall x_α0. x > x_α0
+    // Correct: forall x$α0. x > x$α0
     let expr = forall("x", gt(var("y"), var("x")));
     let mut binding = HashMap::new();
     binding.insert("y".to_string(), var("x"));

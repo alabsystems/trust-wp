@@ -85,8 +85,10 @@ pub(super) fn call_may_mutate_params(
 /// `FnOnce::call_once` regardless of whether the receiver is a concrete
 /// closure type or a generic `F: Fn(...)` type parameter.
 pub(super) fn is_fn_trait_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
+            // Refusal-direction classifier (an Fn-trait call bails the
+            // tracker), so a lookalike may only make results stricter.
             let path = tcx.def_path_str(*def_id);
             return FN_TRAIT_ALL_METHODS.iter().any(|m| path == *m);
         }
@@ -104,8 +106,11 @@ pub(super) fn is_fn_trait_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 /// Used by `call_may_mutate_params` to avoid bailing on non-mutating
 /// `proof_assert!` closures that call through `Fn::call`. (#2318)
 pub(super) fn is_fn_trait_mutating_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
+            // Refusal-direction classifier (a mutating call bails the
+            // tracker), so a lookalike may only make results stricter: keep
+            // matching non-std items too.
             let path = tcx.def_path_str(*def_id);
             return FN_TRAIT_MUTATING_METHODS.iter().any(|m| path == *m);
         }
@@ -120,8 +125,13 @@ pub(super) fn is_fn_trait_mutating_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> 
 /// `<Vec as IndexMut>::index_mut`) and plain paths (e.g., `Vec::index_mut`).
 /// (#2124 Phase 4)
 pub(super) fn is_index_mut_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
+            // Provenance: suffix match; only library `index_mut` impls have
+            // the modelled spec-driven advancement.
+            if !crate::provenance::is_builtin_provider(tcx, *def_id) {
+                return false;
+            }
             let path = tcx.def_path_str(*def_id);
             // Match any IndexMut::index_mut path — both concrete types and
             // trait-qualified paths.
@@ -141,8 +151,13 @@ pub(super) fn is_index_mut_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 /// argument reborrows a `&mut` parameter, the Box wrapping that reborrow still
 /// aliases the same mutable reference. (#2318)
 pub(super) fn is_box_new_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
+            // Provenance: `::Box::new` is a suffix match; only the real
+            // `alloc::boxed::Box::new` is an identity-preserving wrapper.
+            if !crate::provenance::is_std_item(tcx, *def_id) {
+                return false;
+            }
             let path = tcx.def_path_str(*def_id);
             let stripped = strip_generics(&path);
             return stripped == "Box::new"
@@ -161,8 +176,12 @@ pub(super) fn is_box_new_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 /// and the re-export path (`trust_wp_std::Snapshot::capture`), with or without
 /// generic parameters (e.g., `Snapshot::<i32>::capture`).
 pub(super) fn is_snapshot_capture_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
-    if let Operand::Constant(box constant) = func {
+    if let Operand::Constant(deref!(constant)) = func {
         if let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() {
+            // Provenance: only the spec library's capture freezes its argument.
+            if !crate::provenance::is_spec_library_item(tcx, *def_id) {
+                return false;
+            }
             let path = tcx.def_path_str(*def_id);
             // Strip generic parameters for matching:
             // "Snapshot::<i32>::capture" -> "Snapshot::capture"
@@ -181,7 +200,7 @@ pub(super) fn is_snapshot_capture_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> b
 
 /// Strip generic parameters from a path string.
 /// E.g., `"Foo::<T>::bar::<U>"` -> `"Foo::bar"`.
-pub(super) fn strip_generics(path: &str) -> String {
+pub(in crate::mir_analysis) fn strip_generics(path: &str) -> String {
     let mut result = String::with_capacity(path.len());
     let mut depth: u32 = 0;
     let chars: Vec<char> = path.chars().collect();

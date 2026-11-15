@@ -45,6 +45,9 @@ fn is_uf_injecting_method(method: &str) -> bool {
             | "fset_intersection"
             | "fset_difference"
             | "fset_len"
+            | "fset_interval"
+            | "fset_filter"
+            | "fset_map"
             // FMap operations (match_enc.rs)
             | "fmap_contains"
             | "fmap_lookup"

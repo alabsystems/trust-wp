@@ -191,7 +191,7 @@ fn resolve_iterator_local_from_call_ref_chain(
             .iter()
             .rev()
             .find_map(|stmt| match &stmt.kind {
-                StatementKind::Assign(box (place, Rvalue::Ref(_, _, source_place)))
+                StatementKind::Assign((place, Rvalue::Ref(_, _, source_place)))
                     if place.projection.is_empty() && place.local == current =>
                 {
                     Some(source_place)
@@ -275,7 +275,7 @@ fn loop_entry_chain_to_call(
         }
 
         current = match &body.basic_blocks[current].terminator().kind {
-            TerminatorKind::Goto { target } => *target,
+            TerminatorKind::Goto { target, .. } => *target,
             TerminatorKind::FalseUnwind { real_target, .. } => *real_target,
             _ => return None,
         };
@@ -296,7 +296,7 @@ fn find_iterator_source_local(
         .statements
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, Rvalue::Use(operand, _)))
+            StatementKind::Assign((place, Rvalue::Use(operand, _)))
                 if place.projection.is_empty() && place.local == iterator_local =>
             {
                 match operand {
@@ -418,7 +418,7 @@ fn recover_range_expr_from_block_assignment(
         .iter()
         .rev()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, rvalue))
+            StatementKind::Assign((place, rvalue))
                 if place.projection.is_empty() && place.local == target_local =>
             {
                 recover_range_expr_from_rvalue(rvalue, body, block, local_exprs)
@@ -600,7 +600,7 @@ fn recover_range_expr_from_block_operand(
         .iter()
         .rev()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, rvalue))
+            StatementKind::Assign((place, rvalue))
                 if place.projection.is_empty() && place.local == source_local =>
             {
                 recover_range_expr_from_rvalue(rvalue, body, block, local_exprs)
@@ -616,7 +616,7 @@ fn recover_range_expr_from_rvalue<'tcx>(
     local_exprs: &HashMap<Local, PureExpr>,
 ) -> Option<PureExpr> {
     match rvalue {
-        Rvalue::Aggregate(box rustc_middle::mir::AggregateKind::Adt(..), operands)
+        Rvalue::Aggregate(rustc_middle::mir::AggregateKind::Adt(..), operands)
             if operands.len() == 2 =>
         {
             let mut translated = Vec::with_capacity(2);

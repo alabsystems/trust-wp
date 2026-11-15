@@ -18,7 +18,7 @@ fn projected_write_substitution_repair_follows_synthetic_local_aliases() {
     )]);
     let call_assumptions = vec![
         PureExpr::BinOp(
-            Arc::new(PureExpr::Var("call_7".into(), None)),
+            Arc::new(PureExpr::Var("$call_7".into(), None)),
             BinOp::Eq,
             Arc::new(PureExpr::LogicFnCall {
                 name: tuple2_name.clone(),
@@ -28,7 +28,7 @@ fn projected_write_substitution_repair_follows_synthetic_local_aliases() {
         PureExpr::BinOp(
             Arc::new(PureExpr::LogicFnCall {
                 name: get_0_name,
-                args: vec![PureExpr::Var("_local_7".into(), None)],
+                args: vec![PureExpr::Var("$local_7".into(), None)],
             }),
             BinOp::Eq,
             Arc::new(PureExpr::Int(4)),
@@ -49,41 +49,6 @@ fn projected_write_substitution_repair_follows_synthetic_local_aliases() {
         }),
         "synthetic _local_N projected write should update the corresponding source substitution",
     );
-}
-
-#[test]
-fn test_build_param_normalization_renames_mismatched() {
-    let trait_names = vec!["self".to_string(), "x".to_string()];
-    let impl_names = vec!["self".to_string(), "y".to_string()];
-    let subs = build_param_normalization(&trait_names, &impl_names).expect("arity should match");
-    assert_eq!(subs.len(), 1);
-    assert_eq!(subs.get("y"), Some(&PureExpr::Var("x".to_string(), None)));
-}
-
-#[test]
-fn test_build_param_normalization_same_names_no_subs() {
-    let trait_names = vec!["self".to_string(), "x".to_string()];
-    let impl_names = vec!["self".to_string(), "x".to_string()];
-    let subs = build_param_normalization(&trait_names, &impl_names).expect("arity should match");
-    assert!(subs.is_empty());
-}
-
-#[test]
-fn test_build_param_normalization_multiple_mismatches() {
-    let trait_names = vec!["self".to_string(), "a".to_string(), "b".to_string()];
-    let impl_names = vec!["self".to_string(), "x".to_string(), "y".to_string()];
-    let subs = build_param_normalization(&trait_names, &impl_names).expect("arity should match");
-    assert_eq!(subs.len(), 2);
-    assert_eq!(subs.get("x"), Some(&PureExpr::Var("a".to_string(), None)));
-    assert_eq!(subs.get("y"), Some(&PureExpr::Var("b".to_string(), None)));
-}
-
-#[test]
-fn test_build_param_normalization_mismatched_arity_returns_none() {
-    let trait_names = vec!["self".to_string(), "x".to_string()];
-    let impl_names = vec!["self".to_string(), "x".to_string(), "y".to_string()];
-    let subs = build_param_normalization(&trait_names, &impl_names);
-    assert!(subs.is_none());
 }
 
 // =========================================================================

@@ -64,18 +64,6 @@ impl AYEncoder {
         self.encode_pure_impl(arg, prefix)
     }
 
-    /// Encode the `__trust_wp_real_to_int_floor` builtin to ay's `real_to_int`. (#1802)
-    fn encode_floor_builtin(
-        &mut self,
-        arg: &PureExpr,
-        prefix: Option<DerivedKind>,
-    ) -> Result<Term, EncodingError> {
-        let arg_term = self.encode_pure_impl(arg, prefix)?;
-        self.solver
-            .try_real_to_int(arg_term)
-            .map_err(|e| EncodingError::solver_error(format!("real_to_int: {e}")))
-    }
-
     /// Internal logic function call encoding with optional prefix.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn encode_logic_fn_call_impl(
@@ -84,10 +72,58 @@ impl AYEncoder {
         args: &[PureExpr],
         prefix: Option<DerivedKind>,
     ) -> Result<Term, EncodingError> {
+        if let Some(f) = trust_wp_core::formula::ieee::IeeeFn::parse(name) {
+            return self.encode_ieee_call(f, args, prefix);
+        }
+        if let Some(f) = trust_wp_core::formula::ieee::OpaqueFloatFn::parse(name) {
+            return self.encode_opaque_float_call(f, args, prefix);
+        }
         if name.starts_with("__trust_wp_concrete_float_") {
             return Err(EncodingError::unsupported(
                 "concrete float literal escaped MIR translation folding (#1200)".to_string(),
             ));
+        }
+
+        // A std-spec clause the call site did not rewrite (an element layout of
+        // a generic argument it could not compute, or a panic the spec cannot
+        // state). Encoding it as a free symbol would let the solver pick the
+        // size that makes the clause true.
+        if let Some(marker) =
+            name.strip_prefix(trust_wp_core::formula::internal::builtins::STD_SITE_MARKER_PREFIX)
+        {
+            return Err(EncodingError::unsupported(
+                if marker.starts_with("unmodelled_panic") {
+                    format!("std call can panic under a condition its spec cannot state (`{name}`)")
+                } else {
+                    format!("std spec clause `{name}` was not resolved at its call site")
+                },
+            ));
+        }
+
+        // A clause's raw-pointer cast the driver did not read at its operand's
+        // type: it is the identity or `thin`, and guessing either can prove
+        // two pointers equal or different when they are not.
+        if let Some(pointee) =
+            name.strip_prefix(trust_wp_core::formula::internal::builtins::PTR_CAST_PENDING_PREFIX)
+        {
+            return Err(EncodingError::unsupported(format!(
+                "raw pointer cast to a pointer to `{pointee}` was not classified as the identity \
+                 or `thin` at its operand's type"
+            )));
+        }
+
+        // `thin(p)` and a raw-pointer cast's pair function: uninterpreted, at the
+        // operand's own sort (the sort the result had when every pointer cast
+        // was read as its operand).
+        if (name == trust_wp_core::formula::internal::builtins::PTR_THIN_LOGIC_FN
+            || name
+                .starts_with(trust_wp_core::formula::internal::builtins::PTR_PAIR_LOGIC_FN_PREFIX))
+            && args.len() == 1
+        {
+            let operand = self.encode_pure_impl(&args[0], prefix)?;
+            let sort = self.solver.get_sort(operand);
+            let func = self.get_or_declare_spec_fn(name, std::slice::from_ref(&sort), sort.clone());
+            return self.safe_apply(name, &func, &[operand]);
         }
 
         // Built-in: resolve(x) expands to x_current == x_final.
@@ -148,6 +184,27 @@ impl AYEncoder {
             return Ok(self.solver.declare_const("fset_empty", Sort::Int));
         }
 
+        // Built-in: `FSet::interval(l, r)` (Creusot `#[builtin("set.FsetInt.interval")]`)
+        // is the finite integer set `[l, r)`. Encoded as the dedicated
+        // `fset_interval(l, r)` UF on the Int FSet carrier; its membership
+        // characterisation is Why3 `FsetInt.interval_def` (see
+        // `assert_fset_axioms`). Without this it lowered to an unconstrained
+        // placeholder and nothing about it was provable.
+        if matches!(name, "fset_interval" | "FSet::interval") && args.len() == 2 {
+            let lo = self.encode_pure_impl(&args[0], prefix)?;
+            let hi = self.encode_pure_impl(&args[1], prefix)?;
+            if self.solver.get_sort(lo) == Sort::Int && self.solver.get_sort(hi) == Sort::Int {
+                let func = self.get_or_declare_spec_fn(
+                    "fset_interval",
+                    &[Sort::Int, Sort::Int],
+                    Sort::Int,
+                );
+                let result = self.safe_apply("fset_interval", &func, &[lo, hi])?;
+                self.register_standard_ground_application("fset_interval", result, vec![lo, hi]);
+                return Ok(result);
+            }
+        }
+
         // Transparent iterator adapters (`Copied` / `Cloned`) do not change
         // the underlying iterator state. Encode them as the inner iterator
         // term so result postconditions and view bridges see the same relation
@@ -179,13 +236,6 @@ impl AYEncoder {
         // assert_unit_singleton_axioms. (#1271, #2059 Phase 2)
         if name == "__trust_wp_tuple0" && args.is_empty() {
             return Ok(self.solver.declare_const("__trust_wp_unit", unit_sort()));
-        }
-
-        // Built-in: floor(x) for FloatToInt casts — maps to ay real_to_int. (#1802)
-        if name == trust_wp_core::formula::internal::builtins::REAL_TO_INT_FLOOR_LOGIC_FN
-            && args.len() == 1
-        {
-            return self.encode_floor_builtin(&args[0], prefix);
         }
 
         // Built-in: `Int::min` / `Int::max` — the creusot-std logic `Int` type
@@ -1139,6 +1189,348 @@ mod tests {
             Sort::Bool,
             "resolve(x) should produce a Bool-sorted term (x == x_final)"
         );
+    }
+
+    /// Whether `term` holds in every model the encoder's assertions allow.
+    fn always_holds(encoder: &mut AYEncoder, term: ay_dpll::api::Term) -> bool {
+        let negated = encoder.solver.not(term);
+        encoder.assert_term(negated);
+        matches!(encoder.check_sat(), SolveResult::Unsat(_))
+    }
+
+    fn typed_var(
+        name: &str,
+        sort: trust_wp_core::formula::ExprSort,
+    ) -> trust_wp_core::formula::PureExpr {
+        trust_wp_core::formula::PureExpr::Var(name.to_string(), Some(sort))
+    }
+
+    /// Whether `resolve(arg)` is read as a claim that holds in every model:
+    /// a refusal is not.
+    fn resolve_read_as_true(
+        encoder: &mut AYEncoder,
+        arg: trust_wp_core::formula::PureExpr,
+    ) -> bool {
+        match encoder.encode_pure(&logic_fn_call("resolve", vec![arg])) {
+            Ok(term) => always_holds(encoder, term),
+            Err(_) => false,
+        }
+    }
+
+    /// `resolve(x)` of a borrow whose final value has no symbol in the lane
+    /// (a loop head, the entry state) is not the trivially true resolve of a
+    /// by-value parameter: reading the missing symbol as by-value made
+    /// `#[invariant(resolve(x))]` and `old(resolve(x))` true of `*x = 5`
+    /// under `*x != 5` (D-109). It is refused (D-126): a fresh final refuted
+    /// the true `resolve(b)` of an untouched `b: Box<&mut i32>`.
+    #[test]
+    #[timeout(30000)]
+    fn test_resolve_of_a_borrow_without_a_final_symbol_is_not_true() {
+        use trust_wp_core::formula::ExprSort;
+        let borrow = || typed_var("x", ExprSort::MutRef(Box::new(ExprSort::Int)));
+
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("x_current", Sort::Int)
+            .expect("declare x_current");
+        assert!(
+            encoder
+                .encode_pure(&logic_fn_call("resolve", vec![borrow()]))
+                .is_err(),
+            "resolve(x) of a borrow the lane names no final value of was not refused"
+        );
+
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("x_current", Sort::Int)
+            .expect("declare x_current");
+        encoder
+            .get_or_declare_var("x_final", Sort::Int)
+            .expect("declare x_final");
+        let old_resolve = trust_wp_core::formula::PureExpr::Old(std::sync::Arc::new(
+            logic_fn_call("resolve", vec![borrow()]),
+        ));
+        let read_as_true = match encoder.encode_pure(&old_resolve) {
+            Ok(term) => always_holds(&mut encoder, term),
+            Err(_) => false,
+        };
+        assert!(!read_as_true, "old(resolve(x)) read as true");
+
+        // Unannotated, the lane's current state of `x` says it is a borrow.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("x_current", Sort::Int)
+            .expect("declare x_current");
+        assert!(
+            !resolve_read_as_true(&mut encoder, var("x")),
+            "resolve(x) of an unannotated borrow read as true"
+        );
+
+        // With its final value in the lane, a borrow is `*x == ^x`.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("x_current", Sort::Int)
+            .expect("declare x_current");
+        encoder
+            .get_or_declare_var("x_final", Sort::Int)
+            .expect("declare x_final");
+        let term = encoder
+            .encode_pure(&logic_fn_call("resolve", vec![borrow()]))
+            .expect("resolve of a borrow with its final value should encode");
+        assert!(!always_holds(&mut encoder, term), "resolve(x) read as true");
+
+        // A by-value parameter has no borrow to resolve.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("v", Sort::Int)
+            .expect("declare v");
+        assert!(
+            resolve_read_as_true(&mut encoder, typed_var("v", ExprSort::Int)),
+            "resolve(v) of a value"
+        );
+    }
+
+    /// Nothing but the annotated variable itself, at a sort certainly holding
+    /// no borrow, is the by-value `true` (D-126). Each of these was read as
+    /// `true` and verified a false claim of a borrow the CALLER decides.
+    #[test]
+    #[timeout(30000)]
+    fn test_resolve_is_by_value_only_of_a_sort_certainly_holding_no_borrow() {
+        use trust_wp_core::formula::{intern_sort_name, ExprSort, PureExpr};
+
+        // `#[ensures(|r: &mut i32| resolve(r))]` reads the returned borrow
+        // as an unannotated `result`, declared at the borrow's record sort.
+        let mut encoder = AYEncoder::new();
+        let record = encoder.sort_from_expr_sort(ExprSort::MutRef(Box::new(ExprSort::Int)));
+        encoder
+            .get_or_declare_var("result", record)
+            .expect("declare result");
+        assert!(
+            !resolve_read_as_true(&mut encoder, var("result")),
+            "resolve(result) of an unannotated returned borrow read as true"
+        );
+
+        // A `let` or closure binder with no sort, no state in the lane.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("t", Sort::Int)
+            .expect("declare t");
+        assert!(
+            !resolve_read_as_true(&mut encoder, var("t")),
+            "resolve(t) of an unannotated value read as true"
+        );
+
+        // A returned `Vec<&mut i32>`: the value-model sort erased the element.
+        drop(encoder);
+        for container in ["std::vec::Vec", "creusot_std::logic::seq::Seq"] {
+            let mut encoder = AYEncoder::new();
+            let vec = ExprSort::Datatype(intern_sort_name(container));
+            let sort = encoder.sort_from_expr_sort(vec.clone());
+            encoder
+                .get_or_declare_var("result", sort)
+                .expect("declare result");
+            assert!(
+                !resolve_read_as_true(&mut encoder, typed_var("result", vec)),
+                "resolve(result) of a {container} read as true"
+            );
+        }
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("s", ay_dpll::api::Sort::Int)
+            .expect("declare s");
+        assert!(
+            !resolve_read_as_true(&mut encoder, typed_var("s", ExprSort::Seq)),
+            "resolve(s) of a Seq read as true"
+        );
+
+        // `resolve(*s)` of `s = snapshot!(x)`: `*s` is the borrow `x`, not
+        // its referent; stripping the `*` read `s` as a value.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        encoder
+            .get_or_declare_var("s", Sort::Int)
+            .expect("declare s");
+        assert!(
+            !resolve_read_as_true(
+                &mut encoder,
+                PureExpr::Deref(std::sync::Arc::new(typed_var("s", ExprSort::Int)))
+            ),
+            "resolve(*s) read as true"
+        );
+
+        // `w: W<'_>` with `W { o: Option<&mut i32> }`: the builtin Option
+        // model declares the field at `Int`, so the declaration says nothing
+        // of the borrow `w` holds.
+        drop(encoder);
+        let mut encoder = AYEncoder::new();
+        let mut decls = trust_wp_core::logic::AdtDecls::new();
+        decls.insert(
+            "W".to_string(),
+            trust_wp_core::logic::AdtDecl::new(
+                "W".to_string(),
+                "W".to_string(),
+                trust_wp_core::logic::AdtKind::Struct,
+                vec![trust_wp_core::logic::AdtConstructorDecl::new(
+                    "W".to_string(),
+                    "W".to_string(),
+                    vec![trust_wp_core::logic::AdtFieldDecl::new(
+                        "o".to_string(),
+                        ExprSort::Int,
+                    )],
+                )],
+            ),
+        );
+        encoder.register_adt_decls(&decls);
+        let w = ExprSort::Datatype(intern_sort_name("W"));
+        let sort = encoder.sort_from_expr_sort(w.clone());
+        encoder.get_or_declare_var("w", sort).expect("declare w");
+        assert!(
+            !resolve_read_as_true(&mut encoder, typed_var("w", w)),
+            "resolve(w) of a struct declared with only an Int field read as true"
+        );
+
+        // A value, annotated, stays `true`.
+        drop(encoder);
+        for value in [
+            ExprSort::Int,
+            ExprSort::Bool,
+            ExprSort::Ref(Box::new(ExprSort::Int)),
+        ] {
+            let mut encoder = AYEncoder::new();
+            assert!(
+                resolve_read_as_true(&mut encoder, typed_var("v", value.clone())),
+                "resolve(v) of a {value}"
+            );
+        }
+    }
+
+    /// A quantifier's binder that may hold a borrow is one bound term for
+    /// `*q` and `^q`: the collapse read `resolve(q)` (and `^q == *q`) of every
+    /// borrow as `true`, and `!(exists<q: &mut i32> !resolve(q))` verified.
+    /// Its final value is refused; a binder whose sort's shape holds no borrow
+    /// keeps the by-value reading (D-126).
+    #[test]
+    #[timeout(30000)]
+    fn test_a_quantified_borrow_is_not_resolved_by_its_binding() {
+        use std::sync::Arc;
+
+        use trust_wp_core::formula::{intern_sort_name, BinOp, ExprSort, PureExpr, UnOp};
+
+        let binder_sorts = [
+            ExprSort::MutRef(Box::new(ExprSort::Int)),
+            ExprSort::Tuple(2),
+            ExprSort::Datatype(intern_sort_name("core::option::Option")),
+        ];
+        for sort in binder_sorts {
+            let q = || typed_var("q", sort.clone());
+            let none_unresolved = PureExpr::UnOp(
+                UnOp::Not,
+                Arc::new(PureExpr::Exists {
+                    var: "q".to_string(),
+                    var_sort: Some(sort.clone()),
+                    body: Arc::new(PureExpr::UnOp(
+                        UnOp::Not,
+                        Arc::new(logic_fn_call("resolve", vec![q()])),
+                    )),
+                    triggers: vec![],
+                }),
+            );
+            let mut encoder = AYEncoder::new();
+            let read_as_true = match encoder.encode_pure(&none_unresolved) {
+                Ok(term) => always_holds(&mut encoder, term),
+                Err(_) => false,
+            };
+            assert!(
+                !read_as_true,
+                "!(exists<q: {sort}> !resolve(q)) read as true"
+            );
+            let all_settled = PureExpr::Forall {
+                var: "q".to_string(),
+                var_sort: Some(sort.clone()),
+                body: Arc::new(PureExpr::BinOp(
+                    Arc::new(PureExpr::Final(Arc::new(q()))),
+                    BinOp::Eq,
+                    Arc::new(PureExpr::Deref(Arc::new(q()))),
+                )),
+                triggers: vec![],
+            };
+            drop(encoder);
+            let mut encoder = AYEncoder::new();
+            let read_as_true = match encoder.encode_pure(&all_settled) {
+                Ok(term) => always_holds(&mut encoder, term),
+                Err(_) => false,
+            };
+            assert!(!read_as_true, "forall<q: {sort}> ^q == *q read as true");
+        }
+
+        let ints_resolve = PureExpr::Forall {
+            var: "v".to_string(),
+            var_sort: Some(ExprSort::Int),
+            body: Arc::new(logic_fn_call(
+                "resolve",
+                vec![typed_var("v", ExprSort::Int)],
+            )),
+            triggers: vec![],
+        };
+        let mut encoder = AYEncoder::new();
+        let term = encoder
+            .encode_pure(&ints_resolve)
+            .expect("forall<v: Int> resolve(v) should encode");
+        assert!(
+            always_holds(&mut encoder, term),
+            "forall<v: Int> resolve(v)"
+        );
+    }
+
+    /// A binder a written `forall`/`exists` binds without a sort ranges over
+    /// every value of its type, which the parser did not keep: a tuple or an
+    /// `Option` of a borrow, a `&mut` of a named type, a closure state. Its
+    /// final value is refused like an annotated borrow's, so
+    /// `!(exists<q> !resolve(q))` and `forall<q> ^q == *q` are not read as
+    /// true (D-127); the collapse read both as `q == q`.
+    #[test]
+    #[timeout(30000)]
+    fn test_an_unannotated_written_binder_is_not_resolved_by_its_binding() {
+        use std::sync::Arc;
+
+        use trust_wp_core::formula::{BinOp, PureExpr, UnOp};
+
+        let q = || var("q");
+        let none_unresolved = PureExpr::UnOp(
+            UnOp::Not,
+            Arc::new(PureExpr::Exists {
+                var: "q".to_string(),
+                var_sort: None,
+                body: Arc::new(PureExpr::UnOp(
+                    UnOp::Not,
+                    Arc::new(logic_fn_call("resolve", vec![q()])),
+                )),
+                triggers: vec![],
+            }),
+        );
+        let all_settled = PureExpr::Forall {
+            var: "q".to_string(),
+            var_sort: None,
+            body: Arc::new(PureExpr::BinOp(
+                Arc::new(PureExpr::Final(Arc::new(q()))),
+                BinOp::Eq,
+                Arc::new(PureExpr::Deref(Arc::new(q()))),
+            )),
+            triggers: vec![],
+        };
+        for claim in [none_unresolved, all_settled] {
+            let mut encoder = AYEncoder::new();
+            let read_as_true = match encoder.encode_pure(&claim) {
+                Ok(term) => always_holds(&mut encoder, term),
+                Err(_) => false,
+            };
+            assert!(!read_as_true, "{claim} read as true");
+        }
     }
 
     /// `Int::min(3, 5)` dispatches to ay's native min and equals `3` — the

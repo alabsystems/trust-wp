@@ -1,0 +1,57 @@
+//@ expect: reject
+//@ verdict: failed
+//@ fn-failed: caller
+//@ also-verified: via, <Ap as Apply<Sum10>>::apply
+//@ mechanism: the invariant-bearing argument is typed by a TRAIT parameter, `Apply<X>`, not by
+//@ mechanism: `Self`. The declaration's `x: X` clause stated at the impl `Apply<Sum10>` is
+//@ mechanism: `Sum10`'s invariant, so it covers that impl's grant; `via<X, A>` discharges it from
+//@ mechanism: `inv_X(x)`, and `via(&Ap, s)` owes it where it fixes `X = Sum10` (D-141).
+//@ accept-means: only the trait's `Self` is instantiated, so a trait parameter launders the
+//@ accept-means: argument it types.
+//@ WHY THE CONTRACT IS FALSE: `caller` overwrites `s` with 1 and 1, the impl returns 2, and
+//@ WHY THE CONTRACT IS FALSE: `caller` claims 10.
+//@ teeth: MEASURED with the instantiating call's clause dropped by a local knob: `caller` is
+//@ teeth: credited `verified`, exit 0.
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+extern crate creusot_std;
+use creusot_std::prelude::*;
+
+pub struct Sum10 {
+    pub a: i32,
+    pub b: i32,
+}
+
+impl Invariant for Sum10 {
+    #[logic(open)]
+    fn invariant(self) -> bool {
+        pearlite! { self.a@ + self.b@ == 10 }
+    }
+}
+
+pub trait Apply<X> {
+    #[ensures(result@ == 10)]
+    fn apply(&self, x: X) -> i32;
+}
+
+pub struct Ap;
+
+impl Apply<Sum10> for Ap {
+    fn apply(&self, x: Sum10) -> i32 {
+        x.a + x.b
+    }
+}
+
+#[ensures(result@ == 10)]
+pub fn via<X, A: Apply<X>>(a: &A, x: X) -> i32 {
+    a.apply(x)
+}
+
+#[ensures(result@ == 10)]
+pub fn caller(mut s: Sum10) -> i32 {
+    s.a = 1;
+    s.b = 1;
+    via(&Ap, s)
+}

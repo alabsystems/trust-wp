@@ -679,9 +679,8 @@ fn is_axiom_deps_only_false_when_verified_present() {
 fn summary_exit_code_orphaned_invariants_produce_errors_not_skipped() {
     use crate::callbacks::reporting::VerificationSummary;
 
-    // Simulate the counters state after orphaned invariants are detected.
-    // Before #2122, this would have been skipped=1, errors=0 → exit code 0.
-    // After #2122, this is errors=1 → exit code 2.
+    // Simulate the counters state after orphaned invariants are detected:
+    // they are counted as errors (exit code 2), not as skipped.
     let summary = VerificationSummary {
         errors: 1,
         ..Default::default()
@@ -748,4 +747,159 @@ fn summary_exit_code_trusted_only_returns_2() {
         2,
         "trusted-only is not a clean proof and must fail strict true-100"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Refutation authority: no FAILED without a validated counterexample model.
+//
+// Both halves must fail if the rule is reverted — the withholding half AND the
+// honest half, so the fix can never be "withhold everything".
+// ---------------------------------------------------------------------------
+
+/// A SAT snapshot ay validated and accepted: the shape of an honest refutation.
+fn validated_sat_provenance() -> trust_wp_ay::VerificationProvenance {
+    let mut evidence = trust_wp_ay::SolveEvidenceSnapshot::default();
+    evidence.result = "sat".to_string();
+    evidence.model_validated = true;
+    evidence.accepted_for_consumer = true;
+    evidence.verification.sat_model_validated = true;
+    evidence.verification_level = trust_wp_ay::SolveVerificationLevelSnapshot::FullyVerified;
+    trust_wp_ay::VerificationProvenance::with_solve_time(std::time::Duration::from_millis(11))
+        .with_assertion_count(4)
+        .with_solve_evidence(Some(evidence))
+}
+
+/// `invariant_moves` in one test: a loop call obligation refuted on
+/// `ay_result=trust-wp-structural-provenance accepted_for_consumer=false
+/// model_validated=false` is NOT a counterexample. It must classify as the
+/// error channel (unknown), never the failed channel.
+#[test]
+fn classify_obligation_outcome_failed_without_validated_model_is_unknown() {
+    let (outcome, delta_failed, delta_errors, delta_demoted, delta_evidence_gaps, delta_warnings) =
+        classify_obligation_outcome(
+            VerificationOutcome::without_provenance(VerificationResult::Failed(
+                Counterexample::empty(),
+            )),
+            "test::fn",
+            "test.rs:1",
+        );
+    assert_eq!(outcome, ObligationOutcome::ErrorRecorded);
+    assert_eq!(
+        delta_failed, 0,
+        "an unvalidated refutation must NOT increment failed"
+    );
+    assert_eq!(
+        delta_errors, 1,
+        "it is an inconclusive: count it as an error"
+    );
+    assert_eq!(delta_demoted, 0);
+    assert_eq!(delta_evidence_gaps, 0, "this is not a Verified-side gap");
+    assert_eq!(delta_warnings, 0);
+}
+
+/// The honest path, pinned: a refutation ay computed AND validated still
+/// counts as failed. If this flips, the rule has been over-applied.
+#[test]
+fn classify_obligation_outcome_failed_with_validated_model_stays_failed() {
+    let (outcome, delta_failed, delta_errors, delta_demoted, delta_evidence_gaps, delta_warnings) =
+        classify_obligation_outcome(
+            VerificationOutcome::new(
+                VerificationResult::Failed(Counterexample::empty()),
+                Some(validated_sat_provenance()),
+            ),
+            "test::fn",
+            "test.rs:1",
+        );
+    assert_eq!(outcome, ObligationOutcome::ErrorRecorded);
+    assert_eq!(
+        delta_failed, 1,
+        "a validated counterexample is a real refutation and must stay failed"
+    );
+    assert_eq!(delta_errors, 0);
+    assert_eq!(delta_demoted, 0);
+    assert_eq!(delta_evidence_gaps, 0);
+    assert_eq!(delta_warnings, 0);
+}
+
+/// `unknown` must never be counted as verified — the one guarantee the
+/// withheld-refutation policy rests on (D-27).
+#[test]
+fn a_withheld_refutation_is_never_verified() {
+    let (outcome, ..) = classify_obligation_outcome(
+        VerificationOutcome::without_provenance(
+            VerificationResult::Failed(Counterexample::empty()),
+        ),
+        "test::fn",
+        "test.rs:1",
+    );
+    assert_ne!(outcome, ObligationOutcome::Verified);
+    assert_ne!(outcome, ObligationOutcome::Vacuous);
+    assert!(!matches!(outcome, ObligationOutcome::Assumed(_)));
+}
+
+// ---------------------------------------------------------------------------
+// The mirror-image guard for withheld refutations (D-27).
+//
+// Withholding moves verdicts OUT of `failed`. Every one of them must land in
+// `unknown`, and `unknown` must never be readable as success — not in the
+// counters, not in the exit code. These tests fail if it ever becomes one.
+// ---------------------------------------------------------------------------
+
+/// A withheld refutation is an `Unknown`, so it takes the `Unknown` arm:
+/// errors +1, failed +0, verified untouched.
+#[test]
+fn a_withheld_refutation_is_counted_as_an_error_never_as_verified() {
+    let (outcome, delta_failed, delta_errors, delta_demoted) = classify_obligation_result(
+        VerificationResult::Unknown(UnknownReason::SolverMessage(format!(
+            "{}: {}",
+            trust_wp_ay::REFUTATION_AUTHORITY_MESSAGE,
+            trust_wp_ay::INJECTED_FAIL_CLOSED_GOAL_REASON
+        ))),
+        "test::fn",
+        "test.rs:1",
+    );
+    assert_eq!(outcome, ObligationOutcome::ErrorRecorded);
+    assert_ne!(
+        outcome,
+        ObligationOutcome::Verified,
+        "a withheld refutation must never be credited as a proof"
+    );
+    assert_eq!(delta_failed, 0);
+    assert_eq!(delta_errors, 1);
+    assert_eq!(delta_demoted, 0);
+}
+
+/// And the crate exit stays nonzero on it. `unknown` is exit 2 — an error or
+/// soundness gap — never the exit 0 a clean proof earns.
+#[test]
+fn a_crate_whose_only_verdict_was_withheld_never_exits_zero() {
+    use crate::callbacks::reporting::{ProofAssertCounters, VerificationSummary};
+
+    let withheld_only = VerificationCounters {
+        errors: 1,
+        refutations_withheld: 1,
+        ..VerificationCounters::default()
+    };
+    assert_eq!(withheld_only.verified, 0);
+    assert_eq!(withheld_only.failed, 0);
+    let summary =
+        VerificationSummary::from_counters(&withheld_only, &ProofAssertCounters::default());
+    assert_eq!(
+        summary.exit_code(),
+        2,
+        "an inconclusive crate exits 2, never 0"
+    );
+    assert_eq!(summary.rustc_process_exit_code(), 2);
+
+    // A crate that proved everything else but withheld one refutation is still
+    // not a clean proof.
+    let mixed = VerificationCounters {
+        verified: 9,
+        errors: 1,
+        refutations_withheld: 1,
+        ..VerificationCounters::default()
+    };
+    let mixed_summary = VerificationSummary::from_counters(&mixed, &ProofAssertCounters::default());
+    assert_eq!(mixed_summary.exit_code(), 2);
+    assert_ne!(mixed_summary.exit_code(), 0);
 }

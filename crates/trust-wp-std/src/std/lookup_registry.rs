@@ -8,7 +8,6 @@
 //! aliases + spec string references) so the driver imports metadata instead of
 //! maintaining independent alias arrays.
 //!
-//! See: `designs/2026-03-19-2524-std-spec-path-authority-unification.md`
 //! Issue: #2524
 
 use super::{clone, default, mem, primitives, ptr, slice};
@@ -24,9 +23,11 @@ pub type SpecLookupEntry = (&'static [&'static str], &'static str);
 
 /// Mem, clone, and default spec entries.
 ///
-/// These entries consolidate the path metadata previously split between
-/// `trust-wp-driver/src/std_specs/table/mem_clone_default.rs` (alias arrays)
-/// and `trust-wp-std/src/std/builtin_registry.rs` (extern bridge entries).
+/// These entries own the path metadata for this domain:
+/// `trust-wp-driver/src/std_specs/table/mem_clone_default.rs` re-exports this
+/// slice instead of keeping its own alias arrays, and
+/// `trust-wp-std/src/std/builtin_registry.rs` carries only the extern bridge
+/// entries.
 ///
 /// Entries whose canonical path (first element) appears in
 /// `BUILTIN_EXTERN_SPECS` have `builtin_extern_canonical_path()` return
@@ -357,8 +358,8 @@ pub static MEM_CLONE_DEFAULT: &[SpecLookupEntry] = &[
 
 /// Char, raw pointer, and slice spec entries.
 ///
-/// These entries consolidate the path metadata previously owned by
-/// `trust-wp-driver/src/std_specs/table/ptr_slice.rs`.
+/// These entries own the path metadata for this domain;
+/// `trust-wp-driver/src/std_specs/table/ptr_slice.rs` re-exports this slice.
 /// No entries in this domain participate in the builtin extern-spec bridge.
 pub static PTR_SLICE: &[SpecLookupEntry] = &[
     // Char specs

@@ -236,10 +236,14 @@ impl ProducesGroundCalls {
         self.calls.len() > TRUST_WP_ADAPTER_THREE_HOP_CAP
     }
 
-    /// Returns the calls recorded *before* the last insert (i.e., all but the last).
-    /// Panics if empty.
+    /// Returns the calls recorded *before* the last insert (i.e., all but the
+    /// last), or an empty slice when nothing has been recorded yet.
+    ///
+    /// This used to be documented as "Panics if empty", which is not a contract
+    /// a caller can honour from outside — `split_last` gives the same answer
+    /// for every non-empty input and an empty slice instead of the panic.
     pub(super) fn prior_calls(&self) -> &[ProducesGroundCall] {
-        &self.calls[..self.calls.len() - 1]
+        self.calls.split_last().map_or(&[], |(_, prior)| prior)
     }
 
     /// All recorded calls.

@@ -154,7 +154,7 @@ pub(in crate::encoder) fn is_direct_view_candidate(
     logic_fn: &LogicFnDef,
     _effective_mode: LogicMode,
 ) -> bool {
-    if logic_fn.name() != "view"
+    if logic_fn.short_name() != "view"
         || logic_fn.params().len() != 1
         || !logic_fn.requires().is_empty()
         || logic_fn.is_opaque()
@@ -193,7 +193,7 @@ fn final_tuple_projection_root_view(
     let mut final_depth = 1usize;
     let mut base = inner_final;
     while let PureExpr::Final(next) = base {
-        final_depth += 1;
+        final_depth = final_depth.saturating_add(1);
         base = next;
     }
 
@@ -311,7 +311,7 @@ impl AYEncoder {
         let Some(return_sort) = logic_fn.return_sort() else {
             return false;
         };
-        if logic_fn.name() != "view" || logic_fn.params().len() != 1 {
+        if logic_fn.short_name() != "view" || logic_fn.params().len() != 1 {
             return false;
         }
         let return_sort = self.sort_from_expr_sort(return_sort);
@@ -527,6 +527,15 @@ impl AYEncoder {
         self.view_return_struct_decl(candidate)
             .and_then(|decl| decl.constructors.first())
             .is_some_and(|ctor| ctor.fields.len() == args.len())
+    }
+
+    /// The return sort of the unique registered user `View::view` whose
+    /// parameter matches `inner`, if any. Used by the mut-borrow view-alias
+    /// binder so it declares `<carrier>_view` at the VIEW sort instead of the
+    /// carrier's own sort (a user `View` impl such as `ViewTy = Mapping<Int,
+    /// Int>` on a struct is not an identity view).
+    pub(crate) fn registered_view_return_sort(&mut self, inner: &PureExpr) -> Option<Sort> {
+        self.view_return_sort_for_inner(inner, None)
     }
 
     fn view_return_sort_for_inner(
@@ -933,6 +942,25 @@ impl AYEncoder {
             return self.safe_apply(&uf_name, &func, &[receiver_term, index_term]);
         }
 
+        // View(Deref(Var(name, Ref(Int | Bool)))) → Deref(Var(..)): the view of
+        // a machine integer or a bool IS its value, and the Deref wrapper
+        // encodes `*x` of a shared reference AS `x` (Phase 1b), so `(*x)@` is
+        // that same term. Naming it `x_current_view` instead leaves `(*x)@` a
+        // symbol no fact about `*x` reaches, wherever no other lane happens to
+        // alias `x_current` to `x` (the mut-borrow lane of an `FnMut` closure
+        // body does not: `if *x != 0 { needs_nonzero(*x) }` was refuted
+        // there). Scalars only: a `Ref(Seq)` is how the IndexMut-write lane
+        // spells a `&mut [T]` parameter, whose `(*a)@` is the ENTRY view
+        // while `a_view` advances to the post-write state, and a `Datatype`
+        // may be a smart pointer whose view is not its pointee's.
+        if let PureExpr::Deref(deref_inner) = inner {
+            if let PureExpr::Var(_, Some(ExprSort::Ref(pointee))) = deref_inner.as_ref() {
+                if matches!(pointee.as_ref(), ExprSort::Int | ExprSort::Bool) {
+                    return self.encode_pure_impl(inner, prefix);
+                }
+            }
+        }
+
         // View(Var(name, MutRef(_))) → View(Deref(Var(name, MutRef(_)))) redirect.
         // Viewing a `&mut T` is semantically viewing its current value: `x@` and
         // `(*x)@` must produce the same ay variable (`x_current_view`). Without
@@ -1005,8 +1033,25 @@ impl AYEncoder {
                 // expression (Deref(Var(...))) correctly resolves to Int. (#2694)
                 let effective_ann = effective_expr_annotation(inner)
                     .or_else(|| effective_expr_annotation(inner_final));
+                // `^x` for `x: &mut T` has the referent sort `T`, so the view of
+                // the prophecy is `T`'s registered view. The candidate matcher
+                // compares against the parameter sort `T` and never matches the
+                // raw `MutRef(T)` annotation, which let a method-derived hint
+                // (e.g. `.set` => `Seq`) pick the view sort instead of the
+                // registered `Mapping` (mapping_test::f sort conflict).
                 let view_return_sort = collection_iterator_view_return_sort(inner_final)
-                    .or_else(|| self.view_return_sort_for_inner(inner_final, prefix));
+                    .or_else(|| self.view_return_sort_for_inner(inner_final, prefix))
+                    .or_else(|| {
+                        let is_ref_carrier =
+                            effective_expr_annotation(inner_final).is_some_and(|ann| {
+                                matches!(ann, ExprSort::MutRef(_) | ExprSort::Ref(_))
+                            });
+                        if !is_ref_carrier {
+                            return None;
+                        }
+                        let derefed = PureExpr::Deref(Arc::new(inner_final.as_ref().clone()));
+                        self.view_return_sort_for_inner(&derefed, prefix)
+                    });
                 let prefer_fallback = view_return_sort.is_some();
                 let fallback = view_return_sort.unwrap_or_else(|| match effective_ann {
                     Some(ann) => self.sort_from_expr_sort(ann.clone()),
@@ -1257,6 +1302,19 @@ impl AYEncoder {
     }
 
     fn assert_seq_view_identity_components(&mut self, base_term: Term, view_term: Term) {
+        // A view with no components of its own yet takes the base's through
+        // the same propagation the tail of this function performs. The
+        // component equalities below then relate each term to itself, and an
+        // element read through the view is the read through the base, not a
+        // second select whose agreement only an array-congruence lemma
+        // across offset proxies could show.
+        if self.seq_state.get_seq_value(&view_term).is_none()
+            && self.seq_state.get_seq_array_aux(&view_term).is_none()
+            && self.seq_state.get_seq_len_aux(&view_term).is_none()
+            && self.seq_state.get_seq_offset_aux(&view_term).is_none()
+        {
+            self.propagate_seq_value(base_term, view_term);
+        }
         let Ok(view_arr) = self.seq_array_term(view_term) else {
             return;
         };

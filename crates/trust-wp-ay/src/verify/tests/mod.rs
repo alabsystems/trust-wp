@@ -6,10 +6,7 @@ use std::sync::Arc;
 
 use ntest::timeout;
 
-use super::{
-    detect_body_constructor_name, expr_requires_result_bool,
-    result_match_datatype_from_postcondition,
-};
+use super::{expr_requires_result_bool, result_match_datatype_from_postcondition};
 use crate::{
     encoder::{match_enc::MatchDatatypeKind, AYEncoder},
     tests::helpers::{
@@ -27,6 +24,7 @@ mod loop_verification_result;
 mod mode_overrides;
 mod negated_postcondition_encoding;
 mod provenance;
+mod refutation_authority;
 mod result_inference;
 mod structural_induction_m0;
 mod unknown_reason;
@@ -502,85 +500,6 @@ fn expr_requires_result_bool_nested_or_implies() {
         BinOp::Implies,
         deep
     )));
-}
-
-// --- detect_body_constructor_name tests ---
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_some() {
-    let expr = logic_fn_call("Some", vec![int(42)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Some"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_none_as_var() {
-    let expr = var("None");
-    assert_eq!(detect_body_constructor_name(&expr), Some("None"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_ok() {
-    let expr = logic_fn_call("Ok", vec![int(0)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Ok"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_err() {
-    let expr = logic_fn_call("Err", vec![int(1)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Err"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_qualified_path() {
-    // `short_constructor_name` strips the qualifier: "std::option::Option::Some" → "Some"
-    let expr = logic_fn_call("std::option::Option::Some", vec![int(1)]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Some"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_user_defined_variant() {
-    let expr = logic_fn_call("MyEnum::Variant", vec![]);
-    assert_eq!(detect_body_constructor_name(&expr), Some("Variant"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_self_qualified_variant() {
-    let expr = var("Self::Y");
-    assert_eq!(detect_body_constructor_name(&expr), Some("Y"));
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_bare_int_returns_none() {
-    let expr = int(42);
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_method_call_returns_none() {
-    let expr = method_call(var("x"), "unwrap", vec![]);
-    assert_eq!(detect_body_constructor_name(&expr), None);
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_bool_literal() {
-    assert_eq!(detect_body_constructor_name(&bool_expr(true)), None);
-}
-
-#[test]
-#[timeout(30000)]
-fn detect_body_constructor_name_binop_returns_none() {
-    let expr = add(int(1), int(2));
-    assert_eq!(detect_body_constructor_name(&expr), None);
 }
 
 // --- result_match_datatype_from_postcondition constructor equality tests ---

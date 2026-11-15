@@ -49,6 +49,54 @@ fn test_shared_ref_deref_collapses_to_base_var() {
     );
 }
 
+/// The view of a shared reference's scalar pointee is the pointee itself
+/// (D-118): `*x` encodes AS `x`, so `(*x)@` must be that same term and
+/// `(*x)@ != *x` is unsatisfiable. A separate `x_current_view` symbol left
+/// `if *x != 0 { needs_nonzero(*x) }` refuted in the lane that aliases no
+/// `x_current` to `x`.
+#[test]
+#[timeout(30000)]
+fn test_shared_ref_scalar_deref_view_is_the_deref() {
+    let mut encoder = AYEncoder::new();
+    let x = || var_with_sort("x", ExprSort::Ref(Box::new(ExprSort::Int)));
+    let deref_view = PureExpr::View(Arc::new(deref(x())));
+    let deref_view_term = encoder
+        .encode_pure(&deref_view)
+        .expect("(*x)@ should encode");
+    let deref_term = encoder.encode_pure(&deref(x())).expect("*x should encode");
+    assert_eq!(deref_view_term, deref_term, "(*x)@ and *x must be one term");
+    assert!(
+        encoder.var_term("x_current_view").is_none(),
+        "a shared scalar dereference's view must not mint a `x_current_view` symbol"
+    );
+    let differs = encoder
+        .encode_pure(&ne(PureExpr::View(Arc::new(deref(x()))), deref(x())))
+        .expect("(*x)@ != *x should encode");
+    encoder.assert_term(differs);
+    assert!(matches!(encoder.check_sat(), SolveResult::Unsat(_)));
+}
+
+/// The scalar rule above does not reach a `Ref(Seq)`: the IndexMut-write lane
+/// spells a `&mut [T]` parameter that way and reads `(*a)@` as the ENTRY view
+/// while `a_view` advances past the write, so the two must stay distinct.
+#[test]
+#[timeout(30000)]
+fn test_shared_ref_seq_deref_view_stays_the_current_view() {
+    let mut encoder = AYEncoder::new();
+    let a = var_with_sort("a", ExprSort::Ref(Box::new(ExprSort::Seq)));
+    encoder
+        .encode_pure(&PureExpr::View(Arc::new(deref(a))))
+        .expect("(*a)@ should encode");
+    assert!(
+        encoder.var_term("a_current_view").is_some(),
+        "(*a)@ of a `Ref(Seq)` must stay the current view"
+    );
+    assert!(
+        encoder.var_term("a_view").is_none(),
+        "(*a)@ of a `Ref(Seq)` must not be read as `a@`"
+    );
+}
+
 /// Reflexive comparison of identical non-numeric terms must be UNSAT when negated.
 ///
 /// Before #2285 fix: `field(x) <= field(x)` encoded each side as a *different*
@@ -698,128 +746,36 @@ fn test_bool_coercion_bool_operand_no_unsoundness() {
     handle.join().expect("test thread panicked");
 }
 
+/// A float is an IEEE-754 value, never a number: `BinOp` arithmetic, order
+/// and negation over one are refused (Rust's operators arrive as reserved
+/// IEEE calls, see `tests/logic_fn/float_int_builtins.rs`), and so is mixing a
+/// float with an integer.
 #[test]
 #[timeout(30000)]
-fn test_float_arithmetic_uses_real_terms() {
+fn test_float_operands_of_numeric_operators_are_refused() {
+    let x = PureExpr::Var(
+        "x".to_string(),
+        Some(ExprSort::Float(trust_wp_core::formula::FloatWidth::F64)),
+    );
     let cases = [
-        (
-            PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Add, Arc::new(float(2.25))),
-            3.75,
-        ),
-        (
-            PureExpr::BinOp(Arc::new(float(5.5)), BinOp::Sub, Arc::new(float(2.0))),
-            3.5,
-        ),
-        (
-            PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Mul, Arc::new(float(2.0))),
-            3.0,
-        ),
-        (
-            PureExpr::BinOp(Arc::new(float(3.0)), BinOp::Div, Arc::new(float(2.0))),
-            1.5,
-        ),
+        PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Add, Arc::new(float(2.25))),
+        PureExpr::BinOp(Arc::new(float(5.5)), BinOp::Sub, Arc::new(x.clone())),
+        PureExpr::BinOp(Arc::new(x.clone()), BinOp::Mul, Arc::new(float(2.0))),
+        PureExpr::BinOp(Arc::new(float(1.0)), BinOp::Div, Arc::new(x.clone())),
+        PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Lt, Arc::new(float(2.5))),
+        PureExpr::BinOp(Arc::new(x.clone()), BinOp::Le, Arc::new(x.clone())),
+        PureExpr::BinOp(Arc::new(PureExpr::Int(1)), BinOp::Add, Arc::new(float(1.5))),
+        PureExpr::BinOp(Arc::new(PureExpr::Int(1)), BinOp::Lt, Arc::new(float(1.5))),
+        PureExpr::BinOp(Arc::new(PureExpr::Int(2)), BinOp::Eq, Arc::new(float(2.0))),
+        PureExpr::UnOp(UnOp::Neg, Arc::new(float(2.5))),
     ];
-
-    for (expr, expected) in cases {
+    for expr in cases {
         let mut encoder = AYEncoder::new();
-        let term = encoder
-            .encode_pure(&expr)
-            .expect("float arithmetic should encode via Real terms");
-        assert_eq!(encoder.solver.get_sort(term), Sort::Real);
-
-        let expected_term = encoder
-            .solver
-            .try_real_const(expected)
-            .expect("expected finite Real literal");
-        let neq = encoder.solver.neq(term, expected_term);
-        encoder.solver.assert_term(neq);
         assert!(
-            matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-            "encoded float arithmetic should equal {expected}"
+            encoder.encode_pure(&expr).is_err(),
+            "a float under a numeric operator must be refused: {expr:?}"
         );
     }
-}
-
-#[test]
-#[timeout(30000)]
-fn test_float_negation_uses_real_arithmetic() {
-    let mut encoder = AYEncoder::new();
-    let expr = PureExpr::UnOp(UnOp::Neg, Arc::new(float(2.5)));
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("float negation should encode via arithmetic negation");
-
-    assert_eq!(encoder.solver.get_sort(term), Sort::Real);
-
-    let expected = encoder
-        .solver
-        .try_real_const(-2.5)
-        .expect("expected finite Real literal");
-    let neq = encoder.solver.neq(term, expected);
-    encoder.solver.assert_term(neq);
-    assert!(
-        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-        "encoded float negation should equal -2.5"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_mixed_int_real_operands_promote_to_real() {
-    let mut encoder = AYEncoder::new();
-    let expr = PureExpr::BinOp(Arc::new(PureExpr::Int(1)), BinOp::Add, Arc::new(float(1.5)));
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("mixed Int/Real arithmetic should promote Int to Real");
-
-    assert_eq!(encoder.solver.get_sort(term), Sort::Real);
-
-    let expected = encoder
-        .solver
-        .try_real_const(2.5)
-        .expect("expected finite Real literal");
-    let neq = encoder.solver.neq(term, expected);
-    encoder.solver.assert_term(neq);
-    assert!(
-        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-        "mixed Int/Real arithmetic should evaluate in Real sort"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_float_division_records_real_nonzero_obligation() {
-    let mut encoder = AYEncoder::new();
-    let expr = PureExpr::BinOp(
-        Arc::new(float(1.0)),
-        BinOp::Div,
-        Arc::new(PureExpr::Var("x".to_string(), Some(ExprSort::Float))),
-    );
-
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("float division should encode");
-    assert_eq!(encoder.solver.get_sort(term), Sort::Real);
-    assert_eq!(
-        encoder.arithmetic_mode.division_obligations().len(),
-        1,
-        "float division should record exactly one nonzero obligation"
-    );
-
-    let x = encoder
-        .get_or_declare_var("x", Sort::Real)
-        .expect("declare x");
-    let zero = encoder.solver.rational_const(0, 1);
-    let x_is_zero = encoder.solver.eq(x, zero);
-    encoder.solver.assert_term(x_is_zero);
-    encoder
-        .solver
-        .assert_term(encoder.arithmetic_mode.division_obligations()[0]);
-
-    assert!(
-        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-        "real division obligation should rule out x = 0"
-    );
 }
 
 #[test]
@@ -1001,45 +957,12 @@ fn test_literal_div_triangular_concrete_model_discharges() {
     );
 }
 
+/// `==` on floats in a formula is LOGICAL equality of values: literal
+/// `1.5 == 1.5` holds and `1.5 != 2.5` holds (IEEE `==` is the reserved call).
 #[test]
 #[timeout(30000)]
-fn test_float_comparison_operators() {
-    let cases = [
-        (BinOp::Lt, float(1.5), float(2.5), true),
-        (BinOp::Lt, float(2.5), float(1.5), false),
-        (BinOp::Le, float(2.5), float(2.5), true),
-        (BinOp::Gt, float(3.0), float(1.0), true),
-        (BinOp::Gt, float(1.0), float(3.0), false),
-        (BinOp::Ge, float(2.0), float(2.0), true),
-    ];
-    for (op, l, r, expected) in cases {
-        let mut encoder = AYEncoder::new();
-        let expr = PureExpr::BinOp(Arc::new(l.clone()), op, Arc::new(r.clone()));
-        let term = encoder
-            .encode_pure(&expr)
-            .unwrap_or_else(|e| panic!("float {op:?} should encode: {e}"));
-        assert_eq!(encoder.solver.get_sort(term), Sort::Bool);
-
-        // Assert the opposite of expected and check UNSAT.
-        let check = if expected {
-            encoder.solver.not(term)
-        } else {
-            term
-        };
-        encoder.solver.assert_term(check);
-        assert!(
-            matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-            "float {op:?}({l:?}, {r:?}) should be {expected}"
-        );
-    }
-}
-
-#[test]
-#[timeout(30000)]
-fn test_float_equality_and_inequality() {
-    let mut encoder = AYEncoder::new();
-
-    // Eq: 1.5 == 1.5 should be true (negation is UNSAT).
+fn test_float_logical_equality_and_inequality() {
+    let mut encoder = AYEncoder::new_all();
     let eq_expr = PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Eq, Arc::new(float(1.5)));
     let eq_term = encoder
         .encode_pure(&eq_expr)
@@ -1052,98 +975,16 @@ fn test_float_equality_and_inequality() {
         "NOT(1.5 == 1.5) should be UNSAT"
     );
 
-    // Ne: 1.5 != 2.5 should be true (negation is UNSAT).
-    let mut encoder = AYEncoder::new();
+    let mut encoder = AYEncoder::new_all();
     let ne_expr = PureExpr::BinOp(Arc::new(float(1.5)), BinOp::Ne, Arc::new(float(2.5)));
     let ne_term = encoder
         .encode_pure(&ne_expr)
         .expect("float Ne should encode");
-    assert_eq!(encoder.solver.get_sort(ne_term), Sort::Bool);
     let negated = encoder.solver.not(ne_term);
     encoder.solver.assert_term(negated);
     assert!(
         matches!(encoder.check_sat(), SolveResult::Unsat(_)),
         "NOT(1.5 != 2.5) should be UNSAT"
-    );
-}
-
-#[test]
-#[timeout(30000)]
-fn test_mixed_int_float_comparison() {
-    let mut encoder = AYEncoder::new();
-    // Int(1) < Float(1.5) should be true — Int promoted to Real.
-    let expr = PureExpr::BinOp(Arc::new(PureExpr::Int(1)), BinOp::Lt, Arc::new(float(1.5)));
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("mixed Int/Float Lt should encode");
-    assert_eq!(encoder.solver.get_sort(term), Sort::Bool);
-
-    let negated = encoder.solver.not(term);
-    encoder.solver.assert_term(negated);
-    assert!(
-        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
-        "NOT(1 < 1.5) should be UNSAT — Int promoted to Real for comparison"
-    );
-}
-
-/// Mixed Int/Float equality: `Int(2) == Float(2.0)` should be true.
-///
-/// IntToFloat cast identity (W3 #1802) passes Int PureExpr to Float
-/// locals. When these values enter Eq comparisons with Real-sorted terms,
-/// `coerce_ite_sorts` must produce `int_to_real` coercion — NOT a fresh
-/// unconstrained constant that loses the value relationship.
-///
-/// Regression guard for the #2353 Int→Real coercion fix in `coerce_ite_sorts`.
-/// The encoded equality should now preserve the Int value through `int_to_real`,
-/// making the negated formula unsatisfiable.
-#[test]
-#[timeout(30000)]
-fn test_mixed_int_float_equality_coercion_gap() {
-    let mut encoder = AYEncoder::new();
-    // Int(2) == Float(2.0) — mathematically true, but coerce_ite_sorts
-    // replaces the Int term with a fresh unconstrained Real constant.
-    let expr = PureExpr::BinOp(Arc::new(PureExpr::Int(2)), BinOp::Eq, Arc::new(float(2.0)));
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("mixed Int/Float Eq should encode");
-    assert_eq!(encoder.solver.get_sort(term), Sort::Bool);
-
-    let negated = encoder.solver.not(term);
-    encoder.solver.assert_term(negated);
-    let result = encoder.check_sat();
-    // Regression guard: the Int side should be coerced via int_to_real, so
-    // 2 == 2.0 is valid and its negation is unsatisfiable.
-    assert!(
-        matches!(result, SolveResult::Unsat(_)),
-        "NOT(2 == 2.0) should be Unsat after the Int→Real coercion fix. \
-         Got: {result:?}"
-    );
-}
-
-/// Mixed Int/Float inequality should also preserve the Int value through
-/// `int_to_real`; the negation of a true inequality must be unsatisfiable.
-#[test]
-#[timeout(30000)]
-fn test_mixed_int_float_inequality_coercion_gap() {
-    let mut encoder = AYEncoder::new();
-    // Int(2) != Float(2.5) — mathematically true, but coerce_ite_sorts
-    // replaces Int with fresh Real constant, losing the value.
-    let expr = PureExpr::BinOp(Arc::new(PureExpr::Int(2)), BinOp::Ne, Arc::new(float(2.5)));
-    let term = encoder
-        .encode_pure(&expr)
-        .expect("mixed Int/Float Ne should encode");
-    assert_eq!(encoder.solver.get_sort(term), Sort::Bool);
-
-    // The Ne encoding is NOT(eq_or_iff(Int(2), Float(2.5))). After the
-    // Int→Real fix, 2 != 2.5 is valid, so negating the whole expression is
-    // unsatisfiable.
-    let negated = encoder.solver.not(term);
-    encoder.solver.assert_term(negated);
-    let result = encoder.check_sat();
-    assert!(
-        matches!(result, SolveResult::Unsat(_)),
-        "NOT(2 != 2.5) should be Unsat after the Int→Real coercion fix. \
-         Got: {result:?}"
     );
 }
 
@@ -4866,5 +4707,175 @@ fn test_unhinted_bitand_encoding_unchanged() {
         "(bv2nat (bvand ((_ int2bv 64) x) ((_ int2bv 64) y)))",
         "unhinted bitwise encoding must stay the historical width-64 \
          unsigned bridge"
+    );
+}
+
+// ── Machine bit operations at their type (D-242) ───────────────────────
+
+fn machine_bitop(signed: bool, bits: u32, inner: PureExpr) -> PureExpr {
+    PureExpr::LogicFnCall {
+        name: trust_wp_core::formula::internal::machine_bitop::name(signed, bits),
+        args: vec![inner],
+    }
+}
+
+/// Encode `expr` with `x := x_value` (and `y := y_value` when given) and
+/// return whether the result can differ from `expected`, i.e. `Sat` when the
+/// encoding admits a value other than `expected`.
+fn machine_bitop_admits_other_than(
+    expr: &PureExpr,
+    x_value: &num_bigint::BigInt,
+    y_value: Option<&num_bigint::BigInt>,
+    expected: &num_bigint::BigInt,
+) -> bool {
+    let mut encoder = AYEncoder::new();
+    let term = encoder
+        .encode_pure(expr)
+        .expect("machine bit operation encodes");
+    let x_term = encoder.get_or_declare_var("x", Sort::Int).unwrap();
+    let x_const = encoder.solver.int_const_bigint(x_value);
+    let x_eq = encoder.solver.eq(x_term, x_const);
+    encoder.solver.assert_term(x_eq);
+    if let Some(y_value) = y_value {
+        let y_term = encoder.get_or_declare_var("y", Sort::Int).unwrap();
+        let y_const = encoder.solver.int_const_bigint(y_value);
+        let y_eq = encoder.solver.eq(y_term, y_const);
+        encoder.solver.assert_term(y_eq);
+    }
+    let expected = encoder.solver.int_const_bigint(expected);
+    let differs = encoder.solver.neq(term, expected);
+    encoder.solver.assert_term(differs);
+    !matches!(encoder.check_sat(), SolveResult::Unsat(_))
+}
+
+fn big(value: i128) -> num_bigint::BigInt {
+    num_bigint::BigInt::from(value)
+}
+
+/// `200u8 << 1` is `144`: the bit shifted past the top of a `u8` is dropped.
+/// The bare operator reads it at 64 bits as `400` (r30 g5_u8shl).
+#[test]
+#[timeout(30000)]
+fn test_machine_bitop_u8_shl_drops_shifted_out_bit() {
+    let shl = binop(var_with_sort("x", ExprSort::Int), BinOp::Shl, int(1));
+    let marked = machine_bitop(false, 8, shl.clone());
+    assert!(!machine_bitop_admits_other_than(
+        &marked,
+        &big(200),
+        None,
+        &big(144)
+    ));
+    // The bare operator keeps its mathematical reading (a clause's `Int`
+    // shift): the driver marks every machine `<<` below 64 bits.
+    assert!(!machine_bitop_admits_other_than(
+        &shl,
+        &big(200),
+        None,
+        &big(400)
+    ));
+}
+
+/// `!0u8` is `255`, not `2^64 - 1`; `!0i8` is `-1`.
+#[test]
+#[timeout(30000)]
+fn test_machine_bitop_not_complements_within_the_type() {
+    let not = PureExpr::UnOp(UnOp::BitNot, Arc::new(var_with_sort("x", ExprSort::Int)));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(false, 8, not.clone()),
+        &big(0),
+        None,
+        &big(255)
+    ));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(true, 8, not),
+        &big(0),
+        None,
+        &big(-1)
+    ));
+}
+
+/// A `u128` operation keeps its high half: `2^64 | 0 == 2^64` and
+/// `1 << 64 == 2^64` (the 64-bit reading gives `0` for both: r30 g3_u128or,
+/// u128_shl64_lit).
+#[test]
+#[timeout(30000)]
+fn test_machine_bitop_u128_keeps_high_half() {
+    let two64 = big(1i128 << 64);
+    let or = binop(var_with_sort("x", ExprSort::Int), BinOp::BitOr, int(0));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(false, 128, or),
+        &two64,
+        None,
+        &two64
+    ));
+    let shl = binop(var_with_sort("x", ExprSort::Int), BinOp::Shl, int(64));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(false, 128, shl),
+        &big(1),
+        None,
+        &two64
+    ));
+}
+
+/// A signed `>>` is arithmetic at the type's width: `-2i64 >> 1 == -1` and
+/// `-2^66 (i128) >> 1 == -2^65`; a signed `&` returns a negative value.
+#[test]
+#[timeout(30000)]
+fn test_machine_bitop_signed_results_are_twos_complement() {
+    let shr = binop(var_with_sort("x", ExprSort::Int), BinOp::Shr, int(1));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(true, 64, shr.clone()),
+        &big(-2),
+        None,
+        &big(-1)
+    ));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(true, 128, shr),
+        &big(-(1i128 << 66)),
+        None,
+        &big(-(1i128 << 65))
+    ));
+    let and = binop(
+        var_with_sort("x", ExprSort::Int),
+        BinOp::BitAnd,
+        var_with_sort("y", ExprSort::Int),
+    );
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(true, 32, and),
+        &big(-1),
+        Some(&big(-8)),
+        &big(-8)
+    ));
+}
+
+/// A machine `>>` by a literal is the floor quotient at any width: `-3i32 >> 1
+/// == -2`, and `2^100 (u128) >> 64 == 2^36`. A `u128` result also carries
+/// its range: `x >> 64 <= 2^64 - 1` for every `x`, with no premise.
+#[test]
+#[timeout(30000)]
+fn test_machine_bitop_shr_by_literal_is_the_floor() {
+    let shr1 = binop(var_with_sort("x", ExprSort::Int), BinOp::Shr, int(1));
+    assert!(!machine_bitop_admits_other_than(
+        &machine_bitop(true, 32, shr1),
+        &big(-3),
+        None,
+        &big(-2)
+    ));
+    let shr64 = binop(var_with_sort("x", ExprSort::Int), BinOp::Shr, int(64));
+    let marked = machine_bitop(false, 128, shr64);
+    assert!(!machine_bitop_admits_other_than(
+        &marked,
+        &big(1i128 << 100),
+        None,
+        &big(1i128 << 36)
+    ));
+    let mut encoder = AYEncoder::new();
+    let term = encoder.encode_pure(&marked).expect("u128 >> 64 encodes");
+    let max = encoder.solver.int_const_bigint(&big((1i128 << 64) - 1));
+    let above = encoder.solver.gt(term, max);
+    encoder.solver.assert_term(above);
+    assert!(
+        matches!(encoder.check_sat(), SolveResult::Unsat(_)),
+        "a u128 shifted right by 64 is at most 2^64 - 1"
     );
 }

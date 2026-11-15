@@ -1483,3 +1483,47 @@ fn derive_exit_code_from_wire_proof_assert_error_follows_driver() {
     };
     assert_eq!(derive_exit_code_from_wire(&wire, true, false), 2);
 }
+
+fn argv(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+#[timeout(10000)]
+fn build_tool_is_cargo_env_else_targo_never_bare_cargo() {
+    assert_eq!(build_tool_from(None), PathBuf::from("targo"));
+    assert_eq!(
+        build_tool_from(Some(OsStr::new(""))),
+        PathBuf::from("targo")
+    );
+    assert_eq!(
+        build_tool_from(Some(OsStr::new("/opt/trust/bin/targo"))),
+        PathBuf::from("/opt/trust/bin/targo")
+    );
+}
+
+#[test]
+#[timeout(10000)]
+fn crate_mode_check_names_the_unverified_lane_and_metadata_names_none() {
+    let targo = Path::new("/opt/trust/bin/targo");
+    assert_eq!(
+        argv(&build_tool_command(targo, "check")),
+        ["--unverified", "check"]
+    );
+    // targo refuses `--unverified` on a non-compilation command.
+    assert_eq!(argv(&build_tool_command(targo, "metadata")), ["metadata"]);
+    assert_eq!(
+        argv(&build_tool_command(Path::new("targo"), "check")),
+        ["--unverified", "check"]
+    );
+    // A caller's non-targo `$CARGO` picks its own lane.
+    let other = Path::new("/opt/other/bin/cargo");
+    assert_eq!(argv(&build_tool_command(other, "check")), ["check"]);
+    assert_eq!(
+        build_tool_command(targo, "check").get_program(),
+        targo.as_os_str()
+    );
+}

@@ -16,7 +16,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-TRUST_IR_PATH_DEPENDENCY = {"path": "../trust-ir/crates/trust-ir"}
+TRUST_IR_PATHS = {
+    "trust-ir": "../trust-ir/crates/trust-ir",
+    "trust-ir-contract": "../trust-ir/crates/trust-ir-contract",
+    "trust-ir-build": "../trust-ir/crates/trust-ir-build",
+}
 
 
 def _workspace_table(path: Path) -> dict[str, object]:
@@ -24,14 +28,42 @@ def _workspace_table(path: Path) -> dict[str, object]:
     return manifest["workspace"]
 
 
+def _with_sibling_ir_sources(workspace: dict[str, object]) -> dict[str, object]:
+    standalone = deepcopy(workspace)
+    standalone_dependencies = standalone["dependencies"]
+    assert isinstance(standalone_dependencies, dict)
+    for name, path in TRUST_IR_PATHS.items():
+        provider = standalone_dependencies[name]
+        assert isinstance(provider, dict)
+        for selector in ("git", "rev", "branch", "tag"):
+            provider.pop(selector, None)
+        provider["path"] = path
+    return standalone
+
+
 def test_trust_dependency_mode_matches_root_except_trust_ir_source() -> None:
-    standalone = deepcopy(_workspace_table(WORKSPACE_ROOT / "Cargo.toml"))
+    standalone = _with_sibling_ir_sources(_workspace_table(WORKSPACE_ROOT / "Cargo.toml"))
     trust_mode = _workspace_table(
         WORKSPACE_ROOT / "dependency-modes" / "trust" / "Cargo.toml"
     )
 
-    standalone_dependencies = standalone["dependencies"]
-    assert isinstance(standalone_dependencies, dict)
-    standalone_dependencies["trust-ir"] = TRUST_IR_PATH_DEPENDENCY
-
     assert trust_mode == standalone
+
+
+def test_source_replacement_preserves_every_provider_setting() -> None:
+    standalone = _workspace_table(WORKSPACE_ROOT / "Cargo.toml")
+    trust_mode = _workspace_table(
+        WORKSPACE_ROOT / "dependency-modes" / "trust" / "Cargo.toml"
+    )
+    for name in TRUST_IR_PATHS:
+        for setting, value in (
+            ("features", ["different-proof-environment"]),
+            ("default-features", not standalone["dependencies"][name].get("default-features", True)),
+            ("optional", True),
+            ("package", "different-native-provider"),
+        ):
+            changed = deepcopy(standalone)
+            changed["dependencies"][name][setting] = value
+            converted = _with_sibling_ir_sources(changed)
+            assert converted["dependencies"][name][setting] == value
+            assert converted != trust_mode, (name, setting)

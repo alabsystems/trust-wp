@@ -151,8 +151,9 @@ impl AYEncoder {
         let self_sort = self.solver.get_sort(self_term);
         // Mirror the quantified fn_once law (assert_fn_once_law): skip the
         // entire eager axiom when the resolve term cannot be constructed.
-        // The previous `.unwrap_or_else(|| true)` fabricated `resolve(self) = true`,
-        // collapsing postcondition_once to postcondition — unsound. (#2566)
+        // Defaulting the missing term to `true` would fabricate
+        // `resolve(self) = true`, collapsing postcondition_once to
+        // postcondition — unsound. (#2566)
         let Some(resolve) = self.resolve_term_for_sort(self_term, &self_sort) else {
             return Ok(());
         };
@@ -165,7 +166,7 @@ impl AYEncoder {
         Ok(())
     }
 
-    /// Resolve the term used to seed `result_view` from a closure body.
+    /// Resolve the term that seeds `result_view` from a closure body.
     ///
     /// Transparent adapters like `Copied` / `Cloned` should seed
     /// `result_view` from the adapter's inner body term when the body itself
@@ -272,9 +273,9 @@ impl AYEncoder {
         post_arity: usize,
         sort_tags: &[&str],
     ) {
-        // Sort-tag validation removed (#2151 Phase 4): the `closure_sort_from_tag`
-        // round-trip was lossy ("u" → Sort::Int, losing Datatype/Uninterpreted info)
-        // and unnecessary — `post_decl.domain()` provides the actual UF domain sorts.
+        // No sort-tag validation here: the `closure_sort_from_tag` round-trip
+        // is lossy ("u" → Sort::Int, losing Datatype/Uninterpreted info) and
+        // unnecessary — `post_decl.domain()` provides the actual UF domain sorts.
         // Callers already validated that the symbol was parseable by `parse_closure_signature`.
 
         let mut mut_sort_tags = sort_tags.to_vec();
@@ -352,8 +353,9 @@ impl AYEncoder {
         let self_sort = &mut_domain[0];
         let self_eq_res = self.eq_term(vars[0], vars[res_state_idx]);
         let rhs = self.solver.and(post_term, self_eq_res);
-        // Both mut_term and rhs are Bool-sorted postcondition predicates.
-        // Native solver equality now handles that case in the current ay pin.
+        // Both mut_term and rhs are Bool-sorted postcondition predicates;
+        // native solver equality handles Bool-sorted operands, so no separate
+        // iff encoding is needed.
         let iff = self.eq_term(mut_term, rhs);
         let axiom = self.solver.forall_with_triggers(&vars, iff, &[&[mut_term]]);
         self.solver.assert_term(axiom);
@@ -620,7 +622,7 @@ impl AYEncoder {
         }
 
         // The compatibility entry point fails closed when once_decl diverges
-        // from the post_decl domain used to create these variables. (#2556)
+        // from the post_decl domain these variables were created from. (#2556)
         let Some(once_term) = self.axiom_apply_sort_adapted("fn_once_law:once", &once_decl, &vars)
         else {
             return;
@@ -636,8 +638,9 @@ impl AYEncoder {
         };
         let rhs = self.solver.and(post_term, resolve_self);
 
-        // Both once_term (postcondition_once predicate) and rhs are Bool, and
-        // native solver equality now handles that case in the current ay pin.
+        // Both once_term (postcondition_once predicate) and rhs are Bool;
+        // native solver equality handles Bool-sorted operands, so no separate
+        // iff encoding is needed.
         let iff = self.eq_term(once_term, rhs);
         let axiom = self
             .solver
@@ -837,35 +840,14 @@ impl AYEncoder {
             })
             .map(|(name, decl)| (name.clone(), decl.clone()));
 
-        // Single-declaration fallback (#2668): when closures pass through generic
-        // functions (e.g., call_fnonce<F: FnOnce()>), the receiver sort becomes Int
-        // and closure_env_sort_name returns None, causing the sort-name match above
-        // to fail. If there is exactly one postcondition_once UF declaration, use it
-        // unconditionally — analogous to find_body_for_receiver's single_body shortcut.
-        let once_decl = once_decl.or_else(|| {
-            if closure_sort_name.is_some() {
-                return None; // Sort-name was available; match genuinely failed.
-            }
-            let candidates: Vec<_> = self
-                .logic_funcs_iter()
-                .filter(|(name, _)| name.starts_with("closure_postcondition_once_"))
-                .filter(|(_, decl)| !decl.domain().is_empty())
-                .map(|(name, decl)| (name.clone(), decl.clone()))
-                .collect();
-            if candidates.len() == 1 {
-                debug!(
-                    "[TRUST_WP_DEBUG] postcondition_once ensures axiom: \
-                         sort-name match failed (Int-sorted receiver), \
-                         using single-declaration fallback: {}",
-                    candidates[0].0
-                );
-
-                Some(candidates.into_iter().next().unwrap())
-            } else {
-                None
-            }
-        });
-
+        // No single-declaration fallback (D-30): when the receiver sort of
+        // a closure passed through a generic callee collapses to `Int`,
+        // `closure_env_sort_name` is `None` and the declaration this closure's
+        // ensures belongs to cannot be identified. Binding the lone
+        // `postcondition_once` declaration anyway would assert THIS closure's
+        // ensures over EVERY closure sharing that declaration — identity-free
+        // credit, the same defect as guessing a body for an unnamed receiver
+        // in `find_body_for_receiver`. Without identity, no axiom.
         let Some((once_name, once_decl)) = once_decl else {
             return Ok(());
         };
@@ -898,14 +880,14 @@ impl AYEncoder {
         // For truly consumed FnOnce closures (ByValue/ByRef captures), both old_
         // and bare names bind to selector(env) — there is no separate post-state.
         //
-        // For ByMutRef captures (#2668 fix): the bare capture name must NOT bind
+        // For ByMutRef captures (#2668): the bare capture name must NOT bind
         // to selector(env), because the ensures expression uses bare names for the
         // post-call state (e.g., `x == old(x) + 1`). Binding both to selector(env)
         // creates `selector(env) == selector(env) + 1` — always false, making the
         // axiom vacuously satisfied and disconnecting postcondition_once from the
         // closure's actual mutation effects.
         //
-        // Fix: use a Skolem FUNCTION `once_post_cap(env, args, result)` for each
+        // Instead, use a Skolem FUNCTION `once_post_cap(env, args, result)` for each
         // ByMutRef capture's post-state, applied to the forall-bound variables.
         // This produces:
         //   forall env, result. postcondition_once(env, result) ==>

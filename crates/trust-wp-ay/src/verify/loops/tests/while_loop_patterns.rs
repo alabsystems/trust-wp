@@ -1261,9 +1261,9 @@ fn auto_le_symmetric_bound_with_increasing_effect() {
 /// - `detect_body_effect_direction` finds the deref effect `*x = *x + 1` → Increasing
 /// - Auto-condition-bound generates `*x <= n` from `*x < n` + Increasing direction
 ///
-/// Without the #1816 fix, `is_modified_var` only matches bare `Var`, so
-/// `Deref(Var("x"))` is not recognized as a modified variable, and no
-/// auto-condition-bound is generated.
+/// If `is_modified_var` matched only bare `Var`, `Deref(Var("x"))` would not
+/// be recognized as a modified variable and no auto-condition-bound would be
+/// generated.
 #[test]
 #[timeout(30000)]
 fn while_loop_deref_condition_lt_with_deref_body_effect() {
@@ -2418,10 +2418,10 @@ fn counter_correlation_lockstep_increment() {
         "preservation: j==i+5, i'=i+1, j'=j+1 => j'==i'+5 ✓; got {:?}",
         result.preservation
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result.postcondition),
         "postcondition: j==i+5, i==n => j==n+5 ✓; got {:?}",
@@ -3130,10 +3130,10 @@ fn auto_constant_deref_multiple_vars() {
 ///   loop { if i > 10 { break; } i += 1; *x = 0; }
 ///   ensures: Deref(x) == 0
 ///
-/// Before #2698, auto-condition-bound generated `i >= 10` from the body-break
-/// exit condition `i > 10`, which failed at initialization (i = 0).
-/// After #2698, body-break conditions do NOT generate condition-bound invariants,
-/// so only the user invariant `*x == 0` is checked (and passes).
+/// Body-break conditions do NOT generate condition-bound invariants (#2698):
+/// an auto-bound `i >= 10` from the body-break exit condition `i > 10` would
+/// fail at initialization (i = 0). Only the user invariant `*x == 0` is
+/// checked (and passes).
 #[test]
 #[timeout(30000)]
 fn body_break_condition_bound_suppressed() {
@@ -3171,10 +3171,9 @@ fn body_break_condition_bound_suppressed() {
 
     let result = verify_loop_invariant(&ctx).expect("body-break loop should encode");
 
-    // Before #2698, this failed because auto-condition-bound generated
-    // `i >= 10` from the body-break exit condition, which is unsound
-    // at initialization (i starts at 0). Now condition-bound inference
-    // is suppressed for body-break patterns.
+    // Condition-bound inference is suppressed for body-break patterns: an
+    // auto-bound `i >= 10` from the body-break exit condition is unsound at
+    // initialization (i starts at 0).
     assert!(
         matches!(result.initialization, VerificationResult::Verified(_)),
         "init: *x==0 from requires, no spurious i>=10 from body-break; got {:?}",
@@ -3201,9 +3200,9 @@ fn body_break_condition_bound_suppressed() {
 ///   #[invariant(sum >= 0)]
 ///   loop { sum += i; i += 1; if i > n { break; } }
 ///
-/// Before #2698, the auto-condition-bound `i >= n` from exit condition
-/// `i > n` failed at init (i = 0). The user invariant `sum >= 0` alone
-/// is correct and should pass all phases.
+/// An auto-condition-bound `i >= n` from the exit condition `i > n` would
+/// fail at init (i = 0), so none is generated for a body-break exit (#2698).
+/// The user invariant `sum >= 0` alone is correct and should pass all phases.
 #[test]
 #[timeout(30000)]
 fn body_break_accumulator_no_false_condition_bound() {
@@ -3260,7 +3259,7 @@ fn body_break_accumulator_no_false_condition_bound() {
 }
 
 // -----------------------------------------------------------------------
-// 11. Post-loop deref write override patterns (#2698 second pass)
+// 11. Post-loop deref write override patterns (#2698)
 // -----------------------------------------------------------------------
 
 /// Models the case where a post-loop deref write overrides the loop body's
@@ -3685,10 +3684,10 @@ fn body_break_exit_ge_auto_bound() {
     // Postcondition: NOT(i' < n) (exit) AND i < n (inv) AND i'=i+1 (effect)
     // => i' >= n AND i < n AND i' = i+1 => i+1 >= n AND i < n => i = n-1, i' = n
     // Ensures primed: i' == n. UNSAT refutation => Verified.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result.postcondition),
         "postcondition: NOT(i'<n) AND i<n AND i'=i+1 => i'==n; got {:?}",
@@ -3760,10 +3759,10 @@ fn body_break_exit_le_auto_bound() {
     // Postcondition: NOT(i' > 0) (exit) AND i > 0 (inv) AND i'=i-1 (effect)
     // => i' <= 0 AND i > 0 AND i' = i-1 => i-1 <= 0 AND i > 0 => i = 1, i' = 0
     // Ensures primed: i' == 0. UNSAT refutation => Verified.
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome still fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         crate::tests::helpers::verified_or_known_proof_trusted(&result.postcondition),
         "postcondition: NOT(i'>0) AND i>0 AND i'=i-1 => i'==0; got {:?}",

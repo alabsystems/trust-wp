@@ -80,10 +80,14 @@ impl AYEncoder {
         let receiver_sort = self
             .infer_expr_sort_with_context(receiver, prefix)
             .as_term_sort();
-        let mut fallback = None;
+        let unique_id_prefix = trust_wp_core::logic::logic_fn_smt_name(
+            trust_wp_core::logic::identity::LOGIC_FN_ID_PREFIX,
+        );
+        let mut candidates = Vec::new();
 
         for (decl_name, decl) in self.logic_funcs_iter() {
             if decl_name.contains("__placeholder_")
+                || decl_name.starts_with(&unique_id_prefix)
                 || !decl_name.ends_with(&smt_suffix)
                 || decl.domain().len() != expected_arity
             {
@@ -97,10 +101,16 @@ impl AYEncoder {
             {
                 return Some(candidate);
             }
-            fallback.get_or_insert(candidate);
+            candidates.push(candidate);
         }
 
-        fallback
+        // Never pick the first of several suffix matches: only a unique
+        // candidate may stand in without an exact receiver-sort match.
+        if candidates.len() == 1 {
+            candidates.pop()
+        } else {
+            None
+        }
     }
 
     fn logic_method_decl(
@@ -243,6 +253,18 @@ impl AYEncoder {
         args: &[PureExpr],
         prefix: Option<crate::encoder::sort_context::DerivedKind>,
     ) -> Option<Result<Term, EncodingError>> {
+        // A method name shared by several local logic definitions is resolved
+        // on the encoded receiver inside `apply_logic_fn` (or refused); never
+        // by the bare symbol or a suffix match.
+        if trust_wp_core::logic::identity::is_refused_logic_fn_marker(method)
+            || method.starts_with(trust_wp_core::logic::identity::LOGIC_FN_ID_PREFIX)
+            || trust_wp_core::logic::identity::logic_fn_identity_registry()
+                .is_some_and(|registry| registry.unresolved_family_for_call(method).is_some())
+        {
+            let mut all_args = vec![receiver.clone()];
+            all_args.extend(args.iter().cloned());
+            return Some(self.encode_logic_fn_call_impl(method, &all_args, prefix));
+        }
         match self.logic_method_decl(method, receiver, args, prefix)? {
             LogicMethodDecl::Direct(func_decl) => {
                 if Self::is_structural_field_receiver(receiver)

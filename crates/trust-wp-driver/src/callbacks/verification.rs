@@ -10,14 +10,9 @@
 use std::{
     collections::HashSet,
     panic::{catch_unwind, AssertUnwindSafe},
-    time::Duration,
 };
 
-// Submodule re-exports for extracted Phase 5 components (#1526).
 use contract_transform::TransformedContract;
-// SMT output generation extracted to `smt_output.rs` (#1526).
-
-// Reporting functions and counter types extracted to `reporting.rs` (#1526).
 use rustc_middle::ty::TyCtxt;
 use skip_decision::{check_contract_skip, SkipDecision};
 use tracing::{info_span, trace, warn};
@@ -26,9 +21,8 @@ use trusted_contract_validation::validate_trusted_contract_references;
 use super::{
     super::contracts::FunctionContract,
     helpers::{build_proof_assert_setup, expr_contains_old},
-    is_ay_panic_for_hook,
     reporting::{ProofAssertCounters, VerificationCounters},
-    trait_refinement::check_logic_fn_trait_refinement,
+    trait_refinement::verify_trait_impl_refinements,
 };
 
 /// Emit diagnostic traces for contract transformation results (#1526).
@@ -148,7 +142,9 @@ pub(super) fn verify_contracts(
             tcx.dcx()
                 .span_err(tcx.def_span(error.contract_def_id), error.message.clone());
         }
-        counters.errors += trusted_contract_errors.len();
+        counters.errors = counters
+            .errors
+            .saturating_add(trusted_contract_errors.len());
         let pa_counters = ProofAssertCounters::default();
         return print_verification_summary(&counters, &pa_counters, &unverified_axioms, verbose);
     }
@@ -157,7 +153,7 @@ pub(super) fn verify_contracts(
     // user_specs (with unverified ensures cleared) for assumption injection (#1878).
     let (pa_setup, pa_setup_warnings) =
         build_proof_assert_setup(tcx, contracts, full_logic_fns, user_specs);
-    counters.warnings += pa_setup_warnings;
+    counters.warnings = counters.warnings.saturating_add(pa_setup_warnings);
     // ProofAssertContext uses the full set for name resolution in proof_assert
     // expressions. Solver-facing paths use the filtered `logic_fns` instead.
     let pa_ctx = super::verification_context::ProofAssertContext {
@@ -170,15 +166,16 @@ pub(super) fn verify_contracts(
     let pa_logic_fns_opt = (!logic_fns.is_empty()).then_some(logic_fns);
     let mut pa_counters = ProofAssertCounters::default();
 
-    let adaptive_timeout = adaptive_timeout(
+    let adaptive_budget = adaptive_timeout(
         tcx,
         contracts,
         logic_fn_paths,
         logic_fn_has_ensures,
         timeout,
     );
+    let adaptive_timeout = adaptive_budget.timeout;
     let stop_after_first_adaptive_error =
-        should_stop_after_first_adaptive_error(timeout, adaptive_timeout);
+        should_stop_after_first_adaptive_error(timeout, adaptive_budget);
     let adaptive_config = super::verification_context::VerificationRunConfig {
         timeout: adaptive_timeout,
         ..*config
@@ -197,26 +194,33 @@ pub(super) fn verify_contracts(
 
     let crate_start = std::time::Instant::now();
     let crate_wall_budget = crate_wall_budget(timeout);
+    // Reserved before admitting the next obligation, and published for the
+    // whole run because the obligations that overrun a crate are not always
+    // contracts. See `watchdog_envelope` and `publish_crate_deadline`.
+    let admission_reserve = watchdog_envelope(adaptive_timeout);
+    let _crate_deadline_guard =
+        publish_crate_deadline(crate_wall_budget, crate_start, admission_reserve);
+
+    // Trait-contract credit ledger (trait-contract-assumed-without-discharge).
+    let mut trait_credit_join = TraitCreditJoin::default();
+    let mut adaptive_stop = AdaptiveStop::default();
+    trait_credit_join.register_own_contracts(tcx, contracts, logic_fn_paths, logic_fn_has_ensures);
 
     for contract in contracts {
+        if adaptive_stop.passes_over(tcx, trait_specs, contract.def_id) {
+            continue;
+        }
         let def_path = tcx.def_path_str(contract.def_id);
 
         // Crate-level wall-clock budget check (#2674): skip remaining
-        // verifiable functions when the budget is exhausted. Trusted and
-        // axiom-only functions are still processed (instant, no solver).
-        if let Some(budget) = crate_wall_budget {
-            if crate_start.elapsed() >= budget {
-                eprintln!(
-                    "trust-wp: {def_path} skipped (crate wall-clock budget exhausted: \
-                     {}s elapsed, {}s budget) (#2674)",
-                    crate_start.elapsed().as_secs(),
-                    budget.as_secs(),
-                );
-                counters.errors += 1;
-                continue;
-            }
+        // verifiable functions when the budget is exhausted. Trusted
+        // functions are still processed (instant, no solver).
+        if !admit_within_crate_budget(&def_path, crate_start.elapsed()) {
+            counters.errors += 1;
+            continue;
         }
 
+        trait_credit_join.reach(contract.def_id);
         // Consolidated skip-decision check (#1526 Phase 5).
         match check_contract_skip(tcx, contract, logic_fn_paths, logic_fn_has_ensures) {
             SkipDecision::Trusted => {
@@ -224,41 +228,23 @@ pub(super) fn verify_contracts(
                 eprintln!("trust-wp: {def_path} trusted (skipped)");
                 continue;
             }
-            SkipDecision::LogicFnAxiom => {
-                eprintln!(
-                    "trust-wp: {} is a logic function (definition registered)",
-                    tcx.def_path_str(contract.def_id)
-                );
-                // Even though the body is not verified, trait refinement
-                // obligations still apply to logic function impls (#2686).
-                check_logic_fn_trait_refinement(
-                    tcx,
-                    contract,
-                    config,
-                    &prep.trait_contract_map,
-                    logic_fns,
-                    &unverified_axioms,
-                    &mut counters,
-                );
+            decision @ (SkipDecision::LogicFnAxiom | SkipDecision::LogicFnEnsures) => {
+                let what = if matches!(decision, SkipDecision::LogicFnAxiom) {
+                    "definition registered"
+                } else {
+                    "postcondition will be verified"
+                };
+                eprintln!("trust-wp: {def_path} is a logic function ({what})");
+                // Trait refinement for logic impls runs in the standalone
+                // refinement pass below (#2686). The trait contract such an
+                // impl owes is settled here, never by silence.
+                let undischarged = &prep.undischarged_logic_impls;
+                trait_credit_join.end_logic_item(tcx, trait_specs, contract.def_id, undischarged);
                 continue;
             }
-            SkipDecision::LogicFnEnsures => {
-                eprintln!(
-                    "trust-wp: {} is a logic function (postcondition will be verified)",
-                    tcx.def_path_str(contract.def_id)
-                );
-                // Even though the body is not verified here (postcondition
-                // verified in separate pass), trait refinement obligations
-                // still apply to logic function impls (#2686).
-                check_logic_fn_trait_refinement(
-                    tcx,
-                    contract,
-                    config,
-                    &prep.trait_contract_map,
-                    logic_fns,
-                    &unverified_axioms,
-                    &mut counters,
-                );
+            SkipDecision::CoroutineBody => {
+                skip_decision::refuse_coroutine_body(&def_path, &mut counters);
+                trait_credit_join.refused(tcx, trait_specs, contract.def_id);
                 continue;
             }
             SkipDecision::BodylessTraitMethod => {
@@ -282,9 +268,16 @@ pub(super) fn verify_contracts(
         .entered();
 
         let prior_failed = counters.failed;
-        let prior_errors = counters.errors;
+        // Trait-contract credit (trait-contract-assumed-without-discharge):
+        // bank this item's credit with the contracted trait methods its
+        // verification conditions were handed, so the demotion pass below can
+        // withdraw it if it rests, directly or through calls, on a contract an
+        // impl never discharged.
+        let credit_before = CounterSnapshot::take(&counters, &pa_counters);
+        trait_credit_join.begin_item();
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
-            verify_single_contract(
+            probe_panic_hook(&def_path);
+            function_verdict::verify_function(
                 &shared,
                 contract,
                 &def_path,
@@ -292,33 +285,38 @@ pub(super) fn verify_contracts(
                 &mut pa_counters,
             );
         })); // end catch_unwind (#1975)
+             // FAIL-CLOSED GUARD (#1975): the panic must be RECORDED. `counters.panics`
+             // is the only trace a panicked item leaves; without it a crashed proof
+             // reads as a pass. It is deliberately recorded BEFORE the trait-credit
+             // join, so that `end_item` sees the panic delta and refuses to treat a
+             // panicked impl body as having discharged the trait contract it inherited.
+        report_verification_panic(&def_path, panic_result, &mut counters);
+        super::function_credit::discard_held_credits(&mut counters);
+        trait_credit_join.end_item(
+            tcx,
+            trait_specs,
+            contract.def_id,
+            &def_path,
+            &credit_before,
+            &counters,
+            &pa_counters,
+        );
 
-        if let Err(panic_payload) = panic_result {
-            let reason = ay_core::panic_payload_to_string(panic_payload.as_ref());
-            counters.panics += 1;
-            // Classify the panic origin (#2687): ay internal panics (sort
-            // mismatches, prefetch OOB, Tseitin assertions) get a distinct
-            // diagnostic message so the harness classifier can distinguish
-            // them from trust-wp-side programmer errors. ay panics are expected
-            // during incremental solving and do not indicate trust-wp bugs.
-            if is_ay_panic_for_hook(&reason) {
-                eprintln!("trust-wp: {def_path} ay solver panic during verification: {reason}");
-            } else {
-                eprintln!("trust-wp: {def_path} panicked during verification: {reason}");
-            }
-            eprintln!("  (continuing with remaining functions)");
-        }
-
-        if stop_after_first_adaptive_error
-            && contract_added_failure_or_error(&counters, prior_failed, prior_errors)
-        {
-            eprintln!(
-                "trust-wp: stopping remaining contract verification after first \
-                 adaptive-budget failure/error (#3771)"
-            );
-            break;
-        }
+        adaptive_stop.after_contract(stop_after_first_adaptive_error, &counters, prior_failed);
     }
+    trait_credit_join.record_unexamined(tcx, trait_specs);
+
+    // Standalone trait refinement pass: one verdict for every trait impl
+    // method, independent of whether its body was verified.
+    verify_trait_impl_refinements(
+        tcx,
+        contracts,
+        config,
+        &prep.trait_contract_map,
+        logic_fns,
+        &mut counters,
+        trait_credit_join.undischarged_mut(),
+    );
 
     // Proof_assert-only function pass (#1581).
     let standalone_env = StandaloneProofAssertEnv {
@@ -336,47 +334,48 @@ pub(super) fn verify_contracts(
         contracts,
         logic_fn_paths,
         &standalone_env,
+        &mut counters,
         &mut pa_counters,
+        &mut trait_credit_join,
     );
+
+    let join = &mut trait_credit_join;
+    escape_credit_join::demote(tcx, config, join, &mut counters, &mut pa_counters);
 
     print_verification_summary(&counters, &pa_counters, &unverified_axioms, verbose)
 }
 
-fn should_stop_after_first_adaptive_error(
-    base_timeout: Option<Duration>,
-    adaptive_timeout: Option<Duration>,
-) -> bool {
-    matches!(
-        (base_timeout, adaptive_timeout),
-        (Some(base), Some(adaptive)) if adaptive < base
-    )
-}
-
-fn contract_added_failure_or_error(
-    counters: &VerificationCounters,
-    prior_failed: usize,
-    prior_errors: usize,
-) -> bool {
-    counters.failed > prior_failed || counters.errors > prior_errors
-}
-
-use per_contract::{verify_single_contract, SharedVerificationState};
+use fail_fast_policy::{should_stop_after_first_adaptive_error, AdaptiveStop};
+use panic_guard::{probe_panic_hook, report_verification_panic};
+use per_contract::SharedVerificationState;
 #[cfg(test)]
 pub(super) use prep::{downgrade_unverified_logic_specs, filter_downstream_logic_fns};
-pub(super) use prep::{prepare_verification, PreparedVerification};
+pub(super) use prep::{neutralized_axiom_reached, prepare_verification, PreparedVerification};
 pub(super) use smt_output::{
     build_smt_artifacts, emit_smt_artifacts_to_stdout, write_smt_artifacts_to_dir,
 };
 use standalone_proof_assert::{verify_standalone_proof_asserts, StandaloneProofAssertEnv};
 use summary::print_verification_summary;
-use timeout_budget::{adaptive_timeout, crate_wall_budget};
+use timeout_budget::{
+    adaptive_timeout, admit_within_crate_budget, crate_wall_budget, publish_crate_deadline,
+    watchdog_envelope,
+};
+use trait_credit_join::{CounterSnapshot, TraitCreditJoin};
 
 mod clause_enrichment;
+mod compound_newtype_guard;
 pub(in crate::callbacks) mod contract_transform;
+mod credit_graph;
+mod escape_credit_join;
+pub(super) mod fail_fast_policy;
+mod field_order_guard;
+mod function_verdict;
 mod in_function_proof_assert;
 mod logic_fn_verify;
 mod loop_contract;
 mod nested_reborrow_transfer;
+mod panic_guard;
+mod partial_verdict;
 mod per_contract;
 mod post_loop_final_values;
 mod prep;
@@ -384,13 +383,15 @@ mod proof_assert_driver;
 mod proof_assert_loop_assumptions;
 mod recursive_induction;
 mod recursive_verify;
-mod skip_decision;
+pub(in crate::callbacks) mod skip_decision;
 mod smt_output;
 mod solver_dispatch;
+mod stale_call_final;
 mod standalone_proof_assert;
 mod store_prophecy_repair;
 mod summary;
 mod timeout_budget;
+mod trait_credit_join;
 mod trusted_contract_validation;
 
 #[cfg(test)]

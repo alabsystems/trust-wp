@@ -81,12 +81,15 @@ fn binds_name_nested_constructor_in_tuple() {
 
 #[test]
 fn bound_names_wildcard_empty() {
-    assert!(Pattern::Wildcard.bound_names().is_empty());
+    assert_eq!(Pattern::Wildcard.bound_names(), Vec::<&str>::new());
 }
 
 #[test]
 fn bound_names_literal_empty() {
-    assert!(Pattern::Literal(PureExpr::Int(0)).bound_names().is_empty());
+    assert_eq!(
+        Pattern::Literal(PureExpr::Int(0)).bound_names(),
+        Vec::<&str>::new()
+    );
 }
 
 #[test]
@@ -100,7 +103,7 @@ fn bound_names_constructor_none_inner() {
         name: "None".to_string(),
         inner: None,
     };
-    assert!(pat.bound_names().is_empty());
+    assert_eq!(pat.bound_names(), Vec::<&str>::new());
 }
 
 #[test]

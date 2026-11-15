@@ -56,6 +56,11 @@ pub struct LoopEncoderConfig<'a> {
     /// must remain available even when the invariant slice mentions only the
     /// stable side of the bridge. (#2116)
     pub(crate) bridge_facts: Vec<PureExpr>,
+    /// Premises about the value a header loop condition reads from a call:
+    /// the callee's postcondition at the header state. Asserted wherever the
+    /// condition or its negation is, because the call runs on every pass
+    /// through the header, the exiting one included.
+    pub(crate) condition_facts: Vec<PureExpr>,
     /// Rustc-backed ADT declarations for native datatype encoding (#1982).
     ///
     /// When present, loop verification bootstrap predeclares these datatypes
@@ -81,9 +86,22 @@ pub struct LoopEncoderConfig<'a> {
     /// variable in the preservation VC, making invariants referencing `^snap`
     /// of pre-loop borrows unprovable.
     pub(crate) loop_element_borrow_vars: Vec<String>,
+    /// How many leading loop invariants the program states; `None` when every
+    /// one does. Every later invariant is a conjecture trust-wp synthesized: a
+    /// model that violates it refutes the conjecture, not the program, so its
+    /// slice may not publish `Failed`.
+    pub(crate) stated_invariants: Option<usize>,
 }
 
 impl<'a> LoopEncoderConfig<'a> {
+    /// Name how many leading invariants the program states; the rest are
+    /// trust-wp's own conjectures and a refutation of one is withheld.
+    #[must_use]
+    pub fn with_stated_invariants(mut self, count: usize) -> Self {
+        self.stated_invariants = Some(count);
+        self
+    }
+
     /// Set type invariant definitions to register as axioms.
     #[must_use]
     pub fn with_type_invariants(mut self, invs: &'a [TypeInvariantDef]) -> Self {
@@ -137,6 +155,13 @@ impl<'a> LoopEncoderConfig<'a> {
     #[must_use]
     pub fn with_bridge_facts(mut self, facts: &[PureExpr]) -> Self {
         self.bridge_facts = facts.to_vec();
+        self
+    }
+
+    /// Set the premises that accompany a header loop condition.
+    #[must_use]
+    pub fn with_condition_facts(mut self, facts: &[PureExpr]) -> Self {
+        self.condition_facts = facts.to_vec();
         self
     }
 

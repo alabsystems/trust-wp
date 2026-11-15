@@ -117,11 +117,13 @@ fn test_mut_borrow_vec_element_invariant_propagation() {
     );
 }
 
-/// Gap 6 regression (#2365): axiom-only mut_borrow contracts should short-cut
-/// to `Assumed` instead of reaching quantifier handling and returning Unknown.
+/// Gap 6 (#2365): a former axiom-only mut_borrow contract used to short-cut
+/// to `Assumed` without a solver query. It is now a real obligation; over an
+/// uninterpreted `f` it is unprovable, so it must be refused, never Verified
+/// and never the unqueried `Assumed`.
 #[test]
 #[timeout(30000)]
-fn test_mut_borrow_axiom_only_forall_none_body_assumed() {
+fn test_mut_borrow_former_axiom_only_forall_none_body_not_assumed() {
     let final_values = HashMap::new();
     let ensures = vec![forall("x", gt(method_call(var("x"), "f", vec![]), int(0)))];
 
@@ -130,7 +132,10 @@ fn test_mut_borrow_axiom_only_forall_none_body_assumed() {
             .expect("axiom-only mut_borrow encoding should not error");
 
     assert!(
-        matches!(result, VerificationResult::Assumed(_)),
-        "axiom-only mut_borrow contract should be Assumed: {result:?}"
+        matches!(
+            result,
+            VerificationResult::Failed(_) | VerificationResult::Unknown(_)
+        ),
+        "former axiom-only mut_borrow contract must be refused: {result:?}"
     );
 }

@@ -158,6 +158,14 @@ class TestResult:
     # Structured verification telemetry from the result protocol (#2641).
     # None when the wire line was not present in cargo-trust-wp output.
     telemetry: VerificationTelemetry | None = None
+    # Def paths the driver reported as ``trusted (skipped)`` (in output order).
+    # Recorded for every row, because pass rows discard the driver output and
+    # the gate resolves these against ``#[trusted]`` in the corpus source.
+    trusted_def_paths: list[str] | None = None
+    # Raw ``trust-wp:`` per-item report lines (pass rows discard the output).
+    driver_report: list[str] | None = None
+    # Creusot goal coverage (scripts/creusot_goal_coverage.py) for should_succeed.
+    goal_coverage: dict | None = None
 
 
 PARSE_FAILURE_PATTERNS: dict[str, re.Pattern[str]] = {

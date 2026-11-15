@@ -562,15 +562,21 @@ pub mod specs {
 
     /// Contract for `[T]::rotate_left`
     ///
-    /// Rotates the slice in-place. Preserves length.
+    /// Rotates the slice in-place. Preserves length. Panics when `mid`
+    /// exceeds the length.
     pub const ROTATE_LEFT: &str = r"
+        params: self, mid
+        requires: mid@ <= self@.len()
         ensures: (^self)@.len() == self@.len()
     ";
 
     /// Contract for `[T]::rotate_right`
     ///
-    /// Rotates the slice in-place. Preserves length.
+    /// Rotates the slice in-place. Preserves length. Panics when `k` exceeds
+    /// the length.
     pub const ROTATE_RIGHT: &str = r"
+        params: self, k
+        requires: k@ <= self@.len()
         ensures: (^self)@.len() == self@.len()
     ";
 

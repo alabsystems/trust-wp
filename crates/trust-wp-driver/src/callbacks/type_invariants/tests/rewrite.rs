@@ -53,6 +53,22 @@ fn discharge_trivial_inv_rewrites_invariant_method_call_for_known_root() {
 }
 
 #[test]
+fn discharge_keeps_a_type_parameter_invariant_on_a_known_root() {
+    // A parameter typed by a type parameter is a "trivial" root to the ADT
+    // maps, but its invariant is the premise the generic body discharges its
+    // own hand-overs with; collapsing it to `true` would leave every such
+    // hand-over owing a clause nothing grants.
+    let expr = PureExpr::MethodCall {
+        receiver: Arc::new(PureExpr::Var("t".to_string(), None)),
+        method: trust_wp_core::logic::type_param_invariant_method_name(0, "T"),
+        args: vec![],
+    };
+    let mut roots = std::collections::HashSet::new();
+    roots.insert("t".to_string());
+    assert_eq!(discharge_trivial_inv_calls_expr(&expr, &roots), expr);
+}
+
+#[test]
 fn discharge_trivial_inv_leaves_unknown_root_untouched() {
     // A root that is NOT a known trivial parameter is conservatively preserved,
     // so the type-qualified rewrite remains authoritative for invariant-bearing
@@ -311,6 +327,11 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields() {
         call_obligations: vec![invariant_call.clone()],
         pre_loop_call_obligations: vec![invariant_call.clone()],
         post_loop_call_obligations: vec![invariant_call.clone()],
+        returning_path_facts: Vec::new(),
+        extraction_fail_closed_reason: None,
+        panic_unreachability_obligations: 0,
+        user_written_false_obligations: 0,
+        proved_dead_edges: Default::default(),
         loop_fields: super::super::super::parsing::LoopFields {
             invariants: vec![invariant_call.clone()],
             per_loop_invariants: vec![(10, 20, vec![invariant_call.clone()])],
@@ -319,6 +340,11 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields() {
             variants: vec![invariant_call.clone()],
             loop_analysis: None,
             loop_obligation_groups: vec![super::super::super::parsing::LoopObligationGroup {
+                loop_index: Some(0),
+                condition_unstated: None,
+                pre_loop_stored_names: Default::default(),
+                unstated_entry_values: Default::default(),
+                injected_fail_closed: false,
                 assumptions: Vec::new(),
                 obligations: vec![invariant_call.clone()],
                 condition: Some(invariant_call.clone()),
@@ -339,9 +365,12 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields() {
                 mutation_continued_params: std::collections::HashSet::new(),
                 nested_slot_resolutions: vec![],
                 nested_transfer_params: std::collections::HashSet::new(),
+                lent_path_resolutions: vec![],
             }),
             mut_ref_param_names: std::collections::HashSet::new(),
+            state_params: std::collections::HashSet::new(),
             projected_final_pins: Vec::new(),
+            stale_call_final_params: std::collections::HashSet::new(),
         },
         reborrow_prophecy: None,
     };
@@ -464,11 +493,11 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields_for_structural_inv() 
                 pattern: trust_wp_core::formula::Pattern::Constructor {
                     name: "Some".to_string(),
                     inner: Some(Box::new(trust_wp_core::formula::Pattern::Binding(
-                        "__inv_some_field0".to_string(),
+                        "$inv_some_field0".to_string(),
                     ))),
                 },
                 body: PureExpr::MethodCall {
-                    receiver: Arc::new(PureExpr::Var("__inv_some_field0".to_string(), None)),
+                    receiver: Arc::new(PureExpr::Var("$inv_some_field0".to_string(), None)),
                     method: "__trust_wp_invariant_NonZero".to_string(),
                     args: vec![],
                 },
@@ -496,6 +525,11 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields_for_structural_inv() 
         call_obligations: vec![invariant_call.clone()],
         pre_loop_call_obligations: vec![invariant_call.clone()],
         post_loop_call_obligations: vec![invariant_call.clone()],
+        returning_path_facts: Vec::new(),
+        extraction_fail_closed_reason: None,
+        panic_unreachability_obligations: 0,
+        user_written_false_obligations: 0,
+        proved_dead_edges: Default::default(),
         loop_fields: super::super::super::parsing::LoopFields {
             invariants: vec![invariant_call.clone()],
             per_loop_invariants: vec![(10, 20, vec![invariant_call.clone()])],
@@ -504,6 +538,11 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields_for_structural_inv() 
             variants: vec![invariant_call.clone()],
             loop_analysis: None,
             loop_obligation_groups: vec![super::super::super::parsing::LoopObligationGroup {
+                loop_index: Some(0),
+                condition_unstated: None,
+                pre_loop_stored_names: Default::default(),
+                unstated_entry_values: Default::default(),
+                injected_fail_closed: false,
                 assumptions: Vec::new(),
                 obligations: vec![invariant_call.clone()],
                 condition: Some(invariant_call.clone()),
@@ -524,9 +563,12 @@ fn rewrite_contract_covers_all_parsed_contract_expr_fields_for_structural_inv() 
                 mutation_continued_params: std::collections::HashSet::new(),
                 nested_slot_resolutions: vec![],
                 nested_transfer_params: std::collections::HashSet::new(),
+                lent_path_resolutions: vec![],
             }),
             mut_ref_param_names: std::collections::HashSet::new(),
+            state_params: std::collections::HashSet::new(),
             projected_final_pins: Vec::new(),
+            stale_call_final_params: std::collections::HashSet::new(),
         },
         reborrow_prophecy: None,
     };

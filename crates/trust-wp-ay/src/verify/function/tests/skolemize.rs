@@ -42,7 +42,7 @@ fn skolemize_single_forall_creates_skolem_constant() {
             PureExpr::LogicFnCall { name, args } => {
                 assert_eq!(name, "P");
                 assert_eq!(args.len(), 1);
-                assert_eq!(args[0], var("sk_x"));
+                assert_eq!(args[0], var("sk$x"));
             }
             other => panic!("expected LogicFnCall, got {other:?}"),
         },
@@ -70,10 +70,10 @@ fn skolemize_nested_forall_creates_multiple_skolem_constants() {
     match &result {
         PureExpr::UnOp(trust_wp_core::formula::UnOp::Not, inner) => match inner.as_ref() {
             PureExpr::BinOp(left, trust_wp_core::formula::BinOp::Lt, right) => {
-                assert_eq!(**left, var("sk_a"), "left should be Skolem constant for a");
+                assert_eq!(**left, var("sk$a"), "left should be Skolem constant for a");
                 assert_eq!(
                     **right,
-                    var("sk_b"),
+                    var("sk$b"),
                     "right should be Skolem constant for b"
                 );
             }
@@ -98,14 +98,14 @@ fn skolemize_preserves_free_variables() {
     let expr = forall("x", body);
     let result = skolemize_negated_universal(&expr).expect("should Skolemize");
 
-    // Check that "y" is still "y" (not sk_y) and "x" became "sk_x"
+    // Check that "y" is still "y" (not sk_y) and "x" became "sk$x"
     let result_str = format!("{result:?}");
     assert!(
-        result_str.contains("sk_x"),
+        result_str.contains("sk$x"),
         "bound var x should become sk_x: {result_str}"
     );
     assert!(
-        !result_str.contains("sk_y"),
+        !result_str.contains("sk$y"),
         "free var y should NOT be Skolemized: {result_str}"
     );
 }
@@ -132,8 +132,8 @@ fn skolemize_preserves_declared_variable_sorts() {
     let result = skolemize_negated_universal(&expr).expect("should Skolemize");
 
     let expected = not(and(
-        eq(var_with_sort("sk_n", ExprSort::Int), int(1)),
-        eq(var_with_sort("sk_flag", ExprSort::Bool), bool_expr(true)),
+        eq(var_with_sort("sk$n", ExprSort::Int), int(1)),
+        eq(var_with_sort("sk$flag", ExprSort::Bool), bool_expr(true)),
     ));
     assert_eq!(
         result, expected,
@@ -161,8 +161,8 @@ fn skolemize_single_implication_extracts_guard() {
 
     // Expected: ge(sk_i, 0) AND NOT P(sk_i)
     let expected = and(
-        ge(var("sk_i"), int(0)),
-        not(logic_fn_call("P", vec![var("sk_i")])),
+        ge(var("sk$i"), int(0)),
+        not(logic_fn_call("P", vec![var("sk$i")])),
     );
     assert_eq!(
         result, expected,
@@ -185,10 +185,10 @@ fn skolemize_nested_implications_extracts_all_guards() {
     let result = skolemize_negated_universal(&expr).expect("should Skolemize");
 
     let expected = and(
-        ge(var("sk_i"), int(0)),
+        ge(var("sk$i"), int(0)),
         and(
-            lt(var("sk_i"), int(10)),
-            not(logic_fn_call("P", vec![var("sk_i")])),
+            lt(var("sk$i"), int(10)),
+            not(logic_fn_call("P", vec![var("sk$i")])),
         ),
     );
     assert_eq!(
@@ -212,8 +212,8 @@ fn skolemize_non_implication_body_negates_directly() {
     let result = skolemize_negated_universal(&expr).expect("should Skolemize");
 
     let expected = not(and(
-        logic_fn_call("P", vec![var("sk_x")]),
-        logic_fn_call("Q", vec![var("sk_x")]),
+        logic_fn_call("P", vec![var("sk$x")]),
+        logic_fn_call("Q", vec![var("sk$x")]),
     ));
     assert_eq!(
         result, expected,
@@ -234,8 +234,8 @@ fn skolemize_nested_forall_with_guard_extraction() {
     let result = skolemize_negated_universal(&expr).expect("should Skolemize");
 
     let expected = and(
-        gt(var("sk_a"), int(0)),
-        not(gt(add(var("sk_a"), var("sk_b")), var("sk_b"))),
+        gt(var("sk$a"), int(0)),
+        not(gt(add(var("sk$a"), var("sk$b")), var("sk$b"))),
     );
     assert_eq!(
         result, expected,

@@ -80,7 +80,9 @@ fn test_cargo_trust_wp_logic_project_verifies() {
 /// The function `add_one_buggy` has an impossible postcondition (`result > add_one(x)`
 /// where body is `x + 1` and `add_one(x) = x + 1`), which should FAIL verification.
 ///
-/// Fixed in ay#1975 (commit 443907a1): LIA correctly handles UF Int terms.
+/// The refutation depends on LIA treating the UF-valued Int term `add_one(x)`
+/// like any other Int term (ay#1975); mishandling it lets this impossible
+/// postcondition verify.
 #[test]
 #[timeout(180_000)]
 fn test_cargo_trust_wp_logic_project_reports_failure() {

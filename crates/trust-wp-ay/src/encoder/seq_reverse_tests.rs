@@ -1183,28 +1183,27 @@ mod seq_reverse_axiom_tests {
         let pb_term = encoder.encode_pure(&push_back_expr).expect("push_back");
         let pf_term = encoder.encode_pure(&push_front_expr).expect("push_front");
 
-        // Body effect: produced_prime = push_back(produced, v)
-        let produced_prime = encoder.var_term("produced_prime");
-        let _produced_prime_view_term = encoder.var_term("produced_prime_view");
-        if let Some(pp) = produced_prime {
-            let eff = if seq_aware {
-                encoder.seq_aware_equality_term(pp, pb_term)
-            } else {
-                encoder.solver.eq(pp, pb_term)
-            };
-            encoder.assert_term(eff);
-        }
+        // concat_new reads produced_prime's VIEW, so the body effect must
+        // relate that same carrier to push_back. Equating only the owner left
+        // produced_prime_view unconstrained and made the raw query SAT.
+        let produced_prime_view_term = encoder
+            .encode_pure(&produced_prime_view)
+            .expect("produced_prime view");
+        let eff = if seq_aware {
+            encoder.seq_aware_equality_term(produced_prime_view_term, pb_term)
+        } else {
+            encoder.solver.eq(produced_prime_view_term, pb_term)
+        };
+        encoder.assert_term(eff);
 
-        // Transition: iter_view = push_front(iter_prime_view, v)
-        let iter_view_term = encoder.var_term("iter_view");
-        if let Some(iv) = iter_view_term {
-            let trans = if seq_aware {
-                encoder.seq_aware_equality_term(iv, pf_term)
-            } else {
-                encoder.solver.eq(iv, pf_term)
-            };
-            encoder.assert_term(trans);
-        }
+        // Use the exact view carrier concat_old reads for the transition too.
+        let iter_view_term = encoder.encode_pure(&iter_view_expr).expect("iter view");
+        let trans = if seq_aware {
+            encoder.seq_aware_equality_term(iter_view_term, pf_term)
+        } else {
+            encoder.solver.eq(iter_view_term, pf_term)
+        };
+        encoder.assert_term(trans);
 
         // Push_back-concat bridge (manually asserted, same as ground pool):
         // concat(push_back(produced_view, v), iter_prime_view) =

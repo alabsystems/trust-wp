@@ -11,9 +11,9 @@ use super::*;
 /// counterexample where `result == true` (because the body forces
 /// `result = Ite(true, Ite(true, true, false), false) = true`).
 ///
-/// Before the fix, the counterexample showed `result = false` with all calls
-/// true — an inconsistent model because `result = body` wasn't constraining
-/// the solver properly.
+/// The defect this pins: a counterexample with `result = false` and all calls
+/// true — an inconsistent model, possible only when `result = body` is not
+/// constraining the solver.
 #[test]
 #[timeout(30000)]
 fn test_short_circuit_and_body_constrains_result() {
@@ -125,7 +125,7 @@ fn test_most_basic_bool_model() {
 /// satisfiable with `result != false`.
 ///
 /// This keeps a direct sanity check for manual biconditional encoding, even
-/// though Bool equality now uses solver `eq` directly.
+/// though Bool equality goes through solver `eq` directly.
 #[test]
 #[timeout(30000)]
 fn test_bool_iff_encoding_is_consistent() {
@@ -170,20 +170,18 @@ fn test_bool_iff_encoding_is_consistent() {
 ///
 /// Contract: requires(x > 0), ensures(result > 10), body = x + 1.
 /// For x=1, result=2 which violates result > 10.
-// ADJUDICATED LOAD FLAKE — root cause named, budget deliberately UNCHANGED
-// (#133 mass unit adjudication, 2026-08-27).
+// KNOWN-CLASS LOAD FLAKE (#133) — root cause named, budget deliberately
+// UNCHANGED.
 //
-// This test's own work takes 0.01s: measured solo 3/3 at this pin, both before
-// and after the pins in this commit. Its in-suite failure is not its own solve,
-// it is time queued behind `encoder::test_solver_limiter`, the crate's global
-// 8-permit cap on concurrent solver instances — and ntest's `#[timeout]`
-// measures wall-clock, queueing included.
+// This test's own work takes about 0.01s and passes solo. Its in-suite failure
+// is not its own solve, it is time queued behind `encoder::test_solver_limiter`,
+// the crate's global 8-permit cap on concurrent solver instances — and ntest's
+// `#[timeout]` measures wall-clock, queueing included.
 //
-// The budget is NOT the lever, and this was MEASURED, not assumed: raising it
-// to 120s made the test wait the full 120s of a 127s suite and never acquire a
-// permit, while adding 90s of occupancy that pushed a second test
-// (`body_break_basic_loop_verifies`, also 3/3 solo) over its own budget. So the
-// raise was reverted.
+// The budget is NOT the lever, and this was MEASURED, not assumed: at 120s the
+// test waits the full 120s of a 127s suite and never acquires a permit, while
+// the added 90s of occupancy pushes a second test
+// (`body_break_basic_loop_verifies`, also green solo) over its own budget.
 //
 // The real defect is that `acquire_solver_permit` is a BARGING semaphore
 // (`Condvar::notify_one` + a `while count >= max` re-check): an arriving thread
@@ -194,7 +192,7 @@ fn test_bool_iff_encoding_is_consistent() {
 // encoder would, under strict FIFO with max == test-threads == 8, deadlock
 // where barging merely delays. Fixing it properly needs a permit budget per
 // test thread (or a re-entrant permit), which is its own change with its own
-// gate, not a line in a test-expectation pass.
+// gate, not a timeout edit.
 #[test]
 #[timeout(30000)]
 fn test_counterexample_contains_meaningful_bindings() {

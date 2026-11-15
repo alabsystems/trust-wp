@@ -27,8 +27,8 @@ use super::{
         AxiomFreeOutcome, VerificationOutcome, VerificationResult,
     },
     encoder_setup::{
-        assert_loop_current_chain_alias_constraints, collect_loop_sort_plan,
-        encode_and_assert_requires, prove_empty_postcondition_outcome,
+        assert_condition_facts, assert_loop_current_chain_alias_constraints,
+        collect_loop_sort_plan, encode_and_assert_requires, prove_empty_postcondition_outcome,
         solve_scoped_loop_obligation_with_base_recheck_outcome, OutcomeContinuation,
     },
     expr_helpers::{collect_final_var_names, expr_references_any_var, strip_scalar_views},
@@ -396,6 +396,7 @@ pub(in crate::verify::loops) fn verify_postcondition_outcome(
         let negated_cond = encoder.solver_mut().not(cond_term);
         encoder.assert_term(negated_cond);
     }
+    assert_condition_facts(&mut encoder, config)?;
     if debug_timing {
         let now = Instant::now();
         debug!(
@@ -769,7 +770,7 @@ pub(in crate::verify::loops) fn verify_postcondition_outcome(
             } else if unaxiomatized_user_logic_without_standard_demand
                 && loop_should_rescue_with_axiom_free_sat(reason)
             {
-                outcome.result = VerificationResult::Failed(crate::verify::Counterexample::empty());
+                outcome.result = crate::verify::structural_failed_traced();
             }
         }
 
@@ -1800,7 +1801,7 @@ fn universal_skolem_terms(expr: &PureExpr) -> Vec<PureExpr> {
         ..
     } = current
     {
-        terms.push(PureExpr::Var(format!("sk_{var}"), var_sort.clone()));
+        terms.push(PureExpr::Var(format!("sk${var}"), var_sort.clone()));
         current = body;
     }
     terms
@@ -1834,7 +1835,7 @@ fn skolem_term_for_universal_var(
     var_sort: Option<&ExprSort>,
     target_terms: &[PureExpr],
 ) -> PureExpr {
-    let expected_name = format!("sk_{var}");
+    let expected_name = format!("sk${var}");
     if let Some(term) = target_terms.iter().find(|term| {
         matches!(term, PureExpr::Var(name, _) if name == &expected_name)
             && skolem_term_matches_sort(term, var_sort)

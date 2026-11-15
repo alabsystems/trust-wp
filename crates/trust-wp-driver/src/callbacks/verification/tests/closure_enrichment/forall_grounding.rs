@@ -22,6 +22,7 @@ fn closure_spec(
         capture_bindings,
         requires_exprs,
         ensures_exprs,
+        env_arity: None,
     }
 }
 
@@ -37,7 +38,7 @@ fn strip_receiver_state_wrappers_removes_nested_final_and_deref() {
     assert_eq!(stripped, base);
 }
 
-/// The `__forall_post_state` variable used in `try_ground_forall_obligation`
+/// The `$forall_post_state` variable used in `try_ground_forall_obligation`
 /// should have `None` sort (untyped), not `ExprSort::Int`, because it
 /// represents a closure capture environment (a product type). (#1187)
 #[test]
@@ -102,11 +103,11 @@ fn try_ground_forall_post_state_has_none_sort() {
 
     let result = try_ground_forall_obligation(&forall, &closure_specs).expect("should ground");
 
-    // Walk the result tree and find __forall_post_state variables.
+    // Walk the result tree and find $forall_post_state variables.
     // They should all have None sort, not Some(ExprSort::Int).
     fn find_post_state_sorts(expr: &PureExpr, found: &mut Vec<Option<ExprSort>>) {
         match expr {
-            PureExpr::Var(name, sort) if name == "__forall_post_state" => {
+            PureExpr::Var(name, sort) if name == "$forall_post_state" => {
                 found.push(sort.clone());
             }
             PureExpr::BinOp(l, _, r) => {
@@ -137,12 +138,12 @@ fn try_ground_forall_post_state_has_none_sort() {
     find_post_state_sorts(&result, &mut sorts);
     assert!(
         !sorts.is_empty(),
-        "expected __forall_post_state in grounded result, got: {result:?}"
+        "expected $forall_post_state in grounded result, got: {result:?}"
     );
     for sort in &sorts {
         assert_eq!(
             sort, &None,
-            "__forall_post_state should have None sort (untyped), not {:?}; \
+            "$forall_post_state should have None sort (untyped), not {:?}; \
              closure captures are product types, not Int",
             sort
         );
@@ -213,7 +214,7 @@ fn try_ground_forall_obligation_projects_captures_to_tuple_fields() {
     let result = try_ground_forall_obligation(&forall, &closure_specs).expect("should ground");
 
     // The result should contain tuple_field_logic_fn_name(0) calls for the
-    // capture projection on __forall_post_state.
+    // capture projection on $forall_post_state.
     let expected_fn = tuple_field_logic_fn_name(0);
     fn contains_logic_fn(expr: &PureExpr, name: &str) -> bool {
         match expr {

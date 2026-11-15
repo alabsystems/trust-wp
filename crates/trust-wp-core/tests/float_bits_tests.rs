@@ -6,7 +6,7 @@
 
 #![allow(clippy::float_cmp, clippy::approx_constant)]
 
-use trust_wp_core::formula::FloatBits;
+use trust_wp_core::formula::{FloatBits, FloatWidth};
 
 #[test]
 fn roundtrip_f64_zero() {
@@ -109,4 +109,75 @@ fn clone_and_copy() {
     let fb = FloatBits::from_f64(9.8);
     let cloned = fb;
     assert_eq!(fb, cloned);
+}
+
+#[test]
+fn the_same_value_in_two_formats_is_two_literals() {
+    assert_ne!(FloatBits::from_f64(1.5), FloatBits::from_f32(1.5));
+    assert_eq!(FloatBits::from_f32(1.5).width(), Some(FloatWidth::F32));
+    assert_eq!(FloatBits::from_f64(1.5).width(), Some(FloatWidth::F64));
+    assert_eq!(FloatBits::unsuffixed("1.5").unwrap().width(), None);
+}
+
+#[test]
+fn an_unsuffixed_literal_is_rounded_into_each_format_directly() {
+    let exact = FloatBits::unsuffixed("1.5").unwrap();
+    assert_eq!(
+        exact.in_width(FloatWidth::F32),
+        Some(FloatBits::from_f32(1.5))
+    );
+    assert_eq!(
+        exact.in_width(FloatWidth::F64),
+        Some(FloatBits::from_f64(1.5))
+    );
+    let tenth = FloatBits::unsuffixed("0.1").unwrap();
+    assert_eq!(
+        tenth.in_width(FloatWidth::F32),
+        Some(FloatBits::from_f32(0.1))
+    );
+    assert_eq!(
+        tenth.in_width(FloatWidth::F64),
+        Some(FloatBits::from_f64(0.1))
+    );
+    // A decimal whose f64 rounding lies exactly halfway between two f32
+    // values: narrowing that f64 rounds to even, which is the wrong f32 for
+    // the decimal itself (it lies above the halfway point).
+    let spelled = "1.000000059604644775390625000000000001";
+    let direct: f32 = spelled.parse().unwrap();
+    #[allow(clippy::cast_possible_truncation)]
+    // The counterexample intentionally narrows an already rounded f64.
+    let double_rounded = spelled.parse::<f64>().unwrap() as f32;
+    assert_ne!(direct, double_rounded);
+    assert_eq!(
+        FloatBits::unsuffixed(spelled)
+            .unwrap()
+            .in_width(FloatWidth::F32),
+        Some(FloatBits::from_f32(direct))
+    );
+    assert_eq!(FloatBits::unsuffixed("not a float"), None);
+}
+
+#[test]
+fn a_suffixed_literal_keeps_its_format() {
+    assert_eq!(FloatBits::from_f32(1.5).in_width(FloatWidth::F64), None);
+    assert_eq!(FloatBits::from_f64(1.5).in_width(FloatWidth::F32), None);
+    let f = FloatBits::from_f32(0.1);
+    assert_eq!(f.in_width(FloatWidth::F32), Some(f));
+}
+
+#[test]
+fn ieee_bits_are_the_bits_of_the_literal_format() {
+    assert_eq!(
+        FloatBits::from_f32(0.1).ieee_bits(),
+        Some(u64::from(0.1_f32.to_bits()))
+    );
+    assert_eq!(
+        FloatBits::from_f64(0.1).ieee_bits(),
+        Some(0.1_f64.to_bits())
+    );
+    assert_eq!(
+        FloatBits::from_f64(-0.0).ieee_bits(),
+        Some((-0.0_f64).to_bits())
+    );
+    assert_eq!(FloatBits::unsuffixed("0.1").unwrap().ieee_bits(), None);
 }

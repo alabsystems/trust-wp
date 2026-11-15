@@ -47,10 +47,8 @@ pub struct FSet<T> {
     set: HashSet<T>,
 }
 
-impl<T> FSet<T>
-where
-    T: Eq + Hash,
-{
+// Constructors need no hashing bounds (Creusot `FSet::empty` has none).
+impl<T> FSet<T> {
     /// Create an empty set.
     ///
     /// SMT encoding: `set_len = 0, forall x. !contains(x)`
@@ -59,12 +57,16 @@ where
             set: HashSet::new(),
         }
     }
-
     /// Create an empty set (Creusot-compatible alias for [`empty`](Self::empty)).
     pub fn new() -> Self {
         Self::empty()
     }
+}
 
+impl<T> FSet<T>
+where
+    T: Eq + Hash,
+{
     /// Unwrap into the inner value (Creusot compatibility).
     ///
     /// In Creusot, this unwraps a `GhostBox<FSet>` into its inner `FSet`.
@@ -113,8 +115,11 @@ where
     /// new_set = set_remove(set, x)
     /// new_len = if contains(x) then set_len - 1 else set_len
     /// ```
-    pub fn remove(mut self, x: &T) -> Self {
-        self.set.remove(x);
+    pub fn remove<Q>(mut self, x: Q) -> Self
+    where
+        Q: std::borrow::Borrow<T>,
+    {
+        self.set.remove(x.borrow());
         self
     }
 
@@ -150,12 +155,13 @@ where
     /// SMT encoding: `set_inter(self, other)`
     ///
     /// Takes `self` by value to match Creusot's `Copy` `FSet` semantics.
-    pub fn intersection(self, other: Self) -> Self
-    where
-        T: Clone,
-    {
+    pub fn intersection(self, other: Self) -> Self {
         Self {
-            set: self.set.intersection(&other.set).cloned().collect(),
+            set: self
+                .set
+                .into_iter()
+                .filter(|x| other.set.contains(x))
+                .collect(),
         }
     }
 
@@ -166,12 +172,13 @@ where
     /// SMT encoding: `set_diff(self, other)`
     ///
     /// Takes `self` by value to match Creusot's `Copy` `FSet` semantics.
-    pub fn difference(self, other: Self) -> Self
-    where
-        T: Clone,
-    {
+    pub fn difference(self, other: Self) -> Self {
         Self {
-            set: self.set.difference(&other.set).cloned().collect(),
+            set: self
+                .set
+                .into_iter()
+                .filter(|x| !other.set.contains(x))
+                .collect(),
         }
     }
 
@@ -204,17 +211,18 @@ where
 
     /// Get an arbitrary element from the set, returning an owned value.
     ///
-    /// Returns `None` if the set is empty.
-    /// If the set is nonempty, returns some element (which one is unspecified).
+    /// Returns some element of a nonempty set (which one is unspecified).
     ///
     /// SMT encoding: `set_pick(set)` (with axiom that result is in set if nonempty)
     ///
     /// Takes `self` by value to match Creusot's `Copy` `FSet` semantics.
-    pub fn peek(self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.set.iter().next().cloned()
+    pub fn peek(self) -> T {
+        // Creusot `FSet::peek(self) -> T` (an arbitrary element; unspecified
+        // on the empty set). The runtime model panics there.
+        self.set
+            .into_iter()
+            .next()
+            .expect("FSet::peek on an empty set")
     }
 
     /// Extensional equality — two sets are `ext_eq` if they contain the same elements.

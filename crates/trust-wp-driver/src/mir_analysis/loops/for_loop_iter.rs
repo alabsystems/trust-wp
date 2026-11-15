@@ -58,7 +58,7 @@ fn range_loop_elem_fallback(loop_info: &LoopInfo, iter_sort: Option<ExprSort>) -
 
     Some(PureExpr::MethodCall {
         receiver: Arc::new(PureExpr::Var(
-            format!("__trust_wp_for_iter_state_{}", loop_info.header.as_u32()),
+            format!("$for_iter_state_{}", loop_info.header.as_u32()),
             Some(iter_sort),
         )),
         method: "start_log".to_string(),
@@ -129,7 +129,7 @@ pub(super) fn synthesize_for_loop_produced_effect<'tcx>(
     .unwrap_or_else(|| {
         range_loop_elem_fallback(loop_info, iter_sort.clone()).unwrap_or_else(|| {
             PureExpr::Var(
-                format!("__trust_wp_for_iter_elem_{}", loop_info.header.as_u32()),
+                format!("$for_iter_elem_{}", loop_info.header.as_u32()),
                 None,
             )
         })
@@ -233,7 +233,7 @@ fn extract_iterable_via_call_block_preheader(
         .statements
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, Rvalue::Use(operand, _)))
+            StatementKind::Assign((place, Rvalue::Use(operand, _)))
                 if place.projection.is_empty() && place.local == iterator_local =>
             {
                 match operand {
@@ -280,9 +280,8 @@ fn call_is_into_iter(func: &Operand<'_>, call_spec_ctx: Option<CallSpecContext<'
         return false;
     };
     let trait_def_id = resolve_trait_method_def_id(ctx.tcx, def_id).unwrap_or(def_id);
-    ctx.tcx
-        .def_path_str(trait_def_id)
-        .ends_with("IntoIterator::into_iter")
+    crate::provenance::builtin_def_path_str(ctx.tcx, trait_def_id)
+        .is_some_and(|path| path.ends_with("IntoIterator::into_iter"))
 }
 
 /// Recover the iterable by walking back from the loop header's external
@@ -348,7 +347,7 @@ fn recover_iterator_binding_from_preheader(
         .statements
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, Rvalue::Use(operand, _)))
+            StatementKind::Assign((place, Rvalue::Use(operand, _)))
                 if place.projection.is_empty() && place.local == iterator_local =>
             {
                 match operand {
@@ -426,7 +425,7 @@ pub(super) fn recover_for_loop_iterable_source_local(
         .statements
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, Rvalue::Use(operand, _)))
+            StatementKind::Assign((place, Rvalue::Use(operand, _)))
                 if place.projection.is_empty() && place.local == iterator_local =>
             {
                 match operand {
@@ -522,18 +521,15 @@ pub(super) fn extract_for_loop_ghost_state<'tcx>(
         None => ty_to_expr_sort(body.local_decls[iterator_local].ty),
     });
     let iter_state = PureExpr::Var(
-        format!("__trust_wp_for_iter_state_{}", loop_info.header.as_u32()),
+        format!("$for_iter_state_{}", loop_info.header.as_u32()),
         iter_sort.clone(),
     );
     let iter_state_next = PureExpr::Var(
-        format!(
-            "__trust_wp_for_iter_state_next_{}",
-            loop_info.header.as_u32()
-        ),
+        format!("$for_iter_state_next_{}", loop_info.header.as_u32()),
         iter_sort.clone(),
     );
     let iter_old = PureExpr::Var(
-        format!("__trust_wp_for_iter_old_{}", loop_info.header.as_u32()),
+        format!("$for_iter_old_{}", loop_info.header.as_u32()),
         iter_sort.clone(),
     );
     let loop_elem = find_for_loop_var_expr(
@@ -547,7 +543,7 @@ pub(super) fn extract_for_loop_ghost_state<'tcx>(
     .unwrap_or_else(|| {
         range_loop_elem_fallback(loop_info, iter_sort.clone()).unwrap_or_else(|| {
             PureExpr::Var(
-                format!("__trust_wp_for_iter_elem_{}", loop_info.header.as_u32()),
+                format!("$for_iter_elem_{}", loop_info.header.as_u32()),
                 None,
             )
         })
@@ -606,9 +602,9 @@ fn call_block_invokes_iterator_next<'tcx>(
         return false;
     };
     let trait_def_id = resolve_trait_method_def_id(ctx.tcx, def_id).unwrap_or(def_id);
-    ctx.tcx
-        .def_path_str(trait_def_id)
-        .ends_with("Iterator::next")
+    // Provenance: a local `MyIterator::next` prints with the same suffix.
+    crate::provenance::builtin_def_path_str(ctx.tcx, trait_def_id)
+        .is_some_and(|path| path.ends_with("Iterator::next"))
 }
 
 fn loop_contains_seq_ghost_mutation(
@@ -677,6 +673,7 @@ pub(super) fn resolve_for_loop_next_call(
                             }
                             TerminatorKind::Goto {
                                 target: goto_target,
+                                ..
                             } if *goto_target == target => {
                                 worklist.push(*pred);
                             }
@@ -687,7 +684,7 @@ pub(super) fn resolve_for_loop_next_call(
                 return None;
             }
             TerminatorKind::FalseUnwind { real_target, .. } => current = *real_target,
-            TerminatorKind::Goto { target } => current = *target,
+            TerminatorKind::Goto { target, .. } => current = *target,
             _ => return None,
         }
     }
@@ -721,7 +718,7 @@ fn check_block_for_loop_var_assign<'tcx>(
         .statements
         .iter()
         .find_map(|stmt| match &stmt.kind {
-            StatementKind::Assign(box (place, Rvalue::Use(operand, _)))
+            StatementKind::Assign((place, Rvalue::Use(operand, _)))
                 if place.projection.is_empty() =>
             {
                 let (Operand::Copy(source) | Operand::Move(source)) = operand else {
@@ -735,9 +732,10 @@ fn check_block_for_loop_var_assign<'tcx>(
                         ProjectionElem::Field(field, _) if field.as_u32() == 0
                     )
                 {
-                    let name = local_to_name.get(&place.local).cloned().unwrap_or_else(|| {
-                        format!("__trust_wp_for_iter_elem_{}", place.local.as_u32())
-                    });
+                    let name = local_to_name
+                        .get(&place.local)
+                        .cloned()
+                        .unwrap_or_else(|| format!("$for_iter_elem_{}", place.local.as_u32()));
                     let sort = match tcx {
                         Some(tcx) => {
                             ty_to_expr_sort_enriched(tcx, body.local_decls[place.local].ty)
@@ -768,7 +766,7 @@ pub(super) fn switch_target_assigns_for_loop_var<'tcx>(
         return Some(expr);
     }
     // Follow one Goto forwarding block (match desugaring artifact in post-borrowck MIR).
-    if let TerminatorKind::Goto { target } = &body.basic_blocks[bb].terminator().kind {
+    if let TerminatorKind::Goto { target, .. } = &body.basic_blocks[bb].terminator().kind {
         return check_block_for_loop_var_assign(body, *target, option_local, local_to_name, tcx);
     }
     None
@@ -875,7 +873,7 @@ pub(super) fn resolve_iterator_local_from_next_arg(
 
     // Typical MIR: `_tmp_ref = &mut iter; next(copy _tmp_ref)`.
     for stmt in header_statements {
-        if let StatementKind::Assign(box (place, Rvalue::Ref(_, _, iter_place))) = &stmt.kind {
+        if let StatementKind::Assign((place, Rvalue::Ref(_, _, iter_place))) = &stmt.kind {
             if place.projection.is_empty()
                 && place.local == arg_place.local
                 && iter_place.projection.is_empty()

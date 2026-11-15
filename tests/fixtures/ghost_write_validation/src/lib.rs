@@ -7,8 +7,11 @@
 
 //! Ghost block write validation test fixtures.
 //!
-//! This module contains test cases for ghost block write validation rules
-//! as defined in `designs/2026-02-01-ghost-code.md` Section D2.
+//! This module contains test cases for ghost block write validation. Ghost
+//! blocks are erased at runtime, so a write to a non-ghost variable inside one
+//! would take effect in the verified program but not in the executed one;
+//! only variables scoped to the ghost block, or specification-only
+//! (`Ghost<T>`/logic-typed) values, may be written.
 //!
 //! ## Validation Rules Tested
 //!
@@ -24,7 +27,7 @@
 //!
 //! ```bash
 //! # Run the ghost write validation integration test
-//! cargo test -p trust-wp-driver --test ghost_write_validation
+//! targo --unverified test -p trust-wp-driver --test ghost_write_validation
 //! ```
 //!
 //! The integration test compiles these fixtures through trust-wp-rustc and

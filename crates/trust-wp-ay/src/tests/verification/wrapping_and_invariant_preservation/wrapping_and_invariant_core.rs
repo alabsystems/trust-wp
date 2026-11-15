@@ -191,10 +191,10 @@ fn test_verify_wrapping_sub_underflow_u8() {
             .return_expr(Some(&body))
             .type_constants(Some(&tc)),
     );
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
-    // certification; the property this test guards is unchanged and every
-    // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
+    // KNOWN-CLASS PIN: the verdict demotes to `Unknown(ProofTrusted)` under
+    // ay's mandatory strict UNSAT certification; the property this test guards
+    // is unchanged and every other outcome fails. See
+    // `tests::helpers::verified_or_known_proof_trusted`.
     assert!(
         result
             .as_ref()
@@ -437,8 +437,8 @@ fn test_verify_multi_field_invariant_preservation() {
     // Proof obligation: given a+b=10, prove (a+1)+(b-1)==10.
     //
     // Inline the body into the postcondition to avoid intermediate result
-    // variables. ay#2767 (LIA equality chain timeout) is now resolved, but
-    // the inlined approach remains a valid encoding strategy.
+    // variables; the inlined form is a valid encoding strategy independent of
+    // whether ay solves the 4-variable equality chain directly (ay#2767).
     let mut solver = Solver::try_new(Logic::QfLia).unwrap();
 
     let a = solver.declare_const("a", Sort::Int);
@@ -643,15 +643,12 @@ fn test_ay_tuple_individual_field_congruence_passes() {
     );
 }
 
-/// ay LIA equality-chain: 4-variable equality chains now solved (ay#2767 RESOLVED).
+/// ay LIA equality chain: `a+b=10, c=a+1, d=b-1 → c+d=10` with four
+/// variables must come back Unsat, not Unknown (ay#2767).
 ///
-/// Previously ay's LIA solver timed out on `a+b=10, c=a+1, d=b-1 → c+d=10`
-/// with 4+ variables (ay#2767). The ay bump to f3b656dd resolved this.
-/// The test now asserts Unsat (correct) instead of Unknown (timeout).
-///
-/// The body-inlining workaround (test_verify_multi_field_invariant_preservation)
-/// is no longer strictly necessary for LIA chains, but remains as a valid
-/// encoding strategy.
+/// This is the shape `test_verify_multi_field_invariant_preservation` inlines
+/// around; inlining stays a valid encoding strategy, but the pipeline does not
+/// depend on it for LIA chains.
 ///
 /// See ay#2767, trust-wp#724, trust-wp#725.
 #[test]
@@ -686,15 +683,13 @@ fn test_ay_lia_equality_chain_limitation_documented() {
     let eq1 = solver.eq(d, b_minus_1);
     solver.assert_term(eq1);
 
-    // NOT(c + d == 10) — UNSAT: ay now derives this correctly after f3b656dd bump
+    // NOT(c + d == 10) — UNSAT
     let sum_post = solver.add(c, d);
     let ten2 = solver.int_const(10);
     let post = solver.eq(sum_post, ten2);
     let neg = solver.not(post);
     solver.assert_term(neg);
 
-    // ay#2767 resolved: ay now solves 4-variable LIA equality chains.
-    // Previously timed out as Unknown; now correctly proves Unsat.
     let result = solver.check_sat().into_inner();
     assert!(
         matches!(result, SolveResult::Unsat(_)),
@@ -702,19 +697,16 @@ fn test_ay_lia_equality_chain_limitation_documented() {
     );
 }
 
-/// SumTo10 preservation via body inlining (originally a workaround for ay#2767).
+/// SumTo10 preservation via body inlining.
 ///
-/// ay#2767 is now resolved (ay f3b656dd handles 4-variable LIA equality chains).
-/// The inlined approach remains valid as an encoding strategy and tests the
-/// pipeline's ability to verify inlined postconditions. This matches the
-/// approach in test_verify_multi_field_invariant_preservation.
+/// Inlining the body into the postcondition avoids the intermediate result
+/// variables that form a 4-variable LIA equality chain (ay#2767); the inlined
+/// form is a valid encoding strategy in its own right, and this test covers it
+/// through the verify_function pipeline. This matches the approach in
+/// test_verify_multi_field_invariant_preservation.
 ///
 /// Precondition invariant: get_0(self_) + get_1(self_) == 10
 /// Inlined postcondition: (get_0(self_)+1) + (get_1(self_)-1) == 10
-///
-/// This test verifies that the inlined approach works through the
-/// verify_function pipeline, providing multi-field invariant coverage
-/// while working around ay's LIA limitation.
 #[test]
 #[timeout(30000)]
 fn test_verify_sumto10_invariant_preservation_inlined_pipeline() {
@@ -865,7 +857,7 @@ fn test_ground_tuple_destructor_instances_detect_violation() {
     let result =
         verify_function_with_modes(VerificationRequest::new(&[pre, body_eq], &[post])).unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "Broken body should produce counterexample: got {result:?}"
     );
 }

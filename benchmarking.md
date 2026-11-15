@@ -1,195 +1,43 @@
-# Benchmarking Guide
+<!-- Copyright 2026 Andrew Yates -->
+<!-- Licensed under the Apache License, Version 2.0 -->
 
-How to set up and run reproducible benchmark evaluations.
+# Measuring trust-wp
 
-## Quick Start
+Use the Trust toolchain and the dependency checkout described in
+[README.md](README.md). Run comparable measurements with the same dependency
+revisions, compiler, build profile, and machine load, and retain that evidence
+beside the results.
 
-```bash
-# Copy templates to your project
-cp -r benchmarks/templates/* benchmarks/
+## Encoding microbenchmarks
 
-# Run evaluation
-./benchmarks/run_eval.sh --suite default --run-id myrun
+The Criterion targets are declared in the crates' manifests:
+
+```sh
+targo --unverified bench --locked -p trust-wp-core --bench smt_encoding
+targo --unverified bench --locked -p trust-wp-ay --features internal-bench-api --bench ay_encoding
 ```
 
-## Directory Structure
+These measure encoding costs. They do not prove a program's contract or
+establish Creusot compatibility. The AY crate also has algorithmic scaling
+regressions under
+[performance_proofs](crates/trust-wp-ay/src/tests/performance_proofs/mod.rs)
+and
+[performance_hotspot_proofs.rs](crates/trust-wp-ay/src/tests/performance_hotspot_proofs.rs).
 
-```
-benchmarks/
-├── templates/           # Copy these to start
-│   ├── Dockerfile      # Container definition
-│   ├── docker-compose.yaml
-│   └── run_eval.sh     # Entry point
-├── data/               # Input data (read-only)
-├── logs/               # Execution logs
-│   ├── build_images/   # Docker build output
-│   └── run_evaluation/ # Per-run logs
-└── results/            # Output results
-    └── <run_id>/       # Results per run
-        ├── metadata.json
-        └── results.json
-```
+## Verification corpus
 
-## Configuration
+The [Creusot harness](tests/creusot_compat/README.md) records per-test results,
+durations, wire counters, and dependency provenance. Use fresh runs of both
+`should_succeed` and `should_fail`; filtered runs diagnose a case but cannot
+establish the replacement claim.
 
-### Environment Variables
+`scripts/creusot_replacement_review.sh` drives the review gate.
+`scripts/compare_baselines.py::find_true_100_violations` determines compatibility
+credit; a faster run or a larger raw pass count alone is not progress toward
+that gate. The [adversarial suite](tests/adversarial/README.md) checks rejection
+of invalid programs.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RUN_ID` | timestamp | Unique run identifier |
-| `TIMEOUT` | 300 | Per-test timeout (seconds) |
-| `MAX_WORKERS` | 4 | Parallel worker count |
-| `SUITE` | default | Benchmark suite name |
-| `LOGS_DIR` | benchmarks/logs | Log output directory |
-| `RESULTS_DIR` | benchmarks/results | Results output directory |
-
-### Command Line
-
-```bash
-./benchmarks/run_eval.sh --run-id myrun --timeout 60 --workers 8 --suite full
-./benchmarks/run_eval.sh --list-suites
-./benchmarks/run_eval.sh --help
-```
-
-## Docker Evaluation
-
-For reproducible containerized runs:
-
-```bash
-# Build and run
-cd benchmarks
-docker compose up --build
-
-# With custom settings
-RUN_ID=experiment1 TIMEOUT=120 docker compose up --build
-
-# Build only (for CI caching)
-docker compose build
-```
-
-### Resource Requirements
-
-Default limits (adjust in docker-compose.yaml):
-- CPU: 8 cores
-- Memory: 16GB
-- Storage: varies by benchmark suite
-
-## Output Format
-
-### metadata.json
-
-```json
-{
-    "benchmark_name": "project-bench",
-    "run_id": "20260125-143022",
-    "suite": "default",
-    "timeout": 300,
-    "max_workers": 4,
-    "started_at": "2026-01-25T14:30:22Z",
-    "completed_at": "2026-01-25T14:35:47Z",
-    "commit": "abc123",
-    "branch": "main",
-    "run_context": {
-        "machine_id": "runner-01",
-        "cpu_model": "Intel(R) Xeon(R) ...",
-        "cpu_arch": "x86_64",
-        "os": "Linux",
-        "os_version": "5.15.0-84",
-        "container_image": "ghcr.io/org/bench:2026-01-29",
-        "tool_version": "bench-runner 1.2.3"
-    }
-}
-```
-
-Optional `run_context` captures machine and environment details for comparing results across hardware or execution environments.
-
-Recommended fields include `machine_id`, `cpu_model`, `cpu_arch`, `os`, `os_version`, `container_image`, and `tool_version`.
-
-Populate `run_context` by extending your runner or `run_eval.sh`, and keep it optional so existing consumers can ignore it.
-
-(This section derives from an internal design note, "Benchmark Run Context Metadata" by Andrew Yates, 2026-01-29; it is not tracked in this repository.)
-
-### Artifact Freshness Invariant (Opt-In)
-
-For baseline/benchmark tracking issues that must block stale artifacts from driving planning:
-
-1. Add issue label: `artifact-freshness`
-2. Add this marker and metadata block to the issue body:
-
-````markdown
-<!-- ARTIFACT_FRESHNESS_REQUIRED -->
-```json
-{
-  "canonical": {
-    "git_commit": "abc1234",
-    "run_date": "2026-02-09T07:10:00Z",
-    "test_count": 120
-  },
-  "diagnostic": {
-    "git_commit": "abc1234-dirty",
-    "run_date": "2026-02-09T07:12:00Z",
-    "test_count": 120
-  }
-}
-```
-````
-
-When `artifact-freshness` is present, `gh issue edit ... --add-label do-audit|needs-review`
-is blocked unless metadata passes validation:
-- `canonical` and `diagnostic` sections both present
-- `git_commit`, `run_date`, and `test_count` present in both
-- `canonical.git_commit` must be clean 7-40 hex commit (no dirty suffix)
-- `run_date` must be valid ISO-8601 and within freshness window (default 14 days;
-  override with `AIT_ARTIFACT_FRESHNESS_MAX_DAYS`)
-- `test_count` must be a positive integer
-
-This preserves diagnostic artifacts for debugging while requiring a clean canonical
-artifact before workflow phase transitions.
-
-### results.json
-
-```json
-{
-    "suite": "default",
-    "passed": 42,
-    "failed": 3,
-    "skipped": 5,
-    "total": 50,
-    "duration_seconds": 325,
-    "tests": [
-        {"name": "test_example", "status": "passed", "duration": 1.2},
-        {"name": "test_slow", "status": "failed", "duration": 30.0, "error": "timeout"}
-    ]
-}
-```
-
-## Customization
-
-1. **Edit `run_eval.sh`**: Implement `run_evaluation()` function
-2. **Define suites**: Update `list_suites()` and suite handling
-3. **Update Dockerfile**: Add project-specific dependencies
-4. **Adjust resources**: Modify docker-compose.yaml limits
-
-## Best Practices
-
-1. **Pin versions**: Use specific image tags in Dockerfile
-2. **Unique run IDs**: Include timestamp or commit hash
-3. **Store logs**: Keep build and run logs for debugging
-4. **Reproducibility**: Document all environment variables used
-5. **Resource limits**: Set memory/CPU limits to prevent runaway tests
-
-## Integration with CI
-
-```bash
-# CI pipeline example
-export RUN_ID="ci-${CI_COMMIT_SHA:0:8}"
-./benchmarks/run_eval.sh --suite quick --timeout 60
-
-# Upload results
-gh release upload "v${VERSION}" "benchmarks/results/${RUN_ID}/results.json"
-```
-
-## References
-
-- SWE-bench evaluation: https://github.com/princeton-nlp/SWE-bench
-- Docker best practices: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
+Retain complete logs and raw lane JSONs. Compare timings only after checking
+that both runs examined the same obligations and received the same proof
+credit. A refusal, timeout, or dropped obligation can appear faster while
+providing less verification.

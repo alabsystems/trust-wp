@@ -110,7 +110,7 @@ impl AYEncoder {
         // The cached `aux_var` still ties multiple occurrences of the same UF
         // application together (congruence via cache), and the range matches
         // the actual semantics of bit-count methods on primitive integers.
-        // (#994, Phase 4)
+        // (#994)
         let bit_count_method = matches!(
             method,
             "leading_zeros_logic"
@@ -137,8 +137,8 @@ impl AYEncoder {
         // non-negativity fact required by loop variants like `iter@.len()`");
         // Seq lengths carry the same ground law (`seq_len_nonnegative_ground`).
         // Name-gated to trust-wp-std/driver-owned iterator carrier sorts so
-        // user-defined `len` methods are never touched. (ce-census 2026-08-20,
-        // ghost/fmap_iter merge_fmaps loop_variant_nonneg)
+        // user-defined `len` methods are never touched. (ghost/fmap_iter
+        // merge_fmaps loop_variant_nonneg)
         if matches!(method, "len" | "len_ghost") {
             let receiver_sort_leaf = match param_sorts.first() {
                 Some(Sort::Datatype(dt)) => Some(dt.name.as_str()),
@@ -196,7 +196,7 @@ impl AYEncoder {
     /// auxiliary Int variable avoids the LRA "unsupported atom" downgrade that
     /// the `aux_var == uf_app` bridge equality would otherwise introduce, while
     /// still giving the solver enough information for downstream arithmetic
-    /// reasoning. (#994, Phase 4)
+    /// reasoning. (#994)
     fn assert_bit_count_range(&mut self, method: &str, result: Term) {
         if !matches!(
             method,
@@ -267,8 +267,8 @@ impl AYEncoder {
     /// - a guarded lower-bound axiom `pow2(i) >= pow2(i - 1) + pow2(i - 2)`
     ///   for `i >= 2` (Fibonacci sum bound — used by `lemma_fib_bound`)
     /// - the semantic doubling axiom `pow2(n + 1) == 2 * pow2(n)` for `n >= 0`
-    ///   (Phase 3/4: gives `pow2` its actual `2^n` definitional semantics;
-    ///   previously only the Fibonacci lower bound was axiomatized)
+    ///   (gives `pow2` its actual `2^n` definitional semantics, which the
+    ///   Fibonacci lower bound alone does not pin down)
     /// - the non-negativity bound `pow2(n) >= 1` for `n >= 0`
     ///
     /// The inductive lower-bound axiom uses a 3-term multi-trigger so it only
@@ -277,7 +277,7 @@ impl AYEncoder {
     /// E-matching floods that a single-pattern recursive axiom would cause.
     /// The doubling axiom uses a 2-term multi-trigger `{pow2(n+1), pow2(n)}`
     /// so it only fires when both ground terms are already present, keeping
-    /// E-matching bounded. (#994; Phase 3/4)
+    /// E-matching bounded. (#994)
     pub(super) fn encode_pow2_method(
         &mut self,
         receiver: &PureExpr,
@@ -377,7 +377,7 @@ impl AYEncoder {
         //
         // Multi-trigger {pow2(n+1), pow2(n)} keeps E-matching bounded: the
         // axiom only fires when both ground terms are already present, so it
-        // does not recursively instantiate to arbitrary depths. (Phase 3/4)
+        // does not recursively instantiate to arbitrary depths.
         let n = self.solver.fresh_var("pow2_n", Sort::Int);
         let n_ge_zero = self.solver.ge(n, zero);
         let n_plus_one = self.solver.add(n, one);
@@ -458,7 +458,7 @@ impl AYEncoder {
         // helps the solver when the quantified trigger cannot find both
         // `pow2(receiver)` and `pow2(receiver-1)` simultaneously (the
         // multi-trigger requires both ground terms to be present, which is
-        // not always the case in a single VC). (Phase 3/4)
+        // not always the case in a single VC).
         let receiver_ge_one = self.solver.ge(receiver, one);
         let pow_minus_1_for_double = self.solver.apply(pow2_func, &[receiver_minus_1]);
         let two_times_prev = self.solver.mul(two, pow_minus_1_for_double);

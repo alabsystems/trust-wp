@@ -294,7 +294,7 @@ fn fresh_borrow_id_rejects_whole_borrow_identity_postcondition() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "fresh borrow ids should reject whole-borrow identity: got {result:?}"
     );
 }
@@ -344,14 +344,14 @@ fn derived_borrow_id_with_same_projection_allows_whole_borrow_equality() {
     );
 }
 
-// ── #2673 strengthening: child_current == parent_current without borrow IDs ──
+// ── #2673: child_current == parent_current without borrow IDs ───────────────
 
 /// Prophecy writeback without borrow IDs should still propagate current values.
 ///
 /// Models the `resolve_drop` pattern where a reborrow chain resolves back
-/// to the original variable. Previously, `child_current == parent_current`
-/// was only emitted when `has_borrow_ids` was true, leaving the solver
-/// unable to chain the resolution. (#2673)
+/// to the original variable. `child_current == parent_current` must be
+/// emitted even when `has_borrow_ids` is false; otherwise the solver
+/// cannot chain the resolution. (#2673)
 #[test]
 #[timeout(30000)]
 fn prophecy_writeback_without_borrow_ids_propagates_current() {
@@ -368,8 +368,8 @@ fn prophecy_writeback_without_borrow_ids_propagates_current() {
     let mut writebacks = HashMap::new();
     writebacks.insert("y_rb5".to_string(), "y".to_string());
 
-    // No borrow_id_origins — this previously broke the child_current == parent_current
-    // constraint. After the #2673 fix, this must still verify.
+    // No borrow_id_origins — the child_current == parent_current constraint
+    // must not depend on them, so this must still verify (#2673).
     let result = verify_mut_borrow_function_with_modes(
         MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&deref(var("y_rb5"))))
@@ -518,7 +518,7 @@ fn field_projection_derived_borrow_id_verifies() {
     );
 }
 
-// ── Projection-aware writeback tests (#2673 strengthened) ──────────────
+// ── Projection-aware writeback tests (#2673) ───────────────────────────
 //
 // These tests verify at the encoder level that `emit_prophecy_writebacks`
 // emits the correct projected equality constraints when field projection
@@ -757,6 +757,12 @@ fn projection_aware_writeback_disjoint_fields_no_contradiction() {
 #[test]
 #[timeout(30000)]
 fn projection_aware_writeback_wrong_field_fails() {
+    let _debug = std::env::var_os("TWP_BR_DBG").map(|_| {
+        ay_core::misc_test_override::set(ay_core::debug_channel::MiscCliFlags {
+            debug_cert: true,
+            ..ay_core::misc_cli_flags().clone()
+        })
+    });
     let mut final_values = HashMap::new();
     final_values.insert("r".to_string(), deref(var("r")));
     final_values.insert("r_rb5".to_string(), int(5));
@@ -779,7 +785,7 @@ fn projection_aware_writeback_wrong_field_fails() {
         },
     );
 
-    let result = verify_mut_borrow_function_with_modes(
+    let outcome = crate::verify_mut_borrow_function_with_modes_outcome(
         MutBorrowRequest::new(&[], &ensures, &final_values)
             .resolve_assumptions(Some(vec!["r_rb5".to_string()]))
             .prophecy_writebacks(Some(writebacks))
@@ -788,9 +794,26 @@ fn projection_aware_writeback_wrong_field_fails() {
     )
     .expect("encoding should succeed");
 
+    let evidence_gap = crate::refutation_evidence_gap_reason(&outcome);
+    if (!matches!(outcome.result, VerificationResult::Failed(_)) || evidence_gap.is_some())
+        && std::env::var_os("TWP_BR_DBG").is_some()
+    {
+        if let Some(replay) = outcome
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.native_replay_json.as_deref())
+        {
+            eprintln!("WRONG_FIELD_NATIVE_REPLAY_BEGIN\n{replay}\nWRONG_FIELD_NATIVE_REPLAY_END");
+        }
+    }
+    let result = outcome.result;
     assert!(
         matches!(result, VerificationResult::Failed(_)),
         "wrong field index should be falsifiable (#2673): got {result:?}"
+    );
+    assert!(
+        evidence_gap.is_none(),
+        "wrong-field counterexample needs accepted, validated model evidence: {evidence_gap:?}"
     );
 }
 
@@ -861,15 +884,14 @@ fn identity_reborrow_still_uses_direct_equality() {
     );
 }
 
-// ── Cross-sort writeback tests (#2673 strengthened: relaxed sort gate) ────
+// ── Cross-sort writeback tests (#2673: relaxed sort gate) ─────────────────
 
 /// When child_current has sort Int (from sort fallback) and parent_current has
-/// a MutRef carrier sort, the writeback should still fire. Previously the strict
-/// `child_sort == parent_sort` gate silently dropped the constraint.
+/// a MutRef carrier sort, the writeback must still fire: a strict
+/// `child_sort == parent_sort` gate silently drops the constraint.
 ///
-/// This is the root cause for `pair_bor_mut.rs` and `unnest.rs` being
-/// "incomplete" — the solver didn't have the writeback constraints needed
-/// to chain the resolution.
+/// Without the writeback constraints the solver cannot chain the resolution,
+/// which is what leaves `pair_bor_mut.rs` and `unnest.rs` "incomplete".
 #[test]
 #[timeout(30000)]
 fn cross_sort_writeback_int_vs_mutref_emits_constraint() {
@@ -1020,14 +1042,14 @@ fn unnest_cross_sort_reborrow_current_value_verifies() {
     )
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27). The property
-    // this test guards is "must NOT verify" — a disconnected coercion model may
-    // never be accepted — and that property is intact: `Verified`, `Assumed` and
-    // `Failed` all still fail here. What changed is WHICH fail-closed route
-    // fires first: ay now answers `Unknown(Incomplete)` on the whole solve, so
-    // the run never reaches the `sort-coercion bridge in negated goal` demotion
-    // this pin was written against. The preferred (mechanism-naming) arm is kept
-    // first and is the one to restore alone once ay decides this query again.
+    // KNOWN-CLASS PIN (upstream `Incomplete` pre-empting the sort-coercion
+    // demotion). The property this test guards is "must NOT verify" — a
+    // disconnected coercion model may never be accepted — and `Verified`,
+    // `Assumed` and `Failed` all fail here. Two fail-closed routes can fire:
+    // when ay answers `Unknown(Incomplete)` on the whole solve, the run never
+    // reaches the `sort-coercion bridge in negated goal` demotion. The
+    // preferred (mechanism-naming) arm is kept first and is the one to keep
+    // alone once ay decides this query.
     assert!(
         matches!(
             result,
@@ -1190,7 +1212,7 @@ fn final_final_alias_independent_per_parameter() {
     );
 }
 
-// ── #2673 strengthened: transitive writeback chain closure ──────────────
+// ── #2673: transitive writeback chain closure ───────────────────────────
 
 /// Three-level reborrow chain mutation flows back via transitive closure.
 ///
@@ -1309,9 +1331,9 @@ fn two_resolved_borrows_sum_of_finals_equals_sum_of_currents() {
 ///   #[ensures(if take_first { result == p0 } else { result == p1 })]
 ///
 /// The return expression is `Ite(take_first, Var("p0", MutRef(Int)), Var("p1", MutRef(Int)))`.
-/// Before the ITE fix (#2673), `bind_whole_mut_ref_result` returned false for ITE
-/// expressions because `effective_expr_annotation` and `resolve_nameable_expr` both
-/// return None for ITE nodes. The fix constructs conditional bindings:
+/// `effective_expr_annotation` and `resolve_nameable_expr` both return None for
+/// ITE nodes, so `bind_whole_mut_ref_result` cannot name the result directly
+/// (#2673); it constructs conditional bindings instead:
 ///   result_current = ite(cond, p0_current, p1_current)
 ///   result_final   = ite(cond, p0_final,   p1_final)
 ///   result_id      = ite(cond, p0_id,      p1_id)
@@ -1328,9 +1350,22 @@ fn ite_result_mut_ref_whole_borrow_binding_verifies() {
     let p1 = var_with_sort("p1", mr_int.clone());
 
     // Identity final values (the function itself doesn't mutate, it picks one)
-    let mut final_values = HashMap::new();
-    final_values.insert("p0".to_string(), deref(p0.clone()));
-    final_values.insert("p1".to_string(), deref(p1.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            var("take_first"),
+            eq(final_expr(p1.clone()), deref(p1.clone())),
+        ),
+        implies(
+            not(var("take_first")),
+            eq(final_expr(p0.clone()), deref(p0.clone())),
+        ),
+    ];
 
     // Return expression: if take_first then p0 else p1
     let return_expr = ite(var("take_first"), p0.clone(), p1.clone());
@@ -1344,21 +1379,19 @@ fn ite_result_mut_ref_whole_borrow_binding_verifies() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr))
             .resolve_assumptions(Some(vec!["p0".to_string(), "p1".to_string()])),
     )
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (2026-08-23 mut_ref drift adjudication): since ay's
-    // mandatory strict UNSAT certification (0.7 line; SelfCheckRejected at the
-    // 0.7 boundary, ProofTrusted on the current line), this VC computes UNSAT
-    // but its certificate fails strict validation, demoting Verified to
-    // `Unknown(ProofTrusted)` — the sound direction. The #2673 ITE
-    // whole-borrow BINDING this test guards is intact (a missing binding
-    // yields Failed/other Unknowns, which still fail here); the gap is
-    // upstream certificate coverage. Retire the tolerance when the class
-    // closes upstream.
+    // KNOWN-CLASS PIN (strict UNSAT certification gap): under ay's mandatory
+    // strict UNSAT certification this VC computes UNSAT but its certificate
+    // fails strict validation, demoting Verified to `Unknown(ProofTrusted)` —
+    // the sound direction. The #2673 ITE whole-borrow BINDING this test guards
+    // is intact (a missing binding yields Failed/other Unknowns, which still
+    // fail here); the gap is upstream certificate coverage. Retire the
+    // tolerance when the class closes upstream.
     assert!(
         matches!(
             result,
@@ -1758,7 +1791,7 @@ fn inc_max_with_preconditions_verifies() {
     );
 }
 
-// ── #2673 strengthening: drop_pair, unnest, pair_bor_mut, inc_max_3 patterns ──
+// ── #2673: drop_pair, unnest, pair_bor_mut, inc_max_3 patterns ─────────────
 
 /// Models the `drop_pair` Creusot compat test with resolve assertions.
 ///
@@ -1875,9 +1908,9 @@ fn unnest_three_postconditions_verify() {
     )
     .expect("encoding should succeed");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the mut-borrow
-    // vacuity gate refuses this verdict fail-closed when ay answers `Incomplete`
-    // on the fresh base re-solve. See `tests::helpers::verified_or_unvalidated_sat_base`.
+    // KNOWN-CLASS PIN (unvalidated SAT base): the mut-borrow vacuity gate
+    // refuses this verdict fail-closed when ay answers `Incomplete` on the
+    // fresh base re-solve. See `tests::helpers::verified_or_unvalidated_sat_base`.
     assert!(
         crate::tests::helpers::verified_or_unvalidated_sat_base(&result),
         "unnest ^*x == ^^x postcondition should verify with full reborrow chain (#2673) \
@@ -2018,9 +2051,22 @@ fn pair_bor_mut_whole_borrow_and_resolve_with_ite_return() {
     let p1 = var_with_sort("p1", mr_int.clone());
 
     // Identity final values: the function returns one but doesn't mutate either
-    let mut final_values = HashMap::new();
-    final_values.insert("p0".to_string(), deref(p0.clone()));
-    final_values.insert("p1".to_string(), deref(p1.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            var("take_first"),
+            eq(final_expr(p1.clone()), deref(p1.clone())),
+        ),
+        implies(
+            not(var("take_first")),
+            eq(final_expr(p0.clone()), deref(p0.clone())),
+        ),
+    ];
 
     // Return expression: if take_first then p0 else p1 (as MutRef values)
     let return_expr = ite(var("take_first"), p0.clone(), p1.clone());
@@ -2040,7 +2086,7 @@ fn pair_bor_mut_whole_borrow_and_resolve_with_ite_return() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr))
             .resolve_assumptions(Some(vec!["p0".to_string(), "p1".to_string()])),
     )
@@ -2093,7 +2139,7 @@ fn pair_bor_mut_wrong_branch_postcondition_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "pair_bor_mut swapped branch postcondition should fail: got {result:?}"
     );
 }
@@ -2105,11 +2151,10 @@ fn pair_bor_mut_wrong_branch_postcondition_fails() {
 /// `pair_bor_mut.rs` compat test. The return expression is
 /// `Ite(take_first, LogicFnCall(tuple_get_0, [Var(p, Tuple(2))]),
 ///      LogicFnCall(tuple_get_1, [Var(p, Tuple(2))]))`,
-/// which previously left `bind_whole_mut_ref_result_ite` blocked because
-/// neither branch carries a MutRef annotation: the inner `Var(p, ...)` is
-/// `Tuple(_)`-typed and the LogicFnCall has no return-sort annotation.
+/// where neither branch carries a MutRef annotation: the inner `Var(p, ...)`
+/// is `Tuple(_)`-typed and the LogicFnCall has no return-sort annotation.
 ///
-/// The fix in `bind_whole_mut_ref_result_ite` recognises this shape and
+/// `bind_whole_mut_ref_result_ite` recognises this shape and
 /// recovers the inner T sort from the `Var("result", Some(MutRef(_)))` use
 /// in `ensures`, then bridges `tuple_get_X_MutRef(p_current) == p.X` so the
 /// postcondition's MutRef equality can decompose into per-field components.
@@ -2427,9 +2472,22 @@ fn conditional_return_whole_borrow_with_untouched_field_preservation() {
     let p1 = var_with_sort("p1", mr_int.clone());
 
     // Identity final values
-    let mut final_values = HashMap::new();
-    final_values.insert("p0".to_string(), deref(p0.clone()));
-    final_values.insert("p1".to_string(), deref(p1.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            var("take_first"),
+            eq(final_expr(p1.clone()), deref(p1.clone())),
+        ),
+        implies(
+            not(var("take_first")),
+            eq(final_expr(p0.clone()), deref(p0.clone())),
+        ),
+    ];
 
     // Return: if take_first then p0 else p1
     let return_expr = ite(var("take_first"), p0.clone(), p1.clone());
@@ -2453,7 +2511,7 @@ fn conditional_return_whole_borrow_with_untouched_field_preservation() {
 
     // Test with resolve only
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr))
             .resolve_assumptions(Some(vec!["p0".to_string(), "p1".to_string()])),
     )
@@ -2466,16 +2524,13 @@ fn conditional_return_whole_borrow_with_untouched_field_preservation() {
 }
 
 /// The `Deref(Final(Var("v")))` form (= `*^v`) for a single-layer `MutRef`
-/// carrier with a *scalar* referent now resolves to the definitional final
+/// carrier with a *scalar* referent resolves to the definitional final
 /// projection `mut_ref_final(v)` rather than minting a disconnected
 /// `v_final_current` during postcondition encoding (Phase 1d Box-collapse leaf in
 /// `encode_deref_or_final`). The extra `Deref` over `Final(v)` — a Box-collapse
 /// artifact for `&mut Box<T>` — is the identity on the scalar leaf, so `*^v`
 /// coincides with `^v`'s leaf and the resolve assertion `v_final == v_current`
-/// discharges `*^v == *v`.
-///
-/// Previously this form documented a timing gap (#2673) where it spuriously
-/// failed; the gap is now closed, so the valid preservation property verifies.
+/// discharges `*^v == *v`, so the valid preservation property verifies.
 ///
 /// Re: #2673, bug/final_borrows::box_reborrow_indirect
 #[test]
@@ -2486,9 +2541,22 @@ fn deref_final_form_untouched_preservation_resolves() {
     let p0 = var_with_sort("p0", mr_int.clone());
     let p1 = var_with_sort("p1", mr_int.clone());
 
-    let mut final_values = HashMap::new();
-    final_values.insert("p0".to_string(), deref(p0.clone()));
-    final_values.insert("p1".to_string(), deref(p1.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            var("take_first"),
+            eq(final_expr(p1.clone()), deref(p1.clone())),
+        ),
+        implies(
+            not(var("take_first")),
+            eq(final_expr(p0.clone()), deref(p0.clone())),
+        ),
+    ];
 
     let return_expr = ite(var("take_first"), p0.clone(), p1.clone());
 
@@ -2508,15 +2576,15 @@ fn deref_final_form_untouched_preservation_resolves() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr))
             .resolve_assumptions(Some(vec!["p0".to_string(), "p1".to_string()])),
     )
     .expect("encoding should succeed");
 
     // The preservation property `*^v == *v` is valid for an untouched borrow
-    // (resolve asserts `v_final == v_current`). With the Box-collapse leaf
-    // resolution closing the #2673 timing gap, it now verifies.
+    // (resolve asserts `v_final == v_current`); the Box-collapse leaf
+    // resolution lets it verify (#2673).
     assert!(
         matches!(result, VerificationResult::Verified(_)),
         "Deref(Final) preservation should verify after closing the #2673 timing gap: got {result:?}"
@@ -2557,12 +2625,12 @@ fn conditional_return_whole_borrow_swapped_branches_fails() {
     .expect("encoding should succeed");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "swapped branch conditional return should fail: got {result:?}"
     );
 }
 
-// ── #2673 strengthened: ghost-context-assisted driver shape tests ────────
+// ── #2673: ghost-context-assisted driver shape tests ─────────────────────
 
 /// Models `inc_max_3` with ghost context providing the post-sorting ordering
 /// invariant. This is the driver shape where swap call postconditions are
@@ -2778,20 +2846,20 @@ fn inc_max_3_with_swap_postconditions_as_ghost() {
     );
 }
 
-// ── #2673 second pass: driver-gap regression tests ──────────────────
+// ── driver-gap regression tests (#2673) ─────────────────────────────
 
 /// Models `pair_bor_mut` when the driver does NOT produce a return expression.
 ///
 /// The driver's main return expression extractor may fail to produce a result_expr
 /// for the conditional field-projection return `if take_first { p.0 } else { p.1 }`.
-/// However, the encoder now synthesizes a result expression from the postcondition
+/// The encoder then synthesizes a result expression from the postcondition
 /// structure: it detects `Ite(cond, And(result == a, ...), And(result == b, ...))`
-/// and extracts `Ite(cond, a, b)` as the result binding. (#2673 strengthened)
+/// and extracts `Ite(cond, a, b)` as the result binding. (#2673)
 ///
 /// This verifies that the postcondition-based result synthesis works correctly
 /// for the `pair_bor_mut` pattern even without driver-provided return_expr.
 ///
-/// Re: #2673 (second pass, then strengthened)
+/// Re: #2673
 #[test]
 #[timeout(60000)]
 fn pair_bor_mut_without_return_expr_verifies_via_synthesis() {
@@ -2823,7 +2891,7 @@ fn pair_bor_mut_without_return_expr_verifies_via_synthesis() {
         verify_mut_borrow_function_with_modes(MutBorrowRequest::new(&[], &ensures, &final_values))
             .expect("encoding should succeed");
 
-    // The encoder now synthesizes result_expr from the postcondition ITE structure,
+    // The encoder synthesizes result_expr from the postcondition ITE structure,
     // enabling verification even without a driver-provided return expression.
     assert!(
         matches!(result, VerificationResult::Verified(_)),
@@ -2839,7 +2907,7 @@ fn pair_bor_mut_without_return_expr_verifies_via_synthesis() {
 /// case where `populate_field_and_newtype_final_values` produces per-field entries
 /// alongside (or instead of) the whole-tuple identity.
 ///
-/// Re: #2673 (second pass)
+/// Re: #2673
 #[test]
 #[timeout(60000)]
 fn pair_bor_mut_with_per_field_final_values_verifies() {
@@ -2904,7 +2972,7 @@ fn pair_bor_mut_with_per_field_final_values_verifies() {
 /// `*ma` refers to the value that was in `*mb` before the swap. The driver
 /// must track this reassignment through MIR.
 ///
-/// Re: #2673 (second pass)
+/// Re: #2673
 #[test]
 #[timeout(120000)]
 fn inc_max_3_with_explicit_swap_call_assumptions() {
@@ -3004,9 +3072,19 @@ fn projection_toggle_e2e_separate_params_verifies() {
     let return_expr_val = ite(var("toggle"), a.clone(), b.clone());
 
     // final_values: identity (neither param is mutated in proj_toggle body)
-    let mut final_values = HashMap::new();
-    final_values.insert("a".to_string(), deref(a.clone()));
-    final_values.insert("b".to_string(), deref(b.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(var("toggle"), eq(final_expr(b.clone()), deref(b.clone()))),
+        implies(
+            not(var("toggle")),
+            eq(final_expr(a.clone()), deref(a.clone())),
+        ),
+    ];
 
     // ensures: if toggle { result == a && ^b == *b }
     //                else { result == b && ^a == *a }
@@ -3028,7 +3106,7 @@ fn projection_toggle_e2e_separate_params_verifies() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr_val))
             .resolve_assumptions(Some(vec!["a".to_string(), "b".to_string()])),
     )
@@ -3078,9 +3156,22 @@ fn take_max_e2e_whole_borrow_return_verifies() {
     );
 
     // final_values: identity (take_max does not mutate either param)
-    let mut final_values = HashMap::new();
-    final_values.insert("ma".to_string(), deref(ma.clone()));
-    final_values.insert("mb".to_string(), deref(mb.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(
+            ge(deref(ma.clone()), deref(mb.clone())),
+            eq(final_expr(mb.clone()), deref(mb.clone())),
+        ),
+        implies(
+            not(ge(deref(ma.clone()), deref(mb.clone()))),
+            eq(final_expr(ma.clone()), deref(ma.clone())),
+        ),
+    ];
 
     // ensures: if *ma >= *mb { *mb == ^mb && result == ma }
     //                   else { *ma == ^ma && result == mb }
@@ -3098,7 +3189,7 @@ fn take_max_e2e_whole_borrow_return_verifies() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr_val))
             .resolve_assumptions(Some(vec!["ma".to_string(), "mb".to_string()])),
     )
@@ -3135,8 +3226,9 @@ fn drop_pair_e2e_with_resolve_postcondition_verifies() {
     let mut final_values = HashMap::new();
     final_values.insert("_x".to_string(), deref(var("_x")));
 
-    // ensures[0]: resolve(_x) — modeled as a logic fn call returning Bool
-    let ens_resolve = logic_fn_call("resolve", vec![deref(var("_x"))]);
+    // ensures[0]: resolve(_x) — the variable itself; `resolve(*_x)` is the
+    // resolve of its referent at the referent's own type, refused (D-127)
+    let ens_resolve = logic_fn_call("resolve", vec![var("_x")]);
 
     // ensures[1]: ^_x.0 == *_x.0 (Deref(Var) form after transform)
     let ens_0 = eq(
@@ -3181,9 +3273,19 @@ fn projection_toggle_e2e_unannotated_result_verifies() {
 
     let return_expr_val = ite(var("toggle"), a.clone(), b.clone());
 
-    let mut final_values = HashMap::new();
-    final_values.insert("a".to_string(), deref(a.clone()));
-    final_values.insert("b".to_string(), deref(b.clone()));
+    use crate::tests::helpers::{implies, not};
+    // Driver shape for lent borrows: both params may be
+    // returned, so no `final_values` entry is emitted for either; the
+    // driver's path-gated resolutions (`lent_path_resolutions`, passed as
+    // call assumptions) resolve only the borrow NOT returned on each path.
+    let final_values: HashMap<String, trust_wp_core::formula::PureExpr> = HashMap::new();
+    let requires = vec![
+        implies(var("toggle"), eq(final_expr(b.clone()), deref(b.clone()))),
+        implies(
+            not(var("toggle")),
+            eq(final_expr(a.clone()), deref(a.clone())),
+        ),
+    ];
 
     // Key difference: result has NO sort annotation (bare Var("result"))
     let result_var = var("result");
@@ -3200,14 +3302,14 @@ fn projection_toggle_e2e_unannotated_result_verifies() {
     )];
 
     let result = verify_mut_borrow_function_with_modes(
-        MutBorrowRequest::new(&[], &ensures, &final_values)
+        MutBorrowRequest::new(&requires, &ensures, &final_values)
             .return_expr(Some(&return_expr_val))
             .resolve_assumptions(Some(vec!["a".to_string(), "b".to_string()])),
     )
     .expect("encoding should succeed for projection_toggle with unannotated result (#2673)");
 
-    // KNOWN-CLASS PIN (#133 mass unit adjudication, 2026-08-27): the verdict
-    // demotes to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
+    // KNOWN-CLASS PIN (strict UNSAT certification gap): the verdict may demote
+    // to `Unknown(ProofTrusted)` under ay's mandatory strict UNSAT
     // certification; the property this test guards is unchanged and every
     // other outcome still fails. See `tests::helpers::verified_or_known_proof_trusted`.
     assert!(

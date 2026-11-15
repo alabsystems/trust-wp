@@ -11,9 +11,9 @@ use trust_wp::{ensures, requires};
 /// Increment a positive number.
 ///
 /// # Contracts
-/// - requires: x > 0
+/// - requires: x > 0 && x < i32::MAX (`x + 1` overflows at exactly `i32::MAX`)
 /// - ensures: result > x
-#[requires(x > 0)]
+#[requires(x > 0 && x < i32::MAX)]
 #[ensures(result > x)]
 pub fn increment(x: i32) -> i32 {
     x + 1

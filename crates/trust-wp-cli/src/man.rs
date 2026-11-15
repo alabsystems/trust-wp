@@ -35,7 +35,7 @@ pub fn render() -> String {
     let _ = writeln!(
         page,
         ".TH TRUST\\-WP 1 \"{}\" \"trust\\-wp {}\" \"User Commands\"",
-        option_env!("TRUST_WP_COMMIT_DATE").unwrap_or(""),
+        option_env!("TWP_COMMIT_DATE").unwrap_or(""),
         crate::build_version()
     );
 
@@ -90,7 +90,6 @@ pub fn render() -> String {
         let arg = match flag.value {
             Value::None => String::new(),
             Value::Choices(values) => format!(" \" \" \\fI{}\\fR", roff(&values.join("|"))),
-            Value::Path => " \" \" \\fIFILE\\fR".to_string(),
             Value::Dir => " \" \" \\fIDIR\\fR".to_string(),
             Value::Free => " \" \" \\fIVALUE\\fR".to_string(),
         };
@@ -245,7 +244,7 @@ mod tests {
     #[test]
     fn the_manual_is_reproducible() {
         assert_eq!(render(), render());
-        let date = option_env!("TRUST_WP_COMMIT_DATE").unwrap_or("");
+        let date = option_env!("TWP_COMMIT_DATE").unwrap_or("");
         if !date.is_empty() {
             assert!(
                 date.len() == 10 && date.starts_with("20"),

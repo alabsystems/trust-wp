@@ -4,14 +4,59 @@
 
 //! Plain and filtered substitution with optional tuple beta-reduction.
 
+use std::sync::Arc;
+
 use super::{
     super::{
         pure_expr::{MatchArm, PureExpr},
         types::{tuple_field_logic_fn_index, tuple_logic_fn_arity},
     },
-    overlay::{ScopedSubstitutions, SubstituteOptions},
+    overlay::{CaptureAvoidingSubstOptions, ScopedSubstitutions, SubstituteOptions},
+    rename::{fresh_var_name, rename_free_var},
     reuse_arc, reuse_expr,
 };
+
+/// A binder of `var` over `scope` (a body and its triggers), renamed apart
+/// when a substitution value visible beneath it reads a free `var`: that
+/// value's `var` is not the bound one, and substituting it under the binder
+/// would capture it (`forall<y> y == result` with `result := y` read
+/// `forall<y> y == y`). `var` must already be shadowed. `None` when nothing
+/// is captured.
+fn rename_captured_binder(
+    var: &str,
+    scope: &[&PureExpr],
+    binding: &mut ScopedSubstitutions<'_>,
+) -> Option<(String, Vec<PureExpr>)> {
+    if !binding.visible_value_mentions_summarizing(var) {
+        return None;
+    }
+    let fresh = fresh_var_name(var, binding, scope, None);
+    let options = CaptureAvoidingSubstOptions::default();
+    let renamed = scope
+        .iter()
+        .map(|expr| rename_free_var(expr, var, &fresh, &options))
+        .collect();
+    Some((fresh, renamed))
+}
+
+/// A quantifier's variable, body and triggers, renamed apart when captured.
+fn quantifier_parts(
+    var: &str,
+    body: &Arc<PureExpr>,
+    triggers: &[Vec<PureExpr>],
+    binding: &mut ScopedSubstitutions<'_>,
+) -> Option<(String, PureExpr, Vec<Vec<PureExpr>>)> {
+    let mut scope: Vec<&PureExpr> = vec![body.as_ref()];
+    scope.extend(triggers.iter().flatten());
+    let (fresh, mut renamed) = rename_captured_binder(var, &scope, binding)?;
+    let body = renamed.remove(0);
+    let mut rest = renamed.into_iter();
+    let triggers = triggers
+        .iter()
+        .map(|group| rest.by_ref().take(group.len()).collect())
+        .collect();
+    Some((fresh, body, triggers))
+}
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn substitute_with_options_inner(
@@ -125,46 +170,50 @@ pub(super) fn substitute_with_options_inner(
             var_sort,
             body,
             triggers,
-        } => {
-            binding.shadow_name(var);
-            let new_body = recurse(body, binding);
-            let new_triggers = triggers
-                .iter()
-                .map(|trigger| trigger.iter().map(|e| recurse(e, binding)).collect())
-                .collect();
-            binding.unshadow_name(var);
-            reuse_expr(
-                expr,
-                PureExpr::Forall {
-                    var: var.clone(),
-                    var_sort: var_sort.clone(),
-                    body: reuse_arc(body, new_body),
-                    triggers: new_triggers,
-                },
-            )
         }
-        PureExpr::Exists {
+        | PureExpr::Exists {
             var,
             var_sort,
             body,
             triggers,
         } => {
             binding.shadow_name(var);
-            let new_body = recurse(body, binding);
-            let new_triggers = triggers
-                .iter()
-                .map(|trigger| trigger.iter().map(|e| recurse(e, binding)).collect())
-                .collect();
+            let renamed = quantifier_parts(var, body, triggers, binding);
+            let (new_var, new_body, new_triggers) = match &renamed {
+                Some((fresh, renamed_body, renamed_triggers)) => (
+                    fresh.clone(),
+                    Arc::new(recurse(renamed_body, binding)),
+                    renamed_triggers
+                        .iter()
+                        .map(|trigger| trigger.iter().map(|e| recurse(e, binding)).collect())
+                        .collect(),
+                ),
+                None => (
+                    var.clone(),
+                    reuse_arc(body, recurse(body, binding)),
+                    triggers
+                        .iter()
+                        .map(|trigger| trigger.iter().map(|e| recurse(e, binding)).collect())
+                        .collect(),
+                ),
+            };
             binding.unshadow_name(var);
-            reuse_expr(
-                expr,
-                PureExpr::Exists {
-                    var: var.clone(),
+            let node = if matches!(expr, PureExpr::Forall { .. }) {
+                PureExpr::Forall {
+                    var: new_var,
                     var_sort: var_sort.clone(),
-                    body: reuse_arc(body, new_body),
+                    body: new_body,
                     triggers: new_triggers,
-                },
-            )
+                }
+            } else {
+                PureExpr::Exists {
+                    var: new_var,
+                    var_sort: var_sort.clone(),
+                    body: new_body,
+                    triggers: new_triggers,
+                }
+            };
+            reuse_expr(expr, node)
         }
         PureExpr::Match { scrutinee, arms } => {
             let new_scrutinee = recurse(scrutinee, binding);
@@ -172,14 +221,21 @@ pub(super) fn substitute_with_options_inner(
                 .iter()
                 .map(|arm| {
                     let bound = binding.shadow_names(arm.pattern.bound_names());
-                    let body = recurse(&arm.body, binding);
+                    let mut pattern = arm.pattern.clone();
+                    let mut arm_body = arm.body.clone();
+                    for name in &bound {
+                        if let Some((fresh, mut renamed)) =
+                            rename_captured_binder(name, &[&arm_body], binding)
+                        {
+                            arm_body = renamed.remove(0);
+                            pattern = pattern.rename_binding(name, &fresh);
+                        }
+                    }
+                    let body = recurse(&arm_body, binding);
                     for name in bound.iter().rev() {
                         binding.unshadow_name(name);
                     }
-                    MatchArm {
-                        pattern: arm.pattern.clone(),
-                        body,
-                    }
+                    MatchArm { pattern, body }
                 })
                 .collect();
             reuse_expr(
@@ -226,14 +282,20 @@ pub(super) fn substitute_with_options_inner(
         PureExpr::Let { var, value, body } => {
             let new_value = recurse(value, binding);
             binding.shadow_name(var);
-            let new_body = recurse(body, binding);
+            let (new_var, new_body) = match rename_captured_binder(var, &[body], binding) {
+                Some((fresh, mut renamed)) => {
+                    let renamed_body = renamed.remove(0);
+                    (fresh, Arc::new(recurse(&renamed_body, binding)))
+                }
+                None => (var.clone(), reuse_arc(body, recurse(body, binding))),
+            };
             binding.unshadow_name(var);
             reuse_expr(
                 expr,
                 PureExpr::Let {
-                    var: var.clone(),
+                    var: new_var,
                     value: reuse_arc(value, new_value),
-                    body: reuse_arc(body, new_body),
+                    body: new_body,
                 },
             )
         }
@@ -261,14 +323,24 @@ pub(super) fn substitute_with_options_inner(
         }
         PureExpr::Closure { params, body } => {
             let shadowed = binding.shadow_names(params.iter().map(|(name, _)| name.as_str()));
-            let new_body = recurse(body, binding);
+            let mut new_params = params.clone();
+            let mut closure_body = body.as_ref().clone();
+            for (param, _) in &mut new_params {
+                if let Some((fresh, mut renamed)) =
+                    rename_captured_binder(param, &[&closure_body], binding)
+                {
+                    closure_body = renamed.remove(0);
+                    *param = fresh;
+                }
+            }
+            let new_body = recurse(&closure_body, binding);
             for name in shadowed.iter().rev() {
                 binding.unshadow_name(name);
             }
             reuse_expr(
                 expr,
                 PureExpr::Closure {
-                    params: params.clone(),
+                    params: new_params,
                     body: reuse_arc(body, new_body),
                 },
             )

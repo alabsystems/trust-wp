@@ -64,45 +64,12 @@ impl ClosureState {
         self.bodies.get(def_id)
     }
 
-    /// Return the single registered body (when exactly one exists).
-    pub(crate) fn single_body(&self) -> Option<&ClosureBodyInfo> {
-        if self.bodies.len() == 1 {
-            self.bodies.values().next()
-        } else {
-            None
-        }
-    }
-
     /// Iterate over all registered bodies with their def_id keys.
     ///
     /// Used by axiom builders that need to correlate closure bodies with
     /// registered closure struct sorts (keyed by the same def_id). (#2668)
     pub(crate) fn bodies_with_def_ids(&self) -> impl Iterator<Item = (&str, &ClosureBodyInfo)> {
         self.bodies.iter().map(|(k, v)| (k.as_str(), v))
-    }
-
-    /// Return the unique closure body that has ensures expressions.
-    ///
-    /// When multiple closures are registered (e.g., a "real" closure with
-    /// user-annotated ensures + a proof_assert lambda), `single_body()`
-    /// returns `None` because there are >1 entries. This method filters to
-    /// bodies with `ensures_exprs.is_some()` and returns the unique match.
-    ///
-    /// This enables closure body inlining for Skolem constants from
-    /// `postcondition_mut` existentials when proof_assert lambdas are present.
-    /// (#2668)
-    pub(crate) fn unique_body_with_ensures(&self) -> Option<&ClosureBodyInfo> {
-        let mut candidate = None;
-        for body in self.bodies.values() {
-            if body.ensures_exprs.is_some() {
-                if candidate.is_some() {
-                    // Ambiguous: more than one closure with ensures
-                    return None;
-                }
-                candidate = Some(body);
-            }
-        }
-        candidate
     }
 
     // ── Mapping context (#2655, #2683) ────────────────────────────────

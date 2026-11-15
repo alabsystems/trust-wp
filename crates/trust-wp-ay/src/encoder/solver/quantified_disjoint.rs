@@ -19,7 +19,7 @@ use ay_dpll::api::{NativeReplayMetadata, SolveDetails, SolveResult, Term};
 use tracing::warn;
 
 use super::super::{replay_artifact::ReplayResultStatus, AYEncoder};
-use crate::shared_types::{SolveEvidenceSnapshot, SolveStatisticsSnapshot, UnknownReason};
+use crate::shared_types::{SolveStatisticsSnapshot, UnknownReason};
 
 /// Outcome of checking one quantified disjoint constraint set against the model.
 enum RecheckOutcome {
@@ -248,7 +248,7 @@ impl AYEncoder {
         let details = self.solver.check_sat_with_details();
         self.cache_native_replay_json(Some(&details));
         let stats = SolveStatisticsSnapshot::from(&details.statistics);
-        let evidence = SolveEvidenceSnapshot::from_solve_details(&details);
+        let evidence = self.consumer_solve_evidence(&details);
         tracing::debug!(
             decisions = stats.decisions,
             conflicts = stats.conflicts,

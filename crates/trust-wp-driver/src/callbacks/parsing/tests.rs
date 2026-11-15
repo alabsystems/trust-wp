@@ -20,7 +20,7 @@ use trust_wp_core::formula::{
 };
 
 use super::{
-    build_param_normalization, build_trait_spec_table, conjoin_exprs,
+    build_positional_param_renaming, build_trait_spec_table, conjoin_exprs,
     extraction::{
         effective_user_specs_for_extraction, ensures_uses_reserved_result_name,
         format_context_extraction_warning,
@@ -136,55 +136,77 @@ fn parse_contract_clauses_invalid_reports_context() {
     );
 }
 
-#[test]
-fn build_param_normalization_same_names_returns_empty() {
-    let trait_names = vec!["x".to_string(), "y".to_string()];
-    let impl_names = vec!["x".to_string(), "y".to_string()];
-    let result = build_param_normalization(&trait_names, &impl_names);
-    assert!(result.is_some());
-    assert!(
-        result.unwrap().is_empty(),
-        "identical names need no substitution"
-    );
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| (*name).to_string()).collect()
+}
+
+fn var(name: &str) -> PureExpr {
+    PureExpr::Var(name.to_string(), None)
 }
 
 #[test]
-fn build_param_normalization_different_names_creates_mapping() {
-    let trait_names = vec!["x".to_string(), "y".to_string()];
-    let impl_names = vec!["a".to_string(), "b".to_string()];
-    let result = build_param_normalization(&trait_names, &impl_names);
-    assert!(result.is_some());
-    let map = result.unwrap();
-    assert_eq!(map.len(), 2);
-    assert_eq!(
-        map.get("a"),
-        Some(&PureExpr::Var("x".to_string(), None)),
-        "impl 'a' should map to trait 'x'"
-    );
-    assert_eq!(
-        map.get("b"),
-        Some(&PureExpr::Var("y".to_string(), None)),
-        "impl 'b' should map to trait 'y'"
-    );
+fn positional_renaming_renames_both_sides_to_the_same_names() {
+    let renaming = build_positional_param_renaming(&names(&["x", "y"]), &names(&["a", "b"]))
+        .expect("injective");
+    assert_eq!(renaming.names, names(&["__trust_wp_p0", "__trust_wp_p1"]));
+    assert_eq!(renaming.trait_subs.get("x"), Some(&var("__trust_wp_p0")));
+    assert_eq!(renaming.trait_subs.get("y"), Some(&var("__trust_wp_p1")));
+    assert_eq!(renaming.impl_subs.get("a"), Some(&var("__trust_wp_p0")));
+    assert_eq!(renaming.impl_subs.get("b"), Some(&var("__trust_wp_p1")));
 }
 
 #[test]
-fn build_param_normalization_mixed_same_and_different() {
-    let trait_names = vec!["self_".to_string(), "x".to_string(), "y".to_string()];
-    let impl_names = vec!["self_".to_string(), "x".to_string(), "z".to_string()];
-    let result = build_param_normalization(&trait_names, &impl_names);
-    assert!(result.is_some());
-    let map = result.unwrap();
-    assert_eq!(map.len(), 1, "only 'z'→'y' should be in the map");
-    assert_eq!(map.get("z"), Some(&PureExpr::Var("y".to_string(), None)));
+fn positional_renaming_keeps_a_self_receiver() {
+    let renaming = build_positional_param_renaming(&names(&["self", "x"]), &names(&["self", "y"]))
+        .expect("injective");
+    assert_eq!(renaming.names, names(&["self", "__trust_wp_p1"]));
+    assert!(!renaming.trait_subs.contains_key("self"));
+    assert!(!renaming.impl_subs.contains_key("self"));
+}
+
+/// Review F1: a trait `_` parameter at position 0 named `arg0` next to a real
+/// parameter `arg0` gave two impl parameters the same trait name.
+#[test]
+fn positional_renaming_refuses_duplicate_names_on_either_side() {
+    for (trait_names, impl_names) in [
+        (names(&["arg0", "arg0"]), names(&["x", "y"])),
+        (names(&["x", "y"]), names(&["arg1", "arg1"])),
+    ] {
+        assert!(
+            build_positional_param_renaming(&trait_names, &impl_names).is_err(),
+            "{trait_names:?} / {impl_names:?}"
+        );
+    }
+}
+
+/// Review F1: a swap that the old impl-onto-trait renaming merged.
+#[test]
+fn positional_renaming_is_injective_under_swaps() {
+    let renaming = build_positional_param_renaming(&names(&["x", "y"]), &names(&["y", "x"]))
+        .expect("injective");
+    assert_eq!(renaming.trait_subs.get("x"), Some(&var("__trust_wp_p0")));
+    assert_eq!(renaming.impl_subs.get("y"), Some(&var("__trust_wp_p0")));
+    assert_eq!(renaming.impl_subs.get("x"), Some(&var("__trust_wp_p1")));
+}
+
+/// Review F2: `result` as a parameter name is refused on both sides.
+#[test]
+fn positional_renaming_refuses_result_and_reserved_names() {
+    for (trait_names, impl_names) in [
+        (names(&["result"]), names(&["x"])),
+        (names(&["x"]), names(&["result"])),
+        (names(&["__trust_wp_p1", "y"]), names(&["a", "b"])),
+    ] {
+        assert!(
+            build_positional_param_renaming(&trait_names, &impl_names).is_err(),
+            "{trait_names:?} / {impl_names:?}"
+        );
+    }
 }
 
 #[test]
-fn build_param_normalization_length_mismatch_returns_none() {
-    let trait_names = vec!["x".to_string()];
-    let impl_names = vec!["a".to_string(), "b".to_string()];
-    let result = build_param_normalization(&trait_names, &impl_names);
-    assert!(result.is_none(), "mismatched lengths should return None");
+fn positional_renaming_refuses_arity_mismatch() {
+    assert!(build_positional_param_renaming(&names(&["x"]), &names(&["a", "b"])).is_err());
 }
 
 mod assoc_const_contracts;
@@ -195,6 +217,7 @@ mod reserved_result_name;
 
 fn install_mir_borrowck_cache(config: &mut Config) {
     config.override_queries = Some(|_sess, providers| {
+        crate::callbacks::spec_typecheck::install_spec_tc_mir_built_erasure(providers);
         providers.queries.mir_borrowck = |tcx, local_id| {
             if tcx.hir_node_by_def_id(local_id).body_id().is_none() {
                 let guar = tcx.dcx().span_delayed_bug(

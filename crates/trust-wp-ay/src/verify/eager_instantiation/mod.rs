@@ -93,8 +93,8 @@ pub(crate) fn assert_eager_negated_existential_instantiations(
 
 /// Attempt eager instantiation for a single existential postcondition.
 ///
-/// Builds a witness binding from ground precondition terms, asserts resolve
-/// facts for terminal states, then asserts NOT body[witness].
+/// Builds a witness binding from ground precondition terms, then asserts NOT
+/// body[witness].
 fn try_eager_instantiate_one(
     encoder: &mut AYEncoder,
     bound_vars: &[String],
@@ -166,26 +166,11 @@ fn try_eager_instantiate_one(
         return Ok(());
     }
 
+    // No `resolve` of the witness state is assumed: a by-value `FnMut`
+    // parameter resolves at the function's exit only where the body drops it,
+    // and one it returns or stores keeps its captured borrows live for its
+    // holder (D-127).
     let instantiated_body = substitute_vars_in_expr(body, &binding);
-
-    // Assert resolve facts for terminal postcondition_mut chain states.
-    // By-value FnMut parameters are consumed at function exit, so the terminal
-    // state resolves (Rust ownership). Without this, NOT(resolve(f_final_final))
-    // is satisfiable because the axiom system's Skolem-based resolve can't be
-    // unified with the concrete state variable in one E-matching round.
-    let body_resolve_calls = collectors::collect_body_resolve_calls(body, bound_vars);
-    for body_resolve_arg in &body_resolve_calls {
-        let substituted = substitute_vars_in_expr(body_resolve_arg, &binding);
-
-        debug!("  [eager-neg-inst] asserting resolve({substituted:?})");
-
-        let resolve_expr = PureExpr::LogicFnCall {
-            name: "resolve".to_string(),
-            args: vec![substituted],
-        };
-        let resolve_term = encoder.encode_pure(&resolve_expr)?;
-        encoder.assert_term(resolve_term);
-    }
 
     debug!(
         "  [eager-neg-inst] asserting ground negated instantiation for {} bound vars",
@@ -195,7 +180,7 @@ fn try_eager_instantiate_one(
     let body_term = encoder.encode_pure(&instantiated_body)?;
     let body_term = encoder.coerce_bool_operand(body_term);
     let negated = encoder.solver_mut().not(body_term);
-    encoder.assert_term(negated);
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(negated));
     Ok(())
 }
 

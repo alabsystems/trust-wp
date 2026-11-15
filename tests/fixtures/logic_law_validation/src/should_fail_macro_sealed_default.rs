@@ -7,14 +7,14 @@
 pub trait Tr {
     #[trust_wp::logic(open, sealed)]
     fn g(&self) -> i32 {
-        1
+        1i32
     }
 }
 
 impl Tr for () {
     #[trust_wp::logic]
     fn g(&self) -> i32 {
-        0
+        0i32
     }
 }
 

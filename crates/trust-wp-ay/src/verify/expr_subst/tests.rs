@@ -23,7 +23,7 @@ use crate::tests::helpers::{
 fn substitute_vars_alpha_renames_let_to_avoid_capture() {
     // let x = 1 in y   with binding { y -> Var("x") }
     // Naive result: let x = 1 in x  (WRONG — free "x" captured by let)
-    // Correct: let x_α0 = 1 in x  (alpha-renamed binder, free "x" preserved)
+    // Correct: let x$α0 = 1 in x  (alpha-renamed binder, free "x" preserved)
     let expr = let_bind("x", int(1), var("y"));
     let mut binding = HashMap::new();
     binding.insert("y".to_string(), var("x"));
@@ -53,7 +53,7 @@ fn substitute_vars_alpha_renames_let_to_avoid_capture() {
 fn substitute_vars_alpha_renames_forall_to_avoid_capture() {
     // forall x. y > x   with binding { y -> Var("x") }
     // Naive: forall x. x > x  (WRONG — free "x" captured by forall)
-    // Correct: forall x_α0. x > x_α0
+    // Correct: forall x$α0. x > x$α0
     let expr = forall("x", gt(var("y"), var("x")));
     let mut binding = HashMap::new();
     binding.insert("y".to_string(), var("x"));
@@ -113,7 +113,7 @@ fn substitute_vars_no_rename_when_no_capture() {
 fn substitute_vars_alpha_renames_exists_to_avoid_capture() {
     // exists x. y > x   with binding { y -> Var("x") }
     // Naive: exists x. x > x  (WRONG — free "x" captured by exists)
-    // Correct: exists x_α0. x > x_α0
+    // Correct: exists x$α0. x > x$α0
     let expr = exists("x", gt(var("y"), var("x")));
     let mut binding = HashMap::new();
     binding.insert("y".to_string(), var("x"));
@@ -564,19 +564,19 @@ fn rename_free_var_through_let_obligation() {
 
 // --- fresh_var_name body/trigger collision avoidance (#2347) ---
 
-/// When the quantifier body already contains a free `x_α0` from a prior
-/// alpha-rename pass, `fresh_var_name` must skip `x_α0` and choose a
+/// When the quantifier body already contains a free `x$α0` from a prior
+/// alpha-rename pass, `fresh_var_name` must skip `x$α0` and choose a
 /// non-colliding name. (#2347)
 #[test]
 #[timeout(30000)]
 fn substitute_vars_alpha_rename_skips_preexisting_alpha0_in_body() {
-    // forall x. (x_α0 > x)   with binding { z -> Var("x") }
+    // forall x. (x$α0 > x)   with binding { z -> Var("x") }
     //
-    // The body already has a free `x_α0`. The binding forces rename of the
+    // The body already has a free `x$α0`. The binding forces rename of the
     // bound `x` (because `z -> x` contains free "x"). Without #2347 fix,
-    // fresh_var_name picks `x_α0`, capturing the pre-existing free variable.
-    // Correct: pick `x_α1` (or higher) to avoid the collision.
-    let body = gt(var("x_α0"), var("x"));
+    // fresh_var_name picks `x$α0`, capturing the pre-existing free variable.
+    // Correct: pick `x$α1` (or higher) to avoid the collision.
+    let body = gt(var("x$α0"), var("x"));
     let expr = forall("x", body);
     let mut binding = HashMap::new();
     binding.insert("z".to_string(), var("x"));
@@ -590,31 +590,31 @@ fn substitute_vars_alpha_rename_skips_preexisting_alpha0_in_body() {
                 "binder must be alpha-renamed (binding contains free x)"
             );
             assert_ne!(
-                v, "x_α0",
-                "binder must NOT become x_α0 — body already has free x_α0"
+                v, "x$α0",
+                "binder must NOT become x$α0 — body already has free x$α0"
             );
-            // The pre-existing free x_α0 must survive unchanged
+            // The pre-existing free x$α0 must survive unchanged
             assert!(
-                expr_has_free_occurrence(body, "x_α0"),
-                "pre-existing free x_α0 must remain free in the body"
+                expr_has_free_occurrence(body, "x$α0"),
+                "pre-existing free x$α0 must remain free in the body"
             );
         }
         other => panic!("expected Forall, got {other:?}"),
     }
 }
 
-/// When a quantifier trigger already contains a free `x_α0`,
+/// When a quantifier trigger already contains a free `x$α0`,
 /// `fresh_var_name` must skip that name. (#2347)
 #[test]
 #[timeout(30000)]
 fn substitute_vars_alpha_rename_skips_preexisting_alpha0_in_trigger() {
-    // forall x [trigger: x_α0 > 0]. (x > 0)   with binding { z -> Var("x") }
+    // forall x [trigger: x$α0 > 0]. (x > 0)   with binding { z -> Var("x") }
     //
-    // The trigger has a free `x_α0`. Binding forces rename of bound `x`.
-    // Without #2347 fix, fresh_var_name picks `x_α0`, capturing the
+    // The trigger has a free `x$α0`. Binding forces rename of bound `x`.
+    // Without #2347 fix, fresh_var_name picks `x$α0`, capturing the
     // pre-existing free variable in the trigger.
     let body = gt(var("x"), int(0));
-    let triggers = vec![vec![gt(var("x_α0"), int(0))]];
+    let triggers = vec![vec![gt(var("x$α0"), int(0))]];
     let expr = forall_with_triggers("x", body, triggers);
     let mut binding = HashMap::new();
     binding.insert("z".to_string(), var("x"));
@@ -630,14 +630,14 @@ fn substitute_vars_alpha_rename_skips_preexisting_alpha0_in_trigger() {
                 "binder must be alpha-renamed (binding contains free x)"
             );
             assert_ne!(
-                v, "x_α0",
-                "binder must NOT become x_α0 — trigger already has free x_α0"
+                v, "x$α0",
+                "binder must NOT become x$α0 — trigger already has free x$α0"
             );
-            // The trigger's pre-existing free x_α0 must survive
+            // The trigger's pre-existing free x$α0 must survive
             let trigger_expr = &triggers[0][0];
             assert!(
-                expr_has_free_occurrence(trigger_expr, "x_α0"),
-                "pre-existing free x_α0 must remain in the trigger"
+                expr_has_free_occurrence(trigger_expr, "x$α0"),
+                "pre-existing free x$α0 must remain in the trigger"
             );
         }
         other => panic!("expected Forall, got {other:?}"),

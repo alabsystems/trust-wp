@@ -15,7 +15,7 @@ use rustc_middle::{
 };
 use trust_wp_core::formula::PureExpr;
 
-use crate::mir_analysis::type_contains_mut_ref_with_tcx;
+use crate::mir_analysis::{name_unnamed_params, type_contains_mut_ref_with_tcx};
 
 pub(super) fn collect_mut_ref_arg_names<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -110,6 +110,32 @@ pub(super) fn closure_capture_substitutions(
             projected_captures.push((source_var.clone(), field_idx, capture_var));
             projected_source_vars.insert(source_var);
         } else {
+            // The body names the capture as the parent's binding is named
+            // (D-237); a clause names it by its source name.
+            let debug_name = crate::mir_analysis::binding_identity::hir_binding_debug_name(
+                tcx,
+                &source_var,
+                capture.get_root_variable(),
+            );
+            if debug_name != source_var {
+                substitutions.insert(debug_name, field_var.clone());
+            }
+            // The name the closure's clauses read this capture by once
+            // discovery renamed it (D-238): any capture of a name the
+            // function binds more than once, a parameter's too (D-239).
+            if crate::mir_analysis::binding_identity::capture_read_apart(
+                tcx,
+                &source_var,
+                capture.get_root_variable(),
+            ) {
+                substitutions.insert(
+                    crate::mir_analysis::binding_identity::capture_clause_name(
+                        &source_var,
+                        capture.get_root_variable(),
+                    ),
+                    field_var.clone(),
+                );
+            }
             substitutions.insert(source_var, field_var.clone());
             if symbol_name != capture.var_ident.as_str() {
                 substitutions.insert(symbol_name, field_var);
@@ -136,6 +162,52 @@ pub(super) fn closure_capture_substitutions(
         substitutions,
         projected_captures,
     }
+}
+
+/// Each whole-variable capture of the closure `local_def_id` under every name
+/// its contracts read it by, as `(capture index, name)`: the table
+/// [`closure_capture_substitutions`] rewrites the closure's own clauses with,
+/// so a call that binds a capture by these names owes the clause the
+/// closure's body is verified under. A projected capture (`p.1`) is not in it.
+pub(crate) fn closure_capture_index_names(
+    tcx: TyCtxt<'_>,
+    local_def_id: LocalDefId,
+) -> Vec<(usize, String)> {
+    // A capture of a binding the function binds more than once is read by
+    // the closure's clauses under its own name only (D-238, D-239). At a call
+    // its source name is the CALLER's: a parameter that keeps it (of the
+    // function, or of a calling closure), which an argument may name, and
+    // which must not be read as the capture.
+    let renamed_sources: HashSet<String> =
+        if tcx.def_kind(local_def_id.to_def_id()) == DefKind::Closure {
+            tcx.closure_captures(local_def_id)
+                .iter()
+                .filter(|capture| {
+                    crate::mir_analysis::binding_identity::capture_read_apart(
+                        tcx,
+                        capture.var_ident.as_str(),
+                        capture.get_root_variable(),
+                    )
+                })
+                .map(|capture| capture.var_ident.as_str().to_string())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+    let mut bindings: Vec<(usize, String)> = closure_capture_substitutions(tcx, local_def_id)
+        .substitutions
+        .into_iter()
+        .filter(|(name, _)| !renamed_sources.contains(name))
+        .filter_map(|(name, field)| match field {
+            PureExpr::Var(field_name, _) => field_name
+                .strip_prefix("self.")
+                .and_then(|idx| idx.parse::<usize>().ok())
+                .map(|idx| (idx, name)),
+            _ => None,
+        })
+        .collect();
+    bindings.sort();
+    bindings
 }
 
 /// Detect if a capture is a projected field capture by comparing the source
@@ -284,20 +356,13 @@ pub(in crate::callbacks) fn get_arg_names_from_def_id(
             if let TraitItemKind::Fn(_, TraitFn::Required(param_names)) = trait_item.kind {
                 let names = param_names
                     .iter()
-                    .enumerate()
-                    .map(|(idx, ident)| match ident {
-                        Some(ident) => {
-                            let name = ident.as_str();
-                            if name.is_empty() || name == "_" {
-                                format!("arg{idx}")
-                            } else {
-                                name.to_string()
-                            }
-                        }
-                        None => format!("arg{idx}"),
+                    .map(|ident| {
+                        ident
+                            .map(|ident| ident.as_str().to_string())
+                            .filter(|name| !name.is_empty() && name != "_")
                     })
                     .collect();
-                return Some(names);
+                return Some(name_unnamed_params(names));
             }
         }
 
@@ -315,25 +380,22 @@ pub(in crate::callbacks) fn get_arg_names_from_def_id(
 /// Get argument names from HIR (source code).
 ///
 /// This extracts parameter names from the function's HIR signature without
-/// needing to access MIR. Falls back to "arg0", "arg1", etc. if names can't
-/// be extracted.
+/// needing to access MIR. A parameter with no source name gets its positional
+/// name (`name_unnamed_params`).
 fn get_arg_names_from_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Vec<String> {
-    let mut names = Vec::new();
-
-    // Try to get names from HIR (source code)
-    if let Some(hir_body_id) = tcx.hir_node_by_def_id(def_id).body_id() {
-        let hir_body = tcx.hir_body(hir_body_id);
-        for param in hir_body.params {
-            if let rustc_hir::PatKind::Binding(_, _, ident, _) = param.pat.kind {
-                names.push(ident.as_str().to_string());
-            } else {
-                // Fallback name
-                names.push(format!("arg{}", names.len()));
-            }
-        }
-    }
-
-    names
+    let Some(hir_body_id) = tcx.hir_node_by_def_id(def_id).body_id() else {
+        return Vec::new();
+    };
+    let names = tcx
+        .hir_body(hir_body_id)
+        .params
+        .iter()
+        .map(|param| match param.pat.kind {
+            rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    name_unnamed_params(names)
 }
 
 /// Extract parameter names from cross-crate MIR `var_debug_info`.
@@ -371,11 +433,5 @@ fn get_arg_names_from_cross_crate_mir(tcx: TyCtxt<'_>, def_id: DefId) -> Option<
     }
 
     // Convert to final names, using positional fallback for any missing entries.
-    let names: Vec<String> = arg_names
-        .into_iter()
-        .enumerate()
-        .map(|(idx, name)| name.unwrap_or_else(|| format!("arg{idx}")))
-        .collect();
-
-    Some(names)
+    Some(name_unnamed_params(arg_names))
 }

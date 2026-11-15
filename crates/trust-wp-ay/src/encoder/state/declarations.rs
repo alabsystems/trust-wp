@@ -20,6 +20,8 @@ pub(crate) struct DeclarationState {
     /// Logic functions with asserted axioms (by SMT name).
     /// Prevents re-asserting defining axioms for already-registered functions.
     logic_fn_axioms: HashSet<String>,
+    /// Solver symbol -> full path of the definition registered under it.
+    logic_fn_symbol_owners: HashMap<String, String>,
     /// Datatypes declared for native constructor/tester/selector operations.
     declared_datatypes: HashMap<String, DatatypeSort>,
     /// Reverse index: constructor short name → datatype name(s).
@@ -47,6 +49,7 @@ impl DeclarationState {
         Self {
             logic_funcs: HashMap::new(),
             logic_fn_axioms: HashSet::new(),
+            logic_fn_symbol_owners: HashMap::new(),
             declared_datatypes: HashMap::new(),
             constructor_to_datatype: HashMap::new(),
             has_synthesized_datatype: false,
@@ -101,6 +104,18 @@ impl DeclarationState {
     /// Mark a logic function axiom as asserted. Returns `true` if newly inserted.
     pub(crate) fn mark_logic_fn_axiom(&mut self, name: String) -> bool {
         self.logic_fn_axioms.insert(name)
+    }
+
+    /// Full path of the definition registered under solver symbol `name`.
+    pub(crate) fn logic_fn_symbol_owner(&self, name: &str) -> Option<&str> {
+        self.logic_fn_symbol_owners.get(name).map(String::as_str)
+    }
+
+    /// Record the definition registered under solver symbol `name`.
+    pub(crate) fn record_logic_fn_symbol_owner(&mut self, name: &str, full_path: &str) {
+        self.logic_fn_symbol_owners
+            .entry(name.to_string())
+            .or_insert_with(|| full_path.to_string());
     }
 
     // --- Spec function registry ---

@@ -10,7 +10,6 @@
 //! - Closure law axiom generation (postcondition encoding for all 3 traits)
 //! - Box<dyn FnOnce> call encoding through the verification pipeline
 //!
-//! Design: `designs/2026-03-13-2318-fnonce-nested-capture-resolve.md` (EXECUTE)
 //! Related: #2318, #985, #1373
 
 use std::sync::Arc;
@@ -944,16 +943,16 @@ fn test_call_site_with_postcondition_mut_in_requires_verifies() {
     );
 }
 
-/// Regression test for postcondition_once ensures axiom with ByMutRef captures.
+/// Regression test for postcondition_once ensures axiom with ByMutRef captures
+/// (#2668).
 ///
-/// Before the fix (#2668): the postcondition_once ensures axiom bound both
-/// `old_x` and `x` to `selector(env)` for ByMutRef captures, creating:
-///   `selector(env) == selector(env) + 1` — always false!
-/// This made the axiom vacuously satisfied and disconnected postcondition_once
-/// from the closure's mutation effects.
+/// The axiom must not bind both `old_x` and `x` to `selector(env)` for a
+/// ByMutRef capture: that yields `selector(env) == selector(env) + 1` — always
+/// false — which makes the axiom vacuously satisfied and disconnects
+/// postcondition_once from the closure's mutation effects.
 ///
-/// After the fix: ByMutRef captures get a fresh Skolem variable for the post-state,
-/// so the ensures becomes `sk_x == selector(env) + 1` — satisfiable.
+/// ByMutRef captures get a fresh Skolem variable for the post-state, so the
+/// ensures becomes `sk_x == selector(env) + 1` — satisfiable.
 ///
 /// Models: test_fnmut3 in 07_mutable_capture.rs — an unannotated FnMut closure
 /// called through `call_fnonce`, with synthesized ensures `x == old(x) + 1`.
@@ -1026,14 +1025,14 @@ fn test_postcondition_once_ensures_bymutref_not_contradictory() {
     .expect("encoding should succeed");
 
     // The verification should succeed or at least not produce contradictory premises.
-    // Before the fix, the postcondition_once ensures axiom created a contradiction
-    // (x == old(x) + 1 where both bind to the same value), which made any proof
-    // vacuously true with Unknown(Incomplete). After the fix, ByMutRef captures get
-    // a fresh Skolem variable for the post-state, so the ensures becomes
-    // `sk_x == selector(env) + 1` — satisfiable and non-contradictory.
+    // An ensures axiom that binds old(x) and x to the same value is a
+    // contradiction (x == x + 1), which makes any proof vacuously true with
+    // Unknown(Incomplete). ByMutRef captures get a fresh Skolem variable for
+    // the post-state, so the ensures becomes `sk_x == selector(env) + 1` —
+    // satisfiable and non-contradictory.
     //
-    // Check that we don't get Unknown(Incomplete) which would indicate the axiom
-    // is still causing AUFLIA undecidability overhead from contradictory premises.
+    // Check that we don't get Unknown(Incomplete), which would indicate the axiom
+    // is causing AUFLIA undecidability overhead from contradictory premises.
     let is_unknown_incomplete = matches!(
         &result,
         crate::VerificationResult::Unknown(reason)
@@ -1170,11 +1169,11 @@ fn test_disjoint_capture_bug962_pattern_verifies() {
 /// The postcondition_once ensures axiom must connect postcondition_once to the
 /// mutation effect without creating contradictory universal quantification.
 ///
-/// Before fix: the axiom was:
+/// Quantifying the post-state as a bound variable:
 ///   forall env, result, sk_x. postcondition_once(env, result) ==> sk_x == selector(env) + 1
-/// This is contradictory (sk_x universally quantified but constrained to one value).
+/// is contradictory (sk_x universally quantified but constrained to one value).
 ///
-/// After fix: uses a Skolem FUNCTION:
+/// The axiom therefore uses a Skolem FUNCTION:
 ///   forall env, result. postcondition_once(env, result) ==> once_post_x(env, result) == selector(env) + 1
 /// This is consistent and allows the solver to derive the mutation effect.
 #[test]

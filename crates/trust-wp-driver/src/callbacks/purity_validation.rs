@@ -4,11 +4,13 @@
 
 //! Creusot-compatible purity validation.
 
+use std::collections::HashSet;
+
 use rustc_hir::{
     def::{DefKind, Res},
     def_id::DefId,
     intravisit::{walk_expr, walk_pat, Visitor},
-    Block, Expr, ExprKind, Pat, PatExprKind, PatKind, QPath, TyKind as HirTyKind, UnOp,
+    Expr, ExprKind, Pat, PatExprKind, PatKind, QPath, UnOp,
 };
 use rustc_middle::{
     hir::nested_filter,
@@ -94,6 +96,11 @@ pub(super) fn validate_program_context_logic_calls(
 
     let mut all_errors = Vec::new();
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         let hir_id = tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = tcx.hir_attrs(hir_id);
         if crate::logic::has_logic_marker(attrs) || attr_utils::has_check_mode(attrs, "ghost") {
@@ -136,6 +143,11 @@ pub(super) fn validate_logic_surface_restrictions(tcx: TyCtxt<'_>) -> Vec<Purity
     let mut all_errors = Vec::new();
 
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         let hir_id = tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = tcx.hir_attrs(hir_id);
         let is_logic = crate::logic::has_logic_marker(attrs);
@@ -217,6 +229,19 @@ pub(super) fn validate_logic_surface_restrictions(tcx: TyCtxt<'_>) -> Vec<Purity
             });
         }
 
+        // Creusot parses logic bodies as Pearlite, which refuses every macro
+        // except `pearlite!`, `proof_assert!` and `seq!`
+        // (pearlite-syn `term.rs`; should_fail/unsupported/macros). Only the
+        // macro-recorded body text is inspected: the compiled body is erased.
+        if has_doc_marker(attrs, "trust-wp:logic_body:")
+            && contains_unsupported_pearlite_macro(&code_text)
+        {
+            all_errors.push(PurityValidationError {
+                span,
+                message: UNSUPPORTED_PEARLITE_MACRO_MESSAGE.to_string(),
+            });
+        }
+
         if body_contains_dead_term(&code_text) && !has_opaque_doc_marker(attrs) {
             all_errors.push(PurityValidationError {
                 span,
@@ -279,6 +304,135 @@ pub(super) fn validate_logic_function_purity(logic_fns: &[LogicFnDef]) -> Vec<St
         .collect()
 }
 
+/// Full paths (crate-name prefixed, the `LogicFnDef::full_path` spelling) of
+/// the local FREE `#[logic(prophetic)]` functions. Associated functions are
+/// excluded on purpose: Creusot specializes a trait-method call to its impl
+/// (should_succeed/purity: a non-prophetic `calls_g` calls `<i32 as Bar>::g`,
+/// declared prophetic in the trait but not in the impl), which name-based
+/// resolution cannot reproduce.
+pub(super) fn local_free_prophetic_logic_paths(tcx: TyCtxt<'_>) -> HashSet<String> {
+    let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+    tcx.iter_local_def_id()
+        .map(rustc_hir::def_id::LocalDefId::to_def_id)
+        .filter(|&def_id| matches!(tcx.def_kind(def_id), DefKind::Fn))
+        .filter(|&def_id| {
+            let attrs = tcx.get_all_attrs(def_id);
+            crate::logic::has_logic_marker(attrs)
+                && crate::logic::extract_logic_mode(attrs) == LogicMode::Prophetic
+        })
+        .map(|def_id| format!("{crate_name}::{}", tcx.def_path_str(def_id)))
+        .collect()
+}
+
+/// Creusot `validate/purity.rs`: a non-prophetic logic body may not call a
+/// prophetic logic function (`Purity::can_call`: `prophetic || !prophetic2`),
+/// "called prophetic logic function `..` in logic context".
+///
+/// Strict subset of Creusot's check: only a `LogicFnCall` whose name resolves
+/// (exact full path, or a `::`-segment suffix of one) to at least one local
+/// logic function, ALL of which are free prophetic functions, is refused. An
+/// ambiguous or unresolved name is left alone.
+pub(super) fn validate_logic_prophetic_calls(
+    logic_fns: &[LogicFnDef],
+    free_prophetic_paths: &HashSet<String>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for logic_fn in logic_fns
+        .iter()
+        .filter(|logic_fn| logic_fn.mode() != LogicMode::Prophetic)
+    {
+        let mut offending: Option<String> = None;
+        logic_fn.body().for_each_recursive(|expr| {
+            if offending.is_some() {
+                return;
+            }
+            let PureExpr::LogicFnCall { name, .. } = expr else {
+                return;
+            };
+            let suffix = format!("::{name}");
+            // A resolved unique id denotes exactly its own definition.
+            let resolved_path = logic_fns
+                .iter()
+                .find(|candidate| candidate.has_unique_id() && candidate.name() == name)
+                .map(LogicFnDef::full_path);
+            let mut candidates = logic_fns
+                .iter()
+                .map(LogicFnDef::full_path)
+                .filter(|path| match resolved_path {
+                    Some(resolved) => *path == resolved,
+                    None => *path == name || path.ends_with(&suffix),
+                })
+                .peekable();
+            if candidates.peek().is_some()
+                && candidates.all(|path| free_prophetic_paths.contains(path))
+            {
+                offending = Some(name.clone());
+            }
+        });
+        if let Some(callee) = offending {
+            errors.push(format!(
+                "called prophetic logic function `{callee}` in logic context (from non-prophetic logic function `{}`)",
+                logic_fn.full_path()
+            ));
+        }
+    }
+    errors
+}
+
+pub(super) const UNSUPPORTED_PEARLITE_MACRO_MESSAGE: &str =
+    "Unsupported expression: macros other than `pearlite!`, `proof_assert!` or `seq!` are unsupported in Pearlite code.";
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "box", "break", "const", "continue", "crate", "do", "dyn", "else",
+    "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
+    "true", "type", "unsafe", "use", "where", "while", "yield",
+];
+
+/// True when `code_text` (comments and literals already stripped) invokes a
+/// macro other than `pearlite!`, `proof_assert!` or `seq!`: an identifier,
+/// then `!`, then an opening delimiter. `!=` and keyword-prefixed unary `!`
+/// (`if !(..)`) are not macro invocations.
+fn contains_unsupported_pearlite_macro(code_text: &str) -> bool {
+    let bytes = code_text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+            || (index > 0 && is_ascii_ident_byte(bytes[index - 1]))
+        {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && is_ascii_ident_byte(bytes[index]) {
+            index += 1;
+        }
+        let ident = &code_text[start..index];
+        let mut cursor = index;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'!' {
+            continue;
+        }
+        cursor += 1;
+        if cursor < bytes.len() && bytes[cursor] == b'=' {
+            continue;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor < bytes.len()
+            && matches!(bytes[cursor], b'(' | b'[' | b'{')
+            && !matches!(ident, "pearlite" | "proof_assert" | "seq")
+            && !RUST_KEYWORDS.contains(&ident)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn logic_body_text(tcx: TyCtxt<'_>, local_def_id: rustc_hir::def_id::LocalDefId) -> String {
     let attrs = tcx.hir_attrs(tcx.local_def_id_to_hir_id(local_def_id));
     if let Some(body) = attr_utils::get_contract_attrs_from_doc(attrs, "logic_body")
@@ -295,27 +449,27 @@ fn logic_body_text(tcx: TyCtxt<'_>, local_def_id: rustc_hir::def_id::LocalDefId)
         .unwrap_or_default()
 }
 
-fn has_opaque_doc_marker(attrs: &[rustc_hir::Attribute]) -> bool {
+fn has_opaque_doc_marker(attrs: &[rustc_attr_ir::Attribute]) -> bool {
     attrs
         .iter()
         .filter_map(crate::attr_utils::doc_marker_str)
         .any(|value| value.as_str().starts_with("trust-wp:opaque:"))
 }
 
-fn has_scoped_open_doc_marker(attrs: &[rustc_hir::Attribute]) -> bool {
+fn has_scoped_open_doc_marker(attrs: &[rustc_attr_ir::Attribute]) -> bool {
     has_doc_marker(attrs, "trust-wp:logic_open_crate:")
         || has_doc_marker(attrs, "trust-wp:logic_open_super:")
 }
 
-fn has_trusted_doc_marker(attrs: &[rustc_hir::Attribute]) -> bool {
+fn has_trusted_doc_marker(attrs: &[rustc_attr_ir::Attribute]) -> bool {
     has_doc_marker(attrs, "trust-wp:trusted:")
 }
 
-fn has_builtin_doc_marker(attrs: &[rustc_hir::Attribute]) -> bool {
+fn has_builtin_doc_marker(attrs: &[rustc_attr_ir::Attribute]) -> bool {
     has_doc_marker(attrs, "trust-wp:builtin:")
 }
 
-fn has_doc_marker(attrs: &[rustc_hir::Attribute], marker: &str) -> bool {
+fn has_doc_marker(attrs: &[rustc_attr_ir::Attribute], marker: &str) -> bool {
     attrs
         .iter()
         .filter_map(crate::attr_utils::doc_marker_str)
@@ -520,6 +674,13 @@ impl<'tcx> Visitor<'tcx> for IntLiteralPatternVisitor<'_, 'tcx> {
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
+        rustc_hir::intravisit::walk_expr(self, expr);
     }
 
     fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
@@ -1004,6 +1165,9 @@ impl<'tcx> Visitor<'tcx> for LoopFalseProofAssertVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         if self.span.is_some() {
             return;
         }
@@ -1072,6 +1236,9 @@ impl<'tcx> Visitor<'tcx> for RawPointerDerefVisitor<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         if self.span.is_some() {
             return;
         }
@@ -1110,30 +1277,25 @@ impl<'tcx> Visitor<'tcx> for ProgramLogicCallValidator<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if crate::callbacks::spec_typecheck::is_spec_tc_closure_expr(self.tcx, expr) {
+            return;
+        }
         if self.is_in_ghost_context(expr.span) {
             return;
         }
 
-        // Statement-form snapshot blocks (`snapshot! { stmt; }`) lower to a
-        // block whose tail is `Snapshot::<()>::new_phantom()`, not a
-        // `Snapshot::capture(...)` call.  Without explicit recognition the
-        // body's statements (which are conceptually ghost) would still be
-        // walked with `snapshot_capture_depth == 0` and reject any
-        // `#[logic]` calls in the captured body. (#9)
+        // The blocks the `snapshot!` expansion writes around a capture (the
+        // statement form, ending in `Snapshot::<()>::new_phantom()`, and the
+        // type-directed dispatch, ending in `snapshot_capture_select(..)
+        // .capture()`) never run, so a logic call in them is a logic call in
+        // a snapshot. The same block written in user code runs
+        // (`crate::ghost::program_context`).
         if let ExprKind::Block(block, _) = expr.kind {
-            if is_unit_block_snapshot_pattern(block) {
-                self.snapshot_capture_depth += 1;
-                rustc_hir::intravisit::walk_expr(self, expr);
-                self.snapshot_capture_depth -= 1;
-                return;
-            }
-
-            // Type-directed `snapshot!` capture dispatch lowers to a block
-            // `{ snapshot_capture_select(&(expr)).capture() }`. The captured
-            // `expr` lives in the `snapshot_capture_select` argument, so the
-            // whole block is the snapshot capture context — allow `#[logic]`
-            // calls in `expr`. (bug/869)
-            if is_dispatch_snapshot_block(block) {
+            if crate::ghost::program_context::is_macro_snapshot_block(
+                self.tcx,
+                self.typeck_results,
+                block,
+            ) {
                 self.snapshot_capture_depth += 1;
                 rustc_hir::intravisit::walk_expr(self, expr);
                 self.snapshot_capture_depth -= 1;
@@ -1169,6 +1331,22 @@ impl<'tcx> Visitor<'tcx> for ProgramLogicCallValidator<'_, 'tcx> {
                     span: expr.span,
                     message: format!(
                         "called logic function `{}` in program context",
+                        self.tcx.def_path_str(def_id)
+                    ),
+                });
+            }
+            // A `snapshot!` body is a NON-prophetic logic context in Creusot
+            // (`snapshot_from_fn` validates its closure with prophetic=false),
+            // so calling a prophetic logic function there is refused
+            // (should_fail/bug/436_0).
+            if self.snapshot_capture_depth > 0
+                && crate::logic::has_logic_marker(attrs)
+                && crate::logic::extract_logic_mode(attrs) == LogicMode::Prophetic
+            {
+                self.errors.push(PurityValidationError {
+                    span: expr.span,
+                    message: format!(
+                        "called prophetic logic function `{}` in logic context (snapshot! is not a prophetic context)",
                         self.tcx.def_path_str(def_id)
                     ),
                 });
@@ -1211,108 +1389,12 @@ impl ProgramLogicCallValidator<'_, '_> {
     }
 
     fn is_snapshot_capture_callee(&self, callee: &Expr<'_>) -> bool {
-        self.call_def_id(callee)
-            .is_some_and(|def_id| is_snapshot_capture_call(self.tcx, def_id))
-            || callee_path_is_snapshot_method(callee, "capture")
+        crate::ghost::program_context::is_macro_snapshot_capture_call(
+            self.tcx,
+            self.typeck_results,
+            callee,
+        )
     }
-}
-
-/// Recognise the HIR shape emitted by statement-form unit `snapshot!`
-/// macros: a block whose tail is a `Snapshot::*::new_phantom()` call.
-/// See `ghost::is_unit_block_snapshot_pattern` for the full rationale. (#9)
-fn is_unit_block_snapshot_pattern(block: &Block<'_>) -> bool {
-    let Some(tail) = block.expr else {
-        return false;
-    };
-    let ExprKind::Call(callee, _) = tail.kind else {
-        return false;
-    };
-    callee_path_is_snapshot_method(callee, "new_phantom")
-}
-
-/// Recognise the HIR shape emitted by the type-directed `snapshot!` capture
-/// dispatch: a block whose tail is `<recv>.capture(_)` where `<recv>` is a
-/// `snapshot_capture_select(_)` call. The captured expression is bound in a
-/// preceding `let`, so the whole block is a snapshot capture context. (bug/869)
-fn is_dispatch_snapshot_block(block: &Block<'_>) -> bool {
-    let Some(tail) = block.expr else {
-        return false;
-    };
-    let ExprKind::MethodCall(seg, receiver, _, _) = tail.kind else {
-        return false;
-    };
-    if seg.ident.as_str() != "capture" {
-        return false;
-    }
-    let ExprKind::Call(callee, _) = receiver.kind else {
-        return false;
-    };
-    let ExprKind::Path(qpath) = &callee.kind else {
-        return false;
-    };
-    let last_segment = match qpath {
-        QPath::Resolved(_, path) => path.segments.last().map(|s| s.ident.as_str()),
-        QPath::TypeRelative(_, segment) => Some(segment.ident.as_str()),
-    };
-    last_segment == Some("snapshot_capture_select")
-}
-
-fn callee_path_is_snapshot_method(callee: &Expr<'_>, method_name: &str) -> bool {
-    let ExprKind::Path(qpath) = &callee.kind else {
-        return false;
-    };
-    qpath_is_snapshot_method(qpath, method_name)
-}
-
-fn qpath_is_snapshot_method(qpath: &QPath<'_>, method_name: &str) -> bool {
-    match qpath {
-        QPath::Resolved(_, path) => {
-            let mut segments = path.segments.iter().rev();
-            let Some(method) = segments.next() else {
-                return false;
-            };
-            if method.ident.as_str() != method_name {
-                return false;
-            }
-            segments
-                .next()
-                .is_some_and(|owner| owner.ident.as_str() == "Snapshot")
-        }
-        QPath::TypeRelative(ty, segment) => {
-            if segment.ident.as_str() != method_name {
-                return false;
-            }
-            matches!(
-                ty.kind,
-                HirTyKind::Path(QPath::Resolved(_, path))
-                    if path.segments.last().is_some_and(|owner| {
-                        owner.ident.as_str() == "Snapshot"
-                    })
-            )
-        }
-    }
-}
-
-fn is_snapshot_capture_call(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    let crate_name = tcx.crate_name(def_id.krate).to_string();
-    if !matches!(
-        crate_name.as_str(),
-        "trust_wp_std" | "trust-wp" | "creusot_std" | "creusot_contracts"
-    ) {
-        return false;
-    }
-    let def_path = tcx.def_path_str(def_id);
-    let mut components = def_path.rsplit("::");
-    let Some(method_name) = components.next() else {
-        return false;
-    };
-    if method_name != "capture" {
-        return false;
-    }
-    let Some(owner) = components.next() else {
-        return false;
-    };
-    matches!(owner, "Snapshot") || owner.contains("Snapshot<")
 }
 
 #[cfg(test)]
@@ -1406,6 +1488,20 @@ x"###
     }
 
     #[test]
+    fn pearlite_macro_scan_flags_only_foreign_macros() {
+        use super::contains_unsupported_pearlite_macro as scan;
+        assert!(scan("{ panic ! () }"));
+        assert!(scan("unreachable!()"));
+        assert!(scan("x + vec![1]"));
+        assert!(!scan("pearlite ! { x @ == 1 }"));
+        assert!(!scan("seq ! [1, 2]"));
+        assert!(!scan("proof_assert!{ true }"));
+        assert!(!scan("if ! (a && b) { 1 } else { 2 }"));
+        assert!(!scan("x != (y)"));
+        assert!(!scan("a && !(b)"));
+    }
+
+    #[test]
     fn sanitized_raw_scan_removes_forbidden_looking_text() {
         let code = strip_comments_and_literals(
             r###"// dead / % proof_assert!(false) Secret { value: 1 } bag[0]
@@ -1428,5 +1524,80 @@ let b = r##"hidden_default(x)"##;"###,
                 "sanitized code should remove {forbidden:?}: {code:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prophetic_call_tests {
+    use std::collections::HashSet;
+
+    use trust_wp_core::{
+        formula::PureExpr,
+        logic::{LogicFnDef, LogicMode},
+    };
+
+    use super::validate_logic_prophetic_calls;
+
+    fn call(name: &str) -> PureExpr {
+        PureExpr::LogicFnCall {
+            name: name.to_string(),
+            args: vec![PureExpr::Var("x".to_string(), None)],
+        }
+    }
+
+    #[test]
+    fn non_prophetic_logic_calling_free_prophetic_fn_is_refused() {
+        let prophecy = LogicFnDef::new(
+            "prophecy".to_string(),
+            "creusot_test::prophecy".to_string(),
+            vec!["x".to_string()],
+            PureExpr::Int(0),
+        )
+        .with_mode(LogicMode::Prophetic);
+        let caller = LogicFnDef::new(
+            "caller".to_string(),
+            "creusot_test::caller".to_string(),
+            vec!["x".to_string()],
+            call("prophecy"),
+        );
+        let prophetic_caller = LogicFnDef::new(
+            "pcaller".to_string(),
+            "creusot_test::pcaller".to_string(),
+            vec!["x".to_string()],
+            call("prophecy"),
+        )
+        .with_mode(LogicMode::Prophetic);
+        let paths: HashSet<String> = ["creusot_test::prophecy".to_string()].into();
+        let defs = vec![prophecy, caller, prophetic_caller];
+        let errors = validate_logic_prophetic_calls(&defs, &paths);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("creusot_test::caller"));
+        // Trait-method (not free) prophetic callee: not refused.
+        assert!(validate_logic_prophetic_calls(&defs, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_callee_with_non_prophetic_candidate_is_not_refused() {
+        let a = LogicFnDef::new(
+            "g".to_string(),
+            "creusot_test::a::g".to_string(),
+            vec![],
+            PureExpr::Int(0),
+        )
+        .with_mode(LogicMode::Prophetic);
+        let b = LogicFnDef::new(
+            "g".to_string(),
+            "creusot_test::b::g".to_string(),
+            vec![],
+            PureExpr::Int(1),
+        );
+        let caller = LogicFnDef::new(
+            "caller".to_string(),
+            "creusot_test::caller".to_string(),
+            vec![],
+            call("g"),
+        );
+        let paths: HashSet<String> = ["creusot_test::a::g".to_string()].into();
+        assert!(validate_logic_prophetic_calls(&[a, b, caller], &paths).is_empty());
     }
 }

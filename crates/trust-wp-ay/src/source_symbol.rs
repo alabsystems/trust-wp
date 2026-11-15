@@ -125,12 +125,12 @@ fn encode_component(value: &str) -> String {
 fn decode_component(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
+    let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if byte.is_ascii_alphanumeric() || byte == b'_' {
             decoded.push(byte);
-            index += 1;
+            index = index.saturating_add(1);
             continue;
         }
         if byte != b'~' || index + 2 >= bytes.len() {

@@ -250,14 +250,16 @@ impl<T> View for Vec<T> {
 // View implementation for HashMap<K, V>
 // =============================================================================
 
+// Creusot `creusot-std/src/std/collections/hash_map.rs`: keys are viewed
+// through their deep model.
 impl<K, V> View for HashMap<K, V>
 where
-    K: Eq + Hash,
+    K: DeepModel,
 {
-    type ViewTy = FMap<K, V>;
+    type ViewTy = FMap<K::DeepModelTy, V>;
 
-    fn view(self) -> FMap<K, V> {
-        FMap::from(self)
+    fn view(self) -> FMap<K::DeepModelTy, V> {
+        panic!("View for HashMap<K, V> is specification-only")
     }
 }
 
@@ -270,12 +272,12 @@ where
 /// Reference: Creusot `creusot-std/src/std/collections/hash_set.rs`
 impl<T> View for HashSet<T>
 where
-    T: Eq + Hash,
+    T: DeepModel,
 {
-    type ViewTy = FSet<T>;
+    type ViewTy = FSet<T::DeepModelTy>;
 
-    fn view(self) -> FSet<T> {
-        FSet::from(self)
+    fn view(self) -> FSet<T::DeepModelTy> {
+        panic!("View for HashSet<T> is specification-only")
     }
 }
 
@@ -392,9 +394,11 @@ impl<T: View> View for Box<T> {
 /// notably when `Rc<PermCell<_>>` values are used as permission-map keys. An
 /// identity view preserves the `Rc` deref step in those expressions.
 impl<T> View for std::rc::Rc<T> {
-    type ViewTy = Self;
+    // Creusot `creusot-std/src/std/rc.rs`: `ViewTy = Box<T>` (so `*rc@` is the
+    // content and `rc@@` its view).
+    type ViewTy = Box<T>;
 
-    fn view(self) -> Self {
+    fn view(self) -> Box<T> {
         panic!("View for Rc<T> is specification-only")
     }
 }
@@ -637,17 +641,20 @@ impl DeepModel for char {
 
 // --- DeepModel: references (delegation) ---
 
-impl<T: DeepModel + Clone> DeepModel for &T {
+// Creusot `creusot-std/src/model.rs`: `impl<T: DeepModel + ?Sized> DeepModel
+// for &T` (no `Clone`). Specification-only here: a borrowed value cannot be
+// deep-modelled at runtime without cloning it.
+impl<T: DeepModel + ?Sized> DeepModel for &T {
     type DeepModelTy = T::DeepModelTy;
     fn deep_model(self) -> T::DeepModelTy {
-        self.clone().deep_model()
+        panic!("DeepModel for &T is specification-only")
     }
 }
 
-impl<T: DeepModel + Clone> DeepModel for &mut T {
+impl<T: DeepModel + ?Sized> DeepModel for &mut T {
     type DeepModelTy = T::DeepModelTy;
     fn deep_model(self) -> T::DeepModelTy {
-        self.clone().deep_model()
+        panic!("DeepModel for &mut T is specification-only")
     }
 }
 
@@ -826,10 +833,12 @@ impl<T: DeepModel> DeepModel for VecDeque<T> {
 /// DeepModel for `Box<T>` delegates to T's DeepModel — boxes are transparent.
 ///
 /// Reference: Creusot `creusot-contracts/src/model.rs`
+// Creusot `creusot-std/src/std/boxed.rs`: `DeepModelTy = Box<T::DeepModelTy>`
+// (so `*b.deep_model()` is the inner deep model).
 impl<T: DeepModel> DeepModel for Box<T> {
-    type DeepModelTy = T::DeepModelTy;
-    fn deep_model(self) -> T::DeepModelTy {
-        (*self).deep_model()
+    type DeepModelTy = Box<T::DeepModelTy>;
+    fn deep_model(self) -> Box<T::DeepModelTy> {
+        Box::new((*self).deep_model())
     }
 }
 
@@ -1040,7 +1049,7 @@ mod tests {
     fn test_deep_model_box() {
         let boxed: Box<i32> = Box::new(42);
         let dm = boxed.deep_model();
-        assert_eq!(dm, Int(42));
+        assert_eq!(*dm, Int(42));
     }
 
     #[test]
@@ -1074,12 +1083,10 @@ mod tests {
 
     #[test]
     fn test_view_hashset() {
-        let mut hs = std::collections::HashSet::new();
-        hs.insert(1);
-        hs.insert(2);
-        let fset = view(hs);
-        assert!(fset.contains(&1));
-        assert!(fset.contains(&2));
+        // Creusot: `HashSet<T>` views as `FSet<T::DeepModelTy>` (`i32` ->
+        // `Int`). The view is specification-only (no runtime model), so only
+        // its type is checked here.
+        let _typed: fn(std::collections::HashSet<i32>) -> FSet<Int> = view;
     }
 
     #[test]

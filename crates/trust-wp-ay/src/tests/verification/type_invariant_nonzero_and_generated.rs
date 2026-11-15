@@ -284,7 +284,7 @@ fn test_generated_sum_invariant_wrong_total_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "generated SumTo10 value has field sum 10, not 20: should fail, got {result:?}"
     );
 }
@@ -608,7 +608,7 @@ fn test_generated_field_update_without_compensation_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "updating only result.0 without compensating result.1 should violate SumTo10: got {result:?}"
     );
 }

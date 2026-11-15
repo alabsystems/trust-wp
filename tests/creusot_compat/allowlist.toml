@@ -1,0 +1,80 @@
+# Translate-only exceptions at the pinned Creusot oracle (D-133).
+# B: refutable; C: contentless; trusted-strip: source-declared trusted item.
+# Any provable goal prevents a row from being translate-only eligible.
+schema_version = 1
+reference_revision = "19e06b99a59a094a4f23a223b3a027a9c8e2dc6f"
+
+[[no_replay."bug/653".items]]
+name = "omg"
+class = "B"
+reason = "ensures result@ == n@*(n@+1)/2 on `fn omg(n) -> usize { n }`: n = 2 gives 2 != 3"
+
+[[no_replay."spec_tests".items]]
+name = "test_specs"
+class = "B"
+reason = "ensures T::A == T::B and S(0u32,true) == S(1u32,false): distinct constructors, 0 != 1"
+
+[[no_replay."bug/511".items]]
+name = "test_u8"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."bug/511".items]]
+name = "test_u16"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."bug/511".items]]
+name = "test_u128"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."bug/511".items]]
+name = "test_i8"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."bug/511".items]]
+name = "test_i16"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."bug/511".items]]
+name = "test_i128"
+class = "C"
+reason = "`as usize` cast, .coma module has no goal"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "has_len_3"
+class = "C"
+reason = "`goal vc_has_len_3: true` (literal true)"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "struct_in_pearlite"
+class = "B"
+reason = "ensures x == A { a: false }, no requires: x = A { a: true }"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "struct_order"
+class = "B"
+reason = "ensures x == B { field2: 0, field1: false }, no requires: x = B { field1: true, field2: 0 }"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "ghost_closure"
+class = "C"
+reason = ".coma module has no goal"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "pearlite_closure"
+class = "C"
+reason = ".coma module has no goal"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "caller"
+class = "C"
+reason = ".coma module has no goal"
+
+[[no_replay."syntax/05_pearlite".items]]
+name = "solver"
+class = "trusted-strip"
+reason = "#[trusted] in the corpus, with no Creusot module or goal; it reports `trusted (skipped)`, and any positive line only raises the contentless-item allowance"

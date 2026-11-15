@@ -52,7 +52,7 @@ use std::collections::HashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::Operand,
-    ty::{self, GenericArgsRef, TyCtxt},
+    ty::{self, GenericArgs, TyCtxt},
 };
 use trust_wp_core::{
     formula::{CaptureAvoidingSubstOptions, PureExpr},
@@ -82,7 +82,7 @@ struct OpenLogicResolution {
 fn build_open_logic_unfold_map<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: DefId,
-    substs: GenericArgsRef<'tcx>,
+    substs: GenericArgs<'tcx>,
 ) -> HashMap<String, OpenLogicResolution> {
     // For each trait predicate in the callee's where-clauses, instantiate it
     // with the call substs to get a concrete (monomorphized) trait reference,
@@ -93,13 +93,13 @@ fn build_open_logic_unfold_map<'tcx>(
 
     // Collect the callee's trait predicates AND those of its enclosing impl /
     // ancestors. A trait bound like `I: Inv<T>` is attached to the IMPL block,
-    // not the method, so `predicates_of(method)` alone misses it; we follow the
+    // not the method, so `clauses_of(method)` alone misses it; we follow the
     // `parent` chain (method -> impl -> ...) to gather every in-scope bound.
     let mut all_predicates: Vec<_> = Vec::new();
     let mut cur = Some(callee_def_id);
     while let Some(did) = cur {
-        let preds = tcx.predicates_of(did);
-        all_predicates.extend(preds.predicates.iter().copied());
+        let preds = tcx.clauses_of(did);
+        all_predicates.extend(preds.clauses.iter().copied());
         cur = preds.parent;
     }
     for &(clause, _span) in &all_predicates {
@@ -179,7 +179,7 @@ fn build_open_logic_unfold_map<'tcx>(
 fn resolve_open_impl_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_method_def_id: DefId,
-    trait_args: GenericArgsRef<'tcx>,
+    trait_args: GenericArgs<'tcx>,
 ) -> Option<(DefId, OpenLogicResolution)> {
     let instance = ty::Instance::try_resolve(
         tcx,
@@ -239,6 +239,16 @@ fn resolve_open_impl_body<'tcx>(
     if params.is_empty() {
         return None;
     }
+    // D-177: a name a parameter pattern binds is that parameter's projection.
+    // Substituting the parameters alone would leave it free, to be read in the
+    // caller's scope; a body that mentions one without a projection is not
+    // unfolded at all.
+    let bindings =
+        crate::param_patterns::param_pattern_bindings(tcx, impl_method_def_id.as_local()?);
+    let body = match crate::param_patterns::destructure_expr(&body, &bindings) {
+        Ok(destructured) => destructured.unwrap_or(body),
+        Err(_) => return None,
+    };
 
     Some((impl_method_def_id, OpenLogicResolution { params, body }))
 }
@@ -249,15 +259,18 @@ fn impl_method_param_names(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Vec<String>
     let local = def_id.as_local()?;
     let body_id = tcx.hir_node_by_def_id(local).body_id()?;
     let hir_body = tcx.hir_body(body_id);
-    let mut names = Vec::new();
-    for param in hir_body.params {
-        if let rustc_hir::PatKind::Binding(_, _, ident, _) = param.pat.kind {
-            names.push(ident.as_str().to_string());
-        } else {
-            names.push(format!("arg{}", names.len()));
-        }
-    }
-    Some(names)
+    // Unnamed parameters get collision-free fallback names: a positional name
+    // equal to a real parameter name would make the later binding win in the
+    // substitution map and unfold the body against the wrong argument.
+    let raw: Vec<Option<String>> = hir_body
+        .params
+        .iter()
+        .map(|param| match param.pat.kind {
+            rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    Some(crate::mir_analysis::name_unnamed_params(raw))
 }
 
 /// Unfold open trait-logic method calls inside `expr` according to `unfold_map`.
@@ -314,12 +327,12 @@ fn unfold_expr(expr: &PureExpr, unfold_map: &HashMap<String, OpenLogicResolution
 
 /// Extract the callee `DefId` and monomorphized substs from a call's `func`
 /// operand. Returns `None` for indirect calls (non-`FnDef` operand).
-fn callee_fn_def<'tcx>(func: &Operand<'tcx>) -> Option<(DefId, GenericArgsRef<'tcx>)> {
-    let Operand::Constant(box constant) = func else {
+fn callee_fn_def<'tcx>(func: &Operand<'tcx>) -> Option<(DefId, GenericArgs<'tcx>)> {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     match constant.const_.ty().kind() {
-        ty::TyKind::FnDef(def_id, substs) => Some((*def_id, substs)),
+        ty::TyKind::FnDef(def_id, substs) => Some((*def_id, substs.skip_binder())),
         _ => None,
     }
 }

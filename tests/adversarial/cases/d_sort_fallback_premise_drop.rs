@@ -13,6 +13,9 @@
 //@ teeth: UNVERIFIED (honest). Method (ii): the int-literal-equality evidence + annotation veto
 //@ teeth: (90fdf8f a1/a2) disabled in-tree. This case still rejects. Like (b), the defect direction
 //@ teeth: is premise weakening, so no accept is reachable through it.
+//@ WHY THE DECLARED ASSERTION IS TRUE: `a` and `b` are two `Arc::new` allocations, so
+//@ `Arc::ptr_eq` is false and `!same` holds; only `*b@ == 5i32` is false.
+//@ also-verified-assertion: creusot_test::arc_view_wrong_literal
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0

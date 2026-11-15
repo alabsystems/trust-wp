@@ -4,6 +4,8 @@
 
 // Trust bootstrap applies rustc-internal warning policy to this standalone
 // verifier crate; these lints are not actionable for trust-wp's public surface.
+#![feature(unsized_fn_params, unboxed_closures, tuple_trait)]
+#![allow(internal_features)]
 #![allow(
     rustc::default_hash_types,
     rustc::potential_query_instability,
@@ -106,6 +108,20 @@ pub use trust_wp_macros::{
     requires, snapshot, terminates, trusted, variant, DeepModel, Default,
 };
 
+// This crate's own contracts expand, like every other crate's, to ABSOLUTE
+// `::trust_wp_std::...` paths (the `__spec_tc` type-check surface,
+// `logic::Int`, `ghost::Snapshot`). Absolute paths resolve against the
+// EXTERN PRELUDE, which never contains the crate being compiled, so without
+// this alias every contract in this file tree dies `error[E0433]: cannot
+// find `trust_wp_std` in the crate root` the moment the trust-wp driver
+// compiles trust-wp-std with its `cfg(trust_wp)` on — which a plain
+// `cargo check` under `RUSTC_WRAPPER=trust-wp-rustc` does for every crate in
+// the graph, this one included. Downstream crates get the same name from the
+// driver instead (`trust-wp-driver` `inject_spec_tc_extern`); this line is
+// the one case that cannot be served that way, since no other copy of
+// trust-wp-std may stand in for the one being compiled.
+extern crate self as trust_wp_std;
+
 /// Ghost code support for specifications
 ///
 /// Ghost code exists only for verification and is erased at compile time.
@@ -167,3 +183,9 @@ pub use crate::std::cell;
 /// use trust_wp_std::prelude::*;
 /// ```
 pub mod prelude;
+
+/// Type-check-only vocabulary for lowered specification clauses. Internal to
+/// the `trust-wp-macros` expansion; never evaluated.
+#[doc(hidden)]
+#[path = "spec_tc.rs"]
+pub mod __spec_tc;

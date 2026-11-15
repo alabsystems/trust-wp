@@ -4,13 +4,20 @@
 
 //! Inner (nested) loop handling during body effect extraction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use rustc_middle::mir::{BasicBlock, ProjectionElem, StatementKind, TerminatorKind};
+use rustc_middle::{
+    mir::{BasicBlock, Local, StatementKind, TerminatorKind},
+    ty::TyKind,
+};
 use trust_wp_core::formula::PureExpr;
 
 use super::{
-    super::super::translate::{translate_rvalue, translate_rvalue_typed},
+    super::{
+        super::{extract::machine_int_range_fact, translate::ty_to_expr_sort_enriched},
+        changed_places::extract_modified_vars,
+        LoopInfo, WriteSites,
+    },
     BodyExtractionCtx, BodyExtractionState,
 };
 
@@ -19,16 +26,16 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
     /// exit block (the successor of the inner header's condition block that is NOT
     /// inside the inner loop body). Mark all inner loop blocks as visited.
     ///
-    /// For variables modified inside the inner loop:
-    /// - Direct effects (`var = expr`) are havoced (removed from state.effects)
-    /// - Deref effects (`*var = expr`) are preserved when the inner loop contains
-    ///   a constant dereference assignment (e.g., `*x = 0`), since the inner loop
-    ///   establishes this value on every iteration
-    /// - IndexMut writes (`v[i] = x`, lowered as `index_mut` Call + `*result = value`,
-    ///   or as a direct `(*v)[i] = rvalue` projection) are summarized by their LENGTH
-    ///   frame: a `set`-shaped deref effect `v@.set(i, x)` is propagated for the outer
-    ///   collection so the outer loop can carry `v@.len() == K` across the inner loop.
-    ///   (gap nested-loop-outer-element-and-indexed-write-frame; 100doors)
+    /// Everything the inner loop may write is havoced: it may run any number of
+    /// times, zero included, so neither a value one of its iterations writes nor
+    /// the value before it is the value after it. That covers a call result or
+    /// an untranslatable value moved into a variable, and a store through a
+    /// reference (loop_inner_call_write_outer_effect_kept,
+    /// loop_inner_opaque_write_outer_effect_kept,
+    /// loop_inner_deref_write_assumed_executed). What the inner loop does
+    /// establish is its invariant at its exit, which this walk does not state:
+    /// each such value is a bare value of its type, recorded as a premise the
+    /// outer VC leaves out.
     ///
     /// Returns `Some(exit_bb)` if `target` is an inner loop header; `None` otherwise.
     /// (#1295)
@@ -47,84 +54,7 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
         for &bb in inner_body {
             visited.insert(bb);
         }
-
-        // Scan inner loop for deref assignments (`*var = expr`) and double-deref
-        // assignments (`**var = expr` via temporaries). If the inner loop contains
-        // a constant deref/double-deref assignment, propagate it as the outer
-        // loop's effect — the inner loop establishes this value.
-        let mut inner_deref_effects: HashMap<String, PureExpr> = HashMap::new();
-        let mut inner_double_deref_effects: HashMap<String, PureExpr> = HashMap::new();
-        let mut inner_direct_modified: HashSet<String> = HashSet::new();
-        // Track temporaries for double-deref tracing within the inner loop.
-        let mut inner_working: HashMap<rustc_middle::mir::Local, PureExpr> =
-            state.working_exprs.clone();
-        let translate_inner = |rvalue, inner_working: &HashMap<_, _>| {
-            self.call_spec_ctx
-                .map(|ctx| ctx.tcx)
-                .and_then(|tcx| translate_rvalue_typed(tcx, rvalue, inner_working, Some(self.body)))
-                .or_else(|| translate_rvalue(rvalue, inner_working, Some(self.body)))
-        };
-        for &bb in inner_body {
-            for stmt in &self.body.basic_blocks[bb].statements {
-                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-                    if place.projection.is_empty() {
-                        // Direct assignment — update inner working exprs for temp tracing.
-                        if let Some(expr) = translate_inner(rvalue, &inner_working) {
-                            inner_working.insert(place.local, expr.clone());
-                            if let Some(var_name) = self.local_to_name.get(&place.local) {
-                                inner_direct_modified.insert(var_name.clone());
-                            }
-                        }
-                    } else if place.projection.len() == 1
-                        && matches!(place.projection.first(), Some(ProjectionElem::Deref))
-                    {
-                        if let Some(var_name) = self.local_to_name.get(&place.local) {
-                            // Deref assignment in inner loop: `*var = expr`
-                            if let Some(expr) = translate_inner(rvalue, &inner_working) {
-                                inner_deref_effects.insert(var_name.clone(), expr);
-                            }
-                        } else if let Some(PureExpr::Deref(inner)) = inner_working.get(&place.local)
-                        {
-                            // Double-deref via temporary in inner loop (#1295)
-                            if let PureExpr::Var(ref base_name, _) = **inner {
-                                if let Some(expr) = translate_inner(rvalue, &inner_working) {
-                                    inner_double_deref_effects.insert(base_name.clone(), expr);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Havoc directly-modified variables (their values are not predictable
-        // after the inner loop). Keep deref effects from the inner loop.
-        for var_name in &inner_direct_modified {
-            state.effects.remove(var_name);
-        }
-        // Nested IndexMut length-frame (gap nested-loop-outer-element-and-indexed-write-frame).
-        // The direct-deref scan above does NOT see `v[i] = x` writes, which lower to an
-        // `index_mut` Call followed by `*result = value` (or to a direct `(*v)[i] = rvalue`
-        // projection). Run an execution-ordered symbolic walk of the inner-loop blocks that
-        // reuses the main effect machinery (apply_assignments) on a SCRATCH state, then
-        // propagate ONLY length-preserving `set` deref effects for collections the inner
-        // loop does NOT also reassign wholesale. The length of `Seq::set` is invariant, so
-        // `len(v@_after) == len(v@_before)` is a sound summary of the entire inner loop for
-        // ANY number of iterations. Element content is intentionally NOT propagated.
-        self.propagate_inner_indexmut_length_frames(
-            inner_body,
-            &inner_working,
-            &inner_direct_modified,
-            state,
-        );
-        // Propagate inner loop deref effects to the outer loop.
-        for (var_name, expr) in inner_deref_effects {
-            state.deref_effects.insert(var_name, expr);
-        }
-        // Propagate inner loop double-deref effects to the outer loop.
-        for (var_name, expr) in inner_double_deref_effects {
-            state.double_deref_effects.insert(var_name, expr);
-        }
+        self.havoc_inner_loop_writes(target, inner_body, state);
 
         // Find the inner loop's condition block and its exit target.
         // The inner header is typically FalseUnwind -> cond_block,
@@ -140,7 +70,9 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
                 target: Some(switch_bb),
                 ..
             } => *switch_bb,
-            TerminatorKind::Goto { target: next_bb } => *next_bb,
+            TerminatorKind::Goto {
+                target: next_bb, ..
+            } => *next_bb,
             _ => target,
         };
         let cond_data = &self.body.basic_blocks[cond_block];
@@ -152,7 +84,9 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
                 target: Some(next_bb),
                 ..
             } => &self.body.basic_blocks[*next_bb],
-            TerminatorKind::Goto { target: next_bb } => &self.body.basic_blocks[*next_bb],
+            TerminatorKind::Goto {
+                target: next_bb, ..
+            } => &self.body.basic_blocks[*next_bb],
             _ => cond_data,
         };
         match &cond_data.terminator().kind {
@@ -172,107 +106,120 @@ impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> BodyExtractionCtx<'a, 'tcx> {
-    /// Summarize an inner loop's IndexMut writes (`v[i] = x`) as LENGTH-preserving
-    /// `set` deref effects on the outer collection, so the outer loop can carry a
-    /// `v@.len() == K` invariant across the inner loop. (gap
-    /// nested-loop-outer-element-and-indexed-write-frame; 100doors)
+    /// Forget every value the inner loop headed by `header` may change.
     ///
-    /// Strategy: run an execution-ordered symbolic walk of the inner-loop blocks,
-    /// reusing `apply_assignments` (which already handles BOTH IndexMut lowerings via
-    /// `record_pending_index_mut`/`apply_indexed_place_assignment`/`apply_deref_assignment`)
-    /// on a SCRATCH `BodyExtractionState` seeded from the inner working exprs. From the
-    /// scratch state, propagate ONLY deref effects whose value is a `set` MethodCall and
-    /// whose base name is NOT directly clobbered by the inner loop. Soundness: the sole
-    /// consequence consumed downstream (preservation `set_effect_preserves_len_equality`)
-    /// is `len(set(s,i,x)) == len(s)`, a Seq theorem.
-    fn propagate_inner_indexmut_length_frames(
+    /// The locals are the ones any statement, call destination or write
+    /// through a reference in the inner blocks may change, and the names are
+    /// the ones the loop-level modified-variable scan attributes to those
+    /// blocks, which follows reborrows to the variable they alias.
+    fn havoc_inner_loop_writes(
         &self,
+        header: BasicBlock,
         inner_body: &HashSet<BasicBlock>,
-        inner_working: &HashMap<rustc_middle::mir::Local, PureExpr>,
-        inner_direct_modified: &HashSet<String>,
         state: &mut BodyExtractionState,
     ) {
-        // IndexMut detection requires a spec context (is_index_mut_call returns false
-        // without one); the positional/test path has none, so skip cleanly there.
-        if self.call_spec_ctx.is_none() {
-            return;
-        }
-        let mut scratch = BodyExtractionState {
-            working_exprs: inner_working.clone(),
-            effects: HashMap::new(),
-            deref_effects: HashMap::new(),
-            double_deref_effects: HashMap::new(),
-            pending_index_mut: HashMap::new(),
-            // Capture the LENGTH frame even when an inner `v[i] = <expr>` write's
-            // value is itself un-modeled (e.g. `door_open[i] = !door_open[i]`): the
-            // length of `Seq::set` is value-invariant, so an opaque-value `set` is a
-            // sound length summary. Element content is suppressed at preservation.
-            index_mut_length_only_on_value_failure: true,
-        };
-        // Execution-ordered, inner-body-bounded walk. Following MIR successors (rather
-        // than iterating the HashSet) keeps the `index_mut` Call's PendingIndexMutWrite
-        // live until its `*result = value` successor block applies the `set` effect.
-        let Some(&entry) = inner_body.iter().min_by_key(|bb| bb.as_u32()) else {
-            return;
-        };
-        let mut walk_visited: HashSet<BasicBlock> = HashSet::new();
-        self.walk_inner_blocks_for_effects(entry, inner_body, &mut scratch, &mut walk_visited);
-        // Propagate ONLY length-preserving `set` deref effects for collections the inner
-        // loop does not reassign wholesale.
-        for (var_name, effect) in scratch.deref_effects {
-            if inner_direct_modified.contains(&var_name) {
-                continue; // wholesale-reassigned -> leave havoced (conservative)
-            }
-            if !is_set_method_call(&effect) {
-                continue; // only the length-invariant `set` shape is a sound frame
-            }
-            // Strict precision floor: never DOWNGRADE an effect the legacy direct-deref
-            // scan already established for this name; only fill a missing entry.
-            state.deref_effects.entry(var_name).or_insert(effect);
-        }
-    }
-
-    /// Execution-ordered symbolic walk of inner-loop blocks, bounded to `inner_body`,
-    /// applying the main effect machinery to `scratch`. Successor-following ensures the
-    /// `index_mut` Call's pending entry is live when the `*result = value` write applies.
-    fn walk_inner_blocks_for_effects(
-        &self,
-        bb: BasicBlock,
-        inner_body: &HashSet<BasicBlock>,
-        scratch: &mut BodyExtractionState,
-        walk_visited: &mut HashSet<BasicBlock>,
-    ) {
-        if !inner_body.contains(&bb) || !walk_visited.insert(bb) {
-            return;
-        }
-        self.apply_assignments(bb, scratch);
-        match &self.body.basic_blocks[bb].terminator().kind {
-            TerminatorKind::Goto { target }
-            | TerminatorKind::Assert { target, .. }
-            | TerminatorKind::Drop { target, .. }
-            | TerminatorKind::Call {
-                target: Some(target),
-                ..
-            } => self.walk_inner_blocks_for_effects(*target, inner_body, scratch, walk_visited),
-            TerminatorKind::FalseEdge { real_target, .. }
-            | TerminatorKind::FalseUnwind { real_target, .. } => {
-                self.walk_inner_blocks_for_effects(*real_target, inner_body, scratch, walk_visited);
-            }
-            TerminatorKind::SwitchInt { targets, .. } => {
-                for t in targets.all_targets() {
-                    self.walk_inner_blocks_for_effects(*t, inner_body, scratch, walk_visited);
+        let mut written: HashSet<Local> = HashSet::new();
+        for &bb in inner_body {
+            let data = &self.body.basic_blocks[bb];
+            for stmt in &data.statements {
+                match &stmt.kind {
+                    StatementKind::Assign((place, _))
+                    | StatementKind::SetDiscriminant {
+                        place: deref!(place),
+                        ..
+                    } => {
+                        written.insert(place.local);
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
+            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
+                written.insert(destination.local);
+            }
+        }
+        written.extend(
+            WriteSites::new(self.body)
+                .writes_in_blocks(inner_body.iter().copied())
+                .into_keys(),
+        );
+        let inner = LoopInfo {
+            header,
+            body_blocks: inner_body.clone(),
+        };
+        let mut names: HashSet<String> =
+            extract_modified_vars(self.body, &inner, self.local_to_name)
+                .into_iter()
+                .collect();
+        names.extend(
+            written
+                .iter()
+                .filter_map(|local| self.local_to_name.get(local).cloned()),
+        );
+        for local in &written {
+            state.working_exprs.remove(local);
+            state.pending_index_mut.remove(local);
+        }
+        for name in &names {
+            state.effects.remove(name);
+            state.deref_effects.remove(name);
+            state.double_deref_effects.remove(name);
+        }
+        let mut named_locals: Vec<(Local, &String)> = self
+            .local_to_name
+            .iter()
+            .filter(|(_, name)| names.contains(*name))
+            .map(|(local, name)| (*local, name))
+            .collect();
+        named_locals.sort();
+        for (local, name) in named_locals {
+            state.working_exprs.remove(&local);
+            state.pending_index_mut.remove(&local);
+            // A value of the local's type, and nothing more: what the inner
+            // invariant says of it at the exit is the premise left out below.
+            if let Some((symbol, range)) = self.inner_loop_exit_symbol(header, local) {
+                state.working_exprs.insert(local, symbol.clone());
+                state.effects.insert(name.clone(), symbol);
+                state.call_facts.extend(range);
+            }
+            let premise = super::DroppedPremise {
+                block: header,
+                what: format!(
+                    "the value of `{name}` after an inner loop, which its invariant states"
+                ),
+                iterator_step: false,
+                only_about: Some(name.clone()),
+            };
+            if !state.dropped_premises.contains(&premise) {
+                state.dropped_premises.push(premise);
+            }
         }
     }
-}
 
-/// True iff `expr` is a `<receiver>.set(index, value)` MethodCall — the length-invariant
-/// indexed-write shape produced by `apply_indexed_write_effect`.
-fn is_set_method_call(expr: &PureExpr) -> bool {
-    matches!(
-        expr,
-        PureExpr::MethodCall { method, args, .. } if method == "set" && args.len() == 2
-    )
+    /// The symbol naming a local's value at an inner loop's exit, with its
+    /// machine-integer range, for a local whose type holds no reference.
+    fn inner_loop_exit_symbol(
+        &self,
+        header: BasicBlock,
+        local: Local,
+    ) -> Option<(PureExpr, Option<PureExpr>)> {
+        let spec_ctx = self.call_spec_ctx?;
+        let ty = self.body.local_decls[local].ty;
+        if ty
+            .walk()
+            .filter_map(|arg| arg.as_type())
+            .any(|t| matches!(t.kind(), TyKind::Ref(..) | TyKind::RawPtr(..)))
+        {
+            return None;
+        }
+        let symbol = PureExpr::Var(
+            format!(
+                "__trust_wp_inner_loop_exit_{}_{}",
+                header.as_u32(),
+                local.as_u32()
+            ),
+            ty_to_expr_sort_enriched(spec_ctx.tcx, ty),
+        );
+        let range = machine_int_range_fact(spec_ctx.tcx, ty, symbol.clone());
+        Some((symbol, range))
+    }
 }

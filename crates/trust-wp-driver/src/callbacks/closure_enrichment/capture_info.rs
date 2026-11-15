@@ -35,19 +35,29 @@ fn capture_field_from_rustc<'tcx>(
 ) -> CaptureField {
     let sort = ty_to_expr_sort_enriched(tcx, capture.place.ty()).unwrap_or(ExprSort::Int);
     let name = capture_field_name(capture);
+    // The caller names the captured binding as its body does (D-237).
+    let name = if name == capture.var_ident.as_str() {
+        crate::mir_analysis::binding_identity::hir_binding_debug_name(
+            tcx,
+            &name,
+            capture.get_root_variable(),
+        )
+    } else {
+        name
+    };
     CaptureField::new(name, sort, capture_kind_from_rustc(capture))
 }
 
-/// Return the caller-side name used to identify a capture in encoder
+/// Return the caller-side name that identifies a capture in encoder
 /// projection assertions.
 ///
 /// For root-variable captures (`|| use(x)`) this is the `var_ident` (`"x"`).
-/// For RFC-2229 disjoint captures (`|| use(p.1)`) `var_ident` is the root
-/// `"p"`, which collides with the outer fn's declaration of `p` and a
-/// different sort (the projected field's sort vs. the root variable's sort).
+/// For RFC-2229 disjoint captures (`|| use(p.1)`, Creusot `bug/962`)
+/// `var_ident` is the root `"p"`, which collides with the outer fn's
+/// declaration of `p` and a different sort (the projected field's sort vs.
+/// the root variable's sort).
 /// Use `to_symbol()` for projected captures so the encoder declares a unique
 /// caller-side name (e.g., `_ref__p__1`) at the projected field's sort.
-/// See designs/2026-05-19-closure-body-extraction-gap.md (bug/962). (#8)
 fn capture_field_name(capture: &rustc_middle::ty::CapturedPlace<'_>) -> String {
     let var_ident = capture.var_ident.as_str().to_string();
     let symbol = capture.to_symbol().to_string();
@@ -72,6 +82,29 @@ fn is_projected_capture(var_ident: &str, symbol: &str) -> bool {
         .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit() || c == '_'))
 }
 
+/// The capture fields of a local closure, in environment order.
+///
+/// One producer, because two consumers read it in different phases: the spec
+/// table pairs these fields with their type invariants, and the capture info
+/// the verification phase builds carries the same fields. A second walk of
+/// `closure_captures` that named or sorted a field differently would key the
+/// grant and the obligation to different captures.
+pub(in crate::callbacks) fn closure_capture_fields(
+    tcx: TyCtxt<'_>,
+    closure_def_id: DefId,
+) -> Vec<CaptureField> {
+    if tcx.def_kind(closure_def_id) != rustc_hir::def::DefKind::Closure {
+        return Vec::new();
+    }
+    let Some(local) = closure_def_id.as_local() else {
+        return Vec::new();
+    };
+    tcx.closure_captures(local)
+        .iter()
+        .map(|capture| capture_field_from_rustc(tcx, capture))
+        .collect()
+}
+
 pub(super) fn build_closure_capture_info(
     tcx: TyCtxt<'_>,
     closure_def_id: DefId,
@@ -83,88 +116,105 @@ pub(super) fn build_closure_capture_info(
     let closure_local_def_id = closure_def_id.as_local()?;
     let has_user_spec = user_specs.contains_key(&closure_def_id);
     let captures = tcx.closure_captures(closure_local_def_id);
-    let typed_captures: Vec<CaptureField> = captures
-        .iter()
-        .map(|capture| capture_field_from_rustc(tcx, capture))
-        .collect();
+    let typed_captures: Vec<CaptureField> = closure_capture_fields(tcx, closure_def_id);
     let def_id_str = tcx.def_path_str(closure_def_id);
+    // READ, never recompute: the construction site pays for exactly the vector
+    // the spec table holds, so a body may enjoy exactly that vector. A closure
+    // with no table entry was granted nothing and owes nothing.
+    let capture_invariants = user_specs
+        .get(&closure_def_id)
+        .map(|spec| spec.capture_inv_requires.clone())
+        .unwrap_or_default();
 
     if !has_user_spec && captures.is_empty() {
         let (body_expr, param_names_vec) =
             try_extract_closure_body(tcx, closure_def_id, user_specs, trait_specs, extern_specs)?;
         return Some(
             ClosureCaptureInfo::new(def_id_str, Vec::new())
+                .with_capture_invariants(capture_invariants)
                 .with_param_name(param_name)
                 .with_body_expr(Some(body_expr))
                 .with_param_names(Some(param_names_vec))
                 .with_ensures_exprs(None),
         );
     }
-    let (body_expr, param_names, ensures_exprs, requires_exprs) = if has_user_spec {
-        let extracted_with_effects = try_extract_closure_body_with_effects(
-            tcx,
-            closure_def_id,
-            &typed_captures,
-            user_specs,
-            trait_specs,
-            extern_specs,
-        );
-        let (body_expr, param_names, synthesized_ensures) = extracted_with_effects
-            .map_or((None, None, None), |(expr, names, ensures)| {
-                (Some(expr), Some(names), ensures)
+    let (body_expr, param_names, ensures_exprs, requires_exprs, synthesized_effects) =
+        if has_user_spec {
+            let extracted_with_effects = try_extract_closure_body_with_effects(
+                tcx,
+                closure_def_id,
+                &typed_captures,
+                user_specs,
+                trait_specs,
+                extern_specs,
+            );
+            let (body_expr, param_names, synthesized_ensures) = extracted_with_effects
+                .map_or((None, None, None), |(expr, names, ensures)| {
+                    (Some(expr), Some(names), ensures)
+                });
+            let ensures_exprs = user_specs.get(&closure_def_id).and_then(|spec| {
+                if spec.ensures.is_empty() {
+                    return None;
+                }
+                let exprs: Vec<PureExpr> = spec
+                    .ensures
+                    .iter()
+                    .filter_map(|ensures| {
+                        trust_wp_core::contract_parser::parse_contract(ensures).ok()
+                    })
+                    .collect();
+                (!exprs.is_empty()).then_some(exprs)
             });
-        let ensures_exprs = user_specs.get(&closure_def_id).and_then(|spec| {
-            if spec.ensures.is_empty() {
-                return None;
-            }
-            let exprs: Vec<PureExpr> = spec
-                .ensures
-                .iter()
-                .filter_map(|ensures| trust_wp_core::contract_parser::parse_contract(ensures).ok())
-                .collect();
-            (!exprs.is_empty()).then_some(exprs)
-        });
-        let ensures_exprs =
-            if param_name.as_deref() == Some("self") && synthesized_ensures.is_some() {
-                synthesized_ensures
-            } else {
-                ensures_exprs
-            };
-        // Extract requires expressions for precondition inlining (#2668).
-        let requires_exprs = user_specs.get(&closure_def_id).and_then(|spec| {
-            if spec.requires.is_empty() {
-                return None;
-            }
-            let exprs: Vec<PureExpr> = spec
-                .requires
-                .iter()
-                .filter_map(|requires| {
-                    trust_wp_core::contract_parser::parse_contract(requires).ok()
-                })
-                .collect();
-            (!exprs.is_empty()).then_some(exprs)
-        });
-        (body_expr, param_names, ensures_exprs, requires_exprs)
-    } else {
-        let extracted = try_extract_closure_body_with_effects(
-            tcx,
-            closure_def_id,
-            &typed_captures,
-            user_specs,
-            trait_specs,
-            extern_specs,
-        );
-        extracted.map_or((None, None, None, None), |(expr, names, ensures)| {
-            (Some(expr), Some(names), ensures, None)
-        })
-    };
+            let synthesized_effects = synthesized_ensures.clone();
+            let ensures_exprs =
+                if param_name.as_deref() == Some("self") && synthesized_ensures.is_some() {
+                    synthesized_ensures
+                } else {
+                    ensures_exprs
+                };
+            // Extract requires expressions for precondition inlining (#2668).
+            let requires_exprs = user_specs.get(&closure_def_id).and_then(|spec| {
+                if spec.requires.is_empty() {
+                    return None;
+                }
+                let exprs: Vec<PureExpr> = spec
+                    .requires
+                    .iter()
+                    .filter_map(|requires| {
+                        trust_wp_core::contract_parser::parse_contract(requires).ok()
+                    })
+                    .collect();
+                (!exprs.is_empty()).then_some(exprs)
+            });
+            (
+                body_expr,
+                param_names,
+                ensures_exprs,
+                requires_exprs,
+                synthesized_effects,
+            )
+        } else {
+            let extracted = try_extract_closure_body_with_effects(
+                tcx,
+                closure_def_id,
+                &typed_captures,
+                user_specs,
+                trait_specs,
+                extern_specs,
+            );
+            extracted.map_or((None, None, None, None, None), |(expr, names, ensures)| {
+                (Some(expr), Some(names), ensures.clone(), None, ensures)
+            })
+        };
 
     Some(
         ClosureCaptureInfo::new(def_id_str, typed_captures)
+            .with_capture_invariants(capture_invariants)
             .with_param_name(param_name)
             .with_body_expr(body_expr)
             .with_param_names(param_names)
             .with_ensures_exprs(ensures_exprs)
+            .with_synthesized_effects(synthesized_effects)
             .with_requires_exprs(requires_exprs),
     )
 }

@@ -48,8 +48,12 @@ fn sample_struct_adt_decls() -> trust_wp_core::logic::AdtDecls {
 #[test]
 #[timeout(30000)]
 fn test_verification_request_adt_decls_thread_native_struct_field_selector() {
+    // The placed spelling: the driver's placement pass (contract_rewrite::
+    // placement) turns `Point{x,y}` into `Point` with its arguments at their
+    // declared indices, and the encoder's one door refuses the unplaced form
+    // (verify::placement_gate).
     let body = PureExpr::LogicFnCall {
-        name: "Point{x,y}".to_string(),
+        name: "Point".to_string(),
         args: vec![PureExpr::Int(5), PureExpr::Int(7)],
     };
     let ensures = eq(named_field("x", var("result")), int(5));
@@ -342,9 +346,13 @@ fn test_inline_registered_struct_tuple_get_falls_back_for_non_native_constructor
 #[test]
 #[timeout(30000)]
 fn test_tuple_get_uses_native_selector_on_registered_struct() {
-    // Construct: Point{x=5, y=7}, ensures: __trust_wp_tuple_get_0(result) == 5
+    // Construct: Point(5, 7), ensures: __trust_wp_tuple_get_0(result) == 5
+    // The placed spelling: the driver's placement pass (contract_rewrite::
+    // placement) turns `Point{x,y}` into `Point` with its arguments at their
+    // declared indices, and the encoder's one door refuses the unplaced form
+    // (verify::placement_gate).
     let body = PureExpr::LogicFnCall {
-        name: "Point{x,y}".to_string(),
+        name: "Point".to_string(),
         args: vec![PureExpr::Int(5), PureExpr::Int(7)],
     };
     let ensures = eq(get_field(0, var("result")), int(5));
@@ -367,8 +375,12 @@ fn test_tuple_get_uses_native_selector_on_registered_struct() {
 #[test]
 #[timeout(30000)]
 fn test_tuple_get_both_fields_native_selector() {
+    // The placed spelling: the driver's placement pass (contract_rewrite::
+    // placement) turns `Point{x,y}` into `Point` with its arguments at their
+    // declared indices, and the encoder's one door refuses the unplaced form
+    // (verify::placement_gate).
     let body = PureExpr::LogicFnCall {
-        name: "Point{x,y}".to_string(),
+        name: "Point".to_string(),
         args: vec![PureExpr::Int(3), PureExpr::Int(9)],
     };
     // ensures: __trust_wp_tuple_get_0(result) + __trust_wp_tuple_get_1(result) == 12

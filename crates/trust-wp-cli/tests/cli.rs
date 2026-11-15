@@ -202,7 +202,13 @@ fn quiet_is_a_presentation_flag_and_never_reaches_the_engine() {
 fn strip_tempdir(text: &str) -> String {
     text.split_whitespace()
         .map(|word| {
-            if word.contains("trust-wp-") && !word.ends_with(".rs") {
+            // `extension()` rather than `ends_with(".rs")`: the words here are
+            // whole paths, and a case-insensitive extension test is what the
+            // check means (clippy::case_sensitive_file_extension_comparisons).
+            let is_rust_source = std::path::Path::new(word)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+            if word.contains("trust-wp-") && !is_rust_source {
                 "<tmp>".to_string()
             } else {
                 word.to_string()
@@ -477,7 +483,10 @@ fn a_false_contract_over_a_mutated_reference_is_never_reported_verified() {
 fn example_writes_a_contracted_file() {
     let (code, stdout, _) = run(&["example"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("#[requires(x > 0)]"), "{stdout}");
+    assert!(
+        stdout.contains("#[requires(x > 0 && x < 1_000_000)]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("#[ensures(result > x)]"));
 
     let dir = TempDir::new().unwrap();

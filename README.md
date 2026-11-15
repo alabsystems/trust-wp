@@ -1,282 +1,72 @@
 # trust-wp
 
-**Prove your Rust code correct for every input — without running it.**
+A deductive verifier for Rust. Write Creusot-compatible contracts —
+`#[requires]`, `#[ensures]`, `#[invariant]`, `#[variant]`, `#[logic]`,
+`proof_assert!`, `ghost!` — and trust-wp proves them by weakest-precondition
+over the compiler's MIR, discharging obligations with the
+[`ay`](https://github.com/alabsystems/ay) solver. Every machine-integer
+overflow, division and index is an obligation, not an assumption. A proof is
+credited only when `ay` produces a checked certificate; anything less is
+reported as unknown, never as verified.
 
-Write a contract. trust-wp reads the post-borrowck MIR, turns your code into a
-verification condition with a Dijkstra-style weakest-precondition transform, and
-discharges it on the `ay` SMT solver. When a contract does not hold, you get the
-input that breaks it.
+**Author:** Andrew Yates · **License:** Apache-2.0 · version: `Cargo.toml`
 
-```console
-$ trust-wp example > demo.rs && trust-wp demo.rs
-✓ increment verified
-✓ identity verified
-
-2 verified, 0 failed, 0 errors
-finished in 2.3s
-
-$ sed -i '' 's/x + 1/x - 1/' demo.rs && trust-wp demo.rs
-✗ increment FAILED (postcondition)
-  return expression at demo.rs:20:5: 20:10
-  violated ensures #0: (result > x)
-  counterexample:
-    result = 0
-    x = 1
-✓ identity verified
-
-1 verified, 1 failed, 0 errors
-```
-
-No test wrote `x = 1`. The solver did, because it is the smallest input for
-which `#[ensures(result > x)]` is false. That is the difference between testing
-and proving: a passing run means *no such input exists*.
-
-**What it is not.** This is a research verifier, not a product. It needs a
-Trust-fork toolchain and the first-party `ay` solver to run — see Install.
-
-Most importantly: **arithmetic overflow is currently assumed, not proved.** The
-`increment` above is `#[requires(x > 0)] #[ensures(result > x)] { x + 1 }`; at
-`x = i32::MAX` it overflows and panics, and `x > 0` does not exclude that input,
-yet the contract verifies. MIR's `+`, `-` and `*` overflow assertions enter the
-verification condition as hypotheses rather than obligations, so a proof here
-means "correct assuming no overflow", not "correct". (Shift amounts are the
-exception: an over-wide shift is a proof obligation, not an assumption.) Closing
-the arithmetic gap is the single most valuable contribution available here.
-
-The other honest failure mode is `unknown (proof-trusted)`: the solver reached
-UNSAT but the proof carried a step no checker could confirm, so the verdict is
-withheld rather than reported as proved. Nothing is proved wrong — this is a
-completeness gap, not a soundness one. When it happens, isolate the function
-with `--filter <NAME>` and read the obligation with `--emit-smt`; stating the
-same property in a form the solver can present — an explicit bound rather than
-an implied one, or returning a value rather than mutating through a reference —
-often gets it proved. The CLI prints the same advice with the verdict.
-
-**Author:** Andrew Yates · **License:** Apache-2.0 · **Copyright:** 2026 Andrew Yates
-
-## Install
-
-There is no `cargo install` for this, and it would be dishonest to imply one.
-trust-wp is a rustc driver: it links `rustc_private` and reads the compiler's
-own post-borrowck MIR, so it must be built against the same compiler it drives
-— and that compiler is a fork. The engine also resolves a Trust sysroot at
-runtime, so it is not relocatable on its own. Expect to build three things.
-
-**1. The Trust toolchain.** A self-hosted rustc fork. Stock nightly will not
-work: the driver reads internals whose shapes differ from upstream's, so it
-does not merely fail to build, it would read the wrong thing. Build it, then
-seal the finished stage2 and point rustup at the sealed artifact — that is the
-default lane, and it is the one this repo needs:
-
-```sh
-# in the trust checkout, after `x.py build --stage 2`
-scripts/promote-toolchain.sh            # seals stage2, flips the `trust` channel
-rustup toolchain list -v | grep trust   # should print: trust  <toolchain root>
-```
-
-Linking rustup straight at `build/host/stage2` also registers the channel, but
-that directory is a live build tree: every `x.py` run empties it, and a plain
-link loses the paired `rustc-private-sysroots` that an out-of-tree
-`rustc_private` driver — this one — resolves beside the compiler. The Trust
-repo's `INSTALL.md` covers both lanes and says the same thing.
-
-trust-wp's own build compiles with the Trust verification pass switched off
-(`-Ztrust-verify=off`, in `.cargo/config.toml`): building the verifier is not
-itself a verification run. Today that switch is blanket — it covers this
-project's crates as well as its dependencies — and narrowing it (host units
-off, first-party units at `-Ztrust-policy=advisory`, third-party scoped off per
-unit) is open work, not something this snapshot already does.
-
-**2. The `ay` solver, as a sibling checkout.** trust-wp consumes it by path,
-not by version — `ay-core = { path = "../ay/crates/ay-core" }` — so `ay` must
-sit next to this repository and be checked out at a revision new enough for the
-manifest. An older `ay` does not fail loudly; it demotes whole lanes to
-`unknown (proof-trusted)`. If a contract you expect to prove does not, check
-that first.
+## Use
 
 ```
-parent/
-├── trust-wp/     <- this repository
-└── ay/           <- github.com/alabsystems/ay
+trust-wp FILE.rs          # verify one file, no Cargo project
+trust-wp                  # verify the crate in the current directory
+targo trust-wp            # the same, as a targo subcommand
+trust-wp example          # write a sample file
+trust-wp doctor           # report readiness
 ```
 
-**3. trust-wp itself.**
+Exit codes: `0` verified · `1` counterexample · `2` refusal, encoding gap, or
+nothing proved · `3` parse or CLI error · `101` internal. A run that examines
+no obligation exits `2`. Unknown options are refused. `demo/run.sh` walks the
+CLI and asserts these codes.
 
-```sh
-cargo build --release -p trust-wp-cli                            # the `trust-wp` binary
-cargo build --release -p trust-wp-driver --bin trust-wp-rustc    # engine, single-file mode
-cargo build --release -p targo-trust-wp                          # engine, crate mode
-cargo build --release -p trust-wp -p creusot-contracts           # the contract crates
-```
+## Build
 
-Then ask the tool whether it believes you:
-
-```console
-$ trust-wp doctor
-trust-wp 0.5.0+g<sha> (https://github.com/alabsystems/trust-wp)
-
-  checkout          /path/to/trust-wp
-  trust-wp-rustc    .../target/release/trust-wp-rustc (via .../target/release)
-  engine runtime    ok (driver loads and responds)
-  targo-trust-wp    .../target/release/targo-trust-wp (via .../target/release)
-  trust_wp          .../deps/libtrust_wp-<hash>.rlib
-  creusot_contracts .../deps/libcreusot_contracts-<hash>.rlib
-  cargo             cargo 1.99.0-dev
-  active sysroot    .../toolchains/trust-<rev>
-
-ready. try:  trust-wp example > demo.rs && trust-wp demo.rs
-```
-
-`doctor` exits non-zero when it is not ready and names what is missing, so it
-works as a setup check in a script. Only the `verify` path needs any of the
-above: the in-process verbs need nothing but `trust-wp-cli`.
-
-Building it here is currently the only way to get it. Checked 2026-08-30
-against the sealed Trust toolchain in use: its `bin/` carries `trustc`,
-`targo`, `targo-trust`, `trustd`, `trustdoc`, `ay`, `clean`, `ty` and the rest
-of the compiler's own tools, and no `trust-wp`, `trust-wp-driver` or
-`targo-trust-wp`. The Trust tree does contain a crate *named* `trust-wp`, but
-its own header describes it as a standalone compatibility boundary that the
-compiler's verifier pass does not call — it is not this engine. Distributing
-these binaries with the toolchain is an intention, not a fact; treat any
-sentence that says otherwise as stale.
-
-## How it works
-
-Contracts are ordinary Rust attributes — `#[requires]`, `#[ensures]`,
-`#[invariant]`, `#[variant]` and `proof_assert!`, with `#[logic]`,
-`#[predicate]` and `#[law]` for specification functions. trust-wp works on
-post-borrowck MIR rather than HIR, so what it proves is what the compiler
-actually compiles, and it models `&mut` borrows with a
-[RustHorn](https://doi.org/10.1145/3462205)-style (current, final) encoding.
-
-The attribute and expression syntax is
-[Creusot](https://github.com/creusot-rs/creusot)-compatible — `*v`, `^v`,
-`old()`, `@` and quantifiers all carry over — but compatibility is not
-complete, and trust-wp is not a drop-in replacement: `creusot-compatibility.md`
-has the matrix, feature by feature, with the open gaps (ghost code chief among
-them). trust-wp is an independent ALab tool, not affiliated with, derived from,
-or endorsed by that project.
-
-## Command line
-
-`trust-wp` is the front door. It verifies one file or a whole crate, and its
-exit code is the answer:
+Requires the Trust toolchain (`rust-toolchain.toml` pins the channel; install
+[aterm](https://github.com/alabsystems/aterm#install) and atpkg installs Trust)
+and a sibling `../ay` checkout (`Cargo.toml` path dependencies). Only
+`trust-wp-driver` links `rustc_private`; `scripts/trustc-private-wrapper.sh`
+supplies the private sysroot without mutating the toolchain.
 
 ```
-trust-wp <FILE.rs>       verify one file — no Cargo project needed
-trust-wp                 verify the crate in the current directory
-trust-wp example         write a small contracted file to start from
-trust-wp doctor          report what is installed, and how to fix what is not
-trust-wp completions     print a completion script for bash, zsh or fish
-trust-wp man             print the roff manual page
+targo --unverified build -p trust-wp-driver -p targo-trust-wp -p trust-wp-cli
+targo --unverified test  -p trust-wp-driver --lib --bins
 ```
 
-Three verbs run `trust-wp-core` in this process and need no engine, sysroot or
-solver:
+`targo` is the Trust toolchain's cargo; it refuses a build that names no lane.
+`--unverified` builds with the Trust verification pass off (no proof claim);
+`targo trust check` runs it.
+
+## Layout
 
 ```
-trust-wp contract parse|vc    parse a contract expression, or emit its
-                              weakest-precondition VC as SMT-LIB2
-trust-wp bundle verify|validate|replay|example
-                              prove, check or independently replay a
-                              `trust-wp.verify-bundle.v1` request
-trust-wp result               decode a saved result-protocol transcript
+crates/
+  trust-wp-driver/    rustc driver: MIR extraction, WP, contract discovery (bins trust-wp-driver, trust-wp-rustc)
+  trust-wp-ay/        encoder to ay and the verify pipeline; certification and verdict gates
+  trust-wp-core/      formula AST and contract parsing
+  trust-wp-macros/    contract proc macros
+  trust-wp-std/       specifications for the standard library
+  trust-wp-cli/       the `trust-wp` binary
+  cargo-trust-wp/     `targo trust-wp`
+  creusot-contracts/, creusot-std/   Creusot-namespace shims over the above
+  trust-wp-lib/       stable, rustc_private-free facade for external consumers
+tests/creusot_compat/ the Creusot corpus harness (reference/creusot is the pinned oracle)
+tests/adversarial/    programs that must be rejected; the suite is red when a known hole is open
+docs/                 undated design documents only: GOAL, DIRECTION, DECISIONS, SOUNDNESS, and the design notes DIRECTION §8 is folding
 ```
 
-`-h` is a summary and `--help` is the full page; `trust-wp help <COMMAND>`
-covers one verb. `-q` prints only failures and the summary; `--filter <NAME>`
-narrows a run to the functions whose path matches `NAME`; `--emit-smt` prints
-the SMT-LIB2 query instead of proving; `--json` gives one
-`trust-wp.cli-report.v1` document on stdout, on every exit, with human output
-left on stderr.
+## Status
 
-| exit | meaning |
-| --- | --- |
-| `0` | everything verified |
-| `1` | a contract was disproved — a counterexample exists |
-| `2` | encoding/solver error, a soundness gap, **nothing was proved**, or the engine could not run |
-| `3` | a contract failed to parse, or the command line was rejected |
-| `101` | internal error |
-
-Exit 2 covers "nothing was proved" on purpose: a run that examined no obligation
-— a file with no contracts, a `--filter` that matched nothing — is an error, not
-a pass. Unknown options are refused rather than ignored, and options from
-comparable verifiers name the trust-wp equivalent. `trust-wp --help` lists every
-option.
-
-## Snapshot scope
-
-This repository is a source snapshot of the trust-wp **specification surface
-and weakest-precondition core**: the contract macros (`crates/trust-wp-macros`),
-the verified std specs (`crates/trust-wp-std`), the WP/formula core
-(`crates/trust-wp-core`), the Creusot-compat contract crates, the
-`targo-trust-wp` front end (`targo trust-wp`, back-compat alias
-`cargo trust-wp`) and the `trust-wp` command itself (`crates/trust-wp-cli`,
-core-only) — together with the test harness, examples and reference docs.
-
-The executable verifier lanes ship too: the SMT encoder (`crates/trust-wp-ay`),
-the rustc driver (`crates/trust-wp-driver`) and the library facade
-(`crates/trust-wp-lib`), with their `ay`, `clean` and `trust-ir` dependencies
-pinned to public releases in the snapshot's `Cargo.toml`. Not everything that
-ships is claimed buildable: the release gate's check is scoped to seven
-crates —
-
-```sh
-cargo check --locked -p trust-wp -p trust-wp-core -p trust-wp-ay \
-  -p trust-wp-macros -p trust-wp-std -p creusot-contracts -p creusot-std
-```
-
-— and `crates/trust-wp-driver` is deliberately outside it, because it is the
-one crate that links `rustc_private` and so needs the Trust fork *with* its
-`rustc-dev` components, which are not publicly distributed (see Install). The
-scoping axis is `rustc-dev`, not the fork: `rust-toolchain.toml` pins
-`channel = "trust"` here too, so every crate in the list is checked under the
-Trust toolchain. `trust-wp-cli`, `targo-trust-wp`, `trust-wp-lib` and
-`trust-wp-test-utils` link no compiler internals either but are not in the
-checked list, so this snapshot makes no claim about them in a bare clone.
-The WP-core crates build standalone, and
-the in-process verbs run here with nothing installed; `verify` reports exactly
-what is missing (`trust-wp doctor`). End-to-end verification of a `.rs` file,
-and the `demo/` tour that exercises it, run from this snapshot once the
-toolchain is provisioned.
-
-## Documentation
-
-Public reference docs live at the repo root:
-
-- `contract-syntax.md` — the contract syntax reference (the full grammar).
-- `creusot-compatibility.md` — the Creusot-compatible attribute lane and its status.
-- `INTERFACE-v1.md` — the frozen specification-language interface (carrier, grade,
-  lane contract, invariants).
-- `benchmarking.md` — running and extending the benchmark suite.
-- `CHANGELOG.md` — what changed, and why.
-
-The project's goal statement, soundness-assumption inventory, developer-workflow
-guide, and the `&mut` give-back (normativity-flip) decision record are internal
-documents of the private tree.
-
-Source comments cite two trees that do not resolve in a clone of this
-repository. `designs/*.md` paths name the private tree's design notes; they are
-retained as provenance only. `reference/creusot/...` paths name a local Creusot
-checkout that the compatibility harness expects at that path — it is gitignored
-and you provision it yourself (`tests/creusot_compat/README.md`).
-
-## Examples
-
-Annotated contract examples. Run any of them with `trust-wp <path>`; the
-status column is what this tree actually prints today, not an aspiration.
-
-| file | shows | status |
-| --- | --- | --- |
-| `examples/simple.rs` | `#[requires]` / `#[ensures]` on plain functions | 2 verified |
-| `examples/loop_invariant.rs` | `#[invariant]` and `#[variant]` on loops | 3 verified |
-| `examples/mut_borrow.rs` | RustHorn `&mut` contracts (`^v`, `old(*v)`) | 3 verified — exit 0 |
-| `examples/verified_math/` | a small verified crate — run `trust-wp` inside it | 6 verified |
-
-`demo/` is a guided tour of the same ground from the command line: contracts,
-counterexamples, loop invariants, the emitted SMT query, and what trust-wp
-refuses to claim. Every step asserts an exit code and part of the output
-(16 checks on a full `./demo/run.sh`; `--quick` skips the crate-mode one), so
-the tour doubles as a regression test for the CLI's user-visible contract.
-`demo/README.md` is the written version.
+The goal is a drop-in, strictly stronger replacement for Creusot with `ay` as
+the only backend (`docs/GOAL.md`). The claim rests on trust-wp-std's
+`#[trusted]` specifications, which trust-wp takes as axioms and does not prove.
+Progress is measured by one function,
+`scripts/compare_baselines.py::find_true_100_violations`, over a fresh corpus
+run; results live beside the run, not here. The plan and the architectural
+decisions taken on it are in `docs/DIRECTION.md` §10 and `docs/DECISIONS.md`.

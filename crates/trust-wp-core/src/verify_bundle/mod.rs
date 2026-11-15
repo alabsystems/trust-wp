@@ -53,7 +53,10 @@ pub const TRUST_FORMULA_CLAIM_SCHEMA_VERSION: &str = "trust-wp.trust-formula.v1"
 // `trust-ir.` in trust-wp-lib) silently bypassed the whole gate.
 pub const TMIR_NATIVE_ORIGIN_SCHEMA_PREFIX: &str = "tmir.native-verification-bundle.";
 
-pub use claim::{native_predicate_for_obligation, NativeBundlePredicate, NativeClaimFormat};
+pub use claim::{
+    native_claim_names, native_predicate_for_obligation, NativeBundlePredicate, NativeClaimFormat,
+    NativeClaimName,
+};
 pub use engine::{FailClosedBundleVerifier, NativeTrustWpBundleVerifier, VerifyBundleEngine};
 pub use metadata::{
     TrustWpMetadataEntry, TrustWpNativeReplayEvidenceInput, TrustWpNativeReplayMetadataError,
@@ -74,7 +77,10 @@ pub use result::{
     ProofEvidenceFormat, ProofEvidenceWireError, ProofStrength, VerifyBundleResult,
     VerifyBundleStatus,
 };
-pub use trust_formula::{decode_trust_formula_v1_claim, TrustFormulaDecodeError};
+pub use trust_formula::{
+    decode_trust_formula_v1_claim, decode_trust_formula_v1_declared_claim, TrustFormulaDecodeError,
+    TrustFormulaV1Claim,
+};
 pub use trust_tmir::{
     compile_trust_tmir_proof_call_vcs, trust_tmir_to_verify_bundle,
     trust_tmir_to_verify_bundle_with_budget, TrustTmirAdapterBudget, TrustTmirAdapterError,
@@ -90,6 +96,8 @@ pub use types::{
     BundleTmirCompilerFactKind, BundleTmirCompilerFactRef, BundleTmirObligationCause,
     BundleTmirObligationSource, BundleTmirSourceSpan, VerifyBundleOptions, VerifyBundleRequest,
 };
+
+pub use crate::formula::elaborate::{NativeNameUse, NativeUseSort};
 
 #[cfg(test)]
 mod tests;

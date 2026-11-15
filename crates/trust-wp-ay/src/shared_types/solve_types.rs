@@ -137,13 +137,15 @@ impl From<ay_dpll::VerificationSummary> for SolveVerificationSnapshot {
 }
 
 /// Trust level applied by ay-dpll while producing a solve result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SolveVerificationLevelSnapshot {
     Trusted,
     DebugChecked,
     ProofChecked,
     FullyVerified,
+    /// Fail-closed default: nothing is known about how the verdict was checked.
+    #[default]
     Unknown,
 }
 
@@ -212,7 +214,14 @@ impl From<&ay_dpll::ResourceUsage> for SolveResourceSnapshot {
 }
 
 /// Full solve evidence retained from ay-dpll's atomic `SolveDetails` envelope.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default` is FAIL-CLOSED on purpose — an empty `result`, `model_validated`
+/// and `accepted_for_consumer` both false — so a default-constructed snapshot
+/// can never satisfy either authority gate
+/// (`refutation_evidence_gap_reason`, `unsat_proof_authority_gap`). It exists
+/// so a consumer's tests can build a snapshot field by field without a struct
+/// expression this `#[non_exhaustive]` type forbids across crates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SolveEvidenceSnapshot {
     pub result: String,

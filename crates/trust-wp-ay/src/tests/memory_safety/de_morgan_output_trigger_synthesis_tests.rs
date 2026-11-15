@@ -60,7 +60,7 @@ fn de_morgan_output_detects_falsifiable_existential_postcondition() {
     .expect("verification should not error");
 
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "exists<a:Bool>(a AND NOT a) is unsatisfiable — should fail verification: got {result:?}"
     );
 }

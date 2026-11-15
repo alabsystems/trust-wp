@@ -19,7 +19,7 @@ pub struct Inner;
 impl Size for Inner {
     #[logic]
     fn size(&self) -> i32 {
-        1
+        1i32
     }
 }
 

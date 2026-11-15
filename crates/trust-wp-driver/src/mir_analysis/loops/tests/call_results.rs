@@ -105,7 +105,6 @@ impl Callbacks for SpecLoopCallbacks {
                         loop_info,
                         Some(&analysis.loops),
                         Some(&call_spec_ctx),
-                        false,
                     )
                 })
                 .collect();
@@ -474,6 +473,9 @@ impl Callbacks for LoopObligationCallbacks {
                             extern_specs: &extern_specs,
                             body_blocks: &exclusive_blocks,
                             name_restore_blocks: Some(&name_restore_blocks),
+                            arithmetic: None,
+                            all_loops: Some(&analysis.loops),
+                            condition_switch: None,
                         };
                         collect_loop_body_call_obligations(
                             tcx,
@@ -565,6 +567,8 @@ i
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result == x + 1".to_string()],
         param_names: Some(vec!["x".to_string()]),
@@ -608,6 +612,8 @@ pub fn loop_with_pre_loop_vec_len_spec() {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result@.len() == count@".to_string()],
         param_names: Some(vec!["count".to_string()]),
@@ -652,6 +658,8 @@ pub fn loop_over_moves() {
 }
 "#;
     let moves_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "result@.len() == 8".to_string(),
@@ -705,6 +713,8 @@ pub fn loop_over_named_moves() {
 }
 "#;
     let moves_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "result@.len() == 8".to_string(),
@@ -755,6 +765,8 @@ pub fn nested_loop_over_moves(n: usize) {
 }
 "#;
     let moves_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "result@.len() == 8".to_string(),
@@ -812,6 +824,8 @@ pub fn loop_updates_max(n: u32, mut a: u32, mut b: u32) -> u32 {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "if *ma >= *mb { *mb == ^mb && result == ma } else { *ma == ^ma && result == mb }"
@@ -916,6 +930,8 @@ pub fn nested_loop_obligations(n: i32, m: i32) {
             SpecEntry {
                 callee_name: "require_outer".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec!["i < n".to_string()],
                     ensures: vec![],
                     param_names: Some(vec!["i".to_string(), "n".to_string()]),
@@ -924,6 +940,8 @@ pub fn nested_loop_obligations(n: i32, m: i32) {
             SpecEntry {
                 callee_name: "require_inner".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec!["j < m".to_string()],
                     ensures: vec![],
                     param_names: Some(vec!["j".to_string(), "m".to_string()]),
@@ -1018,6 +1036,8 @@ pub fn nested_loop_carries_point(n: i32) {
         vec![SpecEntry {
             callee_name: "require_point".to_string(),
             spec: StdSpec {
+                capture_inv_requires: Vec::new(),
+                inv_requires: Vec::new(),
                 requires: vec!["p == p".to_string()],
                 ensures: vec![],
                 param_names: Some(vec!["p".to_string()]),
@@ -1072,6 +1092,8 @@ pub fn loop_carries_call_assigned_local(i: i32, n: i32) {
         vec![SpecEntry {
             callee_name: "require_lt".to_string(),
             spec: StdSpec {
+                capture_inv_requires: Vec::new(),
+                inv_requires: Vec::new(),
                 requires: vec!["j < n".to_string()],
                 ensures: vec![],
                 param_names: Some(vec!["j".to_string(), "n".to_string()]),
@@ -1146,6 +1168,8 @@ pub fn loop_call_result_feeds_next_obligation(n: i32) {
             SpecEntry {
                 callee_name: "inc".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["result == x + 1".to_string()],
                     param_names: Some(vec!["x".to_string()]),
@@ -1154,6 +1178,8 @@ pub fn loop_call_result_feeds_next_obligation(n: i32) {
             SpecEntry {
                 callee_name: "require_positive".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec!["x > 0".to_string()],
                     ensures: vec![],
                     param_names: Some(vec!["x".to_string()]),
@@ -1231,6 +1257,8 @@ pub fn guarded_call_uses_available_postcondition(n: i32) {
             SpecEntry {
                 callee_name: "available".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["result ==> p > 0".to_string()],
                     param_names: Some(vec!["p".to_string()]),
@@ -1239,6 +1267,8 @@ pub fn guarded_call_uses_available_postcondition(n: i32) {
             SpecEntry {
                 callee_name: "require_positive".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec!["x > 0".to_string()],
                     ensures: vec![],
                     param_names: Some(vec!["x".to_string()]),
@@ -1301,6 +1331,8 @@ pub fn loop_available_guards_count_degree(n: i32, board: Board, adj: Point) {
             SpecEntry {
                 callee_name: "available".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec![],
                     ensures: vec!["result ==> b.in_bounds(p)".to_string()],
                     param_names: Some(vec!["b".to_string(), "p".to_string()]),
@@ -1309,6 +1341,8 @@ pub fn loop_available_guards_count_degree(n: i32, board: Board, adj: Point) {
             SpecEntry {
                 callee_name: "count_degree".to_string(),
                 spec: StdSpec {
+                    capture_inv_requires: Vec::new(),
+                    inv_requires: Vec::new(),
                     requires: vec!["b.in_bounds(p)".to_string()],
                     ensures: vec![],
                     param_names: Some(vec!["b".to_string(), "p".to_string()]),
@@ -1349,9 +1383,11 @@ fn contains_board_in_bounds(expr: &PureExpr) -> bool {
         } => {
             method == "in_bounds"
                 && (matches!(receiver.as_ref(), PureExpr::Var(name, _) if name == "board")
-                    || matches!(receiver.as_ref(), PureExpr::Var(name, _) if name == "arg0"))
+                    || matches!(receiver.as_ref(), PureExpr::Var(name, _)
+                        if name.starts_with("$fallback_arg0_")))
                 && (matches!(args.first(), Some(PureExpr::Var(name, _)) if name == "adj")
-                    || matches!(args.first(), Some(PureExpr::Var(name, _)) if name == "arg1"))
+                    || matches!(args.first(), Some(PureExpr::Var(name, _))
+                        if name.starts_with("$fallback_arg1_")))
         }
         PureExpr::BinOp(lhs, _, rhs) => {
             contains_board_in_bounds(lhs) || contains_board_in_bounds(rhs)
@@ -1582,6 +1618,8 @@ result
 "#;
 
     let into_inner_spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result == self".to_string()],
         param_names: Some(vec!["self".to_string()]),
@@ -1796,7 +1834,7 @@ i
     assert!(
         !free_vars
             .iter()
-            .any(|name| name.starts_with("__trust_wp_for_iter_elem_")),
+            .any(|name| name.starts_with("$for_iter_elem_")),
         "range for-loop condition should not depend on a synthetic loop element: {condition:?}"
     );
 }
@@ -2002,10 +2040,12 @@ for _ in 0usize..3usize {
     );
 }
 
-/// When a spec has ensures but no `result == <expr>` pattern (e.g., only
-/// `result > 0`), the call result should still be havoced. (#1463)
+/// A spec with ensures but no `result == <expr>` pattern (only `result > 0`)
+/// names the call's result with a symbol and states the clause about it as a
+/// call fact; a havoced result would let the loop VC pick `i' <= 0`, which the
+/// program rules out (loop_body_call_postcondition_premise_control).
 #[test]
-fn call_result_havoced_with_predicate_only_spec() {
+fn call_result_named_with_predicate_only_spec() {
     let source = r#"
 #[inline(never)]
 fn positive(x: i32) -> i32 {
@@ -2021,6 +2061,8 @@ i
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result > 0".to_string()],
         param_names: Some(vec!["x".to_string()]),
@@ -2036,12 +2078,30 @@ i
         }],
     );
     let loop_body = loop_body.expect("expected loop body extraction");
-    // `result > 0` doesn't produce a `result == <expr>` constraint,
-    // so the call result should be havoced.
+    let Some(PureExpr::Var(symbol, _)) = loop_body.body_effects.get("i") else {
+        panic!(
+            "predicate-only spec should name the call result: {:?}",
+            loop_body.body_effects
+        );
+    };
     assert!(
-        !loop_body.body_effects.contains_key("i"),
-        "predicate-only spec should not model call result: {:?}",
-        loop_body.body_effects
+        symbol.starts_with("__trust_wp_loop_call_result_"),
+        "unexpected result name {symbol}"
+    );
+    let states_positive = |fact: &PureExpr| {
+        matches!(fact, PureExpr::BinOp(lhs, BinOp::Gt, rhs)
+            if matches!(lhs.as_ref(), PureExpr::Var(name, _) if name == symbol)
+                && matches!(rhs.as_ref(), PureExpr::Int(0)))
+    };
+    assert!(
+        loop_body.call_facts.iter().any(states_positive),
+        "the clause `result > 0` should be stated at the result: {:?}",
+        loop_body.call_facts
+    );
+    assert!(
+        loop_body.dropped_premises.is_empty(),
+        "nothing should be dropped: {:?}",
+        loop_body.dropped_premises
     );
 }
 
@@ -2067,6 +2127,8 @@ i
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result@ == self@.len()".to_string()],
         param_names: Some(vec!["self".to_string()]),
@@ -2112,6 +2174,8 @@ i
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["result@ == self@.len()".to_string()],
         param_names: Some(vec!["self".to_string()]),
@@ -2282,6 +2346,8 @@ pub fn inc_max_repeat(mut a: u32, mut b: u32, n: u32) {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec![
             "if *ma >= *mb { *mb == ^mb && result == ma } else { *ma == ^ma && result == mb }"
@@ -2505,6 +2571,8 @@ pub fn loop_pushes(v: &mut Vec<i32>, n: i32) {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["(^self)@ == self@.push_back(value)".to_string()],
         param_names: Some(vec!["self".to_string(), "value".to_string()]),
@@ -2564,6 +2632,8 @@ pub fn loop_swaps(v: &mut Vec<i32>, n: usize) {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         ensures: vec!["(^self)@.exchange(self@, a@, b@)".to_string()],
         param_names: Some(vec!["self".to_string(), "a".to_string(), "b".to_string()]),
@@ -2643,6 +2713,8 @@ pub fn loop_reads(v: &Vec<i32>, n: usize) -> usize {
 }
 "#;
     let spec = StdSpec {
+        capture_inv_requires: Vec::new(),
+        inv_requires: Vec::new(),
         requires: vec![],
         // A (deliberately mis-shaped) final-self clause: even if present, a
         // `&self` receiver must be ignored by the mut-self modeler.

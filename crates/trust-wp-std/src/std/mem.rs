@@ -21,8 +21,9 @@ pub fn size_of_logic<T>() -> Int {
 /// Returns the alignment of type `T` in bytes as a logical `Int`.
 ///
 /// This is the specification-level counterpart to `std::mem::align_of::<T>()`.
-pub fn align_of_logic<T>() -> Int {
-    Int::from(std::mem::align_of::<T>() as i128)
+pub fn align_of_logic<T>() -> usize {
+    // Creusot `creusot-std/src/std/mem.rs`: alignment is a `usize`.
+    std::mem::align_of::<T>()
 }
 
 /// Internal specification definitions used by the driver's hardcoded fallback

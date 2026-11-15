@@ -20,6 +20,7 @@
 //@ teeth: "trust-wp: prophecy_over_literal_false_accept verified ✓", exit code 0, with
 //@ teeth: decisions=0 and the negated postcondition encoded to literal `false`
 //@ teeth: ("(assume t0 false)"). This is not a reconstruction — it is the run that found the bug.
+//@ also-verified: touch
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0

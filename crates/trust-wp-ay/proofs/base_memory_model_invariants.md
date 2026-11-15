@@ -334,18 +334,18 @@ By the SMT array axiom `select(store(A, i, v), i) = v`,
 ## Verification Commands
 
 ```bash
-# Run all memory-model tests under the pinned nightly toolchain
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib -- memory_model
+# Run all memory-model tests with the Trust toolchain (rust-toolchain.toml)
+targo --unverified test -p trust-wp-ay --lib -- memory_model
 
 # Run representative theorem tests
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib test_base_memory_model_encode_points_to
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib test_base_memory_model_encode_sep_conj
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib test_double_dealloc_detection
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib test_use_after_free_detection
-cargo +nightly-2025-11-13 test -p trust-wp-ay --lib test_permission_transfer_soundness
+targo --unverified test -p trust-wp-ay --lib test_base_memory_model_encode_points_to
+targo --unverified test -p trust-wp-ay --lib test_base_memory_model_encode_sep_conj
+targo --unverified test -p trust-wp-ay --lib test_double_dealloc_detection
+targo --unverified test -p trust-wp-ay --lib test_use_after_free_detection
+targo --unverified test -p trust-wp-ay --lib test_permission_transfer_soundness
 
 # Full trust-wp-ay test suite
-cargo +nightly-2025-11-13 test -p trust-wp-ay
+targo --unverified test -p trust-wp-ay
 ```
 
 ---

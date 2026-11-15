@@ -245,9 +245,9 @@ fn test_view_var_eq_constructor_preseed_no_sort_mismatch() {
 /// Regression for #1752: quantifier-bound variable in constructor equality
 /// with Deref(Var) pattern (postcondition `*self == OwnResult::Ok(t)`).
 ///
-/// The preseed mechanism from commit a69174f1 handles the Deref(Var)
-/// pattern for `*self`, resolving the sort mismatch between the Int-sorted
-/// `self_current` and the Datatype-sorted `OwnResult::Ok(t)`.
+/// The preseed mechanism handles the Deref(Var) pattern for `*self`,
+/// resolving the sort mismatch between the Int-sorted `self_current` and
+/// the Datatype-sorted `OwnResult::Ok(t)`.
 #[test]
 #[timeout(30000)]
 fn test_quantifier_bound_var_in_constructor_eq_deref_no_sort_mismatch() {

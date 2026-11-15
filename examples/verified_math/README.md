@@ -59,7 +59,7 @@ trust-wp workspace), so run them from this directory rather than by package
 name from the root:
 
 ```bash
-cd examples/verified_math && cargo test
+cd examples/verified_math && targo --unverified test
 ```
 
 ## Contract Syntax

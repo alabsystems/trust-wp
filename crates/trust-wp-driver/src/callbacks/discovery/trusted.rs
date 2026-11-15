@@ -11,7 +11,9 @@
 
 use std::{fs, path::PathBuf};
 
-use rustc_hir::{attrs::AttributeKind, def::DefKind, def_id::DefId, AttrStyle, Attribute, Node};
+use rustc_ast::attr::AttributeExt;
+use rustc_attr_ir::{Attribute, AttributeKind};
+use rustc_hir::{def::DefKind, def_id::DefId, AttrStyle, Node};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{sym, FileName, Span, Symbol};
 
@@ -91,7 +93,7 @@ fn outer_doc_value(attr: &Attribute) -> Option<Symbol> {
             comment,
             ..
         }) => Some(*comment),
-        Attribute::Unparsed(normal)
+        Attribute::Tool(normal) | Attribute::DeriveHelper(normal)
             if normal.style == AttrStyle::Outer && attr.has_name(sym::doc) =>
         {
             crate::attr_utils::doc_marker_str(attr)

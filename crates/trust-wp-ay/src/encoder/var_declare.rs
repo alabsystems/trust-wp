@@ -262,12 +262,33 @@ impl AYEncoder {
     /// which are always speculative defaults being corrected by stronger type
     /// evidence. Genuine conflicts (non-Int vs different non-Int) still error.
     ///
-    /// The old Int-sorted ay term remains in the solver but is no longer
-    /// referenced by the active shell binding. Assertions already made about the old term
-    /// constrain a phantom variable — this is sound because the Int default
-    /// was incorrect and those constraints were unsound anyway.
-    #[allow(clippy::too_many_lines)]
+    /// The old ay term remains in the solver but is no longer referenced by
+    /// the active shell binding. Assertions already made about it constrain a
+    /// constant no later read sees: an UNSAT over them is still a proof, since
+    /// they only weaken the query, but a model need not be an execution, so
+    /// the abandoned term is recorded and a refutation that reads it is
+    /// withheld (D-218).
     pub(crate) fn get_or_declare_var(
+        &mut self,
+        name: &str,
+        sort: Sort,
+    ) -> Result<Term, EncodingError> {
+        let prior = self.var_term(name);
+        let term = self.get_or_declare_var_at_sort(name, sort)?;
+        // An upgrade that rebinds the name to a fresh constant splits it: the
+        // facts already asserted about the prior constant are not facts about
+        // the new one. The structural bridge rebinds to a term built over the
+        // prior constant, which keeps the two related, and is not counted.
+        if let Some(prior) = prior {
+            if prior != term && self.solver.var_name(term).is_some() {
+                self.var_env.record_split_source(name, prior);
+            }
+        }
+        Ok(term)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn get_or_declare_var_at_sort(
         &mut self,
         name: &str,
         sort: Sort,

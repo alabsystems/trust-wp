@@ -121,6 +121,7 @@ RUNNER_REQUIRED_ATTRS = (
     "BACKEND_PASS_PREFIX",
     "NO_REPLAY_PASS_PREFIX",
     "NO_REPLAY_STRICT_ERROR_MESSAGE",
+    "NO_REPLAY_VERIFIED_PREFIX",
     "STRICT_PASS_PREFIX",
     "TestResult",
     "_KNOWN_STRICT_REJECTION_TESTS",
@@ -133,13 +134,16 @@ RUNNER_REQUIRED_ATTRS = (
     "classify_error_category",
     "classify_failure",
     "classify_no_replay_result",
+    "classify_no_replay_result_with_mode",
     "classify_should_fail_result",
+    "classify_should_fail_result_with_credit",
     "classify_unknown_category",
     "create_test_project",
     "create_warmup_project",
     "ensure_harness_binaries",
     "find_creusot_tests",
     "find_workspace_root",
+    "rejection_pass_message",
     "run_trust_wp_on_project",
     "setup_trust_wp_rustc_wrapper",
     "subprocess",
@@ -161,6 +165,7 @@ class HarnessFacade(Protocol):
     LANE_PAIR_MAX_AGE_GAP_COMMITS: int
     NO_REPLAY_PASS_PREFIX: str
     NO_REPLAY_STRICT_ERROR_MESSAGE: str
+    NO_REPLAY_VERIFIED_PREFIX: str
     PARSE_FAILURE_PATTERNS: dict[str, Pattern[str]]
     STRICT_PASS_PREFIX: str
     VALID_LANES: tuple[str, ...]
@@ -267,6 +272,18 @@ class HarnessFacade(Protocol):
         test_name: str,
         exit_code: int | None = None,
     ) -> tuple[str, str | None]: ...
+    def classify_should_fail_result_with_credit(
+        self,
+        success: bool,
+        output: str,
+        source: str,
+        test_name: str,
+        exit_code: int | None = None,
+    ) -> tuple[str, str | None, str | None]: ...
+    def classify_no_replay_result_with_mode(
+        self, output: str, exit_code: int | None = None, test_name: str | None = None
+    ) -> tuple[str, str | None, str | None]: ...
+    def rejection_pass_message(self, credit: str | None) -> str: ...
     def compute_lane_pair_freshness(
         self,
         *,

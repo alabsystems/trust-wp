@@ -279,31 +279,40 @@ fn test_parse_let_else_tuple_pattern() {
     assert_eq!(arms[1].body, PureExpr::Int(0));
 }
 
-/// `let mut Some(x) = opt else { 0 }; x` — `mut` qualifier is transparent.
+/// `let Some(mut x) = opt else { 0 }; x` — `mut` qualifier is transparent.
+/// A pattern that cannot fail never takes the `else`: `let mut x = opt else
+/// { 0 }; x` is `opt`.
 #[test]
 fn test_parse_let_else_with_mut() {
-    let expr = parse_ok("{ let mut x = opt else { 0 }; x }");
+    let expr = parse_ok("{ let Some(mut x) = opt else { 0 }; x }");
     let PureExpr::Match { scrutinee, arms } = &expr else {
         panic!("expected Match, got {expr:?}");
     };
     assert_eq!(scrutinee.as_ref(), &PureExpr::Var("opt".into(), None));
     assert_eq!(arms.len(), 2);
-    assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "x"));
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { name, inner: Some(inner) }
+        if name == "Some" && matches!(inner.as_ref(), Pattern::Binding(x) if x == "x"))
+    );
     assert_eq!(arms[0].body, PureExpr::Var("x".into(), None));
     assert_eq!(arms[1].pattern, Pattern::Wildcard);
     assert_eq!(arms[1].body, PureExpr::Int(0));
+    assert_eq!(
+        parse_ok("{ let mut x = opt else { 0 }; x }"),
+        PureExpr::Var("opt".into(), None)
+    );
 }
 
 /// `let Some(x): Option<i32> = opt else { 0 }; x` — type annotation
 /// before `=` is consumed and discarded, let-else still parses.
 #[test]
 fn test_parse_let_else_with_type_annotation() {
-    let expr = parse_ok("{ let x: i32 = opt else { 0 }; x }");
+    let expr = parse_ok("{ let Some(x): Option<i32> = opt else { 0 }; x }");
     let PureExpr::Match { arms, .. } = &expr else {
         panic!("expected Match, got {expr:?}");
     };
     assert_eq!(arms.len(), 2);
-    assert!(matches!(&arms[0].pattern, Pattern::Binding(name) if name == "x"));
+    assert!(matches!(&arms[0].pattern, Pattern::Constructor { name, .. } if name == "Some"));
     assert_eq!(arms[1].pattern, Pattern::Wildcard);
 }
 
@@ -381,5 +390,110 @@ fn test_parse_let_else_unclosed_block_errors() {
     assert!(
         result.is_err(),
         "let-else with unclosed else-block must error, got: {result:?}"
+    );
+}
+
+// --- named-field patterns in `let` take the same door a `match` does ---
+
+/// `{ let S { a: aa, b: _bb } = s; aa }` is a single-arm Match whose pattern
+/// still carries the field names. The alternative — nested `Let`s reading
+/// `__trust_wp_tuple_get_<written position>` — decides which field `aa`
+/// denotes by the order the author typed the fields in.
+#[test]
+fn named_field_let_is_a_single_arm_match_with_its_field_names() {
+    let expr = parse_ok("{ let S { a: aa, b: _bb } = s; aa }");
+    let PureExpr::Match { scrutinee, arms } = &expr else {
+        panic!("expected Match, got {expr:?}");
+    };
+    assert_eq!(scrutinee.as_ref(), &PureExpr::Var("s".into(), None));
+    assert_eq!(arms.len(), 1);
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { name, inner: Some(inner) }
+            if name == "S{a,b}"
+                && matches!(inner.as_ref(), Pattern::Tuple(elems)
+                    if elems.len() == 2
+                        && matches!(&elems[0], Pattern::Binding(b) if b == "aa")
+                        && matches!(&elems[1], Pattern::Binding(b) if b == "_bb"))),
+        "expected the S{{a,b}} pattern intact, got {:?}",
+        arms[0].pattern
+    );
+    assert_eq!(arms[0].body, PureExpr::Var("aa".into(), None));
+}
+
+/// The top-level (end-of-input) `let` form desugars through the same function.
+#[test]
+fn named_field_let_at_top_level_keeps_its_field_names() {
+    let expr = parse_body_ok("let S { a: aa, .. } = s; aa@ == 5");
+    let PureExpr::Match { arms, .. } = &expr else {
+        panic!("expected Match, got {expr:?}");
+    };
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { name, .. } if name == "S{a,..}"),
+        "expected S{{a,..}} with the rest marker, got {:?}",
+        arms[0].pattern
+    );
+}
+
+/// A named-field pattern nested inside a tuple-style constructor is reached by
+/// the positional walk and then lowered whole: the outer field read is
+/// positional (unnamed fields), the inner pattern is a Match on that read.
+#[test]
+fn named_field_pattern_nested_in_a_tuple_constructor_let_stays_whole() {
+    let expr = parse_ok("{ let W(S { a: aa, b: _ }) = w; aa }");
+    let PureExpr::Match { scrutinee, arms } = &expr else {
+        panic!("expected Match, got {expr:?}");
+    };
+    assert!(
+        matches!(scrutinee.as_ref(), PureExpr::LogicFnCall { name, args }
+            if name == &tuple_field_logic_fn_name(0)
+                && args == &[PureExpr::Var("w".into(), None)]),
+        "expected the positional read of W's only field, got {scrutinee:?}"
+    );
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { name, .. } if name == "S{a,b}"),
+        "got {:?}",
+        arms[0].pattern
+    );
+}
+
+/// An alias around a named-field pattern names the value (here the name `s`
+/// itself, which the alias is substituted by) and lowers the inner pattern
+/// whole.
+#[test]
+fn aliased_named_field_let_keeps_its_field_names() {
+    let expr = parse_ok("{ let w @ S { a: aa, b: _ } = s; aa == w }");
+    let PureExpr::Match { scrutinee, arms } = &expr else {
+        panic!("expected the named-field Match, got {expr:?}");
+    };
+    assert_eq!(scrutinee.as_ref(), &PureExpr::Var("s".into(), None));
+    assert!(
+        matches!(&arms[0].pattern, Pattern::Constructor { name, .. } if name == "S{a,b}"),
+        "got {:?}",
+        arms[0].pattern
+    );
+    assert_eq!(arms[0].body.to_string(), "(aa == s)");
+}
+
+/// A closure's destructuring parameter is matched as a `let` of the pattern
+/// is: a named-field constructor keeps its field names for the placement
+/// pass, and a tuple-style one reads its fields positionally.
+#[test]
+fn a_constructor_in_a_closure_parameter_is_matched_as_a_let_is() {
+    let named = parse_contract("|(S { a: aa, b: _ }, y)| aa == y").unwrap();
+    let PureExpr::Closure { params, body } = &named else {
+        panic!("expected Closure, got {named:?}");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(
+        matches!(body.as_ref(), PureExpr::Match { arms, .. }
+            if matches!(&arms[0].pattern, Pattern::Constructor { name, .. } if name == "S{a,b}")),
+        "got {body:?}"
+    );
+    let positional = parse_contract("|(Pair(a, b), y)| a == y").unwrap();
+    assert_eq!(
+        positional.to_string(),
+        "|$cp0| let a = __trust_wp_tuple_get_0(__trust_wp_tuple_get_0($cp0)); let b = \
+         __trust_wp_tuple_get_1(__trust_wp_tuple_get_0($cp0)); let y = \
+         __trust_wp_tuple_get_1($cp0); (a == y)"
     );
 }

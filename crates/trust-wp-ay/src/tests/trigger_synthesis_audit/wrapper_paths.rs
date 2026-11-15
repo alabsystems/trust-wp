@@ -16,7 +16,8 @@ use trust_wp_core::logic::LogicFnDef;
 
 use super::{
     super::helpers::{
-        binop, exists, forall, ge, gt, int, le, logic_fn_call, method_call, not, old, var,
+        binop, exists, forall, forall_with_sort, ge, gt, int, le, logic_fn_call, method_call, not,
+        old, var,
     },
     fixtures::{assert_synthesized_triggers, synthesized_trigger},
 };
@@ -580,9 +581,11 @@ fn trigger_synthesis_through_final_wrapper_encodes() {
         .register_logic_fn(&f_def)
         .expect("register logic fn");
 
-    // forall<i> final(test_f(i)) > 0
-    let expr = forall(
+    // forall<i: Int> final(test_f(i)) > 0: an unannotated written binder's
+    // final value is refused (D-127), a value binder's is the binder.
+    let expr = forall_with_sort(
         "i",
+        trust_wp_core::formula::ExprSort::Int,
         gt(
             PureExpr::Final(Arc::new(logic_fn_call("test_f", vec![var("i")]))),
             int(0),

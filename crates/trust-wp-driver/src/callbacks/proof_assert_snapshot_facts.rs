@@ -34,6 +34,13 @@ pub(in crate::callbacks) fn substitute_snapshot_facts(
 }
 
 fn fact_boundary_final_carrier_names(fact: &PureExpr) -> HashSet<String> {
+    // A call postcondition scoped under its own preconditions
+    // (`pre ==> post`) keeps the boundary carriers of `post`; the same
+    // filtered substitution is applied to the whole implication, so the
+    // guard and the post are renamed consistently.
+    if let PureExpr::BinOp(_, BinOp::Implies, post) = fact {
+        return fact_boundary_final_carrier_names(post);
+    }
     let mut names = HashSet::new();
     if let PureExpr::BinOp(lhs, _, rhs) = fact {
         if let Some(name) = bare_final_carrier_root_name(lhs) {
@@ -196,7 +203,7 @@ fn is_scalar_wrapper_alias_expr(expr: &PureExpr) -> bool {
 fn is_scalar_wrapper_alias_sort(sort: Option<&ExprSort>) -> bool {
     matches!(
         sort,
-        Some(ExprSort::Int | ExprSort::Bool | ExprSort::Float | ExprSort::Unit)
+        Some(ExprSort::Int | ExprSort::Bool | ExprSort::Float(_) | ExprSort::Unit)
     )
 }
 

@@ -5,7 +5,7 @@
 //! Recursive variant decrease verification.
 //!
 //! Verifies strict decrease of recursive variants at each recursive call
-//! site to prove termination. Extracted from `verification.rs` (#1669).
+//! site to prove termination.
 //!
 //! ## WellFounded variant support (#2665)
 //!
@@ -26,6 +26,7 @@ use trust_wp_ay::{
 };
 use trust_wp_core::{
     formula::{
+        int_bounds::signed_bounds_expr,
         internal::tuple_lowering::{
             tuple_field_logic_fn_index, tuple_field_logic_fn_name, tuple_logic_fn_arity,
         },
@@ -40,6 +41,7 @@ use super::super::{
         contracts::FunctionContract,
         mir_analysis::{extract_recursive_call_args, get_mir_body},
     },
+    function_credit::{grant_function_credit, CreditKind, FunctionCredit},
     ghost_context::rustc_span_to_source_span,
     helpers::report_counterexample,
     parsing::ParsedContract,
@@ -154,8 +156,13 @@ pub(in crate::callbacks) fn build_recursive_variant_requires(
 
 /// Describes a variant type for decrease-condition generation.
 pub(in crate::callbacks) enum VariantKind {
-    /// Integer-typed variant: use `call_variant < variant`.
+    /// Mathematical integer measure: `0 <= variant && call_variant < variant`.
+    /// A strict descent over all of Z alone is not well-founded.
     Integer,
+    /// A signed machine integer's entire finite domain is well-founded under
+    /// strict decrease, including values below zero. Preserve that domain's
+    /// lower bound rather than imposing the mathematical Int relation.
+    SignedMachineInteger { lower_bound: PureExpr },
     /// Struct with all-integer fields: use componentwise field decrease (#2665).
     ///
     /// The field names are stored for constructing field projections.
@@ -219,13 +226,38 @@ pub(in crate::callbacks) fn classify_variant_type<'tcx>(
     let param_ty = inputs[param_idx];
 
     let kind = match param_ty.kind() {
-        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Char => VariantKind::Integer,
+        TyKind::Int(int_ty) => {
+            let pointer_bits = u32::try_from(tcx.data_layout.pointer_size().bits()).unwrap_or(64);
+            let bits = super::super::integer_range::int_bit_width(*int_ty, pointer_bits);
+            VariantKind::SignedMachineInteger {
+                lower_bound: signed_bounds_expr(bits).0,
+            }
+        }
+        TyKind::Uint(_) | TyKind::Char => VariantKind::Integer,
+        // The runtime carrier of mathematical Int is a one-field struct, but
+        // its verification domain is unbounded. Do not classify it by that
+        // carrier's machine-integer field.
+        TyKind::Adt(adt_def, _)
+            if crate::provenance::is_spec_library_item(tcx, adt_def.did())
+                && matches!(
+                    tcx.def_path_str(adt_def.did()).as_str(),
+                    "trust_wp_std::logic::int::Int"
+                        | "trust_wp_std::logic::Int"
+                        | "trust_wp_std::Int"
+                        | "trust_wp::logic::int::Int"
+                        | "trust_wp::logic::Int"
+                        | "trust_wp::Int"
+                        | "creusot_std::Int"
+                ) =>
+        {
+            VariantKind::Integer
+        }
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             // Check if ALL fields are integer-typed.
             let variant_def = adt_def.non_enum_variant();
             let mut field_names = Vec::new();
             for field in variant_def.fields.iter() {
-                let field_ty = field.ty(tcx, substs).skip_norm_wip();
+                let field_ty = field.ty(tcx, *substs).skip_norm_wip();
                 match field_ty.kind() {
                     TyKind::Int(_) | TyKind::Uint(_) => {
                         field_names.push(field.name.to_string());
@@ -264,7 +296,10 @@ pub(in crate::callbacks) fn classify_variant_type<'tcx>(
 
 /// Build the decrease condition for a variant at a recursive call site.
 ///
-/// For integer variants: `call_variant < variant` (standard).
+/// For mathematical integer variants: `0 <= variant && call_variant < variant`.
+/// The lower bound is a goal, never a hypothesis; checking it on the caller
+/// permits a final call into a negative base case. Signed machine-integer
+/// measures instead use their finite type's minimum.
 /// For struct variants with integer fields: conjunction of per-field
 /// strict decrease (`variant.fi > call_variant.fi` for each field `fi`).
 /// This is the componentwise strict decrease used by `WellFounded` impls
@@ -275,10 +310,15 @@ fn build_decrease_condition(
     kind: &VariantKind,
 ) -> Option<PureExpr> {
     match kind {
-        VariantKind::Integer => Some(PureExpr::BinOp(
-            Arc::new(call_variant.clone()),
-            BinOp::Lt,
-            Arc::new(variant.clone()),
+        VariantKind::Integer => Some(bounded_integer_decrease(
+            variant,
+            call_variant,
+            PureExpr::Int(0),
+        )),
+        VariantKind::SignedMachineInteger { lower_bound } => Some(bounded_integer_decrease(
+            variant,
+            call_variant,
+            lower_bound.clone(),
         )),
         VariantKind::IntegerFieldStruct {
             field_names,
@@ -307,13 +347,21 @@ fn build_decrease_condition(
             let variant_unsorted = strip_datatype_sort(variant);
             let arity = field_names.len();
             let mut conjuncts = Vec::with_capacity(field_names.len());
-            for field_name in field_names {
-                let field_index: usize = field_name.parse().unwrap_or(0);
+            for (field_index, _) in field_names.iter().enumerate() {
                 let getter_name = tuple_field_logic_fn_name(field_index);
-                let variant_field = PureExpr::LogicFnCall {
+                // Both sides can be known aggregates. Project them with the
+                // same checked constructor/arity rule so a concrete current
+                // measure does not introduce unnecessary quantified selectors.
+                let variant_field = beta_reduce_struct_field(
+                    &variant_unsorted,
+                    field_index,
+                    arity,
+                    constructor_name.as_deref(),
+                )
+                .unwrap_or_else(|| PureExpr::LogicFnCall {
                     name: getter_name.clone(),
                     args: vec![variant_unsorted.clone()],
-                };
+                });
                 // Beta-reduce: if call_variant is the struct's own constructor
                 // (or a synthetic tuple constructor) with matching arity,
                 // extract the field directly.
@@ -343,6 +391,26 @@ fn build_decrease_condition(
         VariantKind::StructuralSubterm { .. } => None,
         VariantKind::Unsupported { .. } => None,
     }
+}
+
+fn bounded_integer_decrease(
+    variant: &PureExpr,
+    call_variant: &PureExpr,
+    lower_bound: PureExpr,
+) -> PureExpr {
+    PureExpr::BinOp(
+        Arc::new(PureExpr::BinOp(
+            Arc::new(lower_bound),
+            BinOp::Le,
+            Arc::new(variant.clone()),
+        )),
+        BinOp::And,
+        Arc::new(PureExpr::BinOp(
+            Arc::new(call_variant.clone()),
+            BinOp::Lt,
+            Arc::new(variant.clone()),
+        )),
+    )
 }
 
 trait StructuralVariantFallback<'tcx> {
@@ -377,7 +445,7 @@ fn classify_structural_variant<'tcx>(
     for variant in root_adt.variants() {
         for (idx, field) in variant.fields.iter().enumerate() {
             let (field_ty, used_box) =
-                peel_ref_box_ty_with_box_flag(tcx, field.ty(tcx, root_args).skip_norm_wip());
+                peel_ref_box_ty_with_box_flag(tcx, field.ty(tcx, *root_args).skip_norm_wip());
             if matches!(field_ty.kind(), TyKind::Adt(field_adt, _) if field_adt.did() == root_adt.did())
                 && recursive_fields
                     .iter()
@@ -677,7 +745,8 @@ pub(in crate::callbacks) fn verify_recursive_variant_decrease(
         let _ = cfg.tcx.mir_borrowck(root);
     }
 
-    let Some(body_with_facts) = try_get_body_with_context(cfg.contract.local_def_id) else {
+    let Some(body_with_facts) = try_get_body_with_context(cfg.tcx, cfg.contract.local_def_id)
+    else {
         // MIR body extraction failed for recursive function with variants.
         // Skip normal verification so variant-only contracts cannot fall
         // through to trivial postcondition verification (#825).
@@ -685,7 +754,7 @@ pub(in crate::callbacks) fn verify_recursive_variant_decrease(
         return true;
     };
 
-    let mir_body = get_mir_body(body_with_facts);
+    let mir_body = get_mir_body(&body_with_facts);
     let call_sites = extract_recursive_call_args(
         mir_body,
         &cfg.parsed.arg_names,
@@ -726,6 +795,10 @@ pub(in crate::callbacks) fn verify_recursive_variant_decrease(
     let mut all_variants_verified = true;
     let mut any_assumed = false;
     let mut any_structural_evidence_gap = false;
+    // A call site whose variant obligation came back VACUOUS: the solver found
+    // the base assertions contradictory, so nothing was decided. See the
+    // `is_vacuous` arm below.
+    let mut any_vacuous = false;
     for variant in &cfg.parsed.loop_fields.variants {
         // Classify the variant type once per variant expression (#2665).
         let kind =
@@ -914,16 +987,27 @@ pub(in crate::callbacks) fn verify_recursive_variant_decrease(
                     result: VerificationResult::Unknown(ref reason),
                     ..
                 }) => {
-                    // Vacuous variant decrease: the preconditions + path
-                    // conditions are contradictory, making this call site
-                    // unreachable. The variant decrease is trivially true.
-                    // This is acceptable for variant checks on unreachable
-                    // paths — but we no longer label it "verified" (#2663).
+                    // Vacuous variant decrease: the solver reports the base
+                    // assertions contradictory, so the decrease condition was
+                    // never decided — nothing was proved about this call site.
+                    // It does NOT keep `all_variants_verified` from reaching
+                    // the tail (a contradictory precondition makes the site
+                    // unreachable, so there is no counterexample to report),
+                    // but it must not be credited either: `any_vacuous` routes
+                    // the tail to the `vacuous` arm, which counts
+                    // `counters.vacuous` — exit code 2, never `verified`
+                    // (#2663). Merely logging here would leave
+                    // `all_variants_verified` true and the tail printing
+                    // `verified ✓ (termination)`: a function with UNSAT
+                    // `#[requires]` and a non-terminating self-call would be
+                    // credited with termination on a proof with zero
+                    // assertions (`s61_vacuous_variant_termination_credit.rs`).
                     let is_vacuous = matches!(
                         reason,
                         trust_wp_ay::UnknownReason::SolverMessage(msg) if msg.contains("vacuous proof")
                     );
                     if is_vacuous {
+                        any_vacuous = true;
                         if cfg.verbose {
                             debug!(
                                 "trust-wp:   variant decrease vacuous (unreachable call site {site_idx})"
@@ -971,15 +1055,32 @@ pub(in crate::callbacks) fn verify_recursive_variant_decrease(
         }
     }
 
-    if all_variants_verified && any_assumed {
+    if all_variants_verified && any_vacuous {
+        // Undecided, not discharged: at least one call site's decrease
+        // condition was answered only by the contradiction in its own
+        // premises. `vacuous` is the counter the function-level VC already
+        // uses for exactly this shape (reporting.rs), and a non-zero
+        // `vacuous` forces exit code 2.
+        counters.vacuous += 1;
+        eprintln!(
+            "trust-wp: {} vacuous (termination — variant decrease trivial on contradictory premises) (#2663)",
+            cfg.def_path
+        );
+        eprintln!("  at {}", cfg.loc);
+    } else if all_variants_verified && any_assumed {
         counters.assumed += 1;
         eprintln!(
             "trust-wp: {} assumed (termination — not all call sites proven) (#2121)",
             cfg.def_path
         );
     } else if all_variants_verified && !any_structural_evidence_gap {
-        counters.verified += 1;
-        eprintln!("trust-wp: {} verified \u{2713} (termination)", cfg.def_path);
+        grant_function_credit(
+            counters,
+            FunctionCredit::new(
+                CreditKind::Verified { native_only: false },
+                format!("trust-wp: {} verified \u{2713} (termination)", cfg.def_path),
+            ),
+        );
     } else if all_variants_verified {
         eprintln!(
             "trust-wp: {} unverified (termination — structural variant decrease lacks solver evidence)",
@@ -1082,9 +1183,64 @@ mod tests {
         );
         let cond = build_decrease_condition(&variant, &call_variant, &VariantKind::Integer);
         assert!(cond.is_some());
-        // Should be: (n - 1) < n
+        // A bare strict descent over Z would also admit an infinite chain.
         let cond = cond.unwrap();
-        assert!(matches!(cond, PureExpr::BinOp(_, BinOp::Lt, _)));
+        assert!(matches!(cond, PureExpr::BinOp(_, BinOp::And, _)));
+    }
+
+    #[test]
+    fn integer_variant_proves_the_caller_bound_and_allows_a_negative_base_case() {
+        use trust_wp_ay::{verify_function_with_modes, VerificationRequest, VerificationResult};
+
+        let variant = PureExpr::Var("n".into(), Some(ExprSort::Int));
+        let after = PureExpr::BinOp(
+            Arc::new(variant.clone()),
+            BinOp::Sub,
+            Arc::new(PureExpr::Int(1)),
+        );
+        let ensures = [build_decrease_condition(&variant, &after, &VariantKind::Integer).unwrap()];
+        for (current, should_verify) in [(-1, false), (0, true), (1, true)] {
+            let requires = [PureExpr::BinOp(
+                Arc::new(variant.clone()),
+                BinOp::Eq,
+                Arc::new(PureExpr::Int(current)),
+            )];
+            let result = verify_function_with_modes(
+                VerificationRequest::new(&requires, &ensures)
+                    .timeout(Some(std::time::Duration::from_secs(5))),
+            )
+            .unwrap()
+            .apply_strict_trust(true);
+            if should_verify {
+                assert!(
+                    matches!(result, VerificationResult::Verified(_)),
+                    "{current}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, VerificationResult::Failed(_)),
+                    "negative descent must be refuted: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signed_machine_variant_can_descend_below_zero() {
+        use trust_wp_ay::{verify_function_with_modes, VerificationRequest, VerificationResult};
+
+        let kind = VariantKind::SignedMachineInteger {
+            lower_bound: PureExpr::Int(-128),
+        };
+        let ensures =
+            [build_decrease_condition(&PureExpr::Int(-1), &PureExpr::Int(-2), &kind).unwrap()];
+        let result = verify_function_with_modes(VerificationRequest::new(&[], &ensures))
+            .unwrap()
+            .apply_strict_trust(true);
+        assert!(
+            matches!(result, VerificationResult::Verified(_)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1133,6 +1289,45 @@ mod tests {
             type_name: "SomeType".into(),
         };
         assert!(build_decrease_condition(&variant, &call_variant, &kind).is_none());
+    }
+
+    #[test]
+    fn named_variant_fields_use_distinct_declared_indices() {
+        use trust_wp_ay::{verify_function_with_modes, VerificationRequest, VerificationResult};
+
+        let variant = PureExpr::LogicFnCall {
+            name: tuple_logic_fn_name(2),
+            args: vec![PureExpr::Int(5), PureExpr::Int(5)],
+        };
+        let call_variant = PureExpr::LogicFnCall {
+            name: "Measure".into(),
+            args: vec![PureExpr::Int(4), PureExpr::Int(6)],
+        };
+        let kind = VariantKind::IntegerFieldStruct {
+            field_names: vec!["first".into(), "second".into()],
+            constructor_name: Some("Measure".into()),
+        };
+        let ensures = [build_decrease_condition(&variant, &call_variant, &kind).unwrap()];
+        let result = verify_function_with_modes(VerificationRequest::new(&[], &ensures))
+            .unwrap()
+            .apply_strict_trust(true);
+        assert!(
+            matches!(result, VerificationResult::Failed(_)),
+            "a rising second field must not be mistaken for field zero: {result:?}"
+        );
+
+        let decreasing = PureExpr::LogicFnCall {
+            name: "Measure".into(),
+            args: vec![PureExpr::Int(4), PureExpr::Int(4)],
+        };
+        let ensures = [build_decrease_condition(&variant, &decreasing, &kind).unwrap()];
+        let result = verify_function_with_modes(VerificationRequest::new(&[], &ensures))
+            .unwrap()
+            .apply_strict_trust(true);
+        assert!(
+            matches!(&result, VerificationResult::Verified(Some(proof)) if proof.is_fully_verified()),
+            "both named fields decrease and need a checked proof: {result:?}"
+        );
     }
 
     #[test]

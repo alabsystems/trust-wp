@@ -22,11 +22,6 @@
 //! part of the macro infrastructure (e.g., assigning the conjure() result). These
 //! reads are harmless because cfg-gating erases ghost code at runtime. The
 //! remaining soundness concern is runtime control-flow dependency.
-//!
-//! # Design Reference
-//!
-//! See `designs/2026-02-18-ghost-pipeline-creusot-gap-analysis.md`, Gap 3.
-//! Part of #1768.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -68,6 +63,11 @@ pub(crate) fn validate_erasure_attributes(tcx: TyCtxt<'_>) -> Vec<GhostValidatio
     let mut errors = Vec::new();
 
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         let hir_id = tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = tcx.hir_attrs(hir_id);
         let erasure_targets = crate::attr_utils::get_erasure_targets(attrs);
@@ -129,7 +129,7 @@ pub(crate) fn validate_erasure_attributes(tcx: TyCtxt<'_>) -> Vec<GhostValidatio
 /// The proc macro emits `#[doc = "trust-wp:trusted:"]` for items marked with
 /// `#[trusted]`. We replicate the detection here rather than reach into the
 /// private `callbacks::discovery` module from the ghost layer.
-fn has_trusted_doc_marker(attrs: &[rustc_hir::Attribute]) -> bool {
+fn has_trusted_doc_marker(attrs: &[rustc_attr_ir::Attribute]) -> bool {
     attrs
         .iter()
         .filter_map(crate::attr_utils::doc_marker_str)
@@ -393,7 +393,15 @@ impl<'tcx> ErasureCtx<'_, 'tcx> {
     fn canonical_expr_raw(&mut self, expr: &Expr<'_>) -> ErasedExpr {
         match expr.kind {
             ExprKind::DropTemps(inner) => self.canonical_expr(inner),
-            ExprKind::Block(block, _) => self.canonical_block(expr, block),
+            ExprKind::Block(block, _) => {
+                let inner = crate::callbacks::spec_typecheck::strip_spec_tc_wrapper(self.tcx, expr);
+                if std::ptr::eq(inner, expr) {
+                    self.canonical_block(expr, block)
+                } else {
+                    // Type-check wrapper block around a loop/closure: not program code.
+                    self.canonical_expr(inner)
+                }
+            }
             ExprKind::Ret(Some(inner)) => self.canonical_expr(inner),
             ExprKind::Tup(items) if items.is_empty() => ErasedExpr::Unit,
             ExprKind::Tup(items) => self.canonical_tuple(items),
@@ -472,6 +480,7 @@ impl<'tcx> ErasureCtx<'_, 'tcx> {
         // semicolon-terminated statement in the other body.
         let tail = match block.expr {
             Some(e) => {
+                let e = crate::callbacks::spec_typecheck::strip_spec_tc_wrapper(self.tcx, e);
                 let ty = self.typeck_results.expr_ty(e);
                 if self.ghost_like(ty) {
                     ErasedExpr::Unit
@@ -537,49 +546,51 @@ impl<'tcx> ErasureCtx<'_, 'tcx> {
 
                 out.push(ErasedStmt::Let { pattern, init });
             }
-            StmtKind::Expr(expr) | StmtKind::Semi(expr) => match expr.kind {
-                ExprKind::Assign(place, value, _) => {
-                    out.push(ErasedStmt::Assign {
-                        place: self.canonical_expr(place),
-                        value: self.canonical_expr(value),
-                    });
-                }
-                ExprKind::AssignOp(op, place, value) => {
-                    out.push(ErasedStmt::AssignOp {
-                        op: format!("{:?}", op.node),
-                        place: self.canonical_expr(place),
-                        value: self.canonical_expr(value),
-                    });
-                }
-                ExprKind::Loop(body, _label, _src, _span) => {
-                    if let Some((cond, body_expr)) = while_loop_components(body) {
-                        out.push(ErasedStmt::While {
-                            cond: self.canonical_expr(cond),
-                            body: self.canonical_expr(body_expr),
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
+                match crate::callbacks::spec_typecheck::strip_spec_tc_wrapper(self.tcx, expr).kind {
+                    ExprKind::Assign(place, value, _) => {
+                        out.push(ErasedStmt::Assign {
+                            place: self.canonical_expr(place),
+                            value: self.canonical_expr(value),
                         });
-                        return;
                     }
-                    out.push(ErasedStmt::Expr(self.canonical_expr(expr)));
+                    ExprKind::AssignOp(op, place, value) => {
+                        out.push(ErasedStmt::AssignOp {
+                            op: format!("{:?}", op.node),
+                            place: self.canonical_expr(place),
+                            value: self.canonical_expr(value),
+                        });
+                    }
+                    ExprKind::Loop(body, _label, _src, _span) => {
+                        if let Some((cond, body_expr)) = while_loop_components(body) {
+                            out.push(ErasedStmt::While {
+                                cond: self.canonical_expr(cond),
+                                body: self.canonical_expr(body_expr),
+                            });
+                            return;
+                        }
+                        out.push(ErasedStmt::Expr(self.canonical_expr(expr)));
+                    }
+                    _ => {
+                        if expr_is_pure_ghost_call(self.tcx, self.typeck_results, expr) {
+                            return;
+                        }
+                        // Even if this statement is ghost-typed, we keep it when
+                        // the underlying expression carries non-ghost runtime
+                        // effects (e.g., a call to a `#[erasure(target)]`-marked
+                        // function — its runtime erasure is `target(args)`).
+                        let stmt_ty_ghost = self.ghost_like(self.typeck_results.expr_ty(expr));
+                        let canon = self.canonical_expr_raw(expr);
+                        if stmt_ty_ghost && canonical_is_runtime_inert(&canon) {
+                            return;
+                        }
+                        if matches!(canon, ErasedExpr::Unit) {
+                            return;
+                        }
+                        out.push(ErasedStmt::Expr(canon));
+                    }
                 }
-                _ => {
-                    if expr_is_pure_ghost_call(self.tcx, self.typeck_results, expr) {
-                        return;
-                    }
-                    // Even if this statement is ghost-typed, we keep it when
-                    // the underlying expression carries non-ghost runtime
-                    // effects (e.g., a call to a `#[erasure(target)]`-marked
-                    // function — its runtime erasure is `target(args)`).
-                    let stmt_ty_ghost = self.ghost_like(self.typeck_results.expr_ty(expr));
-                    let canon = self.canonical_expr_raw(expr);
-                    if stmt_ty_ghost && canonical_is_runtime_inert(&canon) {
-                        return;
-                    }
-                    if matches!(canon, ErasedExpr::Unit) {
-                        return;
-                    }
-                    out.push(ErasedStmt::Expr(canon));
-                }
-            },
+            }
             StmtKind::Item(_) => {}
         }
     }
@@ -947,6 +958,11 @@ pub(crate) fn check_ghost_erasure<'tcx>(
     // Also include every body owner whose body span intersects a known ghost
     // span — these are the inner closures created inside `ghost! { ... }`.
     for local_def_id in tcx.hir_body_owners() {
+        // Specification type-check closures are neither program code nor
+        // specifications the verifier reads (see `spec_typecheck`).
+        if crate::callbacks::spec_typecheck::is_spec_tc_body(tcx, local_def_id) {
+            continue;
+        }
         if bodies_to_check.contains(&local_def_id) {
             continue;
         }
@@ -963,7 +979,7 @@ pub(crate) fn check_ghost_erasure<'tcx>(
     let mut errors = Vec::new();
 
     for def_id in &bodies_to_check {
-        let body_with_facts = try_get_body_with_context(*def_id);
+        let body_with_facts = try_get_body_with_context(tcx, *def_id);
         let Some(body_with_facts) = body_with_facts else {
             debug!(
                 "erasure check: no MIR body for {:?}, skipping",
@@ -1062,7 +1078,7 @@ fn find_ghost_dependent_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Ha
 
         for bb_data in body.basic_blocks.iter() {
             for stmt in &bb_data.statements {
-                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                let StatementKind::Assign((place, rvalue)) = &stmt.kind else {
                     continue;
                 };
                 if rvalue_depends_on_ghost(rvalue, &ghost_dependent_locals) {
@@ -1178,7 +1194,7 @@ fn rvalue_depends_on_ghost(rvalue: &Rvalue<'_>, ghost_locals: &HashSet<Local>) -
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
             operand_depends_on_ghost(op, ghost_locals)
         }
-        Rvalue::BinaryOp(_, box (lhs, rhs)) => {
+        Rvalue::BinaryOp(_, (lhs, rhs)) => {
             operand_depends_on_ghost(lhs, ghost_locals)
                 || operand_depends_on_ghost(rhs, ghost_locals)
         }
@@ -1222,7 +1238,7 @@ fn is_erasure_marked_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 }
 
 fn operand_fn_def_id(func: &Operand<'_>) -> Option<DefId> {
-    let Operand::Constant(box constant) = func else {
+    let Operand::Constant(deref!(constant)) = func else {
         return None;
     };
     let TyKind::FnDef(def_id, _) = constant.const_.ty().kind() else {

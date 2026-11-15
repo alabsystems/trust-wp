@@ -13,10 +13,6 @@
 //! - `resolve(x)` built-in encoding (`x_current == x_final`)
 //!
 //! Constructor equality elimination logic is in [`super::quantifier_ctor_elim`].
-//!
-//! Extracted from `logic_fn.rs` as Phase 2 of the logic-fn decomposition
-//! (designs/2026-02-13-logic-fn-decomposition.md, #907).
-//! Decomposed into directory module as part of #1988.
 
 #[cfg(any(test, feature = "sep-logic"))]
 mod formula_quantifier;
@@ -25,66 +21,96 @@ pub(crate) mod pure_quantifier;
 use std::sync::Arc;
 
 use ay_dpll::api::{SolverError, Term};
-use trust_wp_core::formula::PureExpr;
+use trust_wp_core::formula::{ExprSort, PureExpr};
 
-use super::AYEncoder;
+use super::{final_collapse_guard::sort_holds_no_borrow, AYEncoder};
 use crate::error::EncodingError;
 
+/// Whether `expr` is one or more dereferences of a variable annotated as a
+/// shared reference to a sort that holds no borrow (`&i32`, `&&bool`): every
+/// value reached through it is part of that referent, so its resolve is
+/// `true`. Nothing else is: the driver erases a `Box`, `Ghost` or `Snapshot`
+/// layer from a sort, so `b: Box<&mut i32>` and `s: Snapshot<&mut i32>` are
+/// annotated `&mut i32` like `x: &mut i32` (and a value-model snapshot `Int`),
+/// and `*b` and `*s` are the borrow where `*x` is its integer.
+fn dereferences_a_shared_value(expr: &PureExpr) -> bool {
+    let PureExpr::Deref(first) = expr else {
+        return false;
+    };
+    let mut base = first.as_ref();
+    while let PureExpr::Deref(next) = base {
+        base = next.as_ref();
+    }
+    matches!(base, PureExpr::Var(_, Some(sort @ ExprSort::Ref(_))) if sort_holds_no_borrow(sort))
+}
+
 impl AYEncoder {
-    /// Encode `resolve(x)` as `x_current == x_final`.
+    /// Encode `resolve(e)`: Creusot's resolve of `e` at `e`'s own type, `true`
+    /// of a value holding no borrow and `*e == ^e` of a borrow.
     ///
-    /// For mutable references, resolve asserts that the current value equals
-    /// the final/prophecy value, meaning the mutable borrow has ended.
+    /// A value whose sort certainly holds no borrow
+    /// ([`sort_holds_no_borrow`], asked of the sort's own shape) resolves
+    /// trivially (#2683). That reading is taken of the variable itself,
+    /// annotated, with no final value in the lane (D-126). An unannotated
+    /// variable is not known to be a value (the closure postcondition `|r:
+    /// &mut i32| resolve(r)` reads the returned borrow as an unannotated
+    /// `result`); a `Datatype`, a value-model sort, a tuple or a type parameter
+    /// may hold a borrow its sort does not show (`Vec<&mut i32>`, a struct
+    /// with an `Option<&mut i32>` field declared at `Int`).
     ///
-    /// For by-value parameters (no mutable borrow), `resolve(x)` is trivially
-    /// `true` because there is no prophecy variable to constrain. This matches
-    /// Creusot semantics where resolve on non-reference types is vacuously true.
-    /// (#2683)
+    /// Any other variable is the `*x == ^x` it denotes, through the lane's
+    /// own final reading; a variable the lane names no final value of (a
+    /// by-value parameter holding a borrow, a snapshot, a value bound by a
+    /// `let`, a borrow at a loop head) has none to read and is refused,
+    /// fail-closed. A quantifier's binder is read through the wrapper's binder
+    /// arm, which refuses the final value of a binder not certified to hold no
+    /// borrow.
     ///
-    /// The argument can be:
-    /// - `Var("x")` -> generates `x_current == x_final` (if x is &mut)
-    /// - `Deref(Var("x"))` -> strips Deref, generates `x_current == x_final`
-    /// - `Deref(Deref(Var("x")))` -> strips all Deref layers, same result
-    /// - Non-variable expressions (e.g., field access `x.a`) -> delegates to
-    ///   encoding Deref and Final forms of the expression
-    ///
-    /// All `Deref` layers are stripped to reach the base expression. Without
-    /// this, `Deref(Deref(Var("x")))` would produce `x_current_current`
-    /// instead of the intended `x_current`. See #508.
+    /// Every other operand is a value held through another or computed from
+    /// one, and its resolve is its OWN: `true` of the integer `*x` of `x: &mut
+    /// i32`, the inner borrow's `**x == ^*x` of `*x` of `x: &mut &mut i32`, the
+    /// inner borrow's of a field `x.m` of `x: &mut M` that is one, `true` of
+    /// `x@` and of `Some(*x)`. The #508 strip read `resolve(*x)` as the
+    /// OUTER borrow's `*x == ^x`, and a projection, view or constructor as
+    /// `*e == ^e` distributed into it (`(*x).f == (^x).f`, `(*x)@ ==
+    /// (^x)@`): stronger than `true` of a value, so `!resolve(*x)` of a write
+    /// verified, and blind to the borrow the operand may be, so
+    /// `resolve(*x)` of an untouched `x: &mut &mut i32` and `resolve(x.m)` of
+    /// an untouched `x: &mut M` holding the caller's borrow verified (D-127).
+    /// A chain of dereferences of a shared reference to a value is `true`
+    /// ([`dereferences_a_shared_value`]). Everything else is refused: `*x` of
+    /// `x: &mut i32` too, whose sort cannot tell it from `*b` of `b: Box<&mut
+    /// i32>`, and a literal, since at a call a borrow's argument may reach here
+    /// as the constant its referent held (`resolve(3)`) and an existential
+    /// witness probe substitutes one for a binder.
     pub(super) fn encode_resolve(
         &mut self,
         arg: &PureExpr,
         prefix: Option<crate::encoder::sort_context::DerivedKind>,
     ) -> Result<Term, EncodingError> {
-        // Strip all Deref layers to get the base variable -- resolve(*x),
-        // resolve(**x), etc. should all produce x_current == x_final.
-        // A single-layer strip would leave nested derefs broken (#508).
-        let mut base = arg;
-        while let PureExpr::Deref(inner) = base {
-            base = inner.as_ref();
+        use super::sort_context::{apply_name_prefix, DerivedKind};
+
+        let PureExpr::Var(name, sort) = arg else {
+            return if dereferences_a_shared_value(arg) {
+                Ok(self.solver.bool_const(true))
+            } else {
+                Err(self.refuse_resolve_of_a_held_value(arg))
+            };
+        };
+        let final_name = DerivedKind::Final.format_name(&apply_name_prefix(name, prefix));
+        let lane_reads_a_final = self.var_term(&final_name).is_some();
+        if sort.as_ref().is_some_and(sort_holds_no_borrow) && !lane_reads_a_final {
+            return Ok(self.solver.bool_const(true));
         }
-
-        // For simple variable references, check if the variable has a _final
-        // counterpart in the environment. If not, this is a by-value parameter
-        // (no mutable borrow) and resolve is trivially true. (#2683)
-        if let PureExpr::Var(name, _) = base {
-            let final_name = super::sort_context::DerivedKind::Final
-                .format_name(&super::sort_context::apply_name_prefix(name, prefix));
-            if self.var_term(&final_name).is_none() {
-                // No _final variable declared — this is a by-value parameter.
-                // resolve(x) for by-value types is trivially true (no borrow to resolve).
-                return Ok(self.solver.bool_const(true));
-            }
+        if !lane_reads_a_final && !self.is_quantifier_bound(name) {
+            return Err(self.refuse_resolve_without_a_final(name, sort.as_ref()));
         }
-
-        // Build the Deref and Final forms of the base to get _current and _final names
-        let current_expr = PureExpr::Deref(Arc::new(base.clone()));
-        let final_expr = PureExpr::Final(Arc::new(base.clone()));
-        let _base_sort = self.infer_expr_sort_with_context(base, prefix);
-
-        let current_term = self.encode_pure_impl(&current_expr, prefix)?;
-        let final_term = self.encode_pure_impl(&final_expr, prefix)?;
-
+        // Inferring the variable's sort declares it first, and the naming path
+        // reads a declared base's datatype sort for `x_current`/`x_final` (#967).
+        let _ = self.infer_expr_sort_with_context(arg, prefix);
+        let current_term =
+            self.encode_pure_impl(&PureExpr::Deref(Arc::new(arg.clone())), prefix)?;
+        let final_term = self.encode_pure_impl(&PureExpr::Final(Arc::new(arg.clone())), prefix)?;
         Ok(self.eq_term(current_term, final_term))
     }
 

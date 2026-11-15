@@ -109,7 +109,7 @@ fn test_nonzero_mul_unconstrained_rhs_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "NonZero mul with unconstrained rhs should fail (y=-1 is counterexample): got {result:?}"
     );
 }
@@ -268,7 +268,7 @@ fn test_two_nonzero_types_unrelated_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "returning -1 should fail NonZeroU64 invariant: got {result:?}"
     );
 }
@@ -613,7 +613,7 @@ fn test_nonzero_chained_sub_mul_fails() {
     )
     .unwrap();
     assert!(
-        matches!(result, VerificationResult::Failed(_)),
+        crate::tests::rejected(&result),
         "(a-b)*c can be negative when b>a: got {result:?}"
     );
 }

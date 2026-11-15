@@ -54,9 +54,16 @@ impl WireChildMessage {
     ) -> Self {
         let delta = WireUnsoundnessDelta::from_snapshots(baseline, &unsoundness::snapshot());
         match result {
-            Ok(outcome) => Self::Outcome {
-                outcome: WireVerificationOutcome::from_outcome(&outcome),
-                delta,
+            Ok(outcome) => match WireVerificationOutcome::from_outcome(&outcome) {
+                Ok(outcome) => Self::Outcome { outcome, delta },
+                Err(message) => Self::Error {
+                    error: WireEncodingError::Unsupported {
+                        message,
+                        span: None,
+                        contract_text: None,
+                    },
+                    delta,
+                },
             },
             Err(error) => Self::Error {
                 error: WireEncodingError::from_error(&error),
@@ -107,9 +114,16 @@ impl WireLoopChildMessage {
     ) -> Self {
         let delta = WireUnsoundnessDelta::from_snapshots(baseline, &unsoundness::snapshot());
         match result {
-            Ok(outcome) => Self::Outcome {
-                outcome: WireLoopVerificationOutcome::from_outcome(&outcome),
-                delta,
+            Ok(outcome) => match WireLoopVerificationOutcome::from_outcome(&outcome) {
+                Ok(outcome) => Self::Outcome { outcome, delta },
+                Err(message) => Self::Error {
+                    error: WireEncodingError::Unsupported {
+                        message,
+                        span: None,
+                        contract_text: None,
+                    },
+                    delta,
+                },
             },
             Err(error) => Self::Error {
                 error: WireEncodingError::from_error(&error),
@@ -180,14 +194,14 @@ pub(crate) struct WireVerificationOutcome {
 }
 
 impl WireVerificationOutcome {
-    fn from_outcome(outcome: &VerificationOutcome) -> Self {
-        Self {
-            result: WireVerificationResult::from_result(&outcome.result),
+    fn from_outcome(outcome: &VerificationOutcome) -> Result<Self, String> {
+        Ok(Self {
+            result: WireVerificationResult::from_result(&outcome.result)?,
             provenance: outcome
                 .provenance
                 .as_ref()
                 .map(WireVerificationProvenance::from_provenance),
-        }
+        })
     }
 
     pub(crate) fn into_outcome(self) -> Result<VerificationOutcome, String> {
@@ -211,24 +225,27 @@ pub(crate) struct WireLoopVerificationOutcome {
 }
 
 impl WireLoopVerificationOutcome {
-    fn from_outcome(outcome: &LoopVerificationOutcome) -> Self {
-        Self {
-            initialization: WireVerificationOutcome::from_outcome(&outcome.initialization),
-            preservation: WireVerificationOutcome::from_outcome(&outcome.preservation),
-            postcondition: WireVerificationOutcome::from_outcome(&outcome.postcondition),
+    fn from_outcome(outcome: &LoopVerificationOutcome) -> Result<Self, String> {
+        Ok(Self {
+            initialization: WireVerificationOutcome::from_outcome(&outcome.initialization)?,
+            preservation: WireVerificationOutcome::from_outcome(&outcome.preservation)?,
+            postcondition: WireVerificationOutcome::from_outcome(&outcome.postcondition)?,
             variant_nonneg: outcome
                 .variant_nonneg
                 .as_ref()
-                .map(WireVerificationOutcome::from_outcome),
+                .map(WireVerificationOutcome::from_outcome)
+                .transpose()?,
             variant_decrease: outcome
                 .variant_decrease
                 .as_ref()
-                .map(WireVerificationOutcome::from_outcome),
+                .map(WireVerificationOutcome::from_outcome)
+                .transpose()?,
             entry_may_execute: outcome
                 .entry_may_execute
                 .as_ref()
-                .map(WireVerificationOutcome::from_outcome),
-        }
+                .map(WireVerificationOutcome::from_outcome)
+                .transpose()?,
+        })
     }
 
     pub(crate) fn into_outcome(self) -> Result<LoopVerificationOutcome, String> {
@@ -261,8 +278,8 @@ enum WireVerificationResult {
 }
 
 impl WireVerificationResult {
-    fn from_result(result: &VerificationResult) -> Self {
-        match result {
+    fn from_result(result: &VerificationResult) -> Result<Self, String> {
+        Ok(match result {
             VerificationResult::Verified(summary) => Self::Verified(
                 summary
                     .as_ref()
@@ -270,12 +287,12 @@ impl WireVerificationResult {
             ),
             VerificationResult::Assumed(reason) => Self::Assumed(reason.clone()),
             VerificationResult::Failed(counterexample) => {
-                Self::Failed(WireCounterexample::from_counterexample(counterexample))
+                Self::Failed(WireCounterexample::from_counterexample(counterexample)?)
             }
             VerificationResult::Unknown(reason) => {
                 Self::Unknown(WireUnknownReason::from_reason(reason))
             }
-        }
+        })
     }
 
     fn into_result(self) -> Result<VerificationResult, String> {
@@ -351,18 +368,18 @@ struct WireCounterexample {
 }
 
 impl WireCounterexample {
-    fn from_counterexample(counterexample: &Counterexample) -> Self {
-        Self {
+    fn from_counterexample(counterexample: &Counterexample) -> Result<Self, String> {
+        Ok(Self {
             values: counterexample
                 .values
                 .iter()
                 .map(WireCounterexampleValue::from_value)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             violated_postcondition: counterexample
                 .violated_postcondition
                 .as_ref()
                 .map(WirePostconditionInfo::from_info),
-        }
+        })
     }
 
     fn into_counterexample(self) -> Result<Counterexample, String> {
@@ -388,12 +405,12 @@ struct WireCounterexampleValue {
 }
 
 impl WireCounterexampleValue {
-    fn from_value(value: &CounterexampleValue) -> Self {
-        Self {
+    fn from_value(value: &CounterexampleValue) -> Result<Self, String> {
+        Ok(Self {
             name: value.name.clone(),
-            value: WireModelValue::from_model_value(&value.value),
+            value: WireModelValue::from_model_value(&value.value)?,
             origin: value.origin.as_ref().map(WireVarOrigin::from_origin),
-        }
+        })
     }
 
     fn into_value(self) -> Result<CounterexampleValue, String> {
@@ -549,8 +566,8 @@ enum WireModelValue {
 }
 
 impl WireModelValue {
-    fn from_model_value(value: &ModelValue) -> Self {
-        match value {
+    fn from_model_value(value: &ModelValue) -> Result<Self, String> {
+        Ok(match value {
             ModelValue::Bool(value) => Self::Bool(*value),
             ModelValue::Int(value) => Self::Int(value.to_string()),
             ModelValue::Real(value) => Self::Real {
@@ -565,13 +582,16 @@ impl WireModelValue {
             ModelValue::Uninterpreted(value) => Self::Uninterpreted(value.clone()),
             ModelValue::ArraySmtlib(value) => Self::ArraySmtlib(value.clone()),
             ModelValue::Array { default, stores } => Self::Array {
-                default: Box::new(Self::from_model_value(default)),
+                default: Box::new(Self::from_model_value(default)?),
                 stores: stores
                     .iter()
                     .map(|(index, value)| {
-                        (Self::from_model_value(index), Self::from_model_value(value))
+                        Ok((
+                            Self::from_model_value(index)?,
+                            Self::from_model_value(value)?,
+                        ))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, String>>()?,
             },
             ModelValue::FloatingPoint {
                 sign,
@@ -593,14 +613,20 @@ impl WireModelValue {
             },
             ModelValue::Datatype { constructor, args } => Self::Datatype {
                 constructor: constructor.clone(),
-                args: args.iter().map(Self::from_model_value).collect(),
+                args: args
+                    .iter()
+                    .map(Self::from_model_value)
+                    .collect::<Result<Vec<_>, _>>()?,
             },
-            ModelValue::Seq(values) => {
-                Self::Seq(values.iter().map(Self::from_model_value).collect())
-            }
+            ModelValue::Seq(values) => Self::Seq(
+                values
+                    .iter()
+                    .map(Self::from_model_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
             ModelValue::Unknown => Self::Unknown,
-            _ => Self::Unknown,
-        }
+            _ => return Err("model value has no lossless process wire representation".into()),
+        })
     }
 
     fn into_model_value(self) -> Result<ModelValue, String> {
@@ -610,10 +636,18 @@ impl WireModelValue {
             Self::Real {
                 numerator,
                 denominator,
-            } => ModelValue::Real(BigRational::new(
-                parse_bigint(&numerator)?,
-                parse_bigint(&denominator)?,
-            )),
+            } => {
+                let numerator = parse_bigint(&numerator)?;
+                let denominator = parse_bigint(&denominator)?;
+                // BigRational::new PANICS on a zero denominator. These values
+                // arrive over the wire from the solver child process, so this
+                // is reachable input rather than an invariant of this function
+                // — a child that emits "0" here would take the parent down.
+                if denominator == BigInt::from(0) {
+                    return Err("child model Real has a zero denominator".to_string());
+                }
+                ModelValue::Real(BigRational::new(numerator, denominator))
+            }
             Self::BitVec { value, width } => ModelValue::BitVec {
                 value: parse_bigint(&value)?,
                 width,
@@ -812,6 +846,11 @@ struct WireVerificationProvenance {
     /// `#[serde(default)]` for the same reason as the field above.
     #[serde(default)]
     strict_proof_replay_unbound: u32,
+    /// The structural refutation shape that also refuted this
+    /// obligation. `#[serde(default)]` so a worker built before the field
+    /// existed deserializes as "no shape", which is the fail-closed reading.
+    #[serde(default)]
+    refutation_structural_shape: Option<String>,
 }
 
 /// Wire form of [`StrictProofReplayObservation`]. Diagnostics only — no gate,
@@ -888,6 +927,7 @@ impl WireVerificationProvenance {
                 .as_ref()
                 .map(WireStrictProofReplayObservation::from_observation),
             strict_proof_replay_unbound: provenance.strict_proof_replay_unbound,
+            refutation_structural_shape: provenance.refutation_structural_shape.clone(),
         }
     }
 
@@ -919,6 +959,7 @@ impl WireVerificationProvenance {
                 .map(WireStrictProofReplayObservation::into_observation)
                 .transpose()?,
             strict_proof_replay_unbound: self.strict_proof_replay_unbound,
+            refutation_structural_shape: self.refutation_structural_shape,
         })
     }
 }
@@ -1399,6 +1440,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_wire_refuses_unsupported_typed_values_instead_of_erasing_them() {
+        let wide = ModelValue::FloatingPointWide {
+            sign: false,
+            exponent: 1,
+            significand: 1 << 100,
+            eb: 15,
+            sb: 113,
+        };
+        for value in [
+            wide.clone(),
+            ModelValue::Array {
+                default: Box::new(wide.clone()),
+                stores: vec![],
+            },
+            ModelValue::Datatype {
+                constructor: "box".into(),
+                args: vec![wide.clone()],
+            },
+            ModelValue::Seq(vec![wide]),
+        ] {
+            let outcome = VerificationOutcome::without_provenance(VerificationResult::Failed(
+                Counterexample {
+                    values: vec![CounterexampleValue {
+                        name: "value".into(),
+                        value,
+                        origin: None,
+                    }],
+                    violated_postcondition: None,
+                },
+            ));
+            assert!(WireVerificationOutcome::from_outcome(&outcome).is_err());
+            let baseline = unsoundness::snapshot();
+            assert!(matches!(
+                WireChildMessage::from_result(Ok(outcome), &baseline),
+                WireChildMessage::Error {
+                    error: WireEncodingError::Unsupported { .. },
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            WireModelValue::from_model_value(&ModelValue::Unknown),
+            Ok(WireModelValue::Unknown)
+        ));
+    }
+
+    #[test]
+    fn process_wire_loop_refuses_a_lossy_optional_counterexample() {
+        let verified =
+            || VerificationOutcome::without_provenance(VerificationResult::Verified(None));
+        let failed =
+            VerificationOutcome::without_provenance(VerificationResult::Failed(Counterexample {
+                values: vec![CounterexampleValue {
+                    name: "wide".into(),
+                    value: ModelValue::FloatingPointWide {
+                        sign: false,
+                        exponent: 1,
+                        significand: 1 << 100,
+                        eb: 15,
+                        sb: 113,
+                    },
+                    origin: None,
+                }],
+                violated_postcondition: None,
+            }));
+        let outcome = LoopVerificationOutcome {
+            initialization: verified(),
+            preservation: verified(),
+            postcondition: verified(),
+            variant_nonneg: None,
+            variant_decrease: Some(failed),
+            entry_may_execute: None,
+        };
+        let baseline = unsoundness::snapshot();
+        assert!(matches!(
+            WireLoopChildMessage::from_result(Ok(outcome), &baseline),
+            WireLoopChildMessage::Error {
+                error: WireEncodingError::Unsupported { .. },
+                ..
+            }
+        ));
+    }
+
+    /// `BigRational::new` panics on a zero denominator, and this value is
+    /// decoded straight from the solver child's wire message — a child that
+    /// emitted "0" took the parent process down with it. It must be an error,
+    /// which is what every other malformed field on this path already is.
+    #[test]
+    fn a_zero_denominator_from_the_child_is_an_error_not_a_panic() {
+        let wire = WireModelValue::Real {
+            numerator: "1".to_string(),
+            denominator: "0".to_string(),
+        };
+        let error = wire
+            .into_model_value()
+            .expect_err("a zero denominator must not be accepted");
+        assert!(error.contains("zero denominator"), "{error}");
+
+        // A well-formed rational still decodes.
+        let ok = WireModelValue::Real {
+            numerator: "3".to_string(),
+            denominator: "4".to_string(),
+        };
+        assert!(ok.into_model_value().is_ok());
+    }
+
+    #[test]
     fn process_wire_roundtrips_outcome_with_native_replay_json() {
         let provenance = VerificationProvenance::with_solve_time(Duration::from_millis(42))
             .with_assertion_count(7)
@@ -1409,7 +1557,7 @@ mod tests {
             Some(provenance),
         );
 
-        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let wire = WireVerificationOutcome::from_outcome(&outcome).unwrap();
         let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
         let decoded: WireVerificationOutcome =
             serde_json::from_str(&encoded).expect("decode wire outcome");
@@ -1433,7 +1581,7 @@ mod tests {
             UnknownReason::SelfCheckRejected,
         ));
 
-        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let wire = WireVerificationOutcome::from_outcome(&outcome).unwrap();
         let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
         let decoded: WireVerificationOutcome =
             serde_json::from_str(&encoded).expect("decode wire outcome");
@@ -1472,7 +1620,7 @@ mod tests {
         let outcome =
             VerificationOutcome::without_provenance(VerificationResult::Failed(counterexample));
 
-        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let wire = WireVerificationOutcome::from_outcome(&outcome).unwrap();
         let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
         let decoded: WireVerificationOutcome =
             serde_json::from_str(&encoded).expect("decode wire outcome");
@@ -1496,7 +1644,7 @@ mod tests {
     }
 
     /// The rendered Alethe proof text survives a JSON round-trip through the
-    /// wire layer (Phase 1 — soundness, Alethe consumption).
+    /// wire layer.
     #[test]
     fn wire_proof_certificate_summary_roundtrips_alethe_text() {
         let proof_text = "(assume h1 (= a b))\n(step t1 (cl (= a b)) :rule assume)".to_string();
@@ -1516,7 +1664,7 @@ mod tests {
             VerificationResult::verified_with_proof(summary),
         );
 
-        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let wire = WireVerificationOutcome::from_outcome(&outcome).unwrap();
         let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
         let decoded: WireVerificationOutcome =
             serde_json::from_str(&encoded).expect("decode wire outcome");
@@ -1540,7 +1688,7 @@ mod tests {
     /// from one that was never recorded — which is precisely the confusion these
     /// fields exist to end. Pins `unknown_reason`/`unknown_detail` across the
     /// serde boundary alongside `unsat_proof_decline`, whose structural `None`
-    /// was previously the only thing a census could see.
+    /// alone cannot say why the replay was withheld.
     #[test]
     fn wire_strict_proof_replay_roundtrips_the_recorded_unknown_reason() {
         let evidence = SolveEvidenceSnapshot {
@@ -1571,7 +1719,7 @@ mod tests {
             Some(provenance),
         );
 
-        let wire = WireVerificationOutcome::from_outcome(&outcome);
+        let wire = WireVerificationOutcome::from_outcome(&outcome).unwrap();
         let encoded = serde_json::to_string(&wire).expect("encode wire outcome");
         let decoded: WireVerificationOutcome =
             serde_json::from_str(&encoded).expect("decode wire outcome");
@@ -1582,8 +1730,14 @@ mod tests {
             .as_ref()
             .and_then(|provenance| provenance.strict_proof_replay.as_ref())
             .expect("the strict replay observation must survive the wire");
-        assert_eq!(replayed, &observation, "the observation must roundtrip verbatim");
-        assert_eq!(replayed.unknown_reason.as_deref(), Some("self_check_rejected"));
+        assert_eq!(
+            replayed, &observation,
+            "the observation must roundtrip verbatim"
+        );
+        assert_eq!(
+            replayed.unknown_reason.as_deref(),
+            Some("self_check_rejected")
+        );
         assert!(
             replayed
                 .unknown_detail
@@ -1621,7 +1775,9 @@ mod tests {
         let wire = WireStrictProofReplayObservation::from_observation(&observation);
         let mut encoded: serde_json::Value =
             serde_json::to_value(&wire).expect("encode observation");
-        let object = encoded.as_object_mut().expect("observation is a JSON object");
+        let object = encoded
+            .as_object_mut()
+            .expect("observation is a JSON object");
         assert!(
             object.remove("unknown_reason").is_some() && object.remove("unknown_detail").is_some(),
             "precondition: the current payload carries both keys"
@@ -1629,7 +1785,9 @@ mod tests {
 
         let decoded: WireStrictProofReplayObservation =
             serde_json::from_value(encoded).expect("a payload without the keys must still decode");
-        let roundtrip = decoded.into_observation().expect("observation must convert");
+        let roundtrip = decoded
+            .into_observation()
+            .expect("observation must convert");
         assert!(roundtrip.unknown_reason.is_none());
         assert!(roundtrip.unknown_detail.is_none());
     }

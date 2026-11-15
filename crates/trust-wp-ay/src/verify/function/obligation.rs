@@ -36,7 +36,7 @@ use super::super::{
     result_postcondition_matches_return_expr,
     result_postcondition_matches_return_expr_via_logic_bodies,
     solver_tail::{AliasConstraintMode, ObligationSliceContext},
-    Counterexample, PostconditionInfo, ResolveContinuation, UnknownReason, VerificationResult,
+    PostconditionInfo, ResolveContinuation, UnknownReason, VerificationResult,
 };
 use crate::{
     encoder::{
@@ -61,19 +61,39 @@ use crate::{
 /// On `Failed` results, tags the counterexample with violated-postcondition
 /// metadata (clause index + clause text) so the driver can render a precise
 /// "violated ensures #N: <clause>" diagnostic without re-deriving which
-/// clause failed (Phase 8a).
+/// clause failed.
 pub(super) fn verify_single_obligation_slice(
     encoder: &mut AYEncoder,
     obligation_index: usize,
     ensure: &PureExpr,
     ctx: &ObligationSliceContext<'_>,
 ) -> Result<ResolveContinuation, EncodingError> {
+    let _shape_scope = SliceRefutationShapeScope::enter();
     let cont = verify_single_obligation_slice_inner(encoder, obligation_index, ensure, ctx)?;
+    // Publish the shape BEFORE the scope drops. A `Failed` that a structural
+    // shape also refuted was decided from the program text, not from a model
+    // over values trust-wp manufactured, and that is the only refutation the
+    // injected-goal gate (D-27) may let through in a function whose goal set
+    // carries a fail-closed marker.
+    super::super::solver_tail::publish_last_slice_refutation_shape(
+        continuation_is_failed(&cont)
+            .then(slice_refutation_shape)
+            .flatten(),
+    );
     Ok(tag_continuation_with_violated_postcondition(
         cont,
         obligation_index,
         ensure,
     ))
+}
+
+/// Does this continuation carry a refutation?
+fn continuation_is_failed(cont: &ResolveContinuation) -> bool {
+    matches!(
+        cont,
+        ResolveContinuation::Continue(VerificationResult::Failed(_))
+            | ResolveContinuation::Abort(VerificationResult::Failed(_))
+    )
 }
 
 /// Inner implementation of [`verify_single_obligation_slice`]; the public
@@ -201,219 +221,256 @@ fn verify_single_obligation_slice_inner(
             ctx,
         );
     }
-    if result_match_over_option_ite_is_directly_invalid(ensure, ctx.return_expr) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
-    }
-    if postcondition_is_logic_fn_spec_instance(ensure, ctx.logic_fns) {
-        return prove_prechecked_literal_false_obligation_with_solver(
-            encoder,
-            obligation_index,
-            ctx,
-        );
-    }
-    if result_postcondition_matches_return_expr(ensure, ctx.return_expr, ctx.requires) {
-        if postcondition_or_return_contains_div_or_mod(ensure, ctx.return_expr) {
-            if div_mod_denominators_guarded_by_requires(ensure, ctx.return_expr, ctx.requires) {
-                return prove_prechecked_literal_false_obligation_with_solver(
-                    encoder,
-                    obligation_index,
-                    ctx,
-                );
-            }
-            if let Some(result) = structurally_verified_precheck_with_base_recheck(ctx) {
-                return Ok(ResolveContinuation::Continue(result));
-            }
+    // Structural refutations (the shapes below) are trace-only hints, never
+    // the verdict. A `Failed` may only be published with a VALIDATED model
+    // (D-28), and a model-free `Failed` would only ever surface as
+    // `unknown (refutation withheld)`. Each such shape is a query the solver
+    // answers SAT trivially — `requires ∧ body ∧ ¬ensure` with the
+    // contradiction already syntactic — so fall through to
+    // `prove_verified_obligation_with_solver`, which produces the validated
+    // counterexample.
+    let mut structural_refuted = false;
+    // ONCE A SHAPE HAS FIRED, NO STRUCTURAL LANE MAY SAY `Verified`.
+    //
+    // A shape only records a hint and falls through for the model, so the
+    // structural accepts below stay reachable after one fires and the rule
+    // has to be enforced explicitly: `break 'structural_lanes` jumps straight
+    // to the real negated-goal solve at the end of this function, the only
+    // thing allowed to decide a slice a shape refuted (and whose `Verified` is
+    // then withheld by `structural_refutation_disagrees_with_proof`). The
+    // permitted outcomes are exactly: `Failed` with a validated model, or a
+    // withheld `Unknown`.
+    //
+    // `SliceRefutationShapeScope` is the second, non-bypassable half of the
+    // same rule: every structural accept re-checks it, so a lane reached by a
+    // future edit to this ordering still cannot return an accept.
+    'structural_lanes: {
+        if result_match_over_option_ite_is_directly_invalid(ensure, ctx.return_expr) {
+            structural_refuted |=
+                structural_refutation_hint("result-match-over-option-ite-directly-invalid");
         }
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if result_postcondition_matches_return_expr_with_encoder_type_constants(
-        encoder,
-        ensure,
-        ctx.return_expr,
-        ctx.requires,
-    ) {
-        if postcondition_or_return_contains_div_or_mod(ensure, ctx.return_expr) {
-            if div_mod_denominators_guarded_by_requires(ensure, ctx.return_expr, ctx.requires) {
-                return prove_prechecked_literal_false_obligation_with_solver(
-                    encoder,
-                    obligation_index,
-                    ctx,
-                );
-            }
-            if let Some(result) = structurally_verified_precheck_with_base_recheck(ctx) {
-                return Ok(ResolveContinuation::Continue(result));
-            }
+        if structural_refuted {
+            break 'structural_lanes;
         }
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if result_postcondition_matches_return_expr_via_logic_bodies(
-        ensure,
-        ctx.logic_fns,
-        ctx.return_expr,
-        ctx.requires,
-    ) {
-        return prove_prechecked_literal_false_obligation_with_solver(
+        if postcondition_is_logic_fn_spec_instance(ensure, ctx.logic_fns, ctx.requires) {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+        if result_postcondition_matches_return_expr(ensure, ctx.return_expr, ctx.requires) {
+            if postcondition_or_return_contains_div_or_mod(ensure, ctx.return_expr) {
+                if div_mod_denominators_guarded_by_requires(ensure, ctx.return_expr, ctx.requires) {
+                    return prove_prechecked_literal_false_obligation_with_solver(
+                        encoder,
+                        obligation_index,
+                        ctx,
+                    );
+                }
+                if let Some(result) = structurally_verified_precheck_with_base_recheck(ctx) {
+                    return Ok(ResolveContinuation::Continue(result));
+                }
+            }
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if result_postcondition_matches_return_expr_with_encoder_type_constants(
             encoder,
-            obligation_index,
-            ctx,
-        );
-    }
-    if super::result_postcondition_matches_return_expr_via_context_fact(
-        ensure,
-        ctx.return_expr,
-        Some(ctx.requires),
-        ctx.logic_fns,
-    ) || result_equality_follows_from_context_fact(ensure, ctx.return_expr, ctx.requires)
-    {
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if result_postcondition_contradicts_return_expr_via_logic_bodies(
-        ensure,
-        ctx.logic_fns,
-        ctx.return_expr,
-        ctx.requires,
-    ) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
-    }
-    if result_postcondition_contradicts_return_expr(ensure, ctx.return_expr, ctx.requires) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
-    }
-    if postcondition_contradicts_requirements(ensure, ctx.requires) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
-    }
-    if logic_fn_equality_matches_body(ensure, ctx.logic_fns) {
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if recursive_logic_fn_equality_matches_evaluation(ensure, ctx.logic_fns, ctx.mode_overrides) {
-        return prove_prechecked_literal_false_obligation_with_solver(
-            encoder,
-            obligation_index,
-            ctx,
-        );
-    }
-    if recursive_postcondition_matches_evaluation_under_requires(
-        ensure,
-        ctx.requires,
-        ctx.logic_fns,
-        ctx.mode_overrides,
-    ) {
-        return prove_prechecked_literal_false_obligation_with_solver(
-            encoder,
-            obligation_index,
-            ctx,
-        );
-    }
-    // A postcondition over a visible recursive logic fn is normally hopeless
-    // for the solver (the defining forall would need unbounded E-matching), so
-    // it short-circuits to Unknown — UNLESS the setup phase has already
-    // asserted ground one-step unfolding instances of that recursive fn at
-    // exactly this ensure's argument points
-    // (`assert_recursive_logic_fn_symbolic_unfoldings_for_goal_and_assumptions`
-    // runs over ctx.ensures before any obligation slice). In that case the
-    // solver has real ground material — e.g. filter_positive's lemma
-    // postconditions over `num_of_pos` — and must be allowed to RUN. This is a
-    // routing decision only, never a soundness one: Verified still requires a
-    // genuine debug-checked UNSAT from the solver.
-    if postcondition_contains_visible_recursive_logic_call(
-        ensure,
-        ctx.logic_fns,
-        ctx.mode_overrides,
-    ) && !super::return_expr_contains_logic_proof_call(ctx.return_expr, ctx.logic_fns)
-        && !ensure_covered_by_ground_recursive_unfoldings(ensure, ctx)
-    {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Unknown(
-            UnknownReason::Unspecified,
-        )));
-    }
-    // Native QF_BV fast path for `#[bitwise_proof]` popcount-style obligations
-    // (`result@ == count8_log(n)`). The general encoder lowers this through the
-    // `int2bv`/`bv2int` bridge, producing a mixed LIA+BV query that churns and
-    // times out on the current ay; this discharges it as a pure-BV bitblast
-    // instead. SOUND by construction (see `bitwise_bv_proof`): it only returns a
-    // definitive Verified/Failed when the spec side provably stays in range, and
-    // otherwise BAILS to the general path below. (#popcount)
-    if let Some(result) = super::bitwise_bv_proof::try_prove_bitwise_bv_obligation(ensure, ctx) {
-        return Ok(ResolveContinuation::Continue(result));
-    }
-    // Tier 2 of the native QF_BV fast path (#route-100 rightmostbit):
-    // SIGNED widths, boolean obligation structure (==>/&&/iff/!/positive
-    // bounded forall), and wrapping-spec call results. Same soundness
-    // contract as tier 1: UNSAT-only acceptance on an isolated exact-width
-    // encoding, fail-closed bail on anything unsupported (see
-    // `bitwise_bv_proof_general` module docs).
-    if let Some(result) =
-        super::bitwise_bv_proof_general::try_prove_general_bitwise_obligation(ensure, ctx)
-    {
-        return Ok(ResolveContinuation::Continue(result));
-    }
-    if postcondition_true_via_logic_bodies(ensure, ctx.logic_fns) {
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if requirements_imply_postcondition_via_logic_bodies(
-        ensure,
-        ctx.logic_fns,
-        ctx.return_expr,
-        ctx.requires,
-    ) {
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if result_equals_return_expr_via_logic_body_with_requires(
-        ensure,
-        ctx.logic_fns,
-        ctx.return_expr,
-        ctx.requires,
-    ) {
-        return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
-    }
-    if logic_fn_equality_has_visible_body_candidate(ensure, ctx.logic_fns) {
-        // `result@ == f(args)` over a non-recursive logic fn whose body is a
-        // finite-domain integer/bitwise expression (e.g. popcount's
-        // `result@ == count8_log(n)`) is decided by the solver's BV↔LIA
-        // bit-blast/enumeration bridge even when no syntactic body match exists.
-        // Route it to the solver instead of short-circuiting to Unknown. This is
-        // a routing decision only — the solver still requires a full-domain UNSAT
-        // to verify and reports a counterexample for any mismatching value, so a
-        // wrong target (e.g. `result@ == f(n) + 1`) stays unprovable. (#popcount)
-        //
-        // Likewise route `result == f(args)` where f's body is a builtin
-        // collection index over a field projection of a parameter (a user
-        // `IndexLogic` impl accessor like `Memory::index_logic`, whose global
-        // defining axiom is asserted): the obligation reduces to ground select
-        // facts and is cheap for the solver. (list_reversal_lasso)
-        if !logic_fn_equality_is_finite_enumerable_candidate(ensure, ctx.logic_fns, ctx.return_expr)
-            && !logic_fn_equality_is_projected_index_candidate(ensure, ctx.logic_fns)
+            ensure,
+            ctx.return_expr,
+            ctx.requires,
+        ) {
+            if postcondition_or_return_contains_div_or_mod(ensure, ctx.return_expr) {
+                if div_mod_denominators_guarded_by_requires(ensure, ctx.return_expr, ctx.requires) {
+                    return prove_prechecked_literal_false_obligation_with_solver(
+                        encoder,
+                        obligation_index,
+                        ctx,
+                    );
+                }
+                if let Some(result) = structurally_verified_precheck_with_base_recheck(ctx) {
+                    return Ok(ResolveContinuation::Continue(result));
+                }
+            }
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if result_postcondition_matches_return_expr_via_logic_bodies(
+            ensure,
+            ctx.logic_fns,
+            ctx.return_expr,
+            ctx.requires,
+        ) {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+        if super::result_postcondition_matches_return_expr_via_context_fact(
+            ensure,
+            ctx.return_expr,
+            Some(ctx.requires),
+            ctx.logic_fns,
+        ) || result_equality_follows_from_context_fact(ensure, ctx.return_expr, ctx.requires)
+        {
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if result_postcondition_contradicts_return_expr_via_logic_bodies(
+            ensure,
+            ctx.logic_fns,
+            ctx.return_expr,
+            ctx.requires,
+        ) {
+            structural_refuted |=
+                structural_refutation_hint("result-contradicts-return-expr-via-logic-bodies");
+        }
+        if result_postcondition_contradicts_return_expr(ensure, ctx.return_expr, ctx.requires) {
+            structural_refuted |= structural_refutation_hint("result-contradicts-return-expr");
+        }
+        if postcondition_contradicts_requirements(ensure, ctx.requires) {
+            structural_refuted |=
+                structural_refutation_hint("postcondition-contradicts-requirements");
+        }
+        if structural_refuted {
+            break 'structural_lanes;
+        }
+        if logic_fn_equality_matches_body(ensure, ctx.logic_fns) {
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if recursive_logic_fn_equality_matches_evaluation(ensure, ctx.logic_fns, ctx.mode_overrides)
+        {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+        if recursive_postcondition_matches_evaluation_under_requires(
+            ensure,
+            ctx.requires,
+            ctx.logic_fns,
+            ctx.mode_overrides,
+        ) {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+        // A postcondition over a visible recursive logic fn is normally hopeless
+        // for the solver (the defining forall would need unbounded E-matching), so
+        // it short-circuits to Unknown — UNLESS the setup phase has already
+        // asserted ground one-step unfolding instances of that recursive fn at
+        // exactly this ensure's argument points
+        // (`assert_recursive_logic_fn_symbolic_unfoldings_for_goal_and_assumptions`
+        // runs over ctx.ensures before any obligation slice). In that case the
+        // solver has real ground material — e.g. filter_positive's lemma
+        // postconditions over `num_of_pos` — and must be allowed to RUN. This is a
+        // routing decision only, never a soundness one: Verified still requires a
+        // genuine debug-checked UNSAT from the solver.
+        if postcondition_contains_visible_recursive_logic_call(
+            ensure,
+            ctx.logic_fns,
+            ctx.mode_overrides,
+        ) && !super::return_expr_contains_logic_proof_call(ctx.return_expr, ctx.logic_fns)
+            && !ensure_covered_by_ground_recursive_unfoldings(ensure, ctx)
         {
             return Ok(ResolveContinuation::Continue(VerificationResult::Unknown(
                 UnknownReason::Unspecified,
             )));
         }
-    }
-    if closure_weakening_follows_from_requires(encoder, ensure, ctx) {
-        return prove_prechecked_literal_false_obligation_with_solver(
-            encoder,
-            obligation_index,
-            ctx,
-        );
-    }
-    if closure_existential_postcondition_follows_from_requires(ensure, ctx.requires) {
-        return prove_prechecked_literal_false_obligation_with_solver(
-            encoder,
-            obligation_index,
-            ctx,
-        );
-    }
+        // Native QF_BV fast path for `#[bitwise_proof]` popcount-style obligations
+        // (`result@ == count8_log(n)`). The general encoder lowers this through the
+        // `int2bv`/`bv2int` bridge, producing a mixed LIA+BV query that churns and
+        // times out on the current ay; this discharges it as a pure-BV bitblast
+        // instead. SOUND by construction (see `bitwise_bv_proof`): it only returns a
+        // definitive Verified/Failed when the spec side provably stays in range, and
+        // otherwise BAILS to the general path below. (#popcount)
+        if let Some(result) = super::bitwise_bv_proof::try_prove_bitwise_bv_obligation(ensure, ctx)
+        {
+            return Ok(ResolveContinuation::Continue(
+                withhold_structural_accept_after_shape(result),
+            ));
+        }
+        // Tier 2 of the native QF_BV fast path (#route-100 rightmostbit):
+        // SIGNED widths, boolean obligation structure (==>/&&/iff/!/positive
+        // bounded forall), and wrapping-spec call results. Same soundness
+        // contract as tier 1: UNSAT-only acceptance on an isolated exact-width
+        // encoding, fail-closed bail on anything unsupported (see
+        // `bitwise_bv_proof_general` module docs).
+        if let Some(result) =
+            super::bitwise_bv_proof_general::try_prove_general_bitwise_obligation(ensure, ctx)
+        {
+            return Ok(ResolveContinuation::Continue(
+                withhold_structural_accept_after_shape(result),
+            ));
+        }
+        if postcondition_true_via_logic_bodies(ensure, ctx.logic_fns) {
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if requirements_imply_postcondition_via_logic_bodies(
+            ensure,
+            ctx.logic_fns,
+            ctx.return_expr,
+            ctx.requires,
+        ) {
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if result_equals_return_expr_via_logic_body_with_requires(
+            ensure,
+            ctx.logic_fns,
+            ctx.return_expr,
+            ctx.requires,
+        ) {
+            return prove_verified_obligation_with_solver(encoder, obligation_index, ensure, ctx);
+        }
+        if logic_fn_equality_has_visible_body_candidate(ensure, ctx.logic_fns) {
+            // `result@ == f(args)` over a non-recursive logic fn whose body is a
+            // finite-domain integer/bitwise expression (e.g. popcount's
+            // `result@ == count8_log(n)`) is decided by the solver's BV↔LIA
+            // bit-blast/enumeration bridge even when no syntactic body match exists.
+            // Route it to the solver instead of short-circuiting to Unknown. This is
+            // a routing decision only — the solver still requires a full-domain UNSAT
+            // to verify and reports a counterexample for any mismatching value, so a
+            // wrong target (e.g. `result@ == f(n) + 1`) stays unprovable. (#popcount)
+            //
+            // Likewise route `result == f(args)` where f's body is a builtin
+            // collection index over a field projection of a parameter (a user
+            // `IndexLogic` impl accessor like `Memory::index_logic`, whose global
+            // defining axiom is asserted): the obligation reduces to ground select
+            // facts and is cheap for the solver. (list_reversal_lasso)
+            if !logic_fn_equality_is_finite_enumerable_candidate(
+                ensure,
+                ctx.logic_fns,
+                ctx.return_expr,
+            ) && !logic_fn_equality_is_projected_index_candidate(ensure, ctx.logic_fns)
+            {
+                return Ok(ResolveContinuation::Continue(VerificationResult::Unknown(
+                    UnknownReason::Unspecified,
+                )));
+            }
+        }
+        if closure_weakening_follows_from_requires(encoder, ensure, ctx) {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+        if closure_existential_postcondition_follows_from_requires(ensure, ctx.requires) {
+            return prove_prechecked_literal_false_obligation_with_solver(
+                encoder,
+                obligation_index,
+                ctx,
+            );
+        }
+    } // 'structural_lanes
     if postcondition_depends_on_unconstrained_logic_fn(ensure, ctx.logic_fns, ctx.requires) {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
+        // The opaque / body-less logic fn is an uninterpreted symbol to the
+        // solver, so `¬ensure` is satisfiable with a validated model naming
+        // the value the hidden definition would have to rule out.
+        structural_refuted |=
+            structural_refutation_hint("postcondition-depends-on-unconstrained-logic-fn");
     }
 
     if super::result_binding::should_use_slice_local_match_result_binding(
@@ -435,13 +492,180 @@ fn verify_single_obligation_slice_inner(
         &tuple_rewritten_ensure,
     ) && postcondition_contradicts_requirements(&tuple_rewritten_ensure, ctx.requires)
     {
-        return Ok(ResolveContinuation::Continue(VerificationResult::Failed(
-            Counterexample::empty(),
-        )));
+        structural_refuted |=
+            structural_refutation_hint("tuple-rewritten-postcondition-contradicts-requirements");
     }
     let ensure_for_encoding = &tuple_rewritten_ensure;
 
-    prove_verified_obligation_with_solver(encoder, obligation_index, ensure_for_encoding, ctx)
+    let continuation =
+        prove_verified_obligation_with_solver(encoder, obligation_index, ensure_for_encoding, ctx)?;
+    if structural_refuted {
+        let base_is_vacuous = matches!(
+            &continuation,
+            ResolveContinuation::Continue(VerificationResult::Unknown(reason))
+                if unknown_reason_is_vacuous(reason)
+        );
+        if base_is_vacuous {
+            // The fall-through solve reports the BASE itself UNSAT: the
+            // requirements this slice runs under are contradictory, so
+            // nothing about the obligation was proved and the shape's own
+            // `requires ⟹ ¬ensure` reading is moot. Vacuity is its own
+            // soundness gap in this tool (`vacuous > 0` → exit 2, same as
+            // `requirements_are_obviously_contradictory`), and it is the
+            // STRONGER statement, so report it rather than re-dressing it
+            // as a bare structural `Failed` whose public boundary would
+            // spend it as an uncounted `refutation withheld`.
+            crate::verify::authority_trace(|| {
+                "structural slice refutation over a vacuous base; reporting the vacuity".to_string()
+            });
+            return Ok(continuation);
+        }
+        match &continuation {
+            ResolveContinuation::Continue(VerificationResult::Unknown(reason)) => {
+                // The solver could not decide a slice a structural shape
+                // already refuted (quantified context, typically). The shape
+                // proves `requires ⟹ ¬ensure`, so a VALIDATED model of the
+                // base alone is a validated counterexample: ask the AxiomLight
+                // fresh base recheck for one (it records the refutation
+                // witness the pipeline installs). Without one, keep the
+                // structural `Failed` — the public boundary withholds it as
+                // before.
+                crate::verify::authority_trace(|| {
+                    format!(
+                        "solver inconclusive ({}) after a structural slice refutation; seeking \
+                         a base witness",
+                        reason.as_str()
+                    )
+                });
+                return Ok(ResolveContinuation::Continue(
+                    structural_refutation_with_base_witness(ctx),
+                ));
+            }
+            ResolveContinuation::Continue(VerificationResult::Verified(_)) => {
+                // The two disagree. Before the shapes fell through to the
+                // solver this slice was a (withheld) `Failed`, never an
+                // accept; a checked proof outranks a syntactic shape, but a
+                // disagreement is a bug in one of them, so the accept is
+                // withheld — fail closed, strictly narrowing, and the same
+                // rule the function lane applies in
+                // `reconcile_precheck_refutation`.
+                return Ok(ResolveContinuation::Continue(
+                    structural_refutation_disagrees_with_proof(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(continuation)
+}
+
+/// Whether an `Unknown` reason is one of the two vacuity demotions
+/// (`VACUOUS_PROOF_MESSAGE` / `VACUOUS_WITH_ENCODER_AXIOMS_MESSAGE`). The
+/// driver's counter keys off the same `"vacuous proof"` prefix
+/// (`callbacks/reporting.rs`), so this predicate and `vacuous > 0` agree.
+fn unknown_reason_is_vacuous(reason: &UnknownReason) -> bool {
+    matches!(
+        reason,
+        UnknownReason::SolverMessage(message)
+            if message == super::super::solver_tail::VACUOUS_PROOF_MESSAGE
+                || message == super::super::solver_tail::VACUOUS_WITH_ENCODER_AXIOMS_MESSAGE
+    )
+}
+
+thread_local! {
+    /// The first structural refutation shape that fired for the obligation
+    /// slice currently being decided, if any.
+    ///
+    /// The shapes do not end the slice (they fall through to the solver so a
+    /// `Failed` can carry a validated model), so the invariant *a refuted
+    /// slice never reaches a structural accept* is carried here rather than
+    /// by control flow (D-28). `verify_single_obligation_slice_inner`
+    /// opens a `SliceRefutationShapeScope` on entry, so the flag is
+    /// slice-scoped and nest-safe.
+    static SLICE_REFUTATION_SHAPE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Slice-scoped ownership of [`SLICE_REFUTATION_SHAPE`]: clears it on entry and
+/// restores the enclosing slice's value on drop, so a nested verification (a
+/// fresh base recheck, a type-invariant precheck) cannot clobber or inherit an
+/// outer slice's shape.
+struct SliceRefutationShapeScope(Option<&'static str>);
+
+impl SliceRefutationShapeScope {
+    fn enter() -> Self {
+        Self(SLICE_REFUTATION_SHAPE.with(|cell| cell.replace(None)))
+    }
+}
+
+impl Drop for SliceRefutationShapeScope {
+    fn drop(&mut self) {
+        SLICE_REFUTATION_SHAPE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The shape that refuted the slice being decided, if one has fired.
+fn slice_refutation_shape() -> Option<&'static str> {
+    SLICE_REFUTATION_SHAPE.with(std::cell::Cell::get)
+}
+
+/// Demote a structural accept produced after a refutation shape fired for this
+/// slice. `Failed` and `Unknown` pass through untouched — the rule forbids only
+/// the accept.
+fn withhold_structural_accept_after_shape(result: VerificationResult) -> VerificationResult {
+    let Some(shape) = slice_refutation_shape() else {
+        return result;
+    };
+    if !matches!(result, VerificationResult::Verified(_)) {
+        return result;
+    }
+    structural_accept_withheld_after_shape(shape)
+}
+
+/// The withheld verdict for a structural accept lane reached after a shape
+/// refuted this slice. Such a lane proves nothing the shape did not already
+/// contradict, so the accept is refused outright (fail closed).
+fn structural_accept_withheld_after_shape(shape: &'static str) -> VerificationResult {
+    crate::verify::authority_trace(|| {
+        format!(
+            "structural accept lane refused: refutation shape `{shape}` already fired for this              slice"
+        )
+    });
+    VerificationResult::Unknown(UnknownReason::SolverMessage(format!(
+        "structural refutation shape `{shape}` refuted this obligation; a structural accept          lane may not discharge it"
+    )))
+}
+
+/// The withheld verdict for a slice a structural shape refuted and the solver
+/// proved.
+fn structural_refutation_disagrees_with_proof() -> VerificationResult {
+    crate::verify::authority_trace(|| {
+        "structural slice refutation shape disagrees with the solver's proof; verdict withheld"
+            .to_string()
+    });
+    VerificationResult::Unknown(UnknownReason::SolverMessage(
+        "structural refutation shape refuted this obligation but the solver proved it; \
+         verdict withheld"
+            .to_string(),
+    ))
+}
+
+/// `Failed` for a structurally refuted slice, backed by the fresh base witness
+/// when the base solves to a validated SAT (the witness stays in its slot for
+/// the pipeline's installer); the bare structural `Failed` otherwise.
+fn structural_refutation_with_base_witness(ctx: &ObligationSliceContext<'_>) -> VerificationResult {
+    crate::verify::solver_tail::clear_refutation_witness();
+    if let Some(recheck) = ctx.literal_false_base_recheck {
+        if matches!(recheck(), Ok(VerificationResult::Verified(_))) {
+            if let Some(witness) = crate::verify::solver_tail::clone_refutation_witness() {
+                crate::verify::authority_trace(|| {
+                    "structural slice refutation backed by a validated base witness".to_string()
+                });
+                return VerificationResult::Failed(witness.counterexample);
+            }
+        }
+    }
+    crate::verify::structural_failed_traced()
 }
 
 /// Whether the recursive-logic-fn calls in `ensure` are covered by the ground
@@ -478,7 +702,7 @@ fn ensure_covered_by_ground_recursive_unfoldings(
 
 /// Tag the inner verification result with violated-postcondition metadata
 /// when it reports a `Failed` counterexample, so the driver can render a
-/// precise "violated ensures #N: <clause>" diagnostic (Phase 8a). No-op for
+/// precise "violated ensures #N: <clause>" diagnostic. No-op for
 /// non-`Failed` results, and idempotent if the inner solver already attached
 /// metadata.
 fn tag_continuation_with_violated_postcondition(
@@ -513,6 +737,12 @@ fn structurally_verified_precheck_with_base_recheck(
     let fresh_base_recheck = ctx.fresh_base_recheck?;
     match fresh_base_recheck() {
         Ok(VerificationResult::Verified(_)) => {
+            // A SAT base says only that the precheck's accept was not vacuous;
+            // it is not a proof of the obligation. Refuse it outright once a
+            // refutation shape has fired for this slice.
+            if let Some(shape) = slice_refutation_shape() {
+                return Some(structural_accept_withheld_after_shape(shape));
+            }
             Some(super::super::solver_tail::prove_prechecked_literal_false_with_solver_evidence())
         }
         Ok(VerificationResult::Failed(counterexample)) => {
@@ -894,6 +1124,16 @@ fn prove_prechecked_literal_false_obligation_with_solver(
     _obligation_index: usize,
     _ctx: &ObligationSliceContext<'_>,
 ) -> Result<ResolveContinuation, EncodingError> {
+    // This helper asserts `false` in a FRESH encoder and returns the trivial
+    // UNSAT as evidence: it proves `false ⊨ anything` and checks nothing about
+    // the obligation. It is only ever a re-packaging of a structural
+    // precheck's decision, so it must never be the evidence for a slice a
+    // refutation shape has already refuted.
+    if let Some(shape) = slice_refutation_shape() {
+        return Ok(ResolveContinuation::Continue(
+            structural_accept_withheld_after_shape(shape),
+        ));
+    }
     let result = super::super::solver_tail::prove_prechecked_literal_false_with_solver_evidence();
     Ok(ResolveContinuation::Continue(result))
 }
@@ -910,7 +1150,9 @@ pub(in crate::verify) fn prove_implication_false_guard_with_solver(
 
     encoder.push_scope()?;
     let guard_term = encoder.encode_pure(guard)?;
-    encoder.assert_term(guard_term);
+    // The guard is the goal side of this refutation (guard ∧ base UNSAT ⇒ the
+    // implication holds); never classify it as an encoder axiom.
+    encoder.with_goal_assertions(|encoder| encoder.assert_term(guard_term));
 
     let original_timeout = encoder.solver().timeout();
     let probe_timeout = Duration::from_millis(500);
@@ -931,12 +1173,13 @@ pub(in crate::verify) fn prove_implication_false_guard_with_solver(
 
     // Attach the refutation's strict proof authority while the guard is still
     // scoped. The guard solve above is a REAL solve on the live incremental
-    // encoder, which runs with `set_produce_proofs(false)` by design, so this
-    // arm used to return a certificate-free `Verified(None)` for an UNSAT it
-    // had genuinely proved — and the mandatory authority boundary then demoted
-    // it to `Unknown(ProofTrusted)`. The isolated strict replay is the
-    // attachment the encoder constructor's comment names, and it is the same
-    // helper the loop lane uses after an accepted loop UNSAT.
+    // encoder, which runs with `set_produce_proofs(false)` by design, so
+    // without this replay the arm would return a certificate-free
+    // `Verified(None)` for an UNSAT it had genuinely proved — and the
+    // mandatory authority boundary would demote it to `Unknown(ProofTrusted)`.
+    // The isolated strict replay is the attachment the encoder constructor's
+    // comment names, and it is the same helper the loop lane uses after an
+    // accepted loop UNSAT.
     //
     // Order matters: `pop_scope` removes the guard assertion, so the replay
     // must run first or it would re-solve a different stack. Fail-closed —
@@ -1719,22 +1962,33 @@ fn bind_quantified_instance(binding: &mut Option<PureExpr>, expr: &PureExpr) -> 
 }
 
 fn expr_truth_from_facts(expr: &PureExpr, facts: &[&PureExpr]) -> Option<bool> {
+    expr_truth_from_facts_with_depth(expr, facts, 0)
+}
+
+// The depth is the caller's, never restarted: a fact `(a == b) ==> c` sends an equality
+// query through `fact_implies_expr` back to its own antecedent, so a walk that restarts
+// its depth here recurses until the stack overflows.
+fn expr_truth_from_facts_with_depth(
+    expr: &PureExpr,
+    facts: &[&PureExpr],
+    depth: usize,
+) -> Option<bool> {
     match expr {
         PureExpr::Bool(value) => Some(*value),
         PureExpr::Var(name, _) => facts
             .iter()
             .find_map(|fact| bool_var_value_from_fact(fact, name)),
         PureExpr::UnOp(trust_wp_core::formula::UnOp::Not, inner) => {
-            Some(!expr_truth_from_facts(inner, facts)?)
+            Some(!expr_truth_from_facts_with_depth(inner, facts, depth)?)
         }
         PureExpr::BinOp(_, BinOp::Eq, _) => {
             if facts
                 .iter()
-                .any(|fact| fact_implies_expr(fact, expr, facts, 0))
+                .any(|fact| fact_implies_expr(fact, expr, facts, depth))
             {
                 return Some(true);
             }
-            if discriminant_equality_follows_from_constructor_fact(expr, facts) {
+            if discriminant_equality_follows_from_constructor_fact(expr, facts, depth) {
                 return Some(true);
             }
             None
@@ -1792,17 +2046,21 @@ fn expr_follows_from_facts_with_depth(expr: &PureExpr, facts: &[&PureExpr], dept
     facts
         .iter()
         .any(|fact| fact_implies_expr(fact, expr, facts, depth + 1))
-        || matches!(expr_truth_from_facts(expr, facts), Some(true))
+        || matches!(
+            expr_truth_from_facts_with_depth(expr, facts, depth),
+            Some(true)
+        )
 }
 
 fn discriminant_equality_follows_from_constructor_fact(
     expr: &PureExpr,
     facts: &[&PureExpr],
+    depth: usize,
 ) -> bool {
     let Some((receiver, value)) = option_discriminant_equality(expr) else {
         return false;
     };
-    let Some(ctor) = known_option_constructor_for_expr(receiver, facts, 0) else {
+    let Some(ctor) = known_option_constructor_for_expr(receiver, facts, depth) else {
         return false;
     };
     matches!((ctor, value), ("None", 0) | ("Some", 1))
@@ -2669,9 +2927,28 @@ fn some_constructor_payload(expr: &PureExpr) -> Option<&PureExpr> {
     }
 }
 
+/// Is this obligation exactly one instance of some visible logic function's
+/// own `#[ensures]`, AT ARGUMENTS ITS `#[requires]` ADMITS?
+///
+/// The postcondition of a guarded logic function is proved only under that
+/// function's precondition, so the fact a caller may use is the implication
+/// `requires(args) => ensures(args)` — the shape the SMT spec axiom and the
+/// Creusot oracle both emit. Handing over the bare conclusion here would be a
+/// SECOND emitter of the same fact with its domain dropped: the grant and the
+/// obligation would then sit in different environments, and an argument the
+/// domain excludes would harvest a postcondition the body never proved (two
+/// clauses of one such postcondition can be jointly unsatisfiable, which makes
+/// every obligation in that proof context worthless).
+///
+/// So the domain travels with the grant: every `requires` clause, instantiated
+/// at the SAME arguments, must be established in the environment this
+/// obligation is discharged in. When it is not, this lane declines and the
+/// obligation falls through to the solver, which has only the guarded axiom.
+/// (`logic_fn_ensures_granted_outside_requires.rs`)
 fn postcondition_is_logic_fn_spec_instance(
     ensure: &PureExpr,
     logic_fns: Option<&[trust_wp_core::logic::LogicFnDef]>,
+    requires: &[PureExpr],
 ) -> bool {
     let Some(logic_fns) = logic_fns else {
         return false;
@@ -2684,11 +2961,42 @@ fn postcondition_is_logic_fn_spec_instance(
             if logic_fn.name() != name || logic_fn.params().len() != args.len() {
                 return false;
             }
+            if !logic_fn_spec_domain_holds(logic_fn, args, requires) {
+                return false;
+            }
             logic_fn.ensures().iter().any(|spec| {
                 let instantiated = instantiate_logic_fn_spec(logic_fn, args, node, spec);
                 same_expr(&instantiated, ensure)
             })
         })
+    })
+}
+
+/// Does the logic function's declared domain hold at `args`, here?
+///
+/// `requires` clauses never mention `result`, so the instantiation is the
+/// parameter substitution alone — the same substitution
+/// [`instantiate_logic_fn_spec`] applies to the postcondition, which is what
+/// keeps grant and obligation in one environment. A clause this layer cannot
+/// establish is not assumed: it fails closed and the caller routes to the
+/// solver. (`logic_fn_ensures_granted_outside_requires.rs`)
+fn logic_fn_spec_domain_holds(
+    logic_fn: &trust_wp_core::logic::LogicFnDef,
+    args: &[PureExpr],
+    requires: &[PureExpr],
+) -> bool {
+    if logic_fn.requires().is_empty() {
+        return true;
+    }
+    let substitutions: HashMap<String, PureExpr> = logic_fn
+        .params()
+        .iter()
+        .cloned()
+        .zip(args.iter().cloned())
+        .collect();
+    logic_fn.requires().iter().all(|require| {
+        let instantiated = require.substitute(&substitutions);
+        crate::verify::postcondition::expr_established_by_context(&instantiated, requires)
     })
 }
 
@@ -3928,6 +4236,195 @@ mod tests {
         PureExpr::Var(name.to_string(), None)
     }
 
+    /// `#[logic(open)] #[requires(x >= 0)] #[ensures(result == x)] fn idl(x)`.
+    fn guarded_identity_logic_fn() -> trust_wp_core::logic::LogicFnDef {
+        let mut logic_fn = trust_wp_core::logic::LogicFnDef::new_with_requires(
+            "idl".to_string(),
+            "mod::idl".to_string(),
+            vec!["x".to_string()],
+            vec![PureExpr::BinOp(
+                Arc::new(var("x")),
+                BinOp::Ge,
+                Arc::new(PureExpr::Int(0)),
+            )],
+            var("x"),
+        );
+        logic_fn.set_ensures(vec![PureExpr::BinOp(
+            Arc::new(var("result")),
+            BinOp::Eq,
+            Arc::new(var("x")),
+        )]);
+        logic_fn
+    }
+
+    /// `idl(<arg>) == <arg>` — one instance of `idl`'s postcondition.
+    fn idl_spec_instance_at(arg: i64) -> PureExpr {
+        let call = PureExpr::LogicFnCall {
+            name: "idl".to_string(),
+            args: vec![PureExpr::Int(arg)],
+        };
+        PureExpr::BinOp(Arc::new(call), BinOp::Eq, Arc::new(PureExpr::Int(arg)))
+    }
+
+    /// The grant and the obligation must sit in the same environment: an
+    /// instance of a logic fn's `ensures` may discharge an obligation only
+    /// where the SAME instance of its `requires` holds. Outside that domain
+    /// the body proved nothing, so this lane must decline and let the solver —
+    /// which holds only `forall x. requires => ensures` — decide.
+    /// (`logic_fn_ensures_granted_outside_requires.rs`)
+    #[test]
+    fn a_logic_fn_spec_instance_is_granted_only_inside_its_requires() {
+        let logic_fns = [guarded_identity_logic_fn()];
+
+        assert!(
+            postcondition_is_logic_fn_spec_instance(
+                &idl_spec_instance_at(2),
+                Some(&logic_fns),
+                &[],
+            ),
+            "in-domain instance must still be discharged here"
+        );
+        assert!(
+            !postcondition_is_logic_fn_spec_instance(
+                &idl_spec_instance_at(-1),
+                Some(&logic_fns),
+                &[],
+            ),
+            "an argument the requires excludes must not harvest the ensures"
+        );
+
+        // A non-literal argument is in-domain only when the surrounding
+        // requires say so; otherwise this layer cannot establish the domain
+        // and fails closed.
+        let call = PureExpr::LogicFnCall {
+            name: "idl".to_string(),
+            args: vec![var("n")],
+        };
+        let open_instance = PureExpr::BinOp(Arc::new(call), BinOp::Eq, Arc::new(var("n")));
+        let n_nonneg = PureExpr::BinOp(Arc::new(var("n")), BinOp::Ge, Arc::new(PureExpr::Int(0)));
+        assert!(postcondition_is_logic_fn_spec_instance(
+            &open_instance,
+            Some(&logic_fns),
+            std::slice::from_ref(&n_nonneg),
+        ));
+        assert!(!postcondition_is_logic_fn_spec_instance(
+            &open_instance,
+            Some(&logic_fns),
+            &[],
+        ));
+    }
+
+    /// Once a refutation shape has fired for a slice, a structural accept lane
+    /// reached afterwards is REFUSED — the rule holds by this guard, not by
+    /// lane order, so re-ordering the lanes cannot reopen the accept (D-28).
+    #[test]
+    fn a_structural_accept_after_a_fired_shape_is_refused() {
+        let _scope = SliceRefutationShapeScope::enter();
+        assert_eq!(slice_refutation_shape(), None);
+        // No shape: an accept passes through untouched.
+        assert!(matches!(
+            withhold_structural_accept_after_shape(VerificationResult::Verified(None)),
+            VerificationResult::Verified(None)
+        ));
+        assert!(structural_refutation_hint(
+            "postcondition-contradicts-requirements"
+        ));
+        assert_eq!(
+            slice_refutation_shape(),
+            Some("postcondition-contradicts-requirements")
+        );
+        match withhold_structural_accept_after_shape(VerificationResult::Verified(None)) {
+            VerificationResult::Unknown(UnknownReason::SolverMessage(message)) => {
+                assert!(
+                    message.contains("postcondition-contradicts-requirements"),
+                    "the withheld verdict must name the shape: {message}"
+                );
+                assert!(message.contains("may not discharge it"), "{message}");
+            }
+            other => panic!("a structural accept after a shape must be refused, got {other:?}"),
+        }
+        // Rejections and inconclusive verdicts are untouched: the rule forbids
+        // only the accept.
+        assert!(matches!(
+            withhold_structural_accept_after_shape(VerificationResult::Unknown(
+                UnknownReason::Timeout
+            )),
+            VerificationResult::Unknown(UnknownReason::Timeout)
+        ));
+        assert!(matches!(
+            withhold_structural_accept_after_shape(VerificationResult::Failed(
+                crate::verify::Counterexample::empty()
+            )),
+            VerificationResult::Failed(_)
+        ));
+    }
+
+    /// The shape flag is slice-scoped: a nested verification (a fresh base
+    /// recheck, a type-invariant precheck) neither inherits nor clobbers the
+    /// enclosing slice's shape.
+    #[test]
+    fn the_shape_flag_is_slice_scoped_and_nest_safe() {
+        let _outer = SliceRefutationShapeScope::enter();
+        assert!(structural_refutation_hint("result-contradicts-return-expr"));
+        assert_eq!(
+            slice_refutation_shape(),
+            Some("result-contradicts-return-expr")
+        );
+        {
+            let _inner = SliceRefutationShapeScope::enter();
+            assert_eq!(
+                slice_refutation_shape(),
+                None,
+                "a nested slice must not inherit the outer slice's shape"
+            );
+            assert!(structural_refutation_hint(
+                "result-match-over-option-ite-directly-invalid"
+            ));
+        }
+        assert_eq!(
+            slice_refutation_shape(),
+            Some("result-contradicts-return-expr"),
+            "the outer slice's shape must survive a nested slice"
+        );
+    }
+
+    /// The vacuity demotions the fall-through solve can report are recognised,
+    /// so a shape-refuted slice over a contradictory base reports `vacuous`
+    /// (exit 2) instead of an uncounted `refutation withheld`.
+    #[test]
+    fn the_two_vacuity_demotions_are_recognised() {
+        for message in [
+            crate::verify::solver_tail::VACUOUS_PROOF_MESSAGE,
+            crate::verify::solver_tail::VACUOUS_WITH_ENCODER_AXIOMS_MESSAGE,
+        ] {
+            assert!(
+                message.contains("vacuous proof"),
+                "the driver counts on this prefix: {message}"
+            );
+            assert!(unknown_reason_is_vacuous(&UnknownReason::SolverMessage(
+                message.to_string()
+            )));
+        }
+        assert!(!unknown_reason_is_vacuous(&UnknownReason::Timeout));
+        assert!(!unknown_reason_is_vacuous(&UnknownReason::SolverMessage(
+            "refutation withheld".to_string()
+        )));
+    }
+
+    /// A slice a structural shape refuted and the solver proved is withheld,
+    /// never accepted (D-28: the shapes fall through to the solver for the
+    /// model; a disagreement fails closed like the function lane's
+    /// `reconcile_precheck_refutation`).
+    #[test]
+    fn structural_slice_refutation_disagreeing_with_a_proof_is_withheld() {
+        match structural_refutation_disagrees_with_proof() {
+            VerificationResult::Unknown(UnknownReason::SolverMessage(message)) => {
+                assert!(message.contains("verdict withheld"), "{message}");
+            }
+            other => panic!("a disagreement must fail closed, got {other:?}"),
+        }
+    }
+
     fn ok(payload: PureExpr) -> PureExpr {
         PureExpr::LogicFnCall {
             name: "OwnResult::Ok".to_string(),
@@ -4498,4 +4995,70 @@ mod tests {
             "an Err branch that does not preserve its authenticated payload must fail closed"
         );
     }
+
+    fn implies(antecedent: PureExpr, consequent: PureExpr) -> PureExpr {
+        PureExpr::BinOp(Arc::new(antecedent), BinOp::Implies, Arc::new(consequent))
+    }
+
+    /// A premise an arm's edge scopes, `(x == 0) ==> (r == 5)`, sends every equality
+    /// query back through its own antecedent; the walk must end with an answer.
+    #[test]
+    fn edge_scoped_equality_fact_ends_the_truth_walk() {
+        let scoped = implies(
+            eq(var("x"), PureExpr::Int(0)),
+            eq(var("r"), PureExpr::Int(5)),
+        );
+        let facts = [&scoped];
+        assert!(!expr_follows_from_facts(
+            &eq(var("r"), PureExpr::Int(7)),
+            &facts
+        ));
+        assert!(!expr_follows_from_facts(
+            &eq(var("r"), PureExpr::Int(5)),
+            &facts
+        ));
+        assert_eq!(
+            expr_truth_from_facts(&eq(var("x"), PureExpr::Int(0)), &facts),
+            None
+        );
+
+        let unit_increment = eq(var("r"), PureExpr::Int(1));
+        assert!(!increment_by_one_postcondition_follows_from_facts(
+            &unit_increment,
+            std::slice::from_ref(&scoped),
+        ));
+    }
+
+    #[test]
+    fn edge_scoped_equality_fact_holds_where_its_edge_does() {
+        let edge = eq(var("x"), PureExpr::Int(0));
+        let scoped = implies(edge.clone(), eq(var("r"), PureExpr::Int(5)));
+        let facts = [&edge, &scoped];
+        assert!(expr_follows_from_facts(
+            &eq(var("r"), PureExpr::Int(5)),
+            &facts
+        ));
+        assert!(!expr_follows_from_facts(
+            &eq(var("r"), PureExpr::Int(7)),
+            &facts
+        ));
+    }
+}
+
+/// Trace-only marker for a structural shape that refutes the obligation. The
+/// verdict itself comes from the solver (see the comment at the first use).
+fn structural_refutation_hint(shape: &'static str) -> bool {
+    crate::verify::authority_trace(|| {
+        format!("structural refutation shape `{shape}`: falling through to the solver")
+    });
+    // Record it for the whole slice BEFORE any caller can take an early
+    // return: a structural accept reached after this point is refused by
+    // `withhold_structural_accept_after_shape` even if a future edit to the
+    // lane ordering makes it reachable again.
+    SLICE_REFUTATION_SHAPE.with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(shape));
+        }
+    });
+    true
 }

@@ -3,8 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Seq ground instance assertions.
-//!
-//! Extracted from `ground_pool.rs` as part of encoder decomposition (#1988).
 
 use ay_dpll::api::{Sort, Term, TermKind};
 
@@ -155,7 +153,7 @@ impl super::super::AYEncoder {
                 self.assert_solver_term("ground/seq_get_inbounds_is_option", is_option);
                 self.assert_solver_term("ground/seq_get_inbounds_is_some", is_some);
                 self.assert_solver_term("ground/seq_get_inbounds_unwrap", unwrap_eq);
-                let mut count = 3;
+                let mut count = 3usize;
                 if let Some(datatype) = self.get_datatype_decl("OptionInt").cloned() {
                     let native_some =
                         self.solver
@@ -163,14 +161,14 @@ impl super::super::AYEncoder {
                     let native_eq = self.eq_term(get_term, native_some);
                     let has_negated_native_eq = self.assertions_contain_negation_of(native_eq);
                     self.assert_solver_term("ground/seq_get_inbounds_native_some", native_eq);
-                    count += 1;
+                    count = count.saturating_add(1);
                     if has_negated_native_eq {
                         let false_term = self.solver.bool_const(false);
                         self.assert_solver_term(
                             "ground/seq_get_inbounds_native_conflict",
                             false_term,
                         );
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
                 count
@@ -201,7 +199,7 @@ impl super::super::AYEncoder {
             None => {
                 self.assert_solver_term("ground/seq_get_oob_is_option", is_option);
                 self.assert_solver_term("ground/seq_get_oob_not_is_some", not_is_some);
-                let mut count = 2;
+                let mut count = 2usize;
                 if let Some(datatype) = self.get_datatype_decl("OptionInt").cloned() {
                     if let Some(native_none) = self.axiom_datatype_constructor(
                         "ground/seq_get_oob_native_none",
@@ -212,14 +210,14 @@ impl super::super::AYEncoder {
                         let native_eq = self.eq_term(get_term, native_none);
                         let has_negated_native_eq = self.assertions_contain_negation_of(native_eq);
                         self.assert_solver_term("ground/seq_get_oob_native_none", native_eq);
-                        count += 1;
+                        count = count.saturating_add(1);
                         if has_negated_native_eq {
                             let false_term = self.solver.bool_const(false);
                             self.assert_solver_term(
                                 "ground/seq_get_oob_native_conflict",
                                 false_term,
                             );
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                 }
@@ -431,7 +429,7 @@ impl super::super::AYEncoder {
     fn assert_seq_index_distinctness_ground_instances(&mut self, remaining_budget: usize) -> usize {
         const INDEX_DISTINCTNESS_BUDGET: usize = 80;
 
-        let mut count = 0;
+        let mut count = 0usize;
         if remaining_budget == 0 {
             return 0;
         }
@@ -484,7 +482,7 @@ impl super::super::AYEncoder {
                     "ground/seq_index_value_distinct_implies_index_distinct",
                     distinct_implies_distinct,
                 );
-                count += 1;
+                count = count.saturating_add(1);
 
                 if count >= budget {
                     return count;
@@ -496,7 +494,7 @@ impl super::super::AYEncoder {
                 let guard = self.solver.and(left_le_right, values_differ);
                 let ordered = self.solver.implies(guard, left_succ_le_right);
                 self.assert_solver_term("ground/seq_index_value_distinct_order_left", ordered);
-                count += 1;
+                count = count.saturating_add(1);
 
                 if count >= budget {
                     return count;
@@ -508,7 +506,7 @@ impl super::super::AYEncoder {
                 let guard = self.solver.and(right_le_left, values_differ);
                 let ordered = self.solver.implies(guard, right_succ_le_left);
                 self.assert_solver_term("ground/seq_index_value_distinct_order_right", ordered);
-                count += 1;
+                count = count.saturating_add(1);
 
                 for disequality in &disequalities {
                     if count >= budget {
@@ -524,7 +522,7 @@ impl super::super::AYEncoder {
                                 pivot,
                                 "ground/seq_index_pivot_distinct_order_left",
                             );
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                     if count >= budget {
@@ -540,7 +538,7 @@ impl super::super::AYEncoder {
                                 pivot,
                                 "ground/seq_index_pivot_distinct_order_right",
                             );
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                 }
@@ -551,7 +549,7 @@ impl super::super::AYEncoder {
     }
 
     fn assert_seq_subsequence_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         if remaining_budget == 0 {
             return 0;
         }
@@ -599,11 +597,11 @@ impl super::super::AYEncoder {
                 &[],
                 eq,
             );
-            count += 1;
+            count = count.saturating_add(1);
         }
 
         const SUBSEQUENCE_INDEX_BUDGET: usize = 80;
-        let mut index_count = 0;
+        let mut index_count = 0usize;
         'subsequence_outer: for (app, args, path_conditions) in &entries {
             if args.len() != 3 {
                 continue;
@@ -633,8 +631,8 @@ impl super::super::AYEncoder {
                     &[in_bounds],
                     eq,
                 );
-                count += 1;
-                index_count += 1;
+                count = count.saturating_add(1);
+                index_count = index_count.saturating_add(1);
             }
         }
 
@@ -642,7 +640,7 @@ impl super::super::AYEncoder {
     }
 
     fn assert_seq_reverse_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
         if remaining_budget == 0 {
             return 0;
         }
@@ -683,14 +681,13 @@ impl super::super::AYEncoder {
             // time the encoder reaches scope 0; without dedup the axiom is
             // re-emitted N times per VC. For nested-loop VCs (e.g. 100doors)
             // the cumulative re-emission inflates the assertion count enough
-            // to trigger ay #8596 false_term preprocessing pathology. See
-            // designs/2026-05-19-100doors-vec-sort-leakage.md.
+            // to trigger ay #8596 false_term preprocessing pathology.
             if self.mark_logic_fn_axiom_asserted("ground/seq_reverse_empty".to_string()) {
                 budget_guard!();
                 let rev_empty = self.solver.apply(&funcs.seq_reverse, &[funcs.seq_empty]);
                 let eq = self.seq_aware_equality_term(rev_empty, funcs.seq_empty);
                 self.assert_solver_term("ground/seq_reverse_empty", eq);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -708,7 +705,7 @@ impl super::super::AYEncoder {
                     &[base_is_empty],
                     reverse_is_empty,
                 );
-                count += 1;
+                count = count.saturating_add(1);
 
                 let mut aliases: std::collections::HashSet<Term> = self
                     .asserted_equality_closure(args[0], 48)
@@ -731,7 +728,7 @@ impl super::super::AYEncoder {
                         &[],
                         eq,
                     );
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
             budget_guard!();
@@ -743,13 +740,13 @@ impl super::super::AYEncoder {
             };
             let eq = self.eq_term(len_reverse, len_base);
             self.assert_guarded_seq_ground_term("ground/seq_reverse_len", path_conditions, &[], eq);
-            count += 1;
+            count = count.saturating_add(1);
         }
 
         const REVERSE_INDEX_BUDGET: usize = 80;
         const REVERSE_OBSERVED_INDEX_BUDGET: usize = 120;
-        let mut index_count = 0;
-        let mut observed_index_count = 0;
+        let mut index_count = 0usize;
+        let mut observed_index_count = 0usize;
         'reverse_outer: for (app, args, path_conditions) in &entries {
             if args.len() != 1 {
                 continue;
@@ -783,8 +780,8 @@ impl super::super::AYEncoder {
                     &[in_bounds],
                     eq,
                 );
-                count += 1;
-                index_count += 1;
+                count = count.saturating_add(1);
+                index_count = index_count.saturating_add(1);
 
                 for (observed_result, observed_index) in observed_base_indices {
                     if observed_index_count >= REVERSE_OBSERVED_INDEX_BUDGET {
@@ -799,8 +796,8 @@ impl super::super::AYEncoder {
                         &[in_bounds, mirror_matches_observed],
                         observed_eq,
                     );
-                    count += 1;
-                    observed_index_count += 1;
+                    count = count.saturating_add(1);
+                    observed_index_count = observed_index_count.saturating_add(1);
                 }
             }
         }
@@ -817,7 +814,7 @@ impl super::super::AYEncoder {
     /// remaining budget. (#2323, #2707)
     #[allow(clippy::too_many_lines)]
     pub(crate) fn assert_seq_ground_instances(&mut self, remaining_budget: usize) -> usize {
-        let mut count = 0;
+        let mut count = 0usize;
 
         if remaining_budget == 0 {
             tracing::debug!(
@@ -867,7 +864,7 @@ impl super::super::AYEncoder {
                         budget_guard!();
                         let ge_zero = self.solver.ge(len_app, zero);
                         self.assert_solver_term("ground/seq_len_nonneg", ge_zero);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
             }
@@ -920,7 +917,7 @@ impl super::super::AYEncoder {
                         let sum = self.solver.add(len_s1, len_s2);
                         let eq = self.eq_term(len_concat, sum);
                         self.assert_solver_term("ground/seq_concat_len", eq);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
 
                     // Axioms 15c/15d: concrete left and right identities.
@@ -930,7 +927,7 @@ impl super::super::AYEncoder {
                         if self.mark_logic_fn_axiom_asserted(dedup_key) {
                             let eq = self.seq_aware_equality_term(*concat_app, right);
                             self.assert_solver_term("ground/seq_concat_left_identity", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                     if right == funcs.seq_empty {
@@ -939,7 +936,7 @@ impl super::super::AYEncoder {
                         if self.mark_logic_fn_axiom_asserted(dedup_key) {
                             let eq = self.seq_aware_equality_term(*concat_app, left);
                             self.assert_solver_term("ground/seq_concat_right_identity", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
 
@@ -954,7 +951,7 @@ impl super::super::AYEncoder {
                             let counterpart = self.solver.apply(&funcs.seq_concat, &[a, b_right]);
                             let eq = self.seq_aware_equality_term(*concat_app, counterpart);
                             self.assert_solver_term("ground/seq_concat_assoc_left", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                     if let Some((b, c)) = concat_args_by_app.get(&right).copied() {
@@ -965,7 +962,7 @@ impl super::super::AYEncoder {
                             let counterpart = self.solver.apply(&funcs.seq_concat, &[left_b, c]);
                             let eq = self.seq_aware_equality_term(counterpart, *concat_app);
                             self.assert_solver_term("ground/seq_concat_assoc_right", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                         }
                     }
                 }
@@ -1028,7 +1025,7 @@ impl super::super::AYEncoder {
                             count +=
                                 self.assert_seq_get_inbounds_option_facts(None, get_s_i, index_s_i);
                             self.assert_solver_term("ground/seq_get_inbounds_direct", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                             continue;
                         }
                         count += self.assert_seq_get_inbounds_option_facts(
@@ -1038,7 +1035,7 @@ impl super::super::AYEncoder {
                         );
                         let impl_term = self.solver.implies(in_bounds, eq);
                         self.assert_solver_term("ground/seq_get_inbounds", impl_term);
-                        count += 1;
+                        count = count.saturating_add(1);
 
                         // 8b: (i < 0 || i >= len(s)) => get(s, i) = None()
                         budget_guard!();
@@ -1052,13 +1049,13 @@ impl super::super::AYEncoder {
                         {
                             count += self.assert_seq_get_oob_option_facts(None, get_s_i);
                             self.assert_solver_term("ground/seq_get_oob_direct", eq);
-                            count += 1;
+                            count = count.saturating_add(1);
                             continue;
                         }
                         count += self.assert_seq_get_oob_option_facts(Some(out_of_bounds), get_s_i);
                         let impl_term = self.solver.implies(out_of_bounds, eq);
                         self.assert_solver_term("ground/seq_get_oob", impl_term);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
             }
@@ -1110,7 +1107,7 @@ impl super::super::AYEncoder {
                         let len_plus_1 = self.solver.add(len_s, one);
                         let eq = self.eq_term(len_push, len_plus_1);
                         self.assert_solver_term("ground/seq_push_back_len", eq);
-                        count += 1;
+                        count = count.saturating_add(1);
 
                         // Concrete R4 instance for the observed push_back term:
                         // reverse(push_back(s, x)) = push_front(reverse(s), x).
@@ -1132,7 +1129,7 @@ impl super::super::AYEncoder {
                                 self.solver.apply(&funcs.seq_push_front, &[rev_s, args[1]]);
                             let r4_eq = self.seq_aware_equality_term(rev_push, push_front_rev);
                             self.assert_solver_term("ground/seq_reverse_push_back", r4_eq);
-                            count += 1;
+                            count = count.saturating_add(1);
 
                             let mut aliases: std::collections::HashSet<Term> = self
                                 .asserted_equality_closure(rev_s, 48)
@@ -1157,7 +1154,7 @@ impl super::super::AYEncoder {
                                     "ground/seq_reverse_push_back_alias_congruence",
                                     eq,
                                 );
-                                count += 1;
+                                count = count.saturating_add(1);
                             }
 
                             // Component-level congruence for observed
@@ -1184,7 +1181,7 @@ impl super::super::AYEncoder {
                                     "ground/seq_reverse_push_back_front_congruence",
                                     bridge,
                                 );
-                                count += 1;
+                                count = count.saturating_add(1);
                                 r4_front_bridge_count += 1;
                             }
                         }
@@ -1209,7 +1206,7 @@ impl super::super::AYEncoder {
                     let concat_equiv = self.solver.apply(&funcs.seq_concat, &[s, singleton]);
                     let eq = self.seq_aware_equality_term(*push_app, concat_equiv);
                     self.assert_solver_term("ground/push_back_singleton_equiv", eq);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -1227,7 +1224,7 @@ impl super::super::AYEncoder {
                             self.solver.apply(&funcs.seq_push_back, &[rev_s, args[1]]);
                         let r5_eq = self.seq_aware_equality_term(rev_push, push_back_rev);
                         self.assert_solver_term("ground/seq_reverse_push_front", r5_eq);
-                        count += 1;
+                        count = count.saturating_add(1);
                     }
                 }
             }
@@ -1245,14 +1242,14 @@ impl super::super::AYEncoder {
         //
         // The cross-product is bounded by the smaller of TRUST_WP_BRIDGE_BUDGET (80)
         // and the caller-provided remaining budget. (#2671, #2707)
-        // Reduced from 200 (#2688): ghost iterator tests generate many
+        // The cap is small (#2688) because ghost iterator tests generate many
         // push_back + concat entries from produces transitivity chains, and
-        // the cross-product dominates solver time. 80 instances covers the
+        // the cross-product dominates solver time; 80 instances covers the
         // typical verification needs while leaving room for other families.
         const TRUST_WP_BRIDGE_BUDGET: usize = 80;
         let bridge_budget = TRUST_WP_BRIDGE_BUDGET.min(remaining_budget.saturating_sub(count));
         if !push_entries.is_empty() && !concat_entries.is_empty() && bridge_budget > 0 {
-            let mut bridge_count = 0;
+            let mut bridge_count = 0usize;
             if let Some(funcs) = self.seq_funcs_clone() {
                 // Priority-sort concat entries: entries whose first arg matches a
                 // push_back first arg are structurally relevant (the concat builds
@@ -1289,8 +1286,8 @@ impl super::super::AYEncoder {
                         let eq = self.seq_aware_equality_term(lhs, rhs);
                         budget_guard!();
                         self.assert_solver_term("ground/push_back_concat_bridge", eq);
-                        count += 1;
-                        bridge_count += 1;
+                        count = count.saturating_add(1);
+                        bridge_count = bridge_count.saturating_add(1);
                     }
                 }
 
@@ -1365,7 +1362,7 @@ impl super::super::AYEncoder {
                 }
             }
 
-            let mut component_bridge_count = 0;
+            let mut component_bridge_count = 0usize;
             'component_outer: for (push_app, push_args) in &push_entries {
                 if push_args.len() != 2 {
                     continue;
@@ -1416,8 +1413,8 @@ impl super::super::AYEncoder {
                                 "ground/seq_component_preservation_bridge",
                                 bridge,
                             );
-                            count += 1;
-                            component_bridge_count += 1;
+                            count = count.saturating_add(1);
+                            component_bridge_count = component_bridge_count.saturating_add(1);
                         }
                     }
                 }
@@ -1475,7 +1472,7 @@ impl super::super::AYEncoder {
 
             if !concat_arg_map.is_empty() {
                 // Pre-index push_front entries as a HashSet for O(1) lookup
-                // instead of O(F) linear scan per pair. (#performance_proofs)
+                // instead of O(F) linear scan per pair.
                 let pf_set: std::collections::HashSet<(Term, Term)> = pf_entries
                     .iter()
                     .filter(|(_, args)| args.len() == 2)
@@ -1483,7 +1480,7 @@ impl super::super::AYEncoder {
                     .collect();
 
                 // Pre-index push_back entries by first arg for O(1) lookup
-                // instead of O(P) linear scan per pair. (#performance_proofs)
+                // instead of O(P) linear scan per pair.
                 let mut pb_by_first_arg: std::collections::HashMap<Term, Vec<Term>> =
                     std::collections::HashMap::new();
                 for (_pb_app, pb_args) in &push_entries {
@@ -1509,11 +1506,11 @@ impl super::super::AYEncoder {
                 // sharing the same receiver (e.g., loops that push_back into
                 // the same Vec repeatedly). Cap at the smaller of 40 bridges
                 // and the caller-provided remaining budget — each bridge
-                // creates 1 implication term in the solver arena. (#OOM, #2707)
+                // creates 1 implication term in the solver arena. (#2707)
                 const TRUST_WP_EXT_EQ_BRIDGE_BUDGET: usize = 40;
                 let ext_eq_bridge_budget =
                     TRUST_WP_EXT_EQ_BRIDGE_BUDGET.min(remaining_budget.saturating_sub(count));
-                let mut bridge_count = 0;
+                let mut bridge_count = 0usize;
 
                 // Gap-based iteration: prioritize adjacent pairs (gap=1)
                 // over distant pairs (gap=2, 3, ...). For loop-based
@@ -1567,8 +1564,8 @@ impl super::super::AYEncoder {
                                         "ground/ext_eq_preservation_bridge",
                                         bridge,
                                     );
-                                    count += 1;
-                                    bridge_count += 1;
+                                    count = count.saturating_add(1);
+                                    bridge_count = bridge_count.saturating_add(1);
                                 }
                             }
                         }
