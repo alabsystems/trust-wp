@@ -6,5 +6,5 @@ publish = false
 description = "INTERFACE-v1: the frozen spec-language interface — UOb carrier record, three-axis ClauseStatus, Lane contract, invariants I1–I7 as tests."
 [workspace]
 [dependencies]
-clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c" }
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "fae0c94829740c9ffe527eeeb4ea472f9c08001b" }
 cert-meter = { path = "../../spikes/cert-meter" }

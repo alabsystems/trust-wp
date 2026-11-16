@@ -29,7 +29,8 @@ use trust_wp_core::{
 
 use crate::{
     trust_ir_native::{
-        body_native_requests, body_native_requests_validated, TrustIrNativeBundleError,
+        body_native_request_validated, body_native_requests, body_native_requests_validated,
+        TrustIrNativeBundleError,
     },
     verify_bundle, BundleClaim, BundleClaimFormat, BundleObligationStatus, ProofEvidenceFormat,
     VerifyBundleRequest, VerifyBundleResult,
@@ -52,6 +53,11 @@ pub enum TrustIrBodyContractError {
     Replay(String),
 }
 
+mod selected;
+pub use selected::{
+    replay_trust_ir_body_request_validated, verify_trust_ir_body_request_validated,
+    NativeBodyWpVerification,
+};
 mod translation;
 pub use translation::{
     replay_trust_ir_body_translation_witnesses, NativeBodyWpProofPlan,
@@ -173,6 +179,19 @@ pub fn trust_ir_native_bundle_to_body_verify_requests_validated(
 }
 
 fn validate_body_module(bundle: &trust_ir::NativeVerificationBundle) -> Result<()> {
+    validate_body_module_semantics(bundle)?;
+    if bundle.module.proof_obligations.iter().any(|obligation| {
+        obligation
+            .formula
+            .as_ref()
+            .is_some_and(|formula| formula.payload.len() > MAX_FORMULA_BYTES)
+    }) {
+        return Err(refuse("contract exceeds payload budget"));
+    }
+    Ok(())
+}
+
+fn validate_body_module_semantics(bundle: &trust_ir::NativeVerificationBundle) -> Result<()> {
     // Bundle provenance validation does not establish that its instructions
     // are legal TrustIR. Use the shared semantic validator before any WP rule.
     // In particular scalar Boolean negation is a Select, not UnOp::Not.
@@ -181,14 +200,6 @@ fn validate_body_module(bundle: &trust_ir::NativeVerificationBundle) -> Result<(
         return Err(refuse(format!(
             "invalid TrustIR program: {semantic_errors:?}"
         )));
-    }
-    if bundle.module.proof_obligations.iter().any(|obligation| {
-        obligation
-            .formula
-            .as_ref()
-            .is_some_and(|formula| formula.payload.len() > MAX_FORMULA_BYTES)
-    }) {
-        return Err(refuse("contract exceeds payload budget"));
     }
     Ok(())
 }
@@ -220,45 +231,62 @@ fn derive_body_requests(
         _ => None,
     });
     for (request, native) in requests.iter_mut().zip(native) {
-        if native.mode != trust_ir::TrustWpVerificationMode::WeakestPrecondition {
-            return Err(refuse("only WeakestPrecondition mode has body semantics"));
-        }
-        if !native.provenance.replay_context().atoms.is_empty() {
-            return Err(refuse(
-                "external replay assumptions/assertions are not body semantics",
-            ));
-        }
-        let function = bundle
-            .module
-            .function_by_id(native.function)
-            .ok_or_else(|| refuse("missing function"))?;
-        let mut body = ScalarBody::validate(&bundle.module, function, String::new())?;
-        body.capture_plan = witnesses.is_some();
-        request.bundle_id = native_body_wp_bundle_id(
-            &bundle.module.name,
-            native.id.index(),
-            &input_identity.bytes,
-        );
-        let mut plan = None;
-        for (output, id) in request.obligations.iter_mut().zip(&native.obligations) {
-            plan = derive_body_obligation(&body, native, output, *id)?;
-        }
-        if let Some(witnesses) = witnesses.as_deref_mut() {
-            witnesses.push(NativeBodyWpTranslationWitness::new(
-                bundle,
-                native,
-                function,
-                request.clone(),
-                body.entry
-                    .params
-                    .iter()
-                    .map(|(id, _)| (*id, body.value_name(*id)))
-                    .collect(),
-                plan.ok_or_else(|| refuse("translation has no original postcondition"))?,
-            )?);
-        }
+        derive_body_request(
+            bundle,
+            native,
+            request,
+            input_identity,
+            witnesses.as_deref_mut(),
+        )?;
     }
     Ok(requests)
+}
+
+fn derive_body_request(
+    bundle: &trust_ir::NativeVerificationBundle,
+    native: &trust_ir::TrustWpNativeRequest,
+    request: &mut VerifyBundleRequest,
+    input_identity: trust_ir::ProofDigest,
+    mut witnesses: Option<&mut Vec<NativeBodyWpTranslationWitness>>,
+) -> Result<()> {
+    if native.mode != trust_ir::TrustWpVerificationMode::WeakestPrecondition {
+        return Err(refuse("only WeakestPrecondition mode has body semantics"));
+    }
+    if !native.provenance.replay_context().atoms.is_empty() {
+        return Err(refuse(
+            "external replay assumptions/assertions are not body semantics",
+        ));
+    }
+    let function = bundle
+        .module
+        .function_by_id(native.function)
+        .ok_or_else(|| refuse("missing function"))?;
+    let mut body = ScalarBody::validate(&bundle.module, function, String::new())?;
+    body.capture_plan = witnesses.is_some();
+    request.bundle_id = native_body_wp_bundle_id(
+        &bundle.module.name,
+        native.id.index(),
+        &input_identity.bytes,
+    );
+    let mut plan = None;
+    for (output, id) in request.obligations.iter_mut().zip(&native.obligations) {
+        plan = derive_body_obligation(&body, native, output, *id)?;
+    }
+    if let Some(witnesses) = witnesses.as_deref_mut() {
+        witnesses.push(NativeBodyWpTranslationWitness::new(
+            bundle,
+            native,
+            function,
+            request.clone(),
+            body.entry
+                .params
+                .iter()
+                .map(|(id, _)| (*id, body.value_name(*id)))
+                .collect(),
+            plan.ok_or_else(|| refuse("translation has no original postcondition"))?,
+        )?);
+    }
+    Ok(())
 }
 
 fn derive_body_obligation(
@@ -431,6 +459,7 @@ pub fn scalar_claim(predicate: &PureExpr) -> Result<BundleClaim> {
                     BinOp::Le => "le",
                     BinOp::Gt => "gt",
                     BinOp::Ge => "ge",
+                    BinOp::Div => "div",
                     BinOp::Add if expr.free_vars().is_empty() => "add",
                     BinOp::Sub if expr.free_vars().is_empty() => "sub",
                     BinOp::Mul if expr.free_vars().is_empty() => "mul",
@@ -590,6 +619,7 @@ fn scalar_formula_sort(expr: &PureExpr, depth: usize) -> Result<ExprSort> {
                 {
                     ExprSort::Int
                 }
+                BinOp::Div if l == ExprSort::Int && r == l => ExprSort::Int,
                 BinOp::Eq | BinOp::Ne if l == r => ExprSort::Bool,
                 BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if l == ExprSort::Int && r == l => {
                     ExprSort::Bool
@@ -714,6 +744,24 @@ fn instruction_types(
             None,
             false,
         ),
+        Inst::Assert { cond, .. } => (
+            vec![(*cond, Some(ValueKind::Scalar(ScalarSort::Boolean)))],
+            None,
+            false,
+        ),
+        Inst::BinOp {
+            op: trust_ir::BinOp::UDiv,
+            ty: ty @ (Ty::U8 | Ty::U32 | Ty::U64),
+            lhs,
+            rhs,
+        } => {
+            let kind = ValueKind::Scalar(scalar(ty)?);
+            (
+                vec![(*lhs, Some(kind)), (*rhs, Some(kind))],
+                Some(kind),
+                false,
+            )
+        }
         Inst::Br { args, .. } => (args.iter().map(|id| (*id, None)).collect(), None, true),
         Inst::Return { values } if values.len() == 1 => (
             vec![(values[0], Some(ValueKind::Scalar(result_sort)))],
@@ -976,7 +1024,27 @@ impl<'a> ScalarBody<'a> {
                 }
             }
             for (index, node) in block.body.iter().enumerate() {
-                if !node.proofs.is_empty() || node.proof_context.is_some() {
+                // The compiler labels an explicit division check, but the
+                // label is not its proof. Retain it in the original identity;
+                // both the assertion and actual divisor are independently owed.
+                let division_marker_only = node
+                    .proofs
+                    .iter()
+                    .all(|proof| matches!(proof, trust_ir::ProofAnnotation::DivNonZero))
+                    && matches!(
+                        node.inst,
+                        Inst::Assert {
+                            kind: trust_ir::AssertKind::DivByZero,
+                            ..
+                        } | Inst::BinOp {
+                            op: trust_ir::BinOp::UDiv,
+                            ty: Ty::U8 | Ty::U32 | Ty::U64,
+                            ..
+                        }
+                    );
+                if (!node.proofs.is_empty() && !division_marker_only)
+                    || node.proof_context.is_some()
+                {
                     return Err(refuse("instruction proof annotations are not premises"));
                 }
                 let (_, result, terminator) =
@@ -1287,11 +1355,31 @@ impl<'a> ScalarBody<'a> {
                     self.value(*value),
                 ))
             }
-            Inst::Assume { cond } => {
-                // Stronger than the partial-correctness assumption rule:
-                // prove the condition instead of gaining it as a premise.
+            Inst::Assert { cond, .. } | Inst::Assume { cond } => {
+                // An assertion owes truth. Assumptions use the same stronger
+                // safety rule instead of gaining the condition as a premise.
                 wp.predicate = binary(self.value(*cond), BinOp::And, wp.predicate);
                 None
+            }
+            Inst::BinOp {
+                op: trust_ir::BinOp::UDiv,
+                rhs,
+                ..
+            } => {
+                // Canonical unsigned division is undefined at zero. Owe
+                // this independently of any assertion, even for a dead result.
+                // All operands already have the same bounded unsigned type,
+                // so their Euclidean quotient needs no modular reduction.
+                wp.predicate = binary(
+                    binary(self.value(*rhs), BinOp::Ne, PureExpr::Int(0)),
+                    BinOp::And,
+                    wp.predicate,
+                );
+                let (_, expression) = instruction_expression(&node.inst, &self.namespace)?;
+                Some((
+                    self.value_name(node.results[0]),
+                    expression.ok_or_else(|| refuse("missing unsigned quotient"))?,
+                ))
             }
             _ => {
                 let (_, expression) = instruction_expression(&node.inst, &self.namespace)?;
@@ -1407,6 +1495,23 @@ fn instruction_expression(
         Inst::Copy { ty, operand } => {
             let sort = ScalarSort::from_ty(ty).ok_or_else(|| refuse("unsupported copy type"))?;
             (vec![*operand], Some(value_expr(*operand, sort, namespace)))
+        }
+        Inst::BinOp {
+            op: trust_ir::BinOp::UDiv,
+            ty: ty @ (Ty::U8 | Ty::U32 | Ty::U64),
+            lhs,
+            rhs,
+        } => {
+            let sort = ScalarSort::from_ty(ty)
+                .ok_or_else(|| refuse("unsupported unsigned division type"))?;
+            (
+                vec![*lhs, *rhs],
+                Some(binary(
+                    value_expr(*lhs, sort, namespace),
+                    BinOp::Div,
+                    value_expr(*rhs, sort, namespace),
+                )),
+            )
         }
         Inst::ICmp { op, ty, lhs, rhs } => {
             let sort =

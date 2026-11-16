@@ -48,6 +48,10 @@ pub enum TrustIrNativeBundleError {
     #[error("tMIR native bundle contains no trust-wp requests")]
     NoTrustWpRequests,
 
+    /// Explicit work selection must name an original typed trust-wp request.
+    #[error("native request {request_id} is absent or is not a trust-wp request")]
+    SelectedRequestNotTrustWp { request_id: u32 },
+
     /// This trust-wp mode is not implemented by the direct native replay path.
     #[error("tMIR trust-wp request {request_id} uses unsupported mode `{mode}`: {reason}")]
     UnsupportedTrustWpMode {
@@ -455,6 +459,32 @@ pub(crate) fn body_native_requests_validated(
     validate_trust_wp_request_provenance(bundle)?;
     validate_trust_wp_lineage_roots(bundle)?;
     convert_native_requests(bundle, BindingModel::BodyScalar)
+}
+
+/// Select work without constructing a smaller native input or changing its
+/// digest. Generic admission remains for the entire original bundle; mode,
+/// clause and native WP tool compatibility belong to the selected request.
+pub(crate) fn body_native_request_validated<'a>(
+    admitted: &trust_ir::ValidatedNativeBundle<'a>,
+    request_id: trust_ir::NativeRequestId,
+) -> Result<(&'a trust_ir::TrustWpNativeRequest, VerifyBundleRequest), TrustIrNativeBundleError> {
+    let bundle = admitted.bundle();
+    let native = bundle
+        .requests
+        .iter()
+        .find(|request| request.id() == request_id)
+        .ok_or(TrustIrNativeBundleError::SelectedRequestNotTrustWp {
+            request_id: request_id.index(),
+        })?;
+    let trust_ir::NativeVerificationRequest::TrustWp(request) = native else {
+        return Err(TrustIrNativeBundleError::SelectedRequestNotTrustWp {
+            request_id: request_id.index(),
+        });
+    };
+    validate_trust_wp_lineage_request(bundle, request)?;
+    let converted =
+        tmir_trust_wp_request_to_verify_bundle(bundle, native, request, BindingModel::BodyScalar)?;
+    Ok((request, converted))
 }
 
 #[derive(Clone, Copy)]
@@ -881,29 +911,34 @@ fn validate_trust_wp_lineage_roots(
     bundle: &trust_ir::NativeVerificationBundle,
 ) -> Result<(), TrustIrNativeBundleError> {
     for request in &bundle.requests {
-        let trust_ir::NativeVerificationRequest::TrustWp(trust_wp_request) = request else {
-            continue;
-        };
+        if let trust_ir::NativeVerificationRequest::TrustWp(request) = request {
+            validate_trust_wp_lineage_request(bundle, request)?;
+        }
+    }
+    Ok(())
+}
 
-        for root in &trust_wp_request.lineage_roots {
-            if let Some(node) = bundle
-                .lineage
-                .nodes
-                .iter()
-                .find(|candidate| candidate.id == *root)
-            {
-                if node.target_module != bundle.trust_ir_module_digest {
-                    return Err(TrustIrNativeBundleError::MismatchedLineageRootDigest {
-                        request_id: trust_wp_request.id.index(),
-                        lineage_root_id: root.index(),
-                        expected: bundle_digest_from_tmir(bundle.trust_ir_module_digest),
-                        found: bundle_digest_from_tmir(node.target_module),
-                    });
-                }
+fn validate_trust_wp_lineage_request(
+    bundle: &trust_ir::NativeVerificationBundle,
+    request: &trust_ir::TrustWpNativeRequest,
+) -> Result<(), TrustIrNativeBundleError> {
+    for root in &request.lineage_roots {
+        if let Some(node) = bundle
+            .lineage
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == *root)
+        {
+            if node.target_module != bundle.trust_ir_module_digest {
+                return Err(TrustIrNativeBundleError::MismatchedLineageRootDigest {
+                    request_id: request.id.index(),
+                    lineage_root_id: root.index(),
+                    expected: bundle_digest_from_tmir(bundle.trust_ir_module_digest),
+                    found: bundle_digest_from_tmir(node.target_module),
+                });
             }
         }
     }
-
     Ok(())
 }
 
@@ -2098,41 +2133,38 @@ fn proof_context_for_formula(
 }
 
 fn proof_context_from_trust_formula(payload: &str) -> Option<BundleProofContext> {
-    let value: Value = serde_json::from_str(payload).ok()?;
+    let (claim, value) =
+        trust_wp_core::verify_bundle::decode_trust_formula_v1_declared_claim_and_value(payload)
+            .ok()?;
     let envelope = value.as_object()?;
-    let body = envelope.get("body")?;
-    let (assumptions, assertions) = split_trust_formula_body(body);
+    let (assumptions, assertions) = split_trust_wp_pure_predicate(&claim.body);
     let assertion_index_offset = assumptions.len();
-
+    let atoms = |parts: Vec<(&PureExpr, String)>, offset, role| {
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, path))| {
+                // The shared decoder and typed connective walk select this path.
+                // Original syntax only supplies atom bytes; it makes no decisions.
+                let body = value.pointer(&format!("/body{path}"))?.clone();
+                Some(BundleProofAtom::new(
+                    proof_atom_index(offset + index),
+                    role,
+                    BundleClaim::new(
+                        BundleClaimFormat::TrustFormulaV1,
+                        trust_formula_atom_payload(envelope, body),
+                    ),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+    };
     Some(BundleProofContext::new(
-        assumptions
-            .into_iter()
-            .enumerate()
-            .map(|(index, body)| {
-                BundleProofAtom::new(
-                    proof_atom_index(index),
-                    BundleProofAtomRole::Assumption,
-                    BundleClaim::new(
-                        BundleClaimFormat::TrustFormulaV1,
-                        trust_formula_atom_payload(envelope, body),
-                    ),
-                )
-            })
-            .collect(),
-        assertions
-            .into_iter()
-            .enumerate()
-            .map(|(index, body)| {
-                BundleProofAtom::new(
-                    proof_atom_index(assertion_index_offset + index),
-                    BundleProofAtomRole::Assertion,
-                    BundleClaim::new(
-                        BundleClaimFormat::TrustFormulaV1,
-                        trust_formula_atom_payload(envelope, body),
-                    ),
-                )
-            })
-            .collect(),
+        atoms(assumptions, 0, BundleProofAtomRole::Assumption)?,
+        atoms(
+            assertions,
+            assertion_index_offset,
+            BundleProofAtomRole::Assertion,
+        )?,
     ))
 }
 
@@ -2152,48 +2184,15 @@ fn trust_formula_atom_payload(envelope: &Map<String, Value>, body: Value) -> Str
     Value::Object(atom).to_string()
 }
 
-fn split_trust_formula_body(body: &Value) -> (Vec<Value>, Vec<Value>) {
-    let Some(object) = body.as_object() else {
-        return (Vec::new(), vec![body.clone()]);
-    };
-    if object.get("op").and_then(Value::as_str) == Some("implies") {
-        let assumptions = object
-            .get("lhs")
-            .map_or_else(Vec::new, flatten_trust_formula_conjunction);
-        let assertions = object
-            .get("rhs")
-            .map_or_else(Vec::new, flatten_trust_formula_conjunction);
-        return (assumptions, assertions);
-    }
-    (Vec::new(), flatten_trust_formula_conjunction(body))
-}
-
-fn flatten_trust_formula_conjunction(value: &Value) -> Vec<Value> {
-    let Some(object) = value.as_object() else {
-        return vec![value.clone()];
-    };
-    if object.get("op").and_then(Value::as_str) == Some("and") {
-        let mut atoms = Vec::new();
-        if let Some(lhs) = object.get("lhs") {
-            atoms.extend(flatten_trust_formula_conjunction(lhs));
-        }
-        if let Some(rhs) = object.get("rhs") {
-            atoms.extend(flatten_trust_formula_conjunction(rhs));
-        }
-        return atoms;
-    }
-    vec![value.clone()]
-}
-
 fn proof_context_from_trust_wp_pure_expr(payload: &str) -> Option<BundleProofContext> {
     let predicate = parse_contract(payload.trim()).ok()?;
-    let (assumptions, assertions) = split_trust_wp_pure_predicate(predicate);
+    let (assumptions, assertions) = split_trust_wp_pure_predicate(&predicate);
     let assertion_index_offset = assumptions.len();
     Some(BundleProofContext::new(
         assumptions
             .into_iter()
             .enumerate()
-            .map(|(index, expr)| {
+            .map(|(index, (expr, _))| {
                 BundleProofAtom::new(
                     proof_atom_index(index),
                     BundleProofAtomRole::Assumption,
@@ -2204,7 +2203,7 @@ fn proof_context_from_trust_wp_pure_expr(payload: &str) -> Option<BundleProofCon
         assertions
             .into_iter()
             .enumerate()
-            .map(|(index, expr)| {
+            .map(|(index, (expr, _))| {
                 BundleProofAtom::new(
                     proof_atom_index(assertion_index_offset + index),
                     BundleProofAtomRole::Assertion,
@@ -2215,24 +2214,34 @@ fn proof_context_from_trust_wp_pure_expr(payload: &str) -> Option<BundleProofCon
     ))
 }
 
-fn split_trust_wp_pure_predicate(predicate: PureExpr) -> (Vec<PureExpr>, Vec<PureExpr>) {
+/// Split both native codecs using the same typed connective interpretation.
+/// Paths preserve the original typed-JSON atoms, including result placeholders.
+fn split_trust_wp_pure_predicate(
+    predicate: &PureExpr,
+) -> (Vec<(&PureExpr, String)>, Vec<(&PureExpr, String)>) {
     match predicate {
         PureExpr::BinOp(left, BinOp::Implies, right) => (
-            flatten_trust_wp_pure_conjunction((*left).clone()),
-            flatten_trust_wp_pure_conjunction((*right).clone()),
+            flatten_trust_wp_pure_conjunction(left, "/lhs".into()),
+            flatten_trust_wp_pure_conjunction(right, "/rhs".into()),
         ),
-        other => (Vec::new(), flatten_trust_wp_pure_conjunction(other)),
+        other => (
+            Vec::new(),
+            flatten_trust_wp_pure_conjunction(other, String::new()),
+        ),
     }
 }
 
-fn flatten_trust_wp_pure_conjunction(expr: PureExpr) -> Vec<PureExpr> {
+fn flatten_trust_wp_pure_conjunction(expr: &PureExpr, path: String) -> Vec<(&PureExpr, String)> {
     match expr {
         PureExpr::BinOp(left, BinOp::And, right) => {
-            let mut atoms = flatten_trust_wp_pure_conjunction((*left).clone());
-            atoms.extend(flatten_trust_wp_pure_conjunction((*right).clone()));
+            let mut atoms = flatten_trust_wp_pure_conjunction(left, format!("{path}/lhs"));
+            atoms.extend(flatten_trust_wp_pure_conjunction(
+                right,
+                format!("{path}/rhs"),
+            ));
             atoms
         }
-        other => vec![other],
+        other => vec![(other, path)],
     }
 }
 
@@ -2246,4 +2255,133 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod shared_codec_sp_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    // Frozen pre-migration raw connective splitter, confined to this test module.
+    fn legacy_flatten(value: &Value) -> Vec<Value> {
+        let Some(object) = value.as_object() else {
+            return vec![value.clone()];
+        };
+        if object.get("op").and_then(Value::as_str) == Some("and") {
+            let mut atoms = Vec::new();
+            if let Some(lhs) = object.get("lhs") {
+                atoms.extend(legacy_flatten(lhs));
+            }
+            if let Some(rhs) = object.get("rhs") {
+                atoms.extend(legacy_flatten(rhs));
+            }
+            return atoms;
+        }
+        vec![value.clone()]
+    }
+
+    fn legacy_context(payload: &str) -> BundleProofContext {
+        let value: Value = serde_json::from_str(payload).unwrap();
+        let envelope = value.as_object().unwrap();
+        let body = envelope.get("body").unwrap();
+        let object = body.as_object().unwrap();
+        let (assumptions, assertions) =
+            if object.get("op").and_then(Value::as_str) == Some("implies") {
+                (
+                    legacy_flatten(&object["lhs"]),
+                    legacy_flatten(&object["rhs"]),
+                )
+            } else {
+                (Vec::new(), legacy_flatten(body))
+            };
+        let make_atom = |index: usize, role, body| {
+            let mut atom = Map::new();
+            atom.insert(
+                "schema".into(),
+                Value::String(TRUST_FORMULA_CLAIM_SCHEMA_VERSION.into()),
+            );
+            for key in ["variables", "result"] {
+                if let Some(value) = envelope.get(key) {
+                    atom.insert(key.into(), value.clone());
+                }
+            }
+            atom.insert("body".into(), body);
+            BundleProofAtom::new(
+                u32::try_from(index).unwrap(),
+                role,
+                BundleClaim::new(
+                    BundleClaimFormat::TrustFormulaV1,
+                    Value::Object(atom).to_string(),
+                ),
+            )
+        };
+        let offset = assumptions.len();
+        BundleProofContext::new(
+            assumptions
+                .into_iter()
+                .enumerate()
+                .map(|(index, body)| make_atom(index, BundleProofAtomRole::Assumption, body))
+                .collect(),
+            assertions
+                .into_iter()
+                .enumerate()
+                .map(|(index, body)| {
+                    make_atom(offset + index, BundleProofAtomRole::Assertion, body)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn typed_splitter_matches_original_atom_projection_without_granting_provenance() {
+        let payload = json!({
+            "schema":"trust_wp.trust-formula.v1",
+            "variables":[{"name":"x","sort":"Int"}],
+            "result":{"sort":"Int"},
+            "body":{"op":"implies",
+                "lhs":{"op":"and","lhs":{"bool":true},
+                    "rhs":{"op":"and","lhs":{"bool":false},"rhs":{"bool":true}}},
+                "rhs":{"op":"and","lhs":{"op":"eq","lhs":{"result":true},"rhs":{"result":true}},
+                    "rhs":{"op":"and","lhs":{"var":"x"},"rhs":{"int":u64::MAX}}}}
+        });
+        let mut digests = Vec::new();
+        for mut value in [payload.clone(), payload.clone()] {
+            if !digests.is_empty() {
+                value["body"]["rhs"]["lhs"]["lhs"] = json!({"var":"result"});
+            }
+            let source = value.to_string();
+            let expected = legacy_context(&source);
+            let actual = proof_context_from_trust_formula(&source)
+                .expect("well-formed original atoms split");
+            assert_eq!(
+                actual, expected,
+                "exact original atom bytes, roles, order and indices"
+            );
+            assert_eq!(actual.canonical_digest(), expected.canonical_digest());
+            assert_eq!(actual.assumptions.len(), 3);
+            assert_eq!(actual.assertions.len(), 3);
+            for (index, atom) in actual
+                .assumptions
+                .iter()
+                .chain(&actual.assertions)
+                .enumerate()
+            {
+                assert_eq!(atom.index, u32::try_from(index).unwrap());
+                assert_eq!(atom.native_replay_atom_id, None);
+                let atom: Value = serde_json::from_str(&atom.claim.payload).unwrap();
+                assert_eq!(atom["result"], json!({"sort":"Int"}));
+                assert_eq!(atom["variables"], json!([{"name":"x","sort":"Int"}]));
+            }
+            digests.push(
+                actual
+                    .canonical_digest()
+                    .expect("context digest is defined"),
+            );
+        }
+        assert_ne!(
+            digests[0], digests[1],
+            "equal typed expressions keep distinct original result syntax bytes"
+        );
+    }
 }

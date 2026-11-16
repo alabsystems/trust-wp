@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # rust-version omitted: requires the Trust toolchain (rust-toolchain.toml)
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -54,16 +54,16 @@ trust-wp-cli = { path = "crates/trust-wp-cli" }
 # the ay revision this commit was staged against (a sibling ay
 # checkout's HEAD); publish/transforms.sh rewrites these pins, and the
 # stage log records the projection.
-ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
-ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
 
 # trust-ir: universal proof-carrying IR. Provides typed
 # NativeVerificationRequest::TrustWp bundles consumed by the optional
 # trust-ir-native feature in trust-wp-lib. Keep the standalone source exact:
 # a moving branch makes a previously valid --locked build fail when main moves.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
-trust-ir-contract = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", default-features = false }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f" }
+trust-ir-contract = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f" }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", default-features = false }
 
 
 # Proc macro support

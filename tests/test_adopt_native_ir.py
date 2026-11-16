@@ -3,6 +3,7 @@ import importlib.util
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -16,15 +17,71 @@ spec.loader.exec_module(adopt)
 
 class AdoptionTests(unittest.TestCase):
     def test_graph_rejects_unrelated_edges_and_checksums(self):
-        before = ('[[package]]\nname="a"\nversion="1"\nsource="git+' + adopt.IR + '?rev=old#old"\nchecksum="same"\ndependencies=["b"]\n').encode()
+        before = ('[[package]]\nname="a"\nversion="1"\nsource="git+' + adopt.IR + '?rev=old#old"\nchecksum="same"\ndependencies=["b"]\n'
+                  '[[package]]\nname="b"\nversion="1"\n'
+                  '[[package]]\nname="c"\nversion="1"\n').encode()
         moved = before.replace(b'rev=old#old', b'rev=new#new')
         self.assertEqual(adopt.lock_graph(before, [('old', 'new')]), adopt.lock_graph(moved))
-        for changed in (moved.replace(b'"b"', b'"c"'), moved.replace(b'same', b'other')):
+        for changed in (moved.replace(b'dependencies=["b"]', b'dependencies=["c"]'),
+                        moved.replace(b'same', b'other')):
             self.assertNotEqual(adopt.lock_graph(before, [('old', 'new')]), adopt.lock_graph(changed))
 
     def test_idempotent_graph_move_preserves_leaf_nodes(self):
         leaf = b'[[package]]\nname="leaf"\nversion="1"\n'
         self.assertEqual(adopt.lock_graph(leaf, [('a' * 40, 'a' * 40)]), adopt.lock_graph(leaf))
+
+    def test_clean_versions_follow_only_authenticated_manifests(self):
+        before, after = 'a' * 40, 'b' * 40
+        source = f'git+{adopt.CLEAN}?rev={before}#{before}'
+        locked = (f'[[package]]\nname="clean-kernel"\nversion="0.9.0"\nsource="{source}"\n').encode()
+
+        def manifest(store, revision, path):
+            if path == 'Cargo.toml':
+                version = '0.9.0' if revision == before else '0.9.1'
+                return f'[workspace]\nmembers=["crates/clean-kernel"]\n[workspace.package]\nversion="{version}"\n'
+            self.assertEqual(path, 'crates/clean-kernel/Cargo.toml')
+            return '[package]\nname="clean-kernel"\nversion.workspace=true\n'
+
+        with patch.object(adopt, 'blob', side_effect=manifest):
+            moves = adopt.clean_version_moves(None, before, after, [locked])
+            self.assertEqual(moves[0]['version_after'], '0.9.1')
+            for malformed in (locked.replace(b'0.9.0', b'0.9.2'),
+                              locked.replace(b'clean-kernel', b'foreign')):
+                with self.assertRaisesRegex(RuntimeError, 'authenticated source'):
+                    adopt.clean_version_moves(None, before, after, [malformed])
+
+    def test_effective_edges_preserve_foreign_path_and_registry_identities(self):
+        old, new = 'a' * 40, 'b' * 40
+        source = f'git+{adopt.CLEAN}?rev={old}#{old}'
+        before = (f'[[package]]\nname="app"\nversion="1"\ndependencies=["clean-kernel 0.9.0 (git+{adopt.CLEAN}?rev={old})", "clean-kernel 0.9.0", "registry-leaf"]\n'
+                  f'[[package]]\nname="clean-kernel"\nversion="0.9.0"\nsource="{source}"\n'
+                  '[[package]]\nname="clean-kernel"\nversion="0.9.0"\n'
+                  '[[package]]\nname="registry-leaf"\nversion="1"\nsource="registry+canonical"\nchecksum="original"\n').encode()
+        moves = [dict(name='clean-kernel', source_before=source,
+                      source_after=source.replace(old, new),
+                      version_before='0.9.0', version_after='0.9.1')]
+        after = before.replace(old.encode(), new.encode()).replace(
+            f'clean-kernel 0.9.0 (git+{adopt.CLEAN}?rev={new})'.encode(), b'clean-kernel 0.9.1').replace(
+            f'version="0.9.0"\nsource="{source.replace(old, new)}"'.encode(),
+            f'version="0.9.1"\nsource="{source.replace(old, new)}"'.encode())
+        expected = adopt.lock_graph(before, [(old, new)], moves)
+        self.assertEqual(expected, adopt.lock_graph(after))
+        for changed in (after.replace(b'checksum="original"', b'checksum="changed"'),
+                        after.replace(b'version="0.9.0"', b'version="0.9.2"'),
+                        after.replace(adopt.CLEAN.encode(), b'https://example.invalid/clean.git')):
+            with self.subTest(changed=changed):
+                try:
+                    actual = adopt.lock_graph(changed)
+                except RuntimeError:
+                    continue
+                self.assertNotEqual(expected, actual)
+        with self.assertRaisesRegex(RuntimeError, 'unowned Clean version'):
+            adopt.lock_graph(before.replace(b'0.9.0', b'0.9.2'), [(old, new)], moves)
+        for edge in ('clean-kernel', f'clean-kernel (git+{adopt.CLEAN}?rev={new})'):
+            malformed = re.sub(rb'dependencies=\[[^\n]+\]',
+                               ('dependencies=["' + edge + '"]').encode(), after)
+            with self.subTest(edge=edge), self.assertRaisesRegex(RuntimeError, 'version is missing or ambiguous'):
+                adopt.lock_graph(malformed)
 
     def test_immutable_revision_required(self):
         for value in ('main', 'abc', 'a' * 39, 'A' * 40):
@@ -76,7 +133,9 @@ class AdoptionTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(101, 'metadata')
             real_run = subprocess.run
             with patch.object(adopt, 'authority', return_value=root), \
+                 patch.object(adopt, 'source_checkout'), \
                  patch.object(adopt, 'clean_owner', return_value='c' * 40), \
+                 patch.object(adopt, 'clean_version_moves', return_value=[]), \
                  patch.object(adopt, 'metadata', side_effect=fail_producer), \
                  patch.object(adopt.subprocess, 'run', wraps=subprocess.run) as invoked:
                 # Only the main ancestry command is supplied by the authority fixture.
@@ -91,6 +150,96 @@ class AdoptionTests(unittest.TestCase):
 
 
 class GitAuthorityIsolationTests(unittest.TestCase):
+    def test_native_data_cache_refusal_has_no_local_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            (cache / 'trust-ir').mkdir()
+            calls = []
+
+            def transport(argv, cwd=None):
+                calls.append(argv)
+                if argv[2] == 'fetch':
+                    raise subprocess.CalledProcessError(1, argv, stderr='native cache aliases receiver')
+                self.assertEqual(argv[1:3], ['repo', 'fetch-main'])
+                return ''
+
+            with patch.object(adopt, 'run', side_effect=transport), self.assertRaises(subprocess.CalledProcessError):
+                adopt.authority(cache, 'trust-ir', 'a' * 40, cache)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[-1][-2:], ['--checkout-cache', (cache / 'trust-ir').resolve()])
+
+    def test_main_blob_omission_preserves_exact_source_and_ancestry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            store = cache / 'trust-ir'
+            source_data_cache = cache / 'readonly-data'
+            (source_data_cache / 'trust-ir').mkdir(parents=True)
+            subprocess.run(['git', 'init', '--bare', '--quiet', '--template=', store], check=True)
+            objects = []
+
+            def obj(kind, data):
+                raw = kind.encode() + b' ' + str(len(data)).encode() + b'\0' + data
+                identity = hashlib.sha1(raw).hexdigest()
+                objects.append((identity, zlib.compress(raw)))
+                return identity
+
+            source = b'[workspace]\nmembers=[]\n'
+            manifest = obj('blob', source)
+            source_tree = obj('tree', b'100644 Cargo.toml\0' + bytes.fromhex(manifest))
+            author = 'author Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n'
+            absent = 'f' * 40
+            historical_tree = obj('tree', b'100644 old.data\0' + bytes.fromhex(absent))
+            historical = obj('commit', (f'tree {historical_tree}\n{author}\nhistory\n').encode())
+            selected = obj('commit', (f'tree {source_tree}\nparent {historical}\n{author}\nselected\n').encode())
+            main_tree = obj('tree', b'100644 Cargo.toml\0' + bytes.fromhex(absent))
+            main = obj('commit', (f'tree {main_tree}\nparent {selected}\n{author}\nmain\n').encode())
+            real_run = adopt.run
+            calls = []
+
+            def transport(argv, cwd=None):
+                if str(argv[0]) != 'agh':
+                    return real_run(argv, cwd)
+                calls.append([str(x) for x in argv])
+                for identity, data in objects:
+                    target = store / 'objects' / identity[:2] / identity[2:]
+                    target.parent.mkdir(exist_ok=True)
+                    target.write_bytes(data)
+                if argv[2] == 'fetch-main':
+                    self.assertEqual(str(argv[-1]), '--blobless')
+                    real_run(['git', '-C', store, 'update-ref', 'refs/agh/fetched-main', main])
+                else:
+                    self.assertEqual(argv[2], 'fetch')
+                    self.assertNotIn('--blobless', argv)
+                    self.assertIn('--checkout-closure', argv)
+                    self.assertEqual(argv[-2:], ['--checkout-cache', (source_data_cache / 'trust-ir').resolve()])
+                    self.assertNotEqual(argv[-1], store)
+                    real_run(['git', '-C', store, 'update-ref', 'refs/agh/adoption', selected])
+                return ''
+
+            with patch.object(adopt, 'run', side_effect=transport):
+                self.assertEqual(adopt.authority(cache, 'trust-ir', selected, source_data_cache), store)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(adopt.blob(store, selected, 'Cargo.toml').encode(), source)
+            missing = subprocess.run(['git', '-C', store, 'cat-file', '-e', absent],
+                                     env=adopt.git_environment(), capture_output=True)
+            self.assertNotEqual(missing.returncode, 0)
+
+    def test_prior_checkout_uses_the_same_exact_native_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / 'receiver'
+            data = Path(directory) / 'data'
+            (data / 'clean').mkdir(parents=True)
+            before = 'a' * 40
+            after = 'b' * 40
+            with patch.object(adopt, 'run', side_effect=['', before, '', after]) as invoked:
+                adopt.source_checkout(store, 'clean', before, data)
+                adopt.source_checkout(store, 'clean', after, data)
+            for call, revision in zip(invoked.call_args_list[::2], (before, after)):
+                self.assertEqual(call.args[0], [
+                    'agh', 'repo', 'fetch', 'alabsystems/clean', store,
+                    '--ref', revision, '--into', 'refs/agh/adoption', '--checkout-closure',
+                    '--checkout-cache', (data / 'clean').resolve()])
+
     def test_external_and_cached_grafts_cannot_admit_an_unrelated_root(self):
         git = adopt.shutil.which('git')
         self.assertIsNotNone(git)

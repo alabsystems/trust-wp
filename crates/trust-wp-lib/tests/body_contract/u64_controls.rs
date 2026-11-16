@@ -331,7 +331,7 @@ fn local_calls_still_share_one_expansion_budget() {
 }
 
 #[test]
-fn machine_division_and_assertions_remain_explicitly_unsupported() {
+fn executed_assertions_and_dead_division_keep_their_safety_obligations() {
     for assertion in [false, true] {
         let mut bundle = word_question(u64::MAX, None);
         let block = &mut bundle.module.functions[0].blocks[0];
@@ -365,10 +365,25 @@ fn machine_division_and_assertions_remain_explicitly_unsupported() {
         }
         refresh_native_bundle_module_identity(&mut bundle);
         bundle.validate().unwrap();
-        let error = verify_trust_ir_body_contracts(&bundle)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("outside scalar WP fragment"), "{error}");
+        let results = verify_trust_ir_body_contracts(&bundle).unwrap();
+        assert_eq!(results.len(), 1);
+        if assertion {
+            assert_eq!(
+                results[0].status,
+                VerifyBundleStatus::Verified,
+                "{results:#?}"
+            );
+            replay_trust_ir_body_contracts(&bundle, &results).unwrap();
+        } else {
+            assert_eq!(
+                results[0].status,
+                VerifyBundleStatus::Failed,
+                "{results:#?}"
+            );
+            assert!(format!("{:?}", results[0].obligation_results)
+                .contains("checked whole-predicate counterexample"));
+            assert!(replay_trust_ir_body_contracts(&bundle, &results).is_err());
+        }
     }
 }
 

@@ -15,6 +15,7 @@ repository.workspace = true
 tracing-init = ["dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
+trust-ir-contract = { workspace = true, features = ["proof-json"] }
 num-bigint = { workspace = true }
 sha2 = { workspace = true }
 serde = { version = "1", features = ["derive"] }

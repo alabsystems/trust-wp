@@ -2625,6 +2625,14 @@ fn prove_linear_implication(antecedent: &PureExpr, consequent: &PureExpr) -> Opt
 }
 
 fn prove_linear_comparison(left: &PureExpr, op: BinOp, right: &PureExpr) -> Option<TruthValue> {
+    if matches!(op, BinOp::Eq | BinOp::Ne) && is_int_sorted(left) && is_int_sorted(right) {
+        let difference = LinearInt::from_expr(left)?.sub(LinearInt::from_expr(right)?)?;
+        let value = difference.constant_value()?;
+        return Some(TruthValue::from_bool(
+            (value == 0) == (op == BinOp::Eq),
+            "linear-int-comparison",
+        ));
+    }
     let (difference, strict) = linear_goal(left, op, right)?;
     if !difference.terms.is_empty() {
         return None;
@@ -2648,16 +2656,21 @@ fn prove_int_arithmetic_implication(
     }
 
     let consequent = substitute_equalities_from_assumption(antecedent, consequent);
-    prove_int_arithmetic_predicate_with_constraints(&consequent, &constraints)
+    prove_int_arithmetic_predicate_with_constraints(
+        &consequent,
+        &constraints,
+        &[(antecedent, true)],
+    )
 }
 
 fn prove_int_arithmetic_predicate_with_constraints(
     expr: &PureExpr,
     constraints: &[LinearConstraint],
+    guards: &[(&PureExpr, bool)],
 ) -> Option<TruthValue> {
     // This is proof search over the existing typed formula, not evaluation at
     // selected integers. Every branch retains its enclosing linear premises.
-    prove_guarded_integer_predicate(expr, true, constraints, &mut 4096)?;
+    prove_guarded_integer_predicate(expr, true, constraints, guards, &mut 4096)?;
     Some(TruthValue::True {
         rule: "int-arithmetic-implication",
     })
@@ -2667,29 +2680,44 @@ fn prove_guarded_integer_predicate(
     expr: &PureExpr,
     expected: bool,
     constraints: &[LinearConstraint],
+    guards: &[(&PureExpr, bool)],
     remaining: &mut usize,
 ) -> Option<()> {
     *remaining = remaining.checked_sub(1)?;
     match expr {
         PureExpr::Bool(value) => (*value == expected).then_some(()),
         PureExpr::UnOp(UnOp::Not, inner) => {
-            prove_guarded_integer_predicate(inner, !expected, constraints, remaining)
+            prove_guarded_integer_predicate(inner, !expected, constraints, guards, remaining)
         }
         PureExpr::BinOp(left, op @ (BinOp::And | BinOp::Or), right) => {
             let both = expected == (*op == BinOp::And);
             if both {
-                prove_guarded_integer_predicate(left, expected, constraints, remaining)?;
-                prove_guarded_integer_predicate(right, expected, constraints, remaining)
+                prove_guarded_integer_predicate(left, expected, constraints, guards, remaining)?;
+                prove_guarded_integer_predicate(right, expected, constraints, guards, remaining)
             } else {
-                prove_guarded_integer_predicate(left, expected, constraints, remaining).or_else(
-                    || prove_guarded_integer_predicate(right, expected, constraints, remaining),
-                )
+                prove_guarded_integer_predicate(left, expected, constraints, guards, remaining)
+                    .or_else(|| {
+                        prove_guarded_integer_predicate(
+                            right,
+                            expected,
+                            constraints,
+                            guards,
+                            remaining,
+                        )
+                    })
             }
         }
         PureExpr::BinOp(guard, BinOp::Implies, conclusion) if expected => {
             let mut extended = constraints.to_vec();
             collect_guard_constraints(guard, true, &mut extended, &mut 4096);
-            prove_guarded_integer_predicate(conclusion, true, &extended, remaining)
+            if matches!(eval_value(conclusion), Some(KnownValue::Bool(false)))
+                && newly_contradictory_guard(&extended, constraints.len(), remaining).is_some()
+            {
+                return Some(());
+            }
+            let mut scoped = guards.to_vec();
+            scoped.push((guard.as_ref(), true));
+            prove_guarded_integer_predicate(conclusion, true, &extended, &scoped, remaining)
         }
         PureExpr::BinOp(left, op @ (BinOp::Eq | BinOp::Ne), right) => {
             // A Boolean equality to a literal is exactly its operand or its
@@ -2705,6 +2733,7 @@ fn prove_guarded_integer_predicate(
                     other,
                     expected == (value == (*op == BinOp::Eq)),
                     constraints,
+                    guards,
                     remaining,
                 );
             }
@@ -2752,14 +2781,124 @@ fn prove_guarded_integer_predicate(
                 negate_ordered_comparison(*op)?
             };
             if let Some(rewritten) = split_comparison_ite(left, op, right) {
-                prove_guarded_integer_predicate(&rewritten, true, constraints, remaining)
+                prove_guarded_integer_predicate(&rewritten, true, constraints, guards, remaining)
             } else {
                 prove_int_arithmetic_comparison_with_constraints(left, op, right, constraints)
                     .map(|_| ())
+                    .or_else(|| {
+                        prove_ordered_from_guard_disequality(
+                            left,
+                            op,
+                            right,
+                            constraints,
+                            guards,
+                            remaining,
+                        )
+                    })
             }
         }
         _ => None,
     }
+}
+
+/// A closed false conclusion needs an actually impossible path. Check only
+/// exact pairs of the existing integer constraints, charging the same search
+/// budget and preserving strictness; a false conclusion alone proves nothing.
+fn newly_contradictory_guard(
+    constraints: &[LinearConstraint],
+    first_new: usize,
+    remaining: &mut usize,
+) -> Option<()> {
+    for constraint in constraints.get(first_new..)? {
+        *remaining = remaining.checked_sub(1)?;
+        let required = i128::from(constraint.strict);
+        if constraint
+            .expr
+            .constant_value()
+            .is_some_and(|value| value < required)
+        {
+            return Some(());
+        }
+        let Some(negative) = constraint.expr.clone().neg() else {
+            continue;
+        };
+        for other in constraints {
+            *remaining = remaining.checked_sub(1)?;
+            let maximum = negative
+                .minimum_with_linear_constraint(other)
+                .and_then(i128::checked_neg);
+            if maximum.is_some_and(|value| value < required) {
+                return Some(());
+            }
+        }
+    }
+    None
+}
+
+/// Keep nonlinear path terms at their original syntax. A positive quotient
+/// need not become a new linear variable: its actual nonzero guard and an
+/// independently proved weak order suffice. No owed conjunct is an assumption.
+fn prove_ordered_from_guard_disequality(
+    left: &PureExpr,
+    op: BinOp,
+    right: &PureExpr,
+    constraints: &[LinearConstraint],
+    guards: &[(&PureExpr, bool)],
+    remaining: &mut usize,
+) -> Option<()> {
+    let (greater, lesser) = match op {
+        BinOp::Gt | BinOp::Ge => (left, right),
+        BinOp::Lt | BinOp::Le => (right, left),
+        _ => return None,
+    };
+    if !is_int_sorted(greater)
+        || !is_int_sorted(lesser)
+        || !lower_bound_int_difference(greater, lesser, constraints)
+            .is_some_and(|minimum| minimum >= 0)
+    {
+        return None;
+    }
+    fn guarded_unequal(
+        guard: &PureExpr,
+        expected: bool,
+        greater: &PureExpr,
+        lesser: &PureExpr,
+        remaining: &mut usize,
+    ) -> Option<()> {
+        *remaining = remaining.checked_sub(1)?;
+        match guard {
+            PureExpr::UnOp(UnOp::Not, inner) => {
+                guarded_unequal(inner, !expected, greater, lesser, remaining)
+            }
+            PureExpr::BinOp(left, op @ (BinOp::And | BinOp::Or), right)
+                if expected == (*op == BinOp::And) =>
+            {
+                guarded_unequal(left, expected, greater, lesser, remaining)
+                    .or_else(|| guarded_unequal(right, expected, greater, lesser, remaining))
+            }
+            PureExpr::BinOp(left, op @ (BinOp::Eq | BinOp::Ne), right) => {
+                if let (PureExpr::Bool(value), other) | (other, PureExpr::Bool(value)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    return guarded_unequal(
+                        other,
+                        expected == (*value == (*op == BinOp::Eq)),
+                        greater,
+                        lesser,
+                        remaining,
+                    );
+                }
+                (expected != (*op == BinOp::Eq)
+                    && ((left.as_ref() == greater && right.as_ref() == lesser)
+                        || (right.as_ref() == greater && left.as_ref() == lesser)))
+                    .then_some(())
+            }
+            _ => None,
+        }
+    }
+    guards
+        .iter()
+        .find_map(|(guard, expected)| guarded_unequal(guard, *expected, greater, lesser, remaining))
 }
 
 /// Add only necessary consequences of the guard. Unsupported/disjunctive
@@ -2796,6 +2935,26 @@ fn collect_guard_constraints(
             _ if expected == (*op == BinOp::Eq) && is_int_sorted(left) && is_int_sorted(right) => {
                 for op in [BinOp::Le, BinOp::Ge] {
                     if let Some((expr, strict)) = linear_goal(left, op, right) {
+                        constraints.push(LinearConstraint { expr, strict });
+                    }
+                }
+            }
+            _ if is_int_sorted(left) && is_int_sorted(right) => {
+                // A disequality chooses no order by itself. Refine only an
+                // order independently established by the enclosing guards.
+                let ordered = if lower_bound_int_difference(left, right, constraints)
+                    .is_some_and(|minimum| minimum >= 0)
+                {
+                    Some((left, right))
+                } else if lower_bound_int_difference(right, left, constraints)
+                    .is_some_and(|minimum| minimum >= 0)
+                {
+                    Some((right, left))
+                } else {
+                    None
+                };
+                if let Some((greater, lesser)) = ordered {
+                    if let Some((expr, strict)) = linear_goal(greater, BinOp::Gt, lesser) {
                         constraints.push(LinearConstraint { expr, strict });
                     }
                 }
@@ -3025,6 +3184,18 @@ fn lower_bound_int_difference(
         return linear.minimum_with_linear_constraints(constraints);
     }
 
+    // For a nonnegative integer a and positive integer b, a / b <= a.
+    // Keep both domain checks explicit; neither division nor a disequality
+    // alone supplies positivity, including for truncated division.
+    if let PureExpr::BinOp(dividend, BinOp::Div | BinOp::DivTrunc, divisor) = right {
+        if left == dividend.as_ref()
+            && lower_bound_int_expr(dividend, constraints).is_some_and(|minimum| minimum >= 0)
+            && lower_bound_int_expr(divisor, constraints).is_some_and(|minimum| minimum >= 1)
+        {
+            return Some(0);
+        }
+    }
+
     // `left - (dividend % divisor)`. Under `BinOp::Mod`, `(a mod b) <= b - 1`
     // whenever `b >= 1`, so `left - (dividend % divisor) >= (left - divisor) + 1`
     // for a positive divisor. This holds under both Euclidean `(mod a b)` and
@@ -3041,6 +3212,9 @@ fn lower_bound_int_difference(
 
     if let Some(right_constant) = constant_int(right) {
         return lower_bound_int_expr(left, constraints)?.checked_sub(right_constant);
+    }
+    if let Some(left_constant) = constant_int(left) {
+        return left_constant.checked_sub(upper_bound_int_expr(right, constraints)?);
     }
 
     if let PureExpr::BinOp(add_left, BinOp::Add, add_right) = left {
@@ -3329,6 +3503,11 @@ impl LinearInt {
                 } else {
                     None
                 }
+            }
+            PureExpr::BinOp(left, BinOp::Div | BinOp::DivTrunc, right)
+                if constant_int(right) == Some(1) =>
+            {
+                Self::from_expr(left)
             }
             PureExpr::Old(inner) => match inner.as_ref() {
                 PureExpr::Var(name, sort)
@@ -4527,7 +4706,7 @@ mod guarded_unsigned_tests {
         assert!(proved("(x >= 8 && x >= 0) ==> x >= 7"));
         assert!(!proved("(x >= 0 && x >= 8) ==> x >= 9"));
         let expr = parse_contract("x >= 8").unwrap();
-        assert!(prove_guarded_integer_predicate(&expr, true, &[], &mut 0).is_none());
+        assert!(prove_guarded_integer_predicate(&expr, true, &[], &[], &mut 0).is_none());
         let mut constraints = Vec::new();
         collect_guard_constraints(&expr, true, &mut constraints, &mut 0);
         assert!(constraints.is_empty());
@@ -4544,5 +4723,77 @@ mod guarded_unsigned_tests {
         ] {
             assert!(!proved(goal), "{goal}");
         }
+    }
+
+    #[test]
+    fn unsigned_division_bounds_require_the_actual_enclosing_domain() {
+        for goal in [
+            "x / 1 == x",
+            "x + 0 == x",
+            "(x >= 0 && x <= 4294967295) ==> x / 1048576 <= 4095",
+            "(x >= 0 && y >= 1) ==> x / y <= x",
+            "(x >= 0 && y >= 0) ==> (y != 0 ==> x / y <= x)",
+            "(x >= 0 && y >= 0) ==> (((y == 0) == false) ==> x / y <= x)",
+            "x >= 0 ==> (x != 0 ==> x >= 1)",
+            "x <= 0 ==> (x != 0 ==> x <= -1)",
+            "(x >= 0 && y >= 1) ==> (x / y != 0 ==> x / y > 0)",
+            "(x >= 0 && y >= 1) ==> (((x / y == 0) == false) ==> (x >= 0 ==> x / y > 0))",
+            "(x >= 0 && y >= 1) ==> (0 != x / y ==> !(x / y <= 0))",
+            "x >= 0 ==> (x == 0 ==> (x > 0 ==> 0 > 0))",
+            "x == 0 ==> (x > 0 ==> false)",
+            "x > 0 ==> (x == 0 ==> false)",
+        ] {
+            assert!(proved(goal), "{goal}");
+        }
+        for goal in [
+            "x / 1 != x",
+            "x + 1 == x",
+            "x / 2 == x",
+            "(x >= 0 && x <= 4294967295) ==> x / 1048576 <= 4094",
+            "y >= 1 ==> x / y <= x",
+            "x >= 0 ==> x / y <= x",
+            "(x >= 0 && y != 0) ==> x / y >= 0",
+            "(x >= 1 && y <= -1) ==> x / y >= 0",
+            "(x >= 0 && y >= 1) ==> x / y < x",
+            "(x >= 0 && y >= 1) ==> x / y == x",
+            "x != 0 ==> x >= 1",
+            "x >= 0 ==> (x != 8 ==> x >= 9)",
+            "x >= 0 ==> ((x != 0 || true) ==> x >= 1)",
+            "(x >= 0 && y >= 1) ==> ((x / y != 0 || true) ==> x / y > 0)",
+            "(x >= 0 && y >= 1) ==> ((x / y != 0 && false) || x / y > 0)",
+            "y >= 1 ==> (x / y != 0 ==> x / y > 0)",
+            "(x >= 0 && y <= -1) ==> (x / y != 0 ==> x / y > 0)",
+            "(x >= 0 && y >= 1) ==> (old(x / y) != 0 ==> x / y > 0)",
+            "(x >= 0 && y >= 1) ==> (x / y != 0 ==> old(x / y) > 0)",
+            "x >= 0 ==> (x > 0 ==> 0 > 0)",
+            "x >= 0 ==> (x >= 0 ==> (x > 0 ==> false))",
+            "x == 0 ==> (old(x) > 0 ==> false)",
+            "x >= 0 ==> (x < 0 && false)",
+        ] {
+            assert!(!proved(goal), "{goal}");
+        }
+        let quotient = parse_contract("(x : int) / (y : int)").unwrap();
+        let nonnegative = parse_contract("x >= 0 && y >= 1").unwrap();
+        let nonzero = PureExpr::BinOp(
+            Arc::new(quotient.clone()),
+            BinOp::Ne,
+            Arc::new(PureExpr::Int(0)),
+        );
+        assert!(prove_ordered_from_guard_disequality(
+            &quotient,
+            BinOp::Gt,
+            &PureExpr::Int(0),
+            &linear_constraints_from_assumption(&nonnegative),
+            &[(&nonzero, true)],
+            &mut 0
+        )
+        .is_none());
+        let impossible = parse_contract("x == 0 && x > 0").unwrap();
+        assert!(newly_contradictory_guard(
+            &linear_constraints_from_assumption(&impossible),
+            0,
+            &mut 0
+        )
+        .is_none());
     }
 }

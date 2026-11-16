@@ -78,8 +78,8 @@ pub use result::{
     VerifyBundleStatus,
 };
 pub use trust_formula::{
-    decode_trust_formula_v1_claim, decode_trust_formula_v1_declared_claim, TrustFormulaDecodeError,
-    TrustFormulaV1Claim,
+    decode_trust_formula_v1_claim, decode_trust_formula_v1_declared_claim,
+    decode_trust_formula_v1_declared_claim_and_value, TrustFormulaDecodeError, TrustFormulaV1Claim,
 };
 pub use trust_tmir::{
     compile_trust_tmir_proof_call_vcs, trust_tmir_to_verify_bundle,

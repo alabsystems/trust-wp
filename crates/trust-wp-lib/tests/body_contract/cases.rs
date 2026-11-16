@@ -4,6 +4,9 @@ use trust_wp_lib::trust_ir_body::{
 
 use super::*;
 
+#[path = "selected.rs"]
+mod selected;
+
 #[path = "validated.rs"]
 mod validated;
 

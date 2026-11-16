@@ -5,10 +5,14 @@ mod body_contract_cases;
 mod compiler_memory_cases;
 #[path = "body_contract/explicit_branches.rs"]
 mod explicit_branch_cases;
+#[path = "body_contract/shared_codec_sp.rs"]
+mod shared_codec_sp;
 #[path = "body_contract/translation_capabilities.rs"]
 mod translation_capability_cases;
 #[path = "body_contract/u64_calls.rs"]
 mod u64_call_cases;
+#[path = "body_contract/unsigned_division.rs"]
+mod unsigned_division_cases;
 #[path = "body_contract/unsigned_select.rs"]
 mod unsigned_select_cases;
 #[path = "body_contract/widthconv.rs"]

@@ -2737,7 +2737,7 @@ fn test_request_validation_rejects_malformed_typed_summary_binding() {
 }
 
 #[test]
-fn test_native_trust_wp_verifier_keeps_nonlinear_symbolic_product_unsupported() {
+fn test_native_trust_wp_verifier_refutes_nonlinear_symbolic_product() {
     let request = single_obligation_request(typed_obligation(
         "obl-linear-nonlinear-product",
         BundleObligationKind::Postcondition,
@@ -2746,12 +2746,14 @@ fn test_native_trust_wp_verifier_keeps_nonlinear_symbolic_product_unsupported() 
 
     let result = NativeTrustWpBundleVerifier.verify_bundle(request);
 
-    assert_eq!(result.status, VerifyBundleStatus::Unsupported);
-    assert_eq!(result.exit_code(), 2);
+    assert_eq!(result.status, VerifyBundleStatus::Failed);
+    assert_eq!(result.exit_code(), 1);
     assert!(matches!(
         &result.obligation_results[0].status,
-        BundleObligationStatus::Unsupported { reason }
-            if reason.contains("cannot prove or refute")
+        BundleObligationStatus::Failed { reason }
+            if reason.contains("checked whole-predicate counterexample")
+                && reason.contains("x=1")
+                && reason.contains("y=0")
     ));
 }
 
@@ -2779,7 +2781,7 @@ fn test_native_trust_wp_verifier_proves_compiler_lowered_result_alias_ensures_fa
 }
 
 #[test]
-fn test_native_trust_wp_verifier_leaves_unproved_result_alias_unsupported() {
+fn test_native_trust_wp_verifier_refutes_false_result_alias() {
     let request = single_obligation_request(typed_obligation(
         "obl-result-alias-unproved",
         BundleObligationKind::Postcondition,
@@ -2788,12 +2790,13 @@ fn test_native_trust_wp_verifier_leaves_unproved_result_alias_unsupported() {
 
     let result = NativeTrustWpBundleVerifier.verify_bundle(request);
 
-    assert_eq!(result.status, VerifyBundleStatus::Unsupported);
-    assert_eq!(result.exit_code(), 2);
+    assert_eq!(result.status, VerifyBundleStatus::Failed);
+    assert_eq!(result.exit_code(), 1);
     assert!(matches!(
         &result.obligation_results[0].status,
-        BundleObligationStatus::Unsupported { reason }
-            if reason.contains("cannot prove or refute")
+        BundleObligationStatus::Failed { reason }
+            if reason.contains("checked whole-predicate counterexample")
+                && reason.contains("result=0")
     ));
 }
 
@@ -2999,7 +3002,7 @@ fn test_native_trust_wp_verifier_leaves_disjunctive_requires_unsupported() {
 }
 
 #[test]
-fn test_native_trust_wp_verifier_leaves_unproved_linear_implication_unsupported() {
+fn test_native_trust_wp_verifier_refutes_false_linear_implication() {
     let request = single_obligation_request(typed_obligation(
         "obl-linear-unproved",
         BundleObligationKind::Postcondition,
@@ -3008,12 +3011,13 @@ fn test_native_trust_wp_verifier_leaves_unproved_linear_implication_unsupported(
 
     let result = NativeTrustWpBundleVerifier.verify_bundle(request);
 
-    assert_eq!(result.status, VerifyBundleStatus::Unsupported);
-    assert_eq!(result.exit_code(), 2);
+    assert_eq!(result.status, VerifyBundleStatus::Failed);
+    assert_eq!(result.exit_code(), 1);
     assert!(matches!(
         &result.obligation_results[0].status,
-        BundleObligationStatus::Unsupported { reason }
-            if reason.contains("cannot prove or refute")
+        BundleObligationStatus::Failed { reason }
+            if reason.contains("checked whole-predicate counterexample")
+                && reason.contains("x=0")
     ));
 }
 
@@ -3200,7 +3204,7 @@ fn test_native_trust_wp_verifier_proves_typed_precondition_reflexivity() {
 }
 
 #[test]
-fn test_native_trust_wp_verifier_unknown_symbolic_postcondition_fails_closed() {
+fn test_native_trust_wp_verifier_refutes_unconstrained_symbolic_postcondition() {
     let request = single_obligation_request(typed_obligation(
         "obl-post-unknown",
         BundleObligationKind::Postcondition,
@@ -3209,12 +3213,14 @@ fn test_native_trust_wp_verifier_unknown_symbolic_postcondition_fails_closed() {
 
     let result = NativeTrustWpBundleVerifier.verify_bundle(request);
 
-    assert_eq!(result.status, VerifyBundleStatus::Unsupported);
-    assert_eq!(result.exit_code(), 2);
+    assert_eq!(result.status, VerifyBundleStatus::Failed);
+    assert_eq!(result.exit_code(), 1);
     assert!(matches!(
         &result.obligation_results[0].status,
-        BundleObligationStatus::Unsupported { reason }
-            if reason.contains("cannot prove or refute")
+        BundleObligationStatus::Failed { reason }
+            if reason.contains("checked whole-predicate counterexample")
+                && reason.contains("result=0")
+                && reason.contains("x=0")
     ));
 }
 
