@@ -6,4 +6,4 @@ publish = false
 description = "The ONE honesty meter: strictly audit a kernel proof judgment and its complete declaration/provenance closure."
 [workspace]
 [dependencies]
-clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "fae0c94829740c9ffe527eeeb4ea472f9c08001b" }
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "e86b4b61e665f73b4737dd360773677561462f7e" }

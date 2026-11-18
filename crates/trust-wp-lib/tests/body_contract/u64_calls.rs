@@ -42,7 +42,7 @@ fn original_typed_u64_postconditions_prove_and_replay_without_narrowing() {
             // Its explicit refusal is retained in the separate control below.
             continue;
         }
-        let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+        let bundle = derived_v9_capture(text);
         bundle.validate().unwrap();
         let original = bundle.clone();
         match verify_trust_ir_body_contracts(&bundle) {
@@ -68,7 +68,7 @@ fn source_identity_alone_never_supplies_the_missing_unsigned_goal() {
         .iter()
         .find(|(name, _)| *name == "signed_min_magnitude")
         .unwrap();
-    let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+    let bundle = derived_v9_capture(text);
     assert_eq!(
         bundle.module.proof_obligations[0]
             .formula

@@ -15,7 +15,7 @@ fn untranslated_original_unsigned_and_call_questions_keep_their_native_proofs() 
         include_str!("fixtures/u64_calls/clamp_unsigned_to_width.json"),
         include_str!("fixtures/u64_calls/signed_fits_magnitude.json"),
     ] {
-        let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+        let bundle = derived_v9_capture(text);
         bundle.validate().unwrap();
         let original = bundle.clone();
         let witnesses = trust_ir_native_bundle_to_body_translation_witnesses(&bundle).unwrap();
@@ -31,8 +31,8 @@ fn untranslated_original_unsigned_and_call_questions_keep_their_native_proofs() 
         replay_trust_ir_body_contracts(&bundle, &results).unwrap();
         assert_eq!(bundle, original);
     }
-    let missing: NativeVerificationBundle =
-        serde_json::from_str(include_str!("fixtures/u64_calls/signed_min_magnitude.json")).unwrap();
+    let missing =
+        derived_v9_capture(include_str!("fixtures/u64_calls/signed_min_magnitude.json"));
     let original = missing.clone();
     assert!(trust_ir_native_bundle_to_body_translation_witnesses(&missing).is_err());
     assert!(verify_trust_ir_body_contracts(&missing).is_err());

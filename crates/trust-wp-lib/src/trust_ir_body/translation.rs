@@ -46,6 +46,15 @@ pub struct NativeBodyWpTranslationWitness {
     pub parameters: Vec<(ValueId, String)>,
     pub plan: NativeBodyWpProofPlan,
     pub coverage: NativeBodyWpTranslationCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_question: Option<NativeBodyWpEntryWitness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeBodyWpEntryWitness {
+    pub digest: String,
+    pub uses_declared_entry: bool,
+    pub contracts: Vec<(FuncId, ProofId, ProofFormula)>,
 }
 
 impl NativeBodyWpTranslationWitness {
@@ -150,6 +159,7 @@ impl NativeBodyWpTranslationWitness {
             } else {
                 NativeBodyWpTranslationCoverage::Untranslated { reasons }
             },
+            public_question: None,
         })
     }
 }

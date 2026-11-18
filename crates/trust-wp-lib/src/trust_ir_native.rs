@@ -1241,7 +1241,7 @@ fn claim_format_for_tmir_schema(schema: &str) -> BundleClaimFormat {
     }
 }
 
-fn native_claim_for_tmir(
+pub(crate) fn native_claim_for_tmir(
     formula: &trust_ir::ProofFormula,
 ) -> Result<BundleClaim, TrustIrNativeBundleError> {
     if formula.schema == "trust-types.Formula@1" {
@@ -1430,6 +1430,56 @@ fn admit_clause_bindings(
     carrier: TrustIrClauseCarrier,
     model: BindingModel,
 ) -> Result<(), TrustIrNativeBundleError> {
+    admit_clause_bindings_for_function(
+        module,
+        request.id,
+        request.function,
+        obligation,
+        formula,
+        carrier,
+        model,
+    )
+}
+
+pub(crate) fn admit_body_entry_clause(
+    module: &trust_ir::Module,
+    request_id: trust_ir::NativeRequestId,
+    obligation: &trust_ir::ProofObligation,
+) -> Result<(), TrustIrNativeBundleError> {
+    let function = obligation
+        .function
+        .ok_or(TrustIrNativeBundleError::MissingObligation {
+            request_id: request_id.index(),
+            obligation_id: obligation.id.index(),
+        })?;
+    let formula =
+        obligation
+            .formula
+            .as_ref()
+            .ok_or(TrustIrNativeBundleError::MissingObligation {
+                request_id: request_id.index(),
+                obligation_id: obligation.id.index(),
+            })?;
+    admit_clause_bindings_for_function(
+        module,
+        request_id,
+        function,
+        obligation,
+        formula,
+        TrustIrClauseCarrier::Obligation,
+        BindingModel::BodyScalar,
+    )
+}
+
+fn admit_clause_bindings_for_function(
+    module: &trust_ir::Module,
+    request_id: trust_ir::NativeRequestId,
+    function: trust_ir::FuncId,
+    obligation: &trust_ir::ProofObligation,
+    formula: &trust_ir::ProofFormula,
+    carrier: TrustIrClauseCarrier,
+    model: BindingModel,
+) -> Result<(), TrustIrNativeBundleError> {
     use trust_ir::proof::{
         clause_typing::{clause_sort_admits, resolve_clause_place},
         ClausePlace,
@@ -1437,7 +1487,7 @@ fn admit_clause_bindings(
 
     let refuse = |name: &str, reason: TrustIrUnsupportedClauseBindingReason| {
         TrustIrNativeBundleError::UnsupportedClauseBinding {
-            request_id: request.id.index(),
+            request_id: request_id.index(),
             obligation_id: obligation.id.index(),
             carrier,
             name: name.to_string(),
@@ -1451,12 +1501,12 @@ fn admit_clause_bindings(
     let mut seen = std::collections::BTreeSet::new();
     for (name, binding) in &formula.bindings {
         if let Some(obligation_function) = obligation.function {
-            if obligation_function != request.function {
+            if obligation_function != function {
                 return Err(refuse(
                     name,
                     TrustIrUnsupportedClauseBindingReason::OwningFunctionMismatch {
                         obligation_function: obligation_function.index(),
-                        request_function: request.function.index(),
+                        request_function: function.index(),
                     },
                 ));
             }
@@ -1496,20 +1546,19 @@ fn admit_clause_bindings(
             | ClausePlace::Unwind
             | ClausePlace::Value(_) => {}
         }
-        let ty =
-            resolve_clause_place(module, request.function, &binding.place).map_err(|error| {
-                refuse(
-                    name,
-                    TrustIrUnsupportedClauseBindingReason::UnresolvedPlace {
-                        place: binding.place,
-                        error,
-                    },
-                )
-            })?;
+        let ty = resolve_clause_place(module, function, &binding.place).map_err(|error| {
+            refuse(
+                name,
+                TrustIrUnsupportedClauseBindingReason::UnresolvedPlace {
+                    place: binding.place,
+                    error,
+                },
+            )
+        })?;
         // The resolver types a place by the lowered signature's slot alone.
         // That slot is the source parameter or result only while the
         // signature records no ABI placement (D-191).
-        if owning_signature_records_abi_placement(module, request.function) {
+        if owning_signature_records_abi_placement(module, function) {
             return Err(refuse(
                 name,
                 TrustIrUnsupportedClauseBindingReason::PlacedSignature {

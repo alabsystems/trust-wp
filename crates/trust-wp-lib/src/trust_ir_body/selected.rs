@@ -9,6 +9,8 @@ use super::*;
 pub struct NativeBodyWpVerification {
     witness: NativeBodyWpTranslationWitness,
     result: VerifyBundleResult,
+    public_question_digest: Option<String>,
+    uses_declared_entry: bool,
 }
 
 impl NativeBodyWpVerification {
@@ -17,6 +19,21 @@ impl NativeBodyWpVerification {
     }
     pub fn result(&self) -> &VerifyBundleResult {
         &self.result
+    }
+    pub fn public_question_digest(&self) -> Option<&str> {
+        self.public_question_digest.as_deref()
+    }
+    pub fn uses_declared_entry(&self) -> bool {
+        self.uses_declared_entry
+    }
+    pub(super) fn with_public_question(
+        mut self,
+        digest: String,
+        uses_declared_entry: bool,
+    ) -> Self {
+        self.public_question_digest = Some(digest);
+        self.uses_declared_entry = uses_declared_entry;
+        self
     }
 }
 
@@ -29,9 +46,21 @@ pub fn verify_trust_ir_body_request_validated(
 ) -> Result<NativeBodyWpVerification> {
     let (request, witness) = derive_selected(admitted, request_id, true)?;
     let witness = witness.ok_or_else(|| refuse("selected translation has no witness"))?;
+    verify_derived_request(request, witness)
+}
+
+pub(super) fn verify_derived_request(
+    request: VerifyBundleRequest,
+    witness: NativeBodyWpTranslationWitness,
+) -> Result<NativeBodyWpVerification> {
     let result = verify_bundle(request);
     require_native_body_evidence(&result)?;
-    Ok(NativeBodyWpVerification { witness, result })
+    Ok(NativeBodyWpVerification {
+        witness,
+        result,
+        public_question_digest: None,
+        uses_declared_entry: false,
+    })
 }
 
 /// Independently regenerate the selected question against the entire admitted
@@ -58,6 +87,15 @@ fn derive_selected(
     admitted: &trust_ir::ValidatedNativeBundle<'_>,
     request_id: trust_ir::NativeRequestId,
     capture: bool,
+) -> Result<(VerifyBundleRequest, Option<NativeBodyWpTranslationWitness>)> {
+    derive_selected_with_domain(admitted, request_id, capture, None)
+}
+
+pub(super) fn derive_selected_with_domain(
+    admitted: &trust_ir::ValidatedNativeBundle<'_>,
+    request_id: trust_ir::NativeRequestId,
+    capture: bool,
+    entry_domain: Option<&EntryDomain>,
 ) -> Result<(VerifyBundleRequest, Option<NativeBodyWpTranslationWitness>)> {
     let bundle = admitted.bundle();
     let input_identity = bundle.stable_digest();
@@ -100,6 +138,7 @@ fn derive_selected(
         &mut request,
         input_identity,
         capture.then_some(&mut witnesses),
+        entry_domain,
     )?;
     Ok((request, witnesses.pop()))
 }

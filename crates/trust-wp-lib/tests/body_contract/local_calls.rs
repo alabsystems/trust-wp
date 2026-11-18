@@ -8,7 +8,7 @@ const WIDTH: &str = include_str!("fixtures/local_calls/width_supported.json");
 const CONVERSION: &str = include_str!("fixtures/local_calls/conversion_code.json");
 
 fn captured(text: &str) -> NativeVerificationBundle {
-    let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+    let bundle = derived_v9_capture(text);
     bundle.validate().unwrap();
     assert_eq!(bundle.module.stable_digest(), bundle.trust_ir_module_digest);
     bundle

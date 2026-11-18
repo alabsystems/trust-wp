@@ -53,18 +53,31 @@ pub enum TrustIrBodyContractError {
     Replay(String),
 }
 
+#[cfg(feature = "public-question")]
+mod public_question;
 mod selected;
+#[cfg(feature = "public-question")]
+pub use public_question::{replay_native_public_question, verify_native_public_question};
 pub use selected::{
     replay_trust_ir_body_request_validated, verify_trust_ir_body_request_validated,
     NativeBodyWpVerification,
 };
 mod translation;
 pub use translation::{
-    replay_trust_ir_body_translation_witnesses, NativeBodyWpProofPlan,
+    replay_trust_ir_body_translation_witnesses, NativeBodyWpEntryWitness, NativeBodyWpProofPlan,
     NativeBodyWpTranslationCoverage, NativeBodyWpTranslationWitness,
 };
 
 type Result<T> = std::result::Result<T, TrustIrBodyContractError>;
+
+// Engine-local derivation data can only be filled from the sealed shared
+// question. It is neither a new contract grammar nor a serializable premise.
+struct EntryDomain {
+    clauses: BTreeMap<FuncId, Vec<trust_ir::ProofObligation>>,
+    digest: String,
+    request_id: trust_ir::NativeRequestId,
+    conditioned: bool,
+}
 
 fn refuse(reason: impl Into<String>) -> TrustIrBodyContractError {
     TrustIrBodyContractError::Unsupported(reason.into())
@@ -237,6 +250,7 @@ fn derive_body_requests(
             request,
             input_identity,
             witnesses.as_deref_mut(),
+            None,
         )?;
     }
     Ok(requests)
@@ -248,6 +262,7 @@ fn derive_body_request(
     request: &mut VerifyBundleRequest,
     input_identity: trust_ir::ProofDigest,
     mut witnesses: Option<&mut Vec<NativeBodyWpTranslationWitness>>,
+    entry_domain: Option<&EntryDomain>,
 ) -> Result<()> {
     if native.mode != trust_ir::TrustWpVerificationMode::WeakestPrecondition {
         return Err(refuse("only WeakestPrecondition mode has body semantics"));
@@ -263,6 +278,7 @@ fn derive_body_request(
         .ok_or_else(|| refuse("missing function"))?;
     let mut body = ScalarBody::validate(&bundle.module, function, String::new())?;
     body.capture_plan = witnesses.is_some();
+    body.entry_domain = entry_domain;
     request.bundle_id = native_body_wp_bundle_id(
         &bundle.module.name,
         native.id.index(),
@@ -273,7 +289,7 @@ fn derive_body_request(
         plan = derive_body_obligation(&body, native, output, *id)?;
     }
     if let Some(witnesses) = witnesses.as_deref_mut() {
-        witnesses.push(NativeBodyWpTranslationWitness::new(
+        let mut witness = NativeBodyWpTranslationWitness::new(
             bundle,
             native,
             function,
@@ -284,7 +300,38 @@ fn derive_body_request(
                 .map(|(id, _)| (*id, body.value_name(*id)))
                 .collect(),
             plan.ok_or_else(|| refuse("translation has no original postcondition"))?,
-        )?);
+        )?;
+        if let Some(domain) = entry_domain {
+            witness.public_question = Some(translation::NativeBodyWpEntryWitness {
+                digest: domain.digest.clone(),
+                uses_declared_entry: domain.conditioned,
+                contracts: domain
+                    .clauses
+                    .iter()
+                    .flat_map(|(function, clauses)| {
+                        clauses.iter().map(move |clause| {
+                            Ok((
+                                *function,
+                                clause.id,
+                                clause
+                                    .formula
+                                    .clone()
+                                    .ok_or_else(|| refuse("missing original entry formula"))?,
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            });
+            if domain.conditioned {
+                witness.coverage = NativeBodyWpTranslationCoverage::Untranslated {
+                    reasons: vec![
+                        "declared entry-domain implication has no mathematical translation theorem"
+                            .into(),
+                    ],
+                };
+            }
+        }
+        witnesses.push(witness);
     }
     Ok(())
 }
@@ -350,15 +397,27 @@ fn derive_body_obligation(
     if payload.len() > MAX_FORMULA_BYTES {
         return Err(refuse("derived WP exceeds the formula budget"));
     }
+    let predicate = if body
+        .entry_domain
+        .is_some_and(|domain| domain.conditioned && domain.clauses.contains_key(&native.function))
+    {
+        binary(
+            body.entry_predicate(native.id)?,
+            BinOp::Implies,
+            wp.predicate,
+        )
+    } else {
+        wp.predicate
+    };
     output.claim = scalar_claim(&if body
         .entry
         .params
         .iter()
         .any(|(_, ty)| matches!(ty, Ty::U8 | Ty::U32 | Ty::U64))
     {
-        binary(body.input_domain(), BinOp::Implies, wp.predicate)
+        binary(body.input_domain(), BinOp::Implies, predicate)
     } else {
-        wp.predicate
+        predicate
     })?;
     Ok(plan)
 }
@@ -683,6 +742,8 @@ struct ScalarBody<'a> {
     // the default off because their translation remains explicitly unproved.
     capture_plan: bool,
     module: &'a Module,
+    function: FuncId,
+    entry_domain: Option<&'a EntryDomain>,
     namespace: String,
     entry: &'a trust_ir::Block,
     blocks: BTreeMap<BlockId, &'a trust_ir::Block>,
@@ -1106,6 +1167,8 @@ impl<'a> ScalarBody<'a> {
         Ok(Self {
             capture_plan: false,
             module,
+            function: function.id,
+            entry_domain: None,
             namespace,
             entry,
             blocks,
@@ -1141,6 +1204,43 @@ impl<'a> ScalarBody<'a> {
                     ),
                 )
             })
+    }
+
+    fn entry_predicate(&self, request_id: trust_ir::NativeRequestId) -> Result<PureExpr> {
+        let mut predicate = PureExpr::Bool(true);
+        let Some(clauses) = self
+            .entry_domain
+            .and_then(|domain| domain.clauses.get(&self.function))
+        else {
+            return Ok(predicate);
+        };
+        for clause in clauses {
+            crate::trust_ir_native::admit_body_entry_clause(self.module, request_id, clause)?;
+            let formula = clause
+                .formula
+                .as_ref()
+                .ok_or_else(|| refuse("missing entry formula"))?;
+            if formula.bindings.iter().any(|(_, binding)| {
+                !matches!(binding.place, trust_ir::proof::ClausePlace::Param { .. })
+            }) {
+                return Err(refuse("entry clause must bind original parameters"));
+            }
+            let claim = crate::trust_ir_native::native_claim_for_tmir(formula)?;
+            let output = crate::BundleObligation::new(
+                format!("original-entry-{}", clause.id.index()),
+                crate::BundleObligationKind::Precondition {
+                    callee: String::new(),
+                },
+                String::new(),
+                claim,
+            );
+            predicate = binary(
+                predicate,
+                BinOp::And,
+                bound_postcondition(self, formula, &output)?,
+            );
+        }
+        Ok(predicate)
     }
 
     fn edge(
@@ -1416,11 +1516,12 @@ impl<'a> ScalarBody<'a> {
             .module
             .function_by_id(callee)
             .ok_or_else(|| refuse("missing local callee"))?;
-        let body = Self::validate(
+        let mut body = Self::validate(
             self.module,
             function,
             format!("callee_f{}_", callee.index()),
         )?;
+        body.entry_domain = self.entry_domain;
         let continuation = post.substitute(&HashMap::from([(
             self.value_name(result),
             result_expr(body.result_sort, &body.namespace),
@@ -1445,7 +1546,21 @@ impl<'a> ScalarBody<'a> {
             .zip(args)
             .map(|((formal, _), actual)| (body.value_name(*formal), self.value(*actual)))
             .collect();
-        let predicate = wp.predicate.substitute(&substitutions);
+        let predicate = if let Some(domain) = body
+            .entry_domain
+            .filter(|domain| domain.clauses.contains_key(&callee))
+        {
+            // The callee's declaration is owed at the call; it does not
+            // become an assumption about the caller's inputs.
+            binary(
+                body.entry_predicate(domain.request_id)?,
+                BinOp::And,
+                wp.predicate,
+            )
+        } else {
+            wp.predicate
+        }
+        .substitute(&substitutions);
         // No local identity or result placeholder can escape composition.
         // The only remaining reads are the caller's continuation and actuals.
         let mut allowed: BTreeSet<_> = post.free_vars().into_iter().collect();

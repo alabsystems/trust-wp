@@ -77,7 +77,7 @@ fn failed(bundle: &NativeVerificationBundle) {
 fn original_budget_callers_prove_all_five_contracts_and_independently_replay() {
     let mut failures = Vec::new();
     for (name, text, count) in CAPTURES {
-        let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+        let bundle = derived_v9_capture(text);
         let before = bundle.clone();
         let original_bytes = trust_ir::binary::serialize_module(&bundle.module).unwrap();
         let admitted = ValidatedNativeBundle::new(&bundle).unwrap();
@@ -431,7 +431,7 @@ fn changed_return_binding_or_guard_cannot_reuse_original_quotient_evidence() {
 
 #[test]
 fn original_callee_divisor_mutation_is_checked_without_dropping_siblings() {
-    let mut bundle: NativeVerificationBundle = serde_json::from_str(CAPTURES[2].1).unwrap();
+    let mut bundle = derived_v9_capture(CAPTURES[2].1);
     let original = bundle.clone();
     let evidence = checked(&original);
     let callee = bundle.module.function_by_id_mut(FuncId::new(1)).unwrap();

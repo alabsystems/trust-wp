@@ -721,7 +721,7 @@ def test_unanswerable_direction_keeps_the_strict_verdict() -> None:
 def test_live_locks_use_live_context_and_spikes_keep_historical_context(monkeypatch, tmp_path):
     (tmp_path / "dependency-modes").mkdir()
     (tmp_path / "dependency-modes/LIVE_DEPENDS.lock").write_text(
-        "ay main " + "a" * 40 + "\nclean main " + "b" * 40 + "\ntrust-ir main " + "c" * 40 + "\n")
+        "ay main " + "a" * 40 + "\nclean main " + "b" * 40 + "\ntrust-ir main " + "c" * 40 + "\ntrust main " + "e" * 40 + "\n")
     roots = []
     class Root:
         def __init__(self, **kwargs):
@@ -739,7 +739,7 @@ def test_live_locks_use_live_context_and_spikes_keep_historical_context(monkeypa
     monkeypatch.setattr(LOCK_GATE, "HermeticRoot", Root)
     contexts = LOCK_GATE.LockContexts(tmp_path)
     for lock in (Path("Cargo.lock"), LOCK_GATE.TRUST_MODE_LOCK):
-        assert contexts.workspace_for(lock, []) == {"ay": "a" * 40, "clean": "b" * 40, "trust-ir": "c" * 40}
+        assert contexts.workspace_for(lock, []) == {"ay": "a" * 40, "clean": "b" * 40, "trust-ir": "c" * 40, "trust": "e" * 40}
         assert contexts.heal("live")
     assert contexts.workspace_for(Path("spikes/case/Cargo.lock"), []) == {"historical": "d" * 40}
     assert contexts.heal("historical")
@@ -747,6 +747,84 @@ def test_live_locks_use_live_context_and_spikes_keep_historical_context(monkeypa
     assert roots[1].healed == ["historical"]
     contexts.close()
     assert all(root.closed for root in roots)
+
+
+def test_shared_question_context_checks_root_gitlink_before_caching_a_sibling(monkeypatch, tmp_path):
+    root = LOCK_GATE.HermeticRoot.__new__(LOCK_GATE.HermeticRoot)
+    root.root = tmp_path
+    root.pins = {"trust": "a" * 40, "trust-ir": "b" * 40}
+    root.shared_question = True
+    root._trees = {}
+    source = tmp_path / "source"
+    monkeypatch.setattr(root, "_source_for", lambda *_: source)
+    monkeypatch.setattr(LOCK_GATE, "_tree_entry", lambda *_: ("160000", "c" * 40))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="same selected source"):
+            root._register_siblings()
+        assert root._trees == {}, "a failed context must never cache an unchecked sibling"
+    monkeypatch.setattr(LOCK_GATE, "_tree_entry", lambda *_: ("160000", "b" * 40))
+    root._register_siblings()
+    assert root._trees[tmp_path / "trust"] == (source, "a" * 40)
+
+
+def test_historical_context_does_not_acquire_the_new_live_root_cohort(monkeypatch, tmp_path):
+    root = LOCK_GATE.HermeticRoot.__new__(LOCK_GATE.HermeticRoot)
+    root.root = tmp_path
+    root.pins = {"trust": "a" * 40, "trust-ir": "b" * 40}
+    root.shared_question = False
+    root._trees = {}
+    def unexpected(*_):
+        raise AssertionError("historical scope must keep its own original owner")
+    monkeypatch.setattr(root, "_source_for", unexpected)
+    root._register_siblings()
+    assert root._trees[tmp_path / "trust"] == (Path("@pin"), "a" * 40)
+
+
+def test_pinned_git_reads_ignore_ambient_routing_and_replacement(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "foreign"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.worktree")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "other"))
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/forged/")
+    def read(argv, **kwargs):
+        env = kwargs["env"]
+        assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+        assert env["GIT_NO_LAZY_FETCH"] == "1"
+        assert env["GIT_GRAFT_FILE"] == LOCK_GATE.os.devnull
+        assert not any(key in env for key in ("GIT_DIR", "GIT_CONFIG_COUNT", "GIT_REPLACE_REF_BASE"))
+        value = "original" if kwargs.get("text") else (b"" if "ls-files" in argv else b"original")
+        return subprocess.CompletedProcess(argv, 0, stdout=value, stderr=b"")
+    monkeypatch.setattr(LOCK_GATE.subprocess, "run", read)
+    assert LOCK_GATE._git(tmp_path, "show", "a" * 40) == "original"
+    assert LOCK_GATE.has_revision(tmp_path, "a" * 40)
+    assert LOCK_GATE.discover_lockfiles(tmp_path) == []
+    assert LOCK_GATE.repair_lock_path(tmp_path) == tmp_path / "original"
+
+
+def test_ambient_gitdir_cannot_choose_a_foreign_census_or_mutation_lock(monkeypatch, tmp_path):
+    source, foreign = tmp_path / "source", tmp_path / "foreign"
+    revisions = []
+    for directory, relative in ((source, Path("Cargo.lock")), (foreign, Path("nested/Cargo.lock"))):
+        subprocess.run(["git", "init", "-q", "--template=", str(directory)], check=True,
+                       env=LOCK_GATE.git_environment())
+        target = directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("original " + directory.name)
+        target.with_name("Cargo.toml").write_text("[workspace]\n")
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(directory), *args],
+                                           env=LOCK_GATE.git_environment(), text=True).strip()
+        git("add", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "source")
+        revisions.append(git("rev-parse", "HEAD"))
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git/index"))
+    assert LOCK_GATE.discover_lockfiles(source) == [Path("Cargo.lock")]
+    assert LOCK_GATE.has_revision(source, revisions[0])
+    assert LOCK_GATE._git(source, "show", revisions[0] + ":Cargo.lock") == "original source"
+    assert LOCK_GATE.repair_lock_path(source).resolve() == (source / ".git/trust-wp-lock-repair.lock").resolve()
 
 
 def test_missing_live_authority_refuses_instead_of_using_historical_pins(tmp_path):

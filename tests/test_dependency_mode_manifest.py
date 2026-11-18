@@ -17,9 +17,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 TRUST_IR_PATHS = {
-    "trust-ir": "../trust-ir/crates/trust-ir",
-    "trust-ir-contract": "../trust-ir/crates/trust-ir-contract",
-    "trust-ir-build": "../trust-ir/crates/trust-ir-build",
+    "trust-ir": "../trust/first-party/trust-ir/crates/trust-ir",
+    "trust-ir-contract": "../trust/first-party/trust-ir/crates/trust-ir-contract",
+    "trust-ir-build": "../trust/first-party/trust-ir/crates/trust-ir-build",
 }
 
 

@@ -1,10 +1,16 @@
 #![cfg(feature = "trust-ir-native")]
+#[path = "body_contract/archived_capture.rs"]
+mod archived_capture;
+use archived_capture::derived_v9_capture;
 #[path = "body_contract/cases.rs"]
 mod body_contract_cases;
 #[path = "body_contract/compiler_memory.rs"]
 mod compiler_memory_cases;
 #[path = "body_contract/explicit_branches.rs"]
 mod explicit_branch_cases;
+#[cfg(feature = "public-question")]
+#[path = "body_contract/public_question.rs"]
+mod public_question_cases;
 #[path = "body_contract/shared_codec_sp.rs"]
 mod shared_codec_sp;
 #[path = "body_contract/translation_capabilities.rs"]

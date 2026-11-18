@@ -5,7 +5,7 @@ fn captured(name: &str) -> NativeVerificationBundle {
         .iter()
         .find(|(candidate, _)| *candidate == name)
         .unwrap();
-    serde_json::from_str(text).unwrap()
+    derived_v9_capture(text)
 }
 
 fn checked(bundle: &NativeVerificationBundle) -> Vec<trust_wp_lib::VerifyBundleResult> {
@@ -127,7 +127,7 @@ fn original_full_width_programs_match_an_independent_unsigned_oracle() {
         u64::MAX,
     ];
     for (name, text) in CAPTURES {
-        let bundle: NativeVerificationBundle = serde_json::from_str(text).unwrap();
+        let bundle = derived_v9_capture(text);
         for width in [0, 1, 2, 8, 16, 31, 32, 33, 63, 64, 65, 128, u32::MAX] {
             let supported = (1..=64).contains(&width);
             let max_unsigned = if supported {

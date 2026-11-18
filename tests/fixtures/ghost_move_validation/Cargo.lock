@@ -226,8 +226,8 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.15.0"
-source = "git+https://github.com/alabsystems/trust-ir.git?rev=8bae728257b123d6394b2dc049b3573ad885049f#8bae728257b123d6394b2dc049b3573ad885049f"
+version = "0.16.0"
+source = "git+https://github.com/alabsystems/trust-ir.git?rev=899d46e7a303fad2b706a88a7a8eda41ec47dcfe#899d46e7a303fad2b706a88a7a8eda41ec47dcfe"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "num-bigint",
  "serde",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-std"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "trust-wp-macros",
 ]
